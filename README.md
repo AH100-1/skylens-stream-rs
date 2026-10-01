@@ -88,12 +88,14 @@ use skylens_core::two_view::{essential_from_fundamental, recover_pose, refine_po
 let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let e = essential_from_fundamental(&f, &k, &k);
-if let Some(rp) = recover_pose(&e, &n1, &n2) {
+if let Some(rp) = recover_pose(&e, &n1, &n2).filter(|rp| rp.translation_observable) {
     // 카메라 1 = [I|0], 카메라 2 = [R|t] (t 는 단위 길이, 스케일 미정)
     let (r, t) = refine_pose(&rp.rotation, &rp.translation, &n1, &n2, 50);
     let x = triangulate(&r, &t, &n1[0], &n2[0]); // 카메라 1 좌표계의 3D 점
 }
-// recover_pose 는 길이 불일치, NaN 입력, 순수 회전(이동 방향을 관측할 수 없음)에서 None.
+// recover_pose 는 길이 불일치, NaN 입력에서 None.
+// 순수 회전·아주 짧은 기선(이동 방향을 관측할 수 없음)이면 translation_observable = false 이고
+// rotation 만 믿을 수 있다(translation 은 0). 회전 평균에는 이 회전도 쓸 수 있다.
 ```
 
 ### 라이브러리: 회전 평균
@@ -210,12 +212,14 @@ use skylens_core::two_view::{essential_from_fundamental, recover_pose, refine_po
 let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let e = essential_from_fundamental(&f, &k, &k);
-if let Some(rp) = recover_pose(&e, &n1, &n2) {
+if let Some(rp) = recover_pose(&e, &n1, &n2).filter(|rp| rp.translation_observable) {
     // camera 1 = [I|0], camera 2 = [R|t] (t has unit length; scale is unknown)
     let (r, t) = refine_pose(&rp.rotation, &rp.translation, &n1, &n2, 50);
     let x = triangulate(&r, &t, &n1[0], &n2[0]); // 3D point in camera 1 coordinates
 }
-// recover_pose returns None on length mismatch, NaN input, or pure rotation (translation unobservable).
+// recover_pose returns None on length mismatch or NaN input.
+// For pure rotation or a very short baseline (translation unobservable), translation_observable = false
+// and only rotation is reliable (translation is zero). That rotation can still feed rotation averaging.
 ```
 
 ### Library: rotation averaging
