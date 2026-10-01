@@ -1,0 +1,12 @@
+[package]
+name = "skylens-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "skylens-stream"
+path = "src/main.rs"
+
+[dependencies]
+skylens-core = { path = "../core" }
