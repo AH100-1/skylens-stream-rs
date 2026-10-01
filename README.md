@@ -11,13 +11,14 @@
 새 구역이 들어올 때마다 빠른 초벌 점군을 먼저 보여 주고, 정밀 계산이 끝난 구역은 정밀본으로 바꿔 끼운다.
 화면에는 단계마다 "이전 구역은 정밀본 + 최신 구역은 초벌" 점군이 나간다.
 
-> 개발 중이다. 아래 명령 중 아직 없는 것은 표시해 둔다.
+> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth` 만 있고, 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정 → 밀집 준비·융합 → 점진 스트림)를 묶어 만들어 가는 중이다.
 
 ### 설치
 
 ```bash
 cargo build --release
 # 실행 파일: target/release/skylens-stream
+# 빌드 없이 바로 실행: cargo run --release -p skylens-stream -- <명령>
 ```
 
 Rust stable 1.88 이상이 필요하다.
@@ -29,10 +30,10 @@ Rust stable 1.88 이상이 필요하다.
   images/camF_0000.jpg ...   # 앞 카메라 (camF_<위치 번호 4자리>.jpg)
   images/camR_0000.jpg ...   # 오른쪽
   images/camL_0000.jpg ...   # 왼쪽
-  gps.txt                    # 한 줄에: 이미지이름 위도 경도 고도
+  gps.txt                    # 한 줄에: 확장자 없는 이미지 이름(camF_0000) 위도 경도(도) 고도(m)
 ```
 
-`synth` 출력도 같은 구조이며, 정답 카메라 `truth/cameras.txt`(한 줄에: 이름 fx fy cx cy 폭 높이, R 행 우선 9개, t 3개)가 더 있다.
+`synth` 출력도 같은 구조이며, 정답 카메라 `truth/cameras.txt`(한 줄에: 이름 fx fy cx cy 폭 높이, 세계→카메라 R 행 우선 9개, t 3개)가 더 있다.
 
 ### 사용법
 
@@ -43,14 +44,14 @@ skylens-stream ply-info <파일.ply>
 
 # 시험용 합성 장면 만들기 (영상 + GPS + 정답 카메라, 기본 960×540, 3대 × 80위치 = 240장)
 # 폭·높이는 16..=8192 정수이며 둘 다 주거나 둘 다 생략한다. 아니면 사용법과 종료 코드 2
+# 끝나면 만든 영상 수를 출력 ("views 240"). 쓰기 실패면 오류 메시지와 종료 코드 1
 skylens-stream synth <출력 폴더> [폭 높이]
 
-# 점진적 점군 생성 (개발 중)
-skylens-stream run <데이터> -o <출력> [--stride 3] [--span 12] [--overlap 2]
-
-# 결과 검증 (개발 중) — 실패하면 종료 코드 1
-skylens-stream verify <출력>
+# 판 번호 출력 ("skylens-stream 0.1.0")
+skylens-stream --version
 ```
+
+인자 없이 실행하거나 모르는 명령이면 사용법을 표준 오류로 내고 종료 코드 2 로 끝난다.
 
 ### 라이브러리: 특징점
 
@@ -123,7 +124,8 @@ if let Some(rp) = refine_relative_pose(&e, &n1, &n2, 50).filter(|rp| rp.translat
 내부 파라미터를 아는 짝은 5점 본질 행렬 RANSAC 으로 바로 검증할 수 있다(지면처럼 평면에 가까운 장면에서도 동작).
 
 ```rust
-use skylens_core::two_view::{ransac_essential_candidates, recover_pose};
+use skylens_core::matching::RansacConfig;
+use skylens_core::two_view::ransac_essential_candidates;
 // n1, n2: 모든 대응의 정규화 좌표(k.to_normalized). 문턱 cfg.threshold_px 는 픽셀, k.fx 로 환산한다.
 let cands = ransac_essential_candidates(&n1, &n2, k.fx, &RansacConfig::default());
 // 평면 장면은 두 시점만으로 두 겹 모호하므로 후보(E, 정상 표시)를 최대 4개 돌려준다.
@@ -145,19 +147,56 @@ if let Some(res) = average_rotations(num_views, &edges, &AveragingConfig::defaul
 // None: 정점 0개, 범위 밖 번호, 쓸 수 있는 간선 없음. NaN 회전·0 이하 가중치·자기 간선은 무시.
 ```
 
-### 출력
+### 라이브러리: 번들 조정
+
+```rust
+use skylens_core::ba::{bundle_adjust, BaOptions, BaProblem, Loss, Observation};
+
+// groups[g]: 내부 파라미터 그룹(DistortedIntrinsics: fx fy cx cy + 왜곡 k1 k2 p1 p2), 카메라 폴더마다 하나
+// poses[c]: 카메라 c 의 세계→카메라 포즈(x_c = R x + t), camera_group[c]: c 가 속한 그룹 번호
+// points[p]: 3D 점 초기값. 관측 픽셀은 카메라 픽셀 좌표(화소 중심 = i + 0.5)
+let observations = vec![Observation { camera: 0, point: 0, pixel: nalgebra::Vector2::new(512.5, 300.5) } /* ... */];
+let mut problem = BaProblem { groups, poses, camera_group, points, observations };
+let opts = BaOptions {
+    loss: Loss::Huber(2.0), // Squared, Huber(δ), Cauchy(δ) — δ 는 픽셀
+    // 자유 파라미터 마스크, 순서는 INTRINSIC_NAMES = [fx, fy, cx, cy, k1, k2, p1, p2]
+    default_free_intrinsics: [true, true, true, true, true, true, false, false],
+    fixed_cameras: vec![0], // 포즈를 고정할 카메라(게이지)
+    ..BaOptions::default()  // 최대 50회, 트랙(점) 최대 100 000개
+};
+let report = bundle_adjust(&mut problem, &opts); // problem 의 포즈·점·내부 파라미터를 제자리에서 고친다
+println!("RMS {:.3} → {:.3} px, {} 회", report.initial_rms, report.final_rms, report.iterations);
+```
+
+점 블록을 슈어 보수로 소거해 카메라 쪽 축소 계통만 푸는 희소 Levenberg–Marquardt 다.
+그룹마다 따로 마스크를 주려면 `free_intrinsics[g]`(비어 있으면 모든 그룹에 `default_free_intrinsics`).
+점은 관측 수가 많은 것부터(같으면 번호 순) `max_tracks` 개만 쓰고, 선택되지 않은 점은 그대로 둔다.
+`max_iterations = 0` 이면 비용만 평가하고(`report.refined = false`), 1 이상이면 고친다.
+`report` 에는 그 밖에 쓴 카메라·트랙·관측 수, 처음·마지막 비용, 수렴 여부가 있다.
+
+### 라이브러리: 밀집 준비·융합·점진 스트림
+
+명령행에는 아직 묶여 있지 않은 단계들이다.
+
+- `skylens_core::undistort`: `undistort_to_long_side(&img, &k, long_side)` 가 왜곡 있는 사진을 긴 변 `long_side` 화소의 핀홀 사진과 새 `Intrinsics` 로 바꾼다(원본 밖 화소는 0, 쌍선형 보간).
+- `skylens_core::view_selection`: `select_neighbors(&views, &points, k)` 가 희소 점을 함께 본 사진들 가운데 사진마다 이웃 최대 k 장(기본 `DEFAULT_NEIGHBORS` = 8)을 고르고, `depth_range(&view, &points)` 가 깊이 탐색 범위를 준다.
+- `skylens_core::fusion`: `fuse(&views, &depth_maps, FusionConfig)` 가 사진별 깊이 맵을 왕복 재투영 검사로 합쳐 `PointCloud` 를 만든다(동의 사진 수 `min_views` 이상).
+- `skylens_core::stream`: `split_regions(위치 수, span, overlap)` 로 구역을 나누고, `align_region` 으로 초벌 구역을 정밀본에 닮음 변환 정렬, `build_snapshots` 로 단계별 점군("이전 구역 정밀본 + 최신 구역 초벌")을 만든 뒤 `write_outputs(출력 폴더, ...)` 가 다음을 쓴다.
 
 ```
 <출력>/
-  preview/preview_00_pos0-14.ply ...   # 구역별 초벌
+  preview/preview_00_pos0-14.ply ...   # 구역별 초벌 (pos<시작>-<끝, 끝 미포함>)
   refined/refined_00_pos0-14.ply ...   # 구역별 정밀본
   snapshots/step_01_1regions.ply ...   # 단계별 화면용 점군
   snapshots/step_final_all_refined.ply
   snapshots/manifest.json              # 단계별 점 수, 정렬 수치
 ```
 
-PLY 는 이진 little-endian, 점마다 `x y z nx ny nz`(float32) + `red green blue`(uint8).
-좌표는 첫 GPS 를 원점으로 하는 동-북-위(미터)다. CloudCompare 등에서 `step_01` 부터 순서대로 열면 공간이 자라며 또렷해지는 과정을 볼 수 있다.
+### PLY 형식
+
+`ply-info` 가 읽고 라이브러리(`skylens_core::ply`)가 쓰는 형식은 이진 little-endian PLY 다.
+쓸 때는 점마다 `x y z nx ny nz`(float32) + `red green blue`(uint8) 이다. 읽을 때는 `vertex` 원소가 첫 원소여야 하고,
+속성을 이름으로 찾으므로 순서가 달라도 되며, 법선·색이 없으면 0 으로 채운다.
 
 ---
 
@@ -168,13 +207,14 @@ A Rust tool that builds a **progressively refined 3D point cloud** from drone-fo
 Each time a new region arrives, a fast preview cloud is shown first; once the accurate solve for a region finishes, its preview is swapped for the refined cloud.
 At every step the output is "refined clouds for earlier regions + preview for the newest region".
 
-> Work in progress. Commands that do not exist yet are marked below.
+> Work in progress. The command-line tool currently has only `ply-info` and `synth`; the progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment → dense preparation and fusion → progressive stream).
 
 ### Build
 
 ```bash
 cargo build --release
 # binary: target/release/skylens-stream
+# or build and run in one step: cargo run --release -p skylens-stream -- <command>
 ```
 
 Requires stable Rust 1.88 or newer.
@@ -186,10 +226,10 @@ Requires stable Rust 1.88 or newer.
   images/camF_0000.jpg ...   # front camera (camF_<4-digit position>.jpg)
   images/camR_0000.jpg ...   # right camera
   images/camL_0000.jpg ...   # left camera
-  gps.txt                    # one line per image: name latitude longitude altitude
+  gps.txt                    # one line per image: image name without extension (camF_0000) latitude longitude (deg) altitude (m)
 ```
 
-`synth` writes the same layout plus ground-truth cameras in `truth/cameras.txt` (one line per image: name fx fy cx cy width height, 9 entries of R row-major, 3 entries of t).
+`synth` writes the same layout plus ground-truth cameras in `truth/cameras.txt` (one line per image: name fx fy cx cy width height, 9 entries of the world→camera R row-major, 3 entries of t).
 
 ### Usage
 
@@ -200,14 +240,14 @@ skylens-stream ply-info <file.ply>
 
 # Generate a synthetic test scene (images + GPS + ground-truth cameras; default 960×540, 3 cameras × 80 positions = 240 images)
 # width and height are integers in 16..=8192, given together or both omitted; otherwise usage and exit code 2
+# Prints the number of images written when done ("views 240"); write errors print a message and exit with code 1
 skylens-stream synth <output dir> [width height]
 
-# Build the progressive point cloud (in progress)
-skylens-stream run <data> -o <output> [--stride 3] [--span 12] [--overlap 2]
-
-# Verify the result (in progress) — exits with code 1 on failure
-skylens-stream verify <output>
+# Print the version ("skylens-stream 0.1.0")
+skylens-stream --version
 ```
+
+Running with no arguments or an unknown command prints the usage to standard error and exits with code 2.
 
 ### Library: features
 
@@ -280,7 +320,8 @@ if let Some(rp) = refine_relative_pose(&e, &n1, &n2, 50).filter(|rp| rp.translat
 With known intrinsics, a pair can be verified directly with 5-point essential-matrix RANSAC (works for near-planar scenes such as the ground).
 
 ```rust
-use skylens_core::two_view::{ransac_essential_candidates, recover_pose};
+use skylens_core::matching::RansacConfig;
+use skylens_core::two_view::ransac_essential_candidates;
 // n1, n2: normalized coordinates of all matches (k.to_normalized). cfg.threshold_px is in pixels, converted with k.fx.
 let cands = ransac_essential_candidates(&n1, &n2, k.fx, &RansacConfig::default());
 // A planar scene is two-fold ambiguous from two views, so up to 4 candidates (E, inlier mask) are returned.
@@ -302,19 +343,56 @@ if let Some(res) = average_rotations(num_views, &edges, &AveragingConfig::defaul
 // None: zero views, out-of-range index, or no usable edge. NaN rotations, non-positive weights and self edges are ignored.
 ```
 
-### Output
+### Library: bundle adjustment
+
+```rust
+use skylens_core::ba::{bundle_adjust, BaOptions, BaProblem, Loss, Observation};
+
+// groups[g]: intrinsics group (DistortedIntrinsics: fx fy cx cy + distortion k1 k2 p1 p2), one per camera folder
+// poses[c]: world→camera pose of camera c (x_c = R x + t), camera_group[c]: group index of camera c
+// points[p]: initial 3D points. Observed pixels are camera pixel coordinates (pixel centre = i + 0.5)
+let observations = vec![Observation { camera: 0, point: 0, pixel: nalgebra::Vector2::new(512.5, 300.5) } /* ... */];
+let mut problem = BaProblem { groups, poses, camera_group, points, observations };
+let opts = BaOptions {
+    loss: Loss::Huber(2.0), // Squared, Huber(δ), Cauchy(δ) — δ in pixels
+    // free-parameter mask, order INTRINSIC_NAMES = [fx, fy, cx, cy, k1, k2, p1, p2]
+    default_free_intrinsics: [true, true, true, true, true, true, false, false],
+    fixed_cameras: vec![0], // cameras whose pose is held fixed (gauge)
+    ..BaOptions::default()  // at most 50 iterations, at most 100 000 tracks (points)
+};
+let report = bundle_adjust(&mut problem, &opts); // updates poses, points and intrinsics of problem in place
+println!("RMS {:.3} → {:.3} px, {} iterations", report.initial_rms, report.final_rms, report.iterations);
+```
+
+This is sparse Levenberg–Marquardt that eliminates the point blocks with the Schur complement and solves only the reduced camera system.
+For a per-group mask set `free_intrinsics[g]` (when empty, `default_free_intrinsics` applies to every group).
+Only `max_tracks` points are used, those with the most observations first (ties by index); unselected points are left unchanged.
+With `max_iterations = 0` the cost is only evaluated (`report.refined = false`); with 1 or more the problem is refined.
+`report` also holds the numbers of cameras, tracks and observations used, the initial and final cost, and whether it converged.
+
+### Library: dense preparation, fusion and progressive stream
+
+These stages are not wired into the command line yet.
+
+- `skylens_core::undistort`: `undistort_to_long_side(&img, &k, long_side)` turns a distorted image into a pinhole image whose long side is `long_side` pixels, plus the new `Intrinsics` (pixels outside the source are 0, bilinear interpolation).
+- `skylens_core::view_selection`: `select_neighbors(&views, &points, k)` picks up to k neighbours per image among the images that share sparse points (default `DEFAULT_NEIGHBORS` = 8), and `depth_range(&view, &points)` gives the depth search range.
+- `skylens_core::fusion`: `fuse(&views, &depth_maps, FusionConfig)` merges per-image depth maps with a round-trip reprojection check into a `PointCloud` (at least `min_views` agreeing images).
+- `skylens_core::stream`: `split_regions(positions, span, overlap)` splits regions, `align_region` aligns a preview region to the refined clouds with a similarity transform, `build_snapshots` builds the per-step clouds ("refined earlier regions + preview of the newest region"), and `write_outputs(output dir, ...)` writes:
 
 ```
 <output>/
-  preview/preview_00_pos0-14.ply ...   # per-region preview
+  preview/preview_00_pos0-14.ply ...   # per-region preview (pos<start>-<end, exclusive>)
   refined/refined_00_pos0-14.ply ...   # per-region refined cloud
   snapshots/step_01_1regions.ply ...   # per-step clouds for display
   snapshots/step_final_all_refined.ply
   snapshots/manifest.json              # point counts per step, alignment figures
 ```
 
-PLY files are binary little-endian with `x y z nx ny nz` (float32) and `red green blue` (uint8) per point.
-Coordinates are local East-North-Up in metres with the first GPS fix as origin. Open `step_01` onward in order in a viewer such as CloudCompare to watch the scene grow and sharpen.
+### PLY format
+
+`ply-info` reads, and the library (`skylens_core::ply`) writes, binary little-endian PLY.
+Written files have `x y z nx ny nz` (float32) + `red green blue` (uint8) per point. When reading, `vertex` must be the first element;
+properties are looked up by name, so their order may differ, and missing normals or colours are filled with 0.
 
 ---
 
