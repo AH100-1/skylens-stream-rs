@@ -710,6 +710,76 @@ mod tests {
         }
     }
 
+    /// 합성 드론 장면에서 같은 카메라의 이웃 위치 두 장을 매칭하고, 정답 깊이로
+    /// 옮긴 위치와 비교한다 → (정답 2 px 이내 비율, 매칭 수).
+    fn scene_match_accuracy(step: usize) -> (f32, usize) {
+        use crate::synth::{Scene, SceneConfig};
+        use nalgebra::Vector2;
+        let scene = Scene::new(SceneConfig {
+            width: 480,
+            height: 270,
+            ..SceneConfig::default()
+        });
+        let va = &scene.views[0];
+        let vb = scene
+            .views
+            .iter()
+            .find(|v| v.cam == va.cam && v.position == va.position + step)
+            .unwrap();
+        let cfg = DetectorConfig::default();
+        let (ia, da) = scene.render(va);
+        let (ib, _) = scene.render(vb);
+        let fa = detect_and_describe(&GrayImage::from_rgb(480, 270, &ia.data), &cfg);
+        let fb = detect_and_describe(&GrayImage::from_rgb(480, 270, &ib.data), &cfg);
+        let (mut good, mut n) = (0, 0);
+        for f in &fa {
+            let mut best = (f32::INFINITY, f32::INFINITY, 0usize);
+            for (j, g) in fb.iter().enumerate() {
+                let d: f32 = f
+                    .desc
+                    .iter()
+                    .zip(&g.desc)
+                    .map(|(p, q)| (p - q).powi(2))
+                    .sum();
+                if d < best.0 {
+                    best = (d, best.0, j);
+                } else if d < best.1 {
+                    best.1 = d;
+                }
+            }
+            if best.0 >= 0.8 * 0.8 * best.1 {
+                continue;
+            }
+            let (px, py) = (f.kp.x.round() as usize, f.kp.y.round() as usize);
+            let z = da[py.min(269) * 480 + px.min(479)];
+            if !z.is_finite() {
+                continue;
+            }
+            // 특징점 좌표는 화소 인덱스 기준, 카메라 모형은 화소 중심이 +0.5.
+            let pa = Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
+            let Some(e) = vb.camera.project(&va.camera.unproject(&pa, z as f64)) else {
+                continue;
+            };
+            n += 1;
+            let k = fb[best.2].kp;
+            let (dx, dy) = (k.x as f64 + 0.5 - e.x, k.y as f64 + 0.5 - e.y);
+            if (dx * dx + dy * dy).sqrt() < 2.0 {
+                good += 1;
+            }
+        }
+        (good as f32 / n.max(1) as f32, n)
+    }
+
+    #[test]
+    fn matching_on_synthetic_drone_views() {
+        for step in [1usize, 3] {
+            let (acc, n) = scene_match_accuracy(step);
+            eprintln!("scene step={step} matches={n} precision={acc:.3}");
+            assert!(n >= 250, "매칭 수 {n}");
+            assert!(acc >= 0.95, "정확도 {acc}");
+        }
+    }
+
     #[test]
     fn flat_image_has_no_features() {
         let img = GrayImage {
