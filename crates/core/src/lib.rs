@@ -2,6 +2,7 @@
 
 pub mod camera;
 pub mod distortion;
+pub mod features;
 pub mod geo;
 pub mod math;
 pub mod ply;

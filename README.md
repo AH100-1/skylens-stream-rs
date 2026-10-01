@@ -48,6 +48,19 @@ skylens-stream run <데이터> -o <출력> [--stride 3] [--span 12] [--overlap 2
 skylens-stream verify <출력>
 ```
 
+### 라이브러리: 특징점
+
+```rust
+use skylens_core::features::{detect_and_describe, DetectorConfig, GrayImage};
+
+let img = GrayImage::from_rgb(width, height, &rgb_bytes);
+let feats = detect_and_describe(&img, &DetectorConfig::default());
+for f in &feats {
+    // f.kp: x, y(화소), sigma(스케일), angle(라디안), response
+    // f.desc: 단위 길이 128차원 기술자
+}
+```
+
 ### 출력
 
 ```
@@ -106,6 +119,19 @@ skylens-stream run <data> -o <output> [--stride 3] [--span 12] [--overlap 2]
 
 # Verify the result (in progress) — exits with code 1 on failure
 skylens-stream verify <output>
+```
+
+### Library: features
+
+```rust
+use skylens_core::features::{detect_and_describe, DetectorConfig, GrayImage};
+
+let img = GrayImage::from_rgb(width, height, &rgb_bytes);
+let feats = detect_and_describe(&img, &DetectorConfig::default());
+for f in &feats {
+    // f.kp: x, y (pixels), sigma (scale), angle (radians), response
+    // f.desc: unit-length 128-dim descriptor
+}
 ```
 
 ### Output
