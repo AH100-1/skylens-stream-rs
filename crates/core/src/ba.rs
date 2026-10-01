@@ -7,9 +7,10 @@
 //! - 게이지: 지정한 카메라(기본: 첫 카메라)의 포즈를 고정한다(목록이 비거나 범위 밖이면 첫 카메라).
 //!   고정 카메라가 하나뿐이면 남는 축척 1자유도는 두 번째 기준 카메라의 평행이동 한 성분을
 //!   고정해 없앤다. 성분은 축척 방향 기울기 |R_k(C_k − C_0)|_i 가 가장 큰 것을 고른다.
-//! - 입력 검증: 포즈·그룹 길이 불일치, 범위 밖 그룹 번호는 아무것도 고치지 않고
-//!   `BaStop::InvalidInput` 으로 돌려준다. 범위 밖 점·카메라 번호, 유한하지 않은 픽셀의
-//!   관측은 제외하고 수를 보고한다.
+//! - 입력 검증: 포즈·그룹 길이 불일치, 범위 밖 그룹 번호, 유한하지 않은 포즈·내부 파라미터는
+//!   아무것도 고치지 않고 `BaStop::InvalidInput` 으로 돌려준다. 범위 밖 점·카메라 번호,
+//!   유한하지 않은 픽셀·점 좌표의 관측은 제외하고 수를 보고한다(비유한 점은 그대로 둔다).
+//! - `refined` 는 받아들인 단계가 하나 이상일 때만 참이다. 쓸 관측이 없으면 반복하지 않는다.
 //! - 관측 트랙(3D 점)은 관측 2개 이상인 점 중 최대 `max_tracks` 개만 쓴다.
 //!   관측 수가 많은 점부터, 같으면 번호 순.
 
@@ -132,8 +133,8 @@ pub enum BaStop {
 /// 번들 조정 보고.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BaReport {
-    /// 0 회면 초벌, 1 회 이상이면 정밀.
     pub iterations: usize,
+    /// 받아들인 단계가 하나 이상이면 참(정밀 포즈). 반복만 하고 모든 단계가 거부되면 거짓.
     pub refined: bool,
     pub num_cameras: usize,
     pub num_tracks_used: usize,
@@ -147,7 +148,7 @@ pub struct BaReport {
     /// `stop == BaStop::Converged` 일 때만 참.
     pub converged: bool,
     pub stop: BaStop,
-    /// 범위 밖 번호·비유한 픽셀로 제외한 관측 수.
+    /// 범위 밖 번호·비유한 픽셀·비유한 점 좌표로 제외한 관측 수.
     pub num_observations_rejected: usize,
     /// 축소 계통 촐레스키 실패 횟수(λ 재시도 포함).
     pub cholesky_failures: usize,
@@ -501,19 +502,34 @@ fn apply(
     out
 }
 
-/// 크기·그룹 번호가 맞는지 본다.
+/// 크기·그룹 번호가 맞고 포즈·내부 파라미터가 모두 유한한지 본다.
 fn input_is_consistent(problem: &BaProblem) -> bool {
-    problem.poses.len() == problem.camera_group.len()
+    let pose_ok = |p: &Pose| {
+        p.translation.iter().all(|v| v.is_finite())
+            && p.rotation.matrix().iter().all(|v| v.is_finite())
+    };
+    let group_ok = |g: &DistortedIntrinsics| {
+        [
+            g.fx, g.fy, g.cx, g.cy, g.dist.k1, g.dist.k2, g.dist.p1, g.dist.p2,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+    };
+    problem.poses.iter().all(pose_ok)
+        && problem.groups.iter().all(group_ok)
+        && problem.poses.len() == problem.camera_group.len()
         && problem
             .camera_group
             .iter()
             .all(|&g| g < problem.groups.len())
 }
 
-/// 관측이 쓸 수 있는지(번호 범위·픽셀 유한성).
+/// 관측이 쓸 수 있는지(번호 범위·픽셀 유한성·점 좌표 유한성).
+/// 유한하지 않은 점은 고치지 않고 그 관측만 뺀다.
 fn observation_is_valid(problem: &BaProblem, o: &Observation) -> bool {
     o.camera < problem.poses.len()
         && o.point < problem.points.len()
+        && problem.points[o.point].iter().all(|v| v.is_finite())
         && o.pixel.x.is_finite()
         && o.pixel.y.is_finite()
 }
@@ -577,8 +593,10 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
     let mut final_behind = behind0;
     let mut lambda = opts.initial_lambda;
     let mut iterations = 0;
+    let mut accepted_steps = 0;
     let mut cholesky_failures = 0;
-    let mut stop = if opts.max_iterations == 0 {
+    // 쓸 관측이 없으면 반복에 들어가지 않는다.
+    let mut stop = if opts.max_iterations == 0 || obs.is_empty() {
         BaStop::EvaluationOnly
     } else {
         BaStop::MaxIterations
@@ -623,6 +641,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
                         final_behind = bad;
                         lambda = (lambda * 0.3).max(1e-12);
                         accepted = true;
+                        accepted_steps += 1;
                         if rel < opts.function_tolerance {
                             stop = BaStop::Converged;
                         }
@@ -639,7 +658,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
     }
     BaReport {
         iterations,
-        refined: iterations > 0,
+        refined: accepted_steps > 0,
         num_cameras: problem.poses.len(),
         num_tracks_used: tracks.len(),
         num_observations_used: obs.len(),
@@ -1294,16 +1313,87 @@ mod tests {
         assert_eq!(*p.points.last().unwrap(), x);
     }
 
-    /// 비유한 비용·촐레스키 실패는 수렴이 아니라 단계 실패로 보고한다.
+    /// 유한하지 않은 점 좌표는 그 점의 관측만 빼고 계속한다(F-121).
+    /// 유한하지 않은 포즈·내부 파라미터는 입력 오류로 아무것도 고치지 않는다.
+    #[test]
+    fn non_finite_points_are_excluded_and_bad_parameters_rejected() {
+        for loss in [Loss::Squared, Loss::Huber(2.0)] {
+            let opts = BaOptions {
+                loss,
+                ..short_opts()
+            };
+            let mut clean = noisy_perturbed(13);
+            let rep0 = bundle_adjust(&mut clean, &opts);
+            assert_eq!(rep0.stop, BaStop::Converged);
+            let base = noisy_perturbed(13);
+            let mut counts = vec![0usize; base.points.len()];
+            for o in &base.observations {
+                counts[o.point] += 1;
+            }
+            let q = (0..counts.len()).find(|&i| counts[i] == 9).unwrap();
+            for bad in [f64::NAN, f64::INFINITY] {
+                let mut p = base.clone();
+                p.points[q].x = bad;
+                let rep = bundle_adjust(&mut p, &opts);
+                assert_eq!(rep.num_observations_rejected, 9, "{loss:?} {bad}");
+                assert_eq!(rep.stop, BaStop::Converged, "{loss:?} {bad}");
+                assert!(rep.refined && rep.converged);
+                let rel = (rep.final_rms - rep0.final_rms).abs() / rep0.final_rms;
+                assert!(
+                    rel < 0.01,
+                    "{loss:?} {bad}: {} vs {}",
+                    rep.final_rms,
+                    rep0.final_rms
+                );
+                assert!(p.points[q].x.is_nan() || p.points[q].x.is_infinite());
+            }
+        }
+        let base = noisy_perturbed(13);
+        let mut nan_pose = base.clone();
+        nan_pose.poses[4].translation.y = f64::NAN;
+        let mut nan_fx = base.clone();
+        nan_fx.groups[0].fx = f64::NAN;
+        for mut p in [nan_pose, nan_fx] {
+            let before = p.clone();
+            let rep = bundle_adjust(&mut p, &short_opts());
+            assert_eq!(rep.stop, BaStop::InvalidInput);
+            assert!(!rep.refined && !rep.converged);
+            assert_eq!(p.points, before.points);
+            assert_eq!(format!("{:?}", p.poses), format!("{:?}", before.poses));
+            assert_eq!(format!("{:?}", p.groups), format!("{:?}", before.groups));
+        }
+    }
+
+    /// 단계를 하나도 받지 못하면 refined 도 거짓이다(F-122).
+    #[test]
+    fn no_accepted_step_is_not_refined() {
+        // 모든 픽셀 NaN → 관측 전부 제외, 반복 없음.
+        let mut all_nan = noisy_perturbed(16);
+        for o in &mut all_nan.observations {
+            o.pixel.x = f64::NAN;
+        }
+        let mut no_obs = noisy_perturbed(16);
+        no_obs.observations.clear();
+        let empty = BaProblem {
+            groups: Vec::new(),
+            poses: Vec::new(),
+            camera_group: Vec::new(),
+            points: Vec::new(),
+            observations: Vec::new(),
+        };
+        for mut p in [all_nan, no_obs, empty] {
+            let rep = bundle_adjust(&mut p, &short_opts());
+            assert!(!rep.refined && !rep.converged, "{:?}", rep.stop);
+            assert_eq!(rep.iterations, 0);
+            assert_eq!(rep.stop, BaStop::EvaluationOnly);
+        }
+        let mut ok = noisy_perturbed(16);
+        assert!(bundle_adjust(&mut ok, &short_opts()).refined);
+    }
+
+    /// 촐레스키 실패는 수렴이 아니라 단계 실패로 보고한다.
     #[test]
     fn failures_are_not_reported_as_convergence() {
-        let mut p = noisy_perturbed(16);
-        let q = p.observations[0].point;
-        p.points[q].x = f64::NAN;
-        let rep = bundle_adjust(&mut p, &short_opts());
-        assert_eq!(rep.stop, BaStop::StepFailed);
-        assert!(!rep.converged);
-
         // 관측 없는 카메라 + 감쇠 0 → 축소 계통이 특이해 촐레스키가 매번 실패.
         let mut p = noisy_perturbed(16);
         p.poses.push(p.poses[5]);
@@ -1319,6 +1409,7 @@ mod tests {
         assert_eq!(rep.stop, BaStop::StepFailed);
         assert!(!rep.converged);
         assert_eq!(rep.cholesky_failures, 12);
+        assert!(!rep.refined);
         assert_eq!(p.points, before.points);
     }
 
