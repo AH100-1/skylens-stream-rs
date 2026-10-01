@@ -812,11 +812,20 @@ mod tests {
 
     /// 합성 드론 장면 같은 카메라 두 장: 특징 → 비율 매칭 → RANSAC.
     /// 정답 깊이로 각 짝의 참·거짓을 판정해 (RANSAC 전 정답 비율, 후 정밀도, 재현율, 정상 수).
-    fn scene_pair(step: usize) -> (f64, f64, f64, usize) {
-        scene_pair_cams(crate::synth::CamId::F, crate::synth::CamId::F, step)
+    fn scene_pair(cam: crate::synth::CamId, step: usize, seed: u64) -> (f64, f64, f64, usize) {
+        scene_pair_cams(
+            crate::synth::SceneConfig {
+                seed,
+                ..crate::synth::SceneConfig::default()
+            },
+            cam,
+            cam,
+            step,
+        )
     }
 
     fn scene_pair_cams(
+        base: crate::synth::SceneConfig,
         cam_a: crate::synth::CamId,
         cam_b: crate::synth::CamId,
         step: usize,
@@ -827,7 +836,7 @@ mod tests {
         let scene = Scene::new(SceneConfig {
             width: w as u32,
             height: h as u32,
-            ..SceneConfig::default()
+            ..base
         });
         let va = scene
             .views
@@ -878,26 +887,46 @@ mod tests {
         )
     }
 
+    // 실측 편대 배치, 시드 1~3 × F/R/L × 간격 1·3 (18 경우) 측정: 정상 479~729,
+    // 정밀도 0.994~1.000, 재현율 1.000. 정상 수 기준은 최솟값 479 의 약 85%,
+    // 정밀도·재현율은 예전과 같은 0.98 (측정 최솟값보다 0.014 아래).
+    const MIN_INL: usize = 400;
+    const MIN_PREC: f64 = 0.98;
+    const MIN_REC: f64 = 0.98;
+
+    /// 실측 편대 배치(SPEC §1: 위치 간 1.0 m, 기울기 60°, 화각 65°)의 같은 카메라 짝.
+    /// 기준은 이 배치에서 시드 1~3·카메라 F/R/L·간격 1/3 을 잰 최솟값에서 정했다(위 상수 주석).
+    /// 예전 기준(정상 ≥250)은 위치 간 2.5 m·기울기 50° 배치의 F 한 대만 잰 값이었다.
+    /// 위치 간 이동이 1.0 m 로 줄어 두 장의 겹침이 커지므로 정상 수는 오히려 늘었다.
     #[test]
     fn ransac_on_synthetic_drone_views() {
-        for step in [1usize, 3] {
-            let (before, prec, rec, ni) = scene_pair(step);
-            eprintln!(
-                "scene step={step} correct_before={before:.3} precision={prec:.3} recall={rec:.3} inliers={ni}"
-            );
-            assert!(ni >= 250, "정상 수 {ni}");
-            assert!(prec >= 0.98, "정밀도 {prec}");
-            assert!(rec >= 0.98, "재현율 {rec}");
+        use crate::synth::CamId;
+        for seed in [1u64, 2, 3] {
+            for cam in CamId::ALL {
+                for step in [1usize, 3] {
+                    let (before, prec, rec, ni) = scene_pair(cam, step, seed);
+                    eprintln!(
+                        "scene seed={seed} cam={cam:?} step={step} correct_before={before:.3} precision={prec:.3} recall={rec:.3} inliers={ni}"
+                    );
+                    assert!(ni >= MIN_INL, "정상 수 {ni}");
+                    assert!(prec >= MIN_PREC, "정밀도 {prec}");
+                    assert!(rec >= MIN_REC, "재현율 {rec}");
+                }
+            }
         }
     }
 
     #[test]
     fn ransac_on_cross_camera_views() {
+        // 큰 시선 차(90°) 짝에서 RANSAC 이 버티는지 보는 시험이라 예전 쉬운 배치를 명시적으로 쓴다:
+        // 실측 편대에서 같은 위치의 F 와 R·L 은 시선이 120° 이상 벌어지고 지면 발자국이 거의
+        // 겹치지 않아 같은 위치 짝이 성립하지 않는다.
         // 앞 카메라 위치 0 과 옆 카메라 위치 0·4(10 m 앞): 시선이 90° 다른 짝.
-        use crate::synth::CamId;
+        use crate::synth::{CamId, SceneConfig};
         for b in [CamId::R, CamId::L] {
             for step in [0usize, 4] {
-                let (before, prec, rec, ni) = scene_pair_cams(CamId::F, b, step);
+                let (before, prec, rec, ni) =
+                    scene_pair_cams(SceneConfig::easy(), CamId::F, b, step);
                 eprintln!(
                     "F->{b:?} step={step} correct_before={before:.3} precision={prec:.3} recall={rec:.3} inliers={ni}"
                 );
