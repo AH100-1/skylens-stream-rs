@@ -3,8 +3,9 @@
 //! - 구역 `i` 는 위치 `[start-OVL, start+SPAN+OVL)` (start = i·SPAN), 전체 위치 범위로 자른다.
 //!   앞 구역이 이미 끝(n)까지 덮어 새 위치가 없는 꼬리 start(start+OVL ≥ n)는 앞 구역에 합친다.
 //! - 초벌 정렬은 같은 이미지의 같은 특징점 번호를 관측한 초벌·정밀 3D 점 짝으로
-//!   [`align::robust_similarity`](crate::align::robust_similarity) 를 돌린다
-//!   (반복 트리밍, 임계 = max(3 × 잔차 중앙값, 바닥값)). 점에는 변환, 법선에는 회전만.
+//!   [`robust_fit`] 을 돌린다: 3점 표본 첫 추정(잔차 분위 최소) 뒤
+//!   [`align::robust_similarity`](crate::align::robust_similarity) 반복 트리밍
+//!   (임계 = max(3 × 잔차 중앙값, 바닥값)). 점에는 변환, 법선에는 회전만.
 //!   짝이 모자라거나 퇴화하면 그 구역은 정렬 실패(`None`)로 남긴다.
 //! - 스냅샷 `step_k` (k = 1..=n) = 정밀 구역 `0..=k-2` + 초벌 구역 `k-1`.
 //!   초벌 점 중 정밀 구역 `0..=k-2` 의 **추출 전** 점 전부에서 반경 안에 있는 점은 뺀다(잔상 방지).
@@ -19,8 +20,8 @@ use std::path::Path;
 use nalgebra::Vector3;
 use rayon::prelude::*;
 
-use crate::align::robust_similarity;
 pub use crate::align::Similarity;
+use crate::align::{robust_similarity, umeyama};
 use crate::ply::{write_ply_file, PointCloud, PointRecord};
 
 /// 기본 구역 크기(위치 수).
@@ -152,6 +153,88 @@ pub fn apply_cloud(sim: &Similarity, cloud: &PointCloud) -> PointCloud {
     PointCloud { points }
 }
 
+/// 첫 추정 표본 수(3점 최소 표본).
+pub const SEED_SAMPLES: usize = 400;
+/// 첫 추정 점수로 쓰는 잔차 분위(최소 분위 제곱 계열). 정상 짝이 이 비율보다 많으면 버틴다.
+pub const SEED_QUANTILE: f64 = 0.4;
+
+fn residual_quantile(
+    sim: &Similarity,
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    q: f64,
+    buf: &mut Vec<f64>,
+) -> f64 {
+    buf.clear();
+    buf.extend(
+        src.iter()
+            .zip(dst)
+            .map(|(a, b)| (sim.apply_point(a) - b).norm()),
+    );
+    let k = ((buf.len() as f64 * q) as usize).min(buf.len() - 1);
+    let (_, v, _) = buf.select_nth_unstable_by(k, |a, b| a.total_cmp(b));
+    *v
+}
+
+/// 강건 첫 추정 + 반복 트리밍.
+///
+/// 1. 고정 씨앗 3점 표본 `SEED_SAMPLES` 개로 닮음 변환을 세우고, 잔차 `SEED_QUANTILE` 분위가 가장
+///    작은 것을 첫 추정으로 고른다(Rousseeuw 1984 최소 중앙 제곱의 분위 판).
+/// 2. 그 분위 값 q 에 대해 잔차 ≤ max(3q, 바닥) 인 짝만 골라 [`robust_similarity`] 로 다듬는다.
+///
+/// 오대응이 없으면 결과는 전체 짝 트리밍과 같은 수준이다. 퇴화(일직선·NaN·짝 < 3)는 `None`.
+pub fn robust_fit(
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+) -> Option<(Similarity, Vec<bool>, f64)> {
+    let n = src.len();
+    if n < 3 || n != dst.len() {
+        return None;
+    }
+    // 퇴화 판정은 전체 짝 추정에 맡긴다(일직선·NaN → None).
+    let full = umeyama(src, dst)?;
+    let mut buf = Vec::with_capacity(n);
+    let mut best = (
+        residual_quantile(&full, src, dst, SEED_QUANTILE, &mut buf),
+        full,
+    );
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d ^ n as u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n as u64) as usize
+    };
+    for _ in 0..SEED_SAMPLES {
+        let (i, j, k) = (next(), next(), next());
+        if i == j || j == k || i == k {
+            continue;
+        }
+        let Some(sim) = umeyama(&[src[i], src[j], src[k]], &[dst[i], dst[j], dst[k]]) else {
+            continue;
+        };
+        if !(sim.s.is_finite() && sim.s > 0.0) {
+            continue;
+        }
+        let q = residual_quantile(&sim, src, dst, SEED_QUANTILE, &mut buf);
+        if q < best.0 {
+            best = (q, sim);
+        }
+    }
+    let thr = (3.0 * best.0).max(TRIM_FLOOR_M);
+    let keep: Vec<usize> = (0..n)
+        .filter(|&i| (best.1.apply_point(&src[i]) - dst[i]).norm() <= thr)
+        .collect();
+    let s2: Vec<_> = keep.iter().map(|&i| src[i]).collect();
+    let d2: Vec<_> = keep.iter().map(|&i| dst[i]).collect();
+    let (sim, sub_inl, med) = robust_similarity(&s2, &d2, TRIM_ITERS, TRIM_FLOOR_M)?;
+    let mut inl = vec![false; n];
+    for (&i, &k) in keep.iter().zip(&sub_inl) {
+        inl[i] = k;
+    }
+    Some((sim, inl, med))
+}
+
 /// 구역 하나의 정렬 기록. 정렬 실패 구역은 `fit_median_m`·`scale` 이 `None`(JSON null).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlignRecord {
@@ -168,7 +251,7 @@ pub fn align_region(
     pairs: &[(Vector3<f64>, Vector3<f64>)],
 ) -> (Option<Similarity>, AlignRecord) {
     let (src, dst): (Vec<_>, Vec<_>) = pairs.iter().copied().unzip();
-    let fit = robust_similarity(&src, &dst, TRIM_ITERS, TRIM_FLOOR_M);
+    let fit = robust_fit(&src, &dst);
     let rec = AlignRecord {
         region: region.index,
         pairs: pairs.len(),
@@ -1158,7 +1241,6 @@ mod tests {
     /// 정상 짝이 과반이므로 트리밍이 정상 쪽으로 수렴하리라 보았으나, 첫 추정(전체 짝 최소제곱)이
     /// ±20 m 오대응에 끌려 스케일이 0.41 로 무너지고 그 잔차 중앙으로 임계를 잡아 복구하지 못한다.
     #[test]
-    #[ignore = "오대응 30 % 에서 스케일 0.41, 창 안 잔차 4.4 m: 첫 추정이 최소제곱이라 트리밍이 복구 못 함(align 쪽 강건 초기값 필요)"]
     fn prelim_alignment_outlier_fractions() {
         for (frac, seed) in [(0.3, 21u64), (0.5, 22)] {
             let warp = Warp {
