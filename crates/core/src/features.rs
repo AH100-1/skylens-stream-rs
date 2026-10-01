@@ -26,20 +26,76 @@ impl std::fmt::Display for ImageSizeError {
 impl std::error::Error for ImageSizeError {}
 
 /// 단일 채널 f32 영상(행 우선).
+///
+/// 필드는 비공개이며 모든 생성자가 `data.len() == width * height` 를 보장한다.
+/// 길이가 틀린 영상은 만들 수 없다:
+///
+/// ```compile_fail
+/// use skylens_core::features::GrayImage;
+/// let img = GrayImage { width: 64, height: 64, data: vec![0.5; 100] };
+/// ```
 #[derive(Clone, Debug)]
 pub struct GrayImage {
-    pub width: usize,
-    pub height: usize,
-    pub data: Vec<f32>,
+    width: usize,
+    height: usize,
+    data: Vec<f32>,
 }
 
 impl GrayImage {
+    /// 0 으로 채운 영상. `width * height` 가 `usize` 를 넘으면 패닉한다.
     pub fn new(width: usize, height: usize) -> Self {
+        let n = width
+            .checked_mul(height)
+            .unwrap_or_else(|| panic!("GrayImage::new: {width}x{height} 가 너무 큼"));
         Self {
             width,
             height,
-            data: vec![0.0; width * height],
+            data: vec![0.0; n],
         }
+    }
+
+    /// 밝기 값 버퍼(행 우선)로 만든다. `data.len()` 이 `width * height` 가 아니면 오류.
+    pub fn try_from_vec(
+        width: usize,
+        height: usize,
+        data: Vec<f32>,
+    ) -> Result<Self, ImageSizeError> {
+        if width.checked_mul(height) != Some(data.len()) {
+            return Err(ImageSizeError {
+                width,
+                height,
+                channels: 1,
+                len: data.len(),
+            });
+        }
+        Ok(Self {
+            width,
+            height,
+            data,
+        })
+    }
+
+    /// 폭(화소).
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// 높이(화소).
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// 밝기 값(행 우선, 길이 `width * height`).
+    #[inline]
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    /// 버퍼를 꺼낸다.
+    pub fn into_data(self) -> Vec<f32> {
+        self.data
     }
 
     /// RGB 8비트 → [0,1] 밝기. `rgb.len()` 이 `width * height * 3` 이 아니면 패닉한다
@@ -1045,5 +1101,20 @@ mod tests {
             data: vec![0.5; 64 * 64],
         };
         assert!(detect(&img, &DetectorConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn mismatched_buffer_cannot_become_image() {
+        // 64x64 에 100 개: 생성 단계에서 거부되므로 detect 까지 갈 수 없다.
+        let e = GrayImage::try_from_vec(64, 64, vec![0.5; 100]).unwrap_err();
+        assert_eq!((e.width, e.height, e.channels, e.len), (64, 64, 1, 100));
+        assert!(GrayImage::try_from_vec(usize::MAX, 2, Vec::new()).is_err());
+        let img = GrayImage::try_from_vec(64, 64, vec![0.5; 64 * 64]).unwrap();
+        assert_eq!(
+            (img.width(), img.height(), img.data().len()),
+            (64, 64, 4096)
+        );
+        assert!(detect(&img, &DetectorConfig::default()).is_empty());
+        assert!(detect_and_describe(&img, &DetectorConfig::default()).is_empty());
     }
 }
