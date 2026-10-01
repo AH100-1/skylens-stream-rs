@@ -1274,8 +1274,8 @@ mod tests {
         st
     }
 
-    /// 평면 장면에서 5점 RANSAC 회전 오차(도)와 정상 판정. 이상치 비율 `out` 만큼 둘째 좌표를 무작위로 바꾼다.
-    fn planar_ransac_case(seed: u64, out: f64) -> (f64, f64, usize, usize) {
+    /// 평면 장면(σ0.5px, 200점)에 이상치 비율 `out` 만큼 둘째 좌표를 무작위로 바꾼 자료와 이상치 표시.
+    fn planar_case_scene(seed: u64, out: f64) -> (Scene, Vec<bool>) {
         let mut s = scene_full(200, 0.5, seed, 3.0, 0.0);
         let k = s.c1.intrinsics;
         let mut rng = Lcg(seed ^ 0xABCD);
@@ -1287,13 +1287,33 @@ mod tests {
                 *b = true;
             }
         }
+        (s, bad)
+    }
+
+    /// 자료 하한: 이상치가 아닌 대응만으로 정답 자세에서 시작한 Sampson 정밀화의 회전 오차(도).
+    fn planar_floor(s: &Scene, bad: &[bool]) -> f64 {
+        let (r, t) = s.rel();
+        let s1: Vec<_> = (0..bad.len())
+            .filter(|&i| !bad[i])
+            .map(|i| s.x1[i])
+            .collect();
+        let s2: Vec<_> = (0..bad.len())
+            .filter(|&i| !bad[i])
+            .map(|i| s.x2[i])
+            .collect();
+        let (rr, _) = refine_pose(&r, &t, &s1, &s2, 50);
+        rotation_angle_between(&rr, &r).to_degrees()
+    }
+
+    /// 평면 장면에서 5점 RANSAC 후보 중 정답에 가장 가까운 것의 (회전, 방향, 거짓 정상, 놓친 정상).
+    fn planar_ransac_case(s: &Scene, bad: &[bool]) -> (f64, f64, usize, usize) {
+        let k = s.c1.intrinsics;
         let cfg = RansacConfig {
             threshold_px: 1.5,
             ..RansacConfig::default()
         };
         let cands = ransac_essential_candidates(&s.x1, &s.x2, k.fx, &cfg);
         assert!(!cands.is_empty(), "RANSAC 실패");
-        eprintln!("후보 {}개", cands.len());
         let (r, t) = s.rel();
         // 후보 중 정답에 가장 가까운 것(평면이면 정답과 쌍둥이 둘이 나온다).
         cands
@@ -1318,30 +1338,40 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    #[ignore = "F-015 진행 중: 평면 σ0.5px 기준 0.3° 는 정답 시작 정밀화 하한(0.43°)보다 작다 — 기준 재검토 대기"]
-    fn ransac_essential_planar_rotation() {
-        let mut worst: f64 = 0.0;
+    /// 시드 1..=20 에서 시드마다 최선 후보 회전 ≤ 그 시드의 자료 하한 + 0.1° 인지 확인하고 최대 초과량을 돌려준다.
+    fn planar_against_floor(out: f64) -> f64 {
+        let mut fails = vec![];
+        let mut worst_excess = f64::NEG_INFINITY;
         for seed in 1..=20 {
-            let (rot, dir, _, missed) = planar_ransac_case(seed, 0.0);
-            eprintln!("평면 이상치 0 시드 {seed}: 회전 {rot:.4}° 방향 {dir:.3}° 놓침 {missed}");
-            worst = worst.max(rot);
+            let (s, bad) = planar_case_scene(seed, out);
+            let floor = planar_floor(&s, &bad);
+            let (rot, dir, false_in, missed) = planar_ransac_case(&s, &bad);
+            eprintln!(
+                "평면 이상치 {out} 시드 {seed}: 최선 후보 회전 {rot:.4}° 하한 {floor:.4}° 방향 {dir:.3}° 거짓정상 {false_in} 놓침 {missed}"
+            );
+            worst_excess = worst_excess.max(rot - floor);
+            if rot > floor + 0.1 {
+                fails.push(seed);
+            }
         }
-        eprintln!("평면 이상치 0: 최악 회전 {worst:.4}°");
-        assert!(worst <= 0.3, "평면 최악 회전 {worst}°");
+        eprintln!("평면 이상치 {out}: 하한 대비 최대 초과 {worst_excess:.4}°");
+        assert!(
+            fails.is_empty(),
+            "이상치 {out}: 하한 + 0.1° 초과 시드 {fails:?}"
+        );
+        worst_excess
     }
 
     #[test]
-    #[ignore = "F-015 진행 중: 평면 σ0.5px 기준 0.3° 는 정답 시작 정밀화 하한(0.43°)보다 작다 — 기준 재검토 대기"]
+    #[ignore = "F-015 진행 중: 시드 18 이 하한 + 0.1° 를 0.026° 넘는다(정상 짝 2개 놓침)"]
+    fn ransac_essential_planar_rotation() {
+        planar_against_floor(0.0);
+    }
+
+    #[test]
+    #[ignore = "F-015 진행 중: 이상치 30% 에서 7/20 시드가 하한 + 0.1° 초과(문턱 안 거짓 정상 짝이 평면 골짜기를 기울인다)"]
     fn ransac_essential_planar_with_outliers() {
-        let mut worst: f64 = 0.0;
-        for seed in 1..=20 {
-            let (rot, dir, false_in, missed) = planar_ransac_case(seed, 0.3);
-            eprintln!("평면 이상치 30% 시드 {seed}: 회전 {rot:.4}° 방향 {dir:.3}° 거짓정상 {false_in} 놓침 {missed}");
-            worst = worst.max(rot);
-        }
-        eprintln!("평면 이상치 30%: 최악 회전 {worst:.4}°");
-        assert!(worst <= 0.3, "이상치 30% 평면 최악 회전 {worst}°");
+        planar_against_floor(0.3);
     }
 
     /// 자료 한계: 정답 자세에서 시작한 Sampson 정밀화의 회전 오차(평면 σ0.5px 에서도 0.3° 를 넘는다).
