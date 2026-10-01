@@ -1,6 +1,6 @@
 //! WGS84 측지 좌표 ↔ 지구중심(ECEF) ↔ 지역 동-북-위(ENU) 변환.
 //!
-//! 유도는 `docs/derivations/geodesy.md`.
+//! 수식은 표준 WGS84 타원체의 측지↔ECEF 변환과 ECEF↔ENU 회전이다.
 
 use crate::math::{Matrix3, Vector3};
 
