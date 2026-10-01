@@ -638,6 +638,50 @@ mod tests {
         (good as f32 / n.max(1) as f32, n, a.len())
     }
 
+    /// 재검출률: 변환 후에도 영상 안쪽(가장자리 16 px 제외)에 들어오는 원본 특징점 중
+    /// 정답 위치 2 px 이내에 특징점이 다시 검출된 비율 → (비율, 분모).
+    fn repeatability(th: f32, sc: f32) -> (f32, usize) {
+        let (w, h) = (240usize, 240usize);
+        let cfg = DetectorConfig::default();
+        let a = detect(&texture_warped(w, h, 7, 0.0, 1.0), &cfg);
+        let b = detect(&texture_warped(w, h, 7, th, sc), &cfg);
+        let (c, s) = (th.cos(), th.sin());
+        let (mut hit, mut n) = (0, 0);
+        for ka in &a {
+            let (fx, fy) = (ka.x - w as f32 / 2.0, ka.y - h as f32 / 2.0);
+            let (ex, ey) = (
+                sc * (c * fx - s * fy) + w as f32 / 2.0,
+                sc * (s * fx + c * fy) + h as f32 / 2.0,
+            );
+            if ex < 16.0 || ey < 16.0 || ex > w as f32 - 16.0 || ey > h as f32 - 16.0 {
+                continue;
+            }
+            n += 1;
+            if b.iter()
+                .any(|kb| ((kb.x - ex).powi(2) + (kb.y - ey).powi(2)).sqrt() < 2.0)
+            {
+                hit += 1;
+            }
+        }
+        (hit as f32 / n.max(1) as f32, n)
+    }
+
+    #[test]
+    fn repeatability_under_rotation_and_scale() {
+        for (deg, sc, min_rate) in [
+            (0.0f32, 1.0f32, 0.99f32),
+            (30.0, 1.0, 0.85),
+            (90.0, 1.0, 0.95),
+            (45.0, 0.8, 0.70),
+            (0.0, 1.25, 0.70),
+        ] {
+            let (rate, n) = repeatability(deg.to_radians(), sc);
+            eprintln!("rot={deg} scale={sc} repeat={rate:.3} of {n}");
+            assert!(n >= 30, "비교 대상 {n}");
+            assert!(rate >= min_rate, "재검출률 {rate}");
+        }
+    }
+
     #[test]
     fn descriptor_unit_length() {
         let img = texture_warped(160, 160, 3, 0.0, 1.0);
