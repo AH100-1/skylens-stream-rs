@@ -725,7 +725,7 @@ fn off_line_count(p: &[Vector2<f64>], th_px: f64) -> usize {
         let (i, j) = (rnd(n), rnd(n));
         let d = p[j] - p[i];
         let len = d.norm();
-        if i == j || !(len > 0.0) {
+        if i == j || len.is_nan() || len <= 0.0 {
             continue;
         }
         let nrm = Vector2::new(-d.y, d.x) / len;
@@ -2117,7 +2117,12 @@ mod tests {
                 continue;
             }
             found += 1;
-            let m = ratio_match(&[a.clone()], &[b1.clone(), b2.clone()], r, false);
+            let m = ratio_match(
+                std::slice::from_ref(&a),
+                &[b1.clone(), b2.clone()],
+                r,
+                false,
+            );
             let expect = d1 < r * r * d2;
             assert_eq!(!m.is_empty(), expect, "경계 행 판정이 명세와 다름");
         }
