@@ -398,4 +398,63 @@ mod tests {
             assert!(worst.1 < max_dir, "정밀화 후 이동 방향 오차 {} 도", worst.1);
         }
     }
+
+    #[test]
+    fn pose_from_rendered_drone_views() {
+        // 합성 장면 렌더 → 특징점 → 비율 매칭 → RANSAC F → E → 자세 복원·정밀화 → 정답 비교.
+        use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
+        use crate::matching::{ransac_fundamental, ratio_match, RansacConfig};
+        use crate::synth::{CamId, Scene, SceneConfig};
+        let (w, h) = (480usize, 270usize);
+        let scene = Scene::new(SceneConfig {
+            width: w as u32,
+            height: h as u32,
+            ..SceneConfig::default()
+        });
+        let view = |pos: usize| {
+            scene
+                .views
+                .iter()
+                .find(|v| v.cam == CamId::F && v.position == pos)
+                .unwrap()
+        };
+        let cfg = DetectorConfig::default();
+        // (위치 간격, 회전 상한 도, 이동 방향 상한 도). 측정값(0.025~0.028°, 0.15~0.18°)의 약 2 배.
+        for (step, max_rot, max_dir) in [(1usize, 0.06, 0.4), (3, 0.06, 0.4)] {
+            let (va, vb) = (view(0), view(step));
+            let (ia, _) = scene.render(va);
+            let (ib, _) = scene.render(vb);
+            let fa = detect_and_describe(&GrayImage::from_rgb(w, h, &ia.data), &cfg);
+            let fb = detect_and_describe(&GrayImage::from_rgb(w, h, &ib.data), &cfg);
+            let m = ratio_match(&fa, &fb, 0.8, true);
+            let px = |f: &Feature| Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
+            let x1: Vec<_> = m.iter().map(|&(i, _)| px(&fa[i])).collect();
+            let x2: Vec<_> = m.iter().map(|&(_, j)| px(&fb[j])).collect();
+            let (f, inl) = ransac_fundamental(&x1, &x2, &RansacConfig::default()).unwrap();
+            let (ka, kb) = (&va.camera.intrinsics, &vb.camera.intrinsics);
+            let sel = |x: &[Vector2<f64>], k: &Intrinsics| -> Vec<Vector2<f64>> {
+                x.iter()
+                    .zip(&inl)
+                    .filter(|(_, &ok)| ok)
+                    .map(|(p, _)| k.to_normalized(p))
+                    .collect()
+            };
+            let (n1, n2) = (sel(&x1, ka), sel(&x2, kb));
+            let e = essential_from_fundamental(&f, ka, kb);
+            let rp = recover_pose(&e, &n1, &n2).unwrap();
+            let (rr, tr) = refine_pose(&rp.rotation, &rp.translation, &n1, &n2, 50);
+            let r = vb.camera.pose.rotation * va.camera.pose.rotation.inverse();
+            let t = vb.camera.pose.translation - r * va.camera.pose.translation;
+            let rot_err = rotation_angle_between(&rr, &r).to_degrees();
+            let dir_err = tr.angle(&t.normalize()).to_degrees();
+            let front = rp.in_front.iter().filter(|&&b| b).count() as f64 / n1.len() as f64;
+            eprintln!(
+                "render step={step} inliers={} rot_err={rot_err:.4} deg dir_err={dir_err:.3} deg front={front:.3}",
+                n1.len()
+            );
+            assert!(rot_err < max_rot, "회전 오차 {rot_err} 도");
+            assert!(dir_err < max_dir, "이동 방향 오차 {dir_err} 도");
+            assert!(front > 0.95, "앞쪽 비율 {front}");
+        }
+    }
 }
