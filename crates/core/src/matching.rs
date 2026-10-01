@@ -65,6 +65,13 @@ pub fn ratio_match(a: &[Feature], b: &[Feature], ratio: f32, mutual: bool) -> Ve
     out
 }
 
+/// 정규화된 8점 계(AᵀA)에서 둘째로 작은 고윳값 / 가장 큰 고윳값이 이보다 작으면 퇴화로 본다.
+const DEGENERATE_EIG_RATIO: f64 = 1e-10;
+
+pub(crate) fn all_finite(p: &[Vector2<f64>]) -> bool {
+    p.iter().all(|v| v.x.is_finite() && v.y.is_finite())
+}
+
 /// 점들을 무게중심 0, 평균 거리 √2 로 옮기는 상사 변환(Hartley 1997).
 fn normalizer(p: &[Vector2<f64>]) -> Matrix3<f64> {
     let n = p.len() as f64;
@@ -75,9 +82,11 @@ fn normalizer(p: &[Vector2<f64>]) -> Matrix3<f64> {
 }
 
 /// 정규화 8점 알고리즘으로 기본 행렬 F (x2ᵀ F x1 = 0, 픽셀 좌표)를 구한다.
-/// 점이 8개 미만이거나 퇴화하면 None. 결과는 계수 2, 프로베니우스 노름 1.
+/// 점이 8개 미만이거나, 길이가 다르거나, 유한하지 않은 좌표가 있거나,
+/// 해가 하나로 정해지지 않으면(영공간 2차원 이상: 동일선상 점, 순수 회전 등) None.
+/// 결과는 계수 2, 프로베니우스 노름 1.
 pub fn fundamental_8pt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matrix3<f64>> {
-    if x1.len() < 8 || x1.len() != x2.len() {
+    if x1.len() < 8 || x1.len() != x2.len() || !all_finite(x1) || !all_finite(x2) {
         return None;
     }
     let (t1, t2) = (normalizer(x1), normalizer(x2));
@@ -101,6 +110,12 @@ pub fn fundamental_8pt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matri
     }
     let eig = ata.symmetric_eigen();
     let k = eig.eigenvalues.imin();
+    // 둘째로 작은 고윳값도 0 에 가까우면 영공간이 2차원 이상이라 F 가 정해지지 않는다.
+    let mut ev: Vec<f64> = eig.eigenvalues.iter().copied().collect();
+    ev.sort_by(f64::total_cmp);
+    if ev[1] <= DEGENERATE_EIG_RATIO * ev[8] {
+        return None;
+    }
     let f = eig.eigenvectors.column(k);
     let fn_ = Matrix3::new(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]);
     // 계수 2 강제: 가장 작은 특이값을 0 으로.
@@ -113,7 +128,8 @@ pub fn fundamental_8pt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matri
     (n.is_finite() && n > 0.0).then(|| f / n)
 }
 
-/// 기본 행렬에 대한 Sampson 거리(픽셀², 1차 기하 오차 근사).
+/// 기본 행렬에 대한 **제곱** Sampson 거리(단위 px², 1차 기하 오차 근사).
+/// 픽셀 거리가 필요하면 `.sqrt()` 를 쓴다. RANSAC 은 이 값을 `threshold_px²` 와 비교한다.
 pub fn sampson_error(f: &Matrix3<f64>, p: &Vector2<f64>, q: &Vector2<f64>) -> f64 {
     let a = Vector3::new(p.x, p.y, 1.0);
     let b = Vector3::new(q.x, q.y, 1.0);
@@ -131,8 +147,10 @@ pub fn sampson_error(f: &Matrix3<f64>, p: &Vector2<f64>, q: &Vector2<f64>) -> f6
 /// RANSAC 설정.
 #[derive(Clone, Copy, Debug)]
 pub struct RansacConfig {
-    /// 정상 판정 Sampson 거리 문턱(픽셀).
+    /// 정상 판정 Sampson 거리 문턱(px, 제곱하지 않은 거리).
     pub threshold_px: f64,
+    /// 받아들일 최소 정상 비율. 이보다 낮으면 None(무관한 대응에서 우연히 맞은 F 를 거른다).
+    pub min_inlier_ratio: f64,
     pub max_iters: usize,
     /// 적응형 종료 신뢰도.
     pub confidence: f64,
@@ -143,6 +161,7 @@ impl Default for RansacConfig {
     fn default() -> Self {
         Self {
             threshold_px: 1.5,
+            min_inlier_ratio: 0.2,
             max_iters: 2000,
             confidence: 0.999,
             seed: 1,
@@ -151,14 +170,16 @@ impl Default for RansacConfig {
 }
 
 /// RANSAC(Fischler & Bolles 1981) + 8점 기본 행렬로 기하 검증.
-/// 반환: (정상 짝으로 다시 맞춘 F, 정상 여부 표시). 정상 짝이 8개 미만이면 None.
+/// 반환: (정상 짝으로 다시 맞춘 F, 정상 여부 표시).
+/// 정상 짝이 8개 미만이거나 정상 비율이 `min_inlier_ratio` 미만이면 None.
+/// 길이가 다르거나 유한하지 않은 좌표가 있으면 None.
 pub fn ransac_fundamental(
     x1: &[Vector2<f64>],
     x2: &[Vector2<f64>],
     cfg: &RansacConfig,
 ) -> Option<(Matrix3<f64>, Vec<bool>)> {
     let n = x1.len();
-    if n < 8 || n != x2.len() {
+    if n < 8 || n != x2.len() || !all_finite(x1) || !all_finite(x2) {
         return None;
     }
     let th2 = cfg.threshold_px * cfg.threshold_px;
@@ -222,7 +243,8 @@ pub fn ransac_fundamental(
         f = g;
         inl = gi;
     }
-    (inl.iter().filter(|&&b| b).count() >= 8).then_some((f, inl))
+    let cnt = inl.iter().filter(|&&b| b).count();
+    (cnt >= 8 && cnt as f64 >= cfg.min_inlier_ratio * n as f64).then_some((f, inl))
 }
 
 /// 정답 카메라 두 대로부터 기본 행렬 F = K2⁻ᵀ [t]× R K1⁻¹ (상대 자세 2←1).
@@ -339,7 +361,7 @@ mod tests {
         let worst = (0..x1.len())
             .map(|i| sampson_error(&f, &x1[i], &x2[i]).sqrt())
             .fold(0.0, f64::max);
-        assert!(worst < 1e-6, "최대 Sampson 거리 {worst} px");
+        assert!(worst < 1e-6, "최대 Sampson 거리 {worst} px (제곱근)");
         // 정답 F 와 부호까지 맞춰 비교.
         let g = fundamental_from_cameras(&c1, &c2);
         let d = (f - g).norm().min((f + g).norm());
@@ -356,7 +378,7 @@ mod tests {
             let fp = (0..x1.len()).filter(|&i| inl[i] && !truth[i]).count();
             let pos = truth.iter().filter(|&&t| t).count();
             let (prec, rec) = (tp as f64 / (tp + fp) as f64, tp as f64 / pos as f64);
-            // 정답 정상 짝에 대한 추정 F 의 Sampson 거리 RMS.
+            // 정답 정상 짝에 대한 추정 F 의 Sampson 거리 RMS(px): 제곱 거리(px²) 평균의 제곱근.
             let g = fundamental_from_cameras(&c1, &c2);
             let rms = |m: &Matrix3<f64>| {
                 let (s, k) = (0..x1.len())
@@ -540,5 +562,56 @@ mod tests {
         assert_eq!(correct, m.len(), "틀린 짝 {}", m.len() - correct);
         assert_eq!(m.len(), 90, "매칭 수 {}", m.len());
         assert!(m.iter().all(|&(i, _)| i >= 10));
+    }
+
+    #[test]
+    fn degenerate_inputs_are_rejected_without_panic() {
+        let (x1, x2, _, _, _) = correspondences(50, 0.0, 0.0, 3);
+        let cfg = RansacConfig::default();
+        // 점 8개 미만
+        assert!(fundamental_8pt(&x1[..7], &x2[..7]).is_none());
+        assert!(ransac_fundamental(&x1[..7], &x2[..7], &cfg).is_none());
+        // 길이 불일치
+        assert!(fundamental_8pt(&x1, &x2[..40]).is_none());
+        assert!(ransac_fundamental(&x1, &x2[..40], &cfg).is_none());
+        // NaN·무한대 좌표
+        for bad in [f64::NAN, f64::INFINITY] {
+            let mut y = x2.clone();
+            y[17].x = bad;
+            assert!(fundamental_8pt(&x1, &y).is_none());
+            assert!(ransac_fundamental(&x1, &y, &cfg).is_none());
+        }
+        // 모든 점이 두 영상에서 각각 한 직선 위: 영공간이 2차원 이상
+        let line = |a: f64, b: f64| -> Vec<Vector2<f64>> {
+            (0..60)
+                .map(|i| Vector2::new(100.0 + 13.0 * i as f64, a + b * i as f64))
+                .collect()
+        };
+        let (l1, l2) = (line(200.0, 3.0), line(350.0, -2.0));
+        assert!(fundamental_8pt(&l1, &l2).is_none());
+        assert!(ransac_fundamental(&l1, &l2, &cfg).is_none());
+    }
+
+    #[test]
+    fn random_correspondences_are_not_confirmed() {
+        // 서로 무관한 무작위 대응 200개: 정상 짝이 없으므로 F 를 확정하면 안 된다.
+        for seed in 1..=10u64 {
+            let mut g = Lcg(seed);
+            let mut pt = || Vector2::new(g.next() * 960.0, g.next() * 540.0);
+            let x1: Vec<_> = (0..200).map(|_| pt()).collect();
+            let x2: Vec<_> = (0..200).map(|_| pt()).collect();
+            let r = ransac_fundamental(&x1, &x2, &RansacConfig::default());
+            // 비율 조건 없이 몇 개가 우연히 문턱을 넘는지도 기록한다.
+            let loose = RansacConfig {
+                min_inlier_ratio: 0.0,
+                ..RansacConfig::default()
+            };
+            let cnt = ransac_fundamental(&x1, &x2, &loose)
+                .map(|(_, inl)| inl.iter().filter(|&&b| b).count())
+                .unwrap_or(0);
+            eprintln!("seed={seed} 우연 정상 수={cnt}/200");
+            assert!(cnt < 40, "우연 정상 비율이 0.2 이상: {cnt}/200");
+            assert!(r.is_none(), "무작위 대응에서 F 확정");
+        }
     }
 }

@@ -4,7 +4,7 @@
 //! 첫 카메라를 [I | 0], 둘째를 [R | t] 로 둘 때 n2ᵀ E n1 = 0, E = [t]× R.
 
 use crate::camera::Intrinsics;
-use crate::matching::fundamental_8pt;
+use crate::matching::{all_finite, fundamental_8pt, sampson_error};
 use crate::math::{skew, Matrix3, Point3, Rotation3, SMatrix, Vector2, Vector3};
 
 /// 정규화 좌표 대응으로 본질 행렬을 구한다(정규화 8점 + 특이값 (1,1,0) 투영).
@@ -91,12 +91,63 @@ pub struct RelativePose {
     pub in_front: Vec<bool>,
 }
 
+/// 순수 회전 판정 배수: 회전만으로 설명한 각 잔차 중앙값이
+/// 에피폴라 잔차 중앙값의 이 배수 이하이면 이동 방향을 관측할 수 없다고 본다.
+const ROTATION_ONLY_FACTOR: f64 = 3.0;
+
+/// 대응을 회전 하나로 설명했을 때의 각 잔차(rad) 중앙값.
+/// 단위 광선 u1, u2 에 대해 Σ‖u2 − R u1‖² 를 최소화하는 R(직교 프로크루스테스) 을 쓴다.
+fn rotation_only_residual(n1: &[Vector2<f64>], n2: &[Vector2<f64>]) -> f64 {
+    let ray = |n: &Vector2<f64>| Vector3::new(n.x, n.y, 1.0).normalize();
+    let h = n1.iter().zip(n2).fold(Matrix3::zeros(), |h, (a, b)| {
+        h + ray(a) * ray(b).transpose()
+    });
+    let svd = h.svd(true, true);
+    let (u, vt) = (svd.u.unwrap(), svd.v_t.unwrap());
+    let d = (vt.transpose() * u.transpose()).determinant().signum();
+    let r = vt.transpose() * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, d)) * u.transpose();
+    median(
+        n1.iter()
+            .zip(n2)
+            .map(|(a, b)| (r * ray(a)).cross(&ray(b)).norm().asin())
+            .collect(),
+    )
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
 /// E 의 네 후보 중 두 카메라 앞(양의 깊이)에 놓이는 점이 가장 많은 것을 고른다.
+/// 길이가 다르거나, 유한하지 않은 값이 있거나, 대응이 순수 회전으로 설명되면
+/// (이동 방향 미정) None.
 pub fn recover_pose(
     e: &Matrix3<f64>,
     n1: &[Vector2<f64>],
     n2: &[Vector2<f64>],
 ) -> Option<RelativePose> {
+    if n1.is_empty()
+        || n1.len() != n2.len()
+        || !all_finite(n1)
+        || !all_finite(n2)
+        || !e.iter().all(|v| v.is_finite())
+    {
+        return None;
+    }
+    // 정규화 좌표의 Sampson 거리 ≈ 각 잔차(rad). E 의 스케일에 무관하다.
+    let epi = median(
+        n1.iter()
+            .zip(n2)
+            .map(|(a, b)| sampson_error(e, a, b).sqrt())
+            .collect(),
+    );
+    if rotation_only_residual(n1, n2) <= ROTATION_ONLY_FACTOR * epi + 1e-12 {
+        return None;
+    }
     let mut best: Option<RelativePose> = None;
     let mut best_n = 0;
     for (r, t) in decompose_essential(e) {
@@ -168,7 +219,7 @@ fn padd(p: &Poly, q: &Poly, s: f64) -> Poly {
 /// z 를 숨은 변수로 둔 10×10 다항 행렬 M(z) 의 다항 고윳값 문제(동반 행렬)로 푼다.
 #[allow(clippy::needless_range_loop)] // 행렬 첨자식이 수식과 그대로 대응한다.
 pub fn essential_5pt(n1: &[Vector2<f64>], n2: &[Vector2<f64>]) -> Vec<Matrix3<f64>> {
-    if n1.len() < 5 || n2.len() < 5 {
+    if n1.len() < 5 || n2.len() < 5 || !all_finite(&n1[..5]) || !all_finite(&n2[..5]) {
         return vec![];
     }
     let mut ata = SMatrix::<f64, 9, 9>::zeros();
@@ -645,5 +696,77 @@ mod tests {
             worst = worst.max(best);
         }
         assert!(worst < 1e-6, "정답 E 와 최소 차이 {worst}");
+    }
+
+    #[test]
+    fn recover_pose_rejects_degenerate_inputs() {
+        let s = scene(60, 0.5, 4);
+        let (r, t) = s.rel();
+        let e = essential_from_pose(&r, &t);
+        // 정상 장면은 그대로 복원된다(기준선).
+        assert!(recover_pose(&e, &s.x1, &s.x2).is_some());
+        // 길이 불일치·빈 입력
+        assert!(recover_pose(&e, &s.x1, &s.x2[..30]).is_none());
+        assert!(recover_pose(&e, &[], &[]).is_none());
+        // NaN 좌표·NaN 행렬
+        let mut y = s.x2.clone();
+        y[5].y = f64::NAN;
+        assert!(recover_pose(&e, &s.x1, &y).is_none());
+        assert!(recover_pose(&(e * f64::NAN), &s.x1, &s.x2).is_none());
+        let mut z = s.x1[..5].to_vec();
+        z[2].x = f64::NAN;
+        assert!(essential_5pt(&z, &s.x2[..5]).is_empty());
+        // 점 부족
+        assert!(essential_5pt(&s.x1[..4], &s.x2[..4]).is_empty());
+        assert!(essential_8pt(&s.x1[..7], &s.x2[..7]).is_none());
+    }
+
+    #[test]
+    fn pure_rotation_gives_no_translation() {
+        // 같은 중심에서 회전만 한 두 카메라: 이동 방향을 관측할 수 없다.
+        for (sigma, seed) in [(0.0, 1u64), (0.5, 2), (1.0, 3)] {
+            let k = Intrinsics::from_hfov(960, 540, 70f64.to_radians());
+            let r1 = Rotation3::from_euler_angles(0.04, -0.03, 0.2);
+            let r2 = Rotation3::from_euler_angles(-0.05, 0.06, 0.28);
+            let center = Point3::new(0.0, 0.0, -40.0);
+            let c1 = Camera {
+                intrinsics: k,
+                pose: Pose::from_center(r1, &center),
+            };
+            let c2 = Camera {
+                intrinsics: k,
+                pose: Pose::from_center(r2, &center),
+            };
+            let mut rng = Lcg(seed);
+            let (mut x1, mut x2) = (vec![], vec![]);
+            while x1.len() < 80 {
+                let x = Point3::new(
+                    (rng.next() - 0.5) * 40.0,
+                    (rng.next() - 0.5) * 24.0,
+                    (rng.next() - 0.5) * 10.0,
+                );
+                if let (Some(p), Some(q)) = (c1.project(&x), c2.project(&x)) {
+                    let mut nz = || Vector2::new(rng.gauss(), rng.gauss()) * sigma;
+                    let (a, b) = (p + nz(), q + nz());
+                    x1.push(k.to_normalized(&a));
+                    x2.push(k.to_normalized(&b));
+                }
+            }
+            let r = r2 * r1.inverse();
+            // 임의 방향 t 로 만든 E 와 대응에서 맞춘 E 모두 이동 방향을 확정하면 안 된다.
+            for t in [Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.3, -0.8, 0.5)] {
+                let e = essential_from_pose(&r, &t.normalize());
+                assert!(
+                    recover_pose(&e, &x1, &x2).is_none(),
+                    "σ={sigma}: 순수 회전에서 t 확정"
+                );
+            }
+            if let Some(e) = essential_8pt(&x1, &x2) {
+                assert!(
+                    recover_pose(&e, &x1, &x2).is_none(),
+                    "σ={sigma}: 맞춘 E 로 순수 회전에서 t 확정"
+                );
+            }
+        }
     }
 }

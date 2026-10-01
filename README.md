@@ -73,6 +73,9 @@ let x2: Vec<_> = pairs.iter().map(|&(_, j)| nalgebra::Vector2::new(feats_b[j].kp
 if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default()) {
     // f: 기본 행렬(x2ᵀ F x1 = 0), inliers[k]: pairs[k] 가 기하적으로 맞는지
 }
+// None: 점 8개 미만, 길이 불일치, NaN·무한대 좌표, 동일선상 등 퇴화 배치,
+// 또는 정상 비율이 min_inlier_ratio(기본 0.2) 미만. 문턱 threshold_px 는 px 단위,
+// sampson_error 는 제곱 거리(px²)를 돌려준다.
 ```
 
 ### 라이브러리: 두 시점 상대 자세와 삼각측량
@@ -90,6 +93,7 @@ if let Some(rp) = recover_pose(&e, &n1, &n2) {
     let (r, t) = refine_pose(&rp.rotation, &rp.translation, &n1, &n2, 50);
     let x = triangulate(&r, &t, &n1[0], &n2[0]); // 카메라 1 좌표계의 3D 점
 }
+// recover_pose 는 길이 불일치, NaN 입력, 순수 회전(이동 방향을 관측할 수 없음)에서 None.
 ```
 
 ### 출력
@@ -177,6 +181,9 @@ let x2: Vec<_> = pairs.iter().map(|&(_, j)| nalgebra::Vector2::new(feats_b[j].kp
 if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default()) {
     // f: fundamental matrix (x2ᵀ F x1 = 0), inliers[k]: whether pairs[k] is geometrically consistent
 }
+// None: fewer than 8 points, length mismatch, NaN/infinite coordinates, degenerate layouts such as
+// collinear points, or an inlier ratio below min_inlier_ratio (default 0.2). threshold_px is in px;
+// sampson_error returns the squared distance (px²).
 ```
 
 ### Library: two-view relative pose and triangulation
@@ -194,6 +201,7 @@ if let Some(rp) = recover_pose(&e, &n1, &n2) {
     let (r, t) = refine_pose(&rp.rotation, &rp.translation, &n1, &n2, 50);
     let x = triangulate(&r, &t, &n1[0], &n2[0]); // 3D point in camera 1 coordinates
 }
+// recover_pose returns None on length mismatch, NaN input, or pure rotation (translation unobservable).
 ```
 
 ### Output
