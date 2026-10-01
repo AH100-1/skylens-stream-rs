@@ -239,8 +239,8 @@ fn constrained_ls(m: usize, edges: &[Edge], w: &[f64]) -> Option<Vec<Vector3<f64
         total += 1.0;
     }
     b[dim - 1] = total;
-    // 게이지(c_0 = 0)와 축척 제약으로 해가 하나로 정해지므로 정칙화는 넣지 않는다
-    // (대각에 작은 값을 더하면 해가 원점 쪽으로 끌려 무잡음에서도 1e-4 m 수준의 편향이 남는다).
+    // 정칙화 항을 두지 않는다: c_0 = 0 과 축척 제약으로 게이지가 모두 고정되므로 방향 강성 그래프에서
+    // 행렬은 정칙이다. 예전의 대각 1e-9 는 긴 사슬(최소 고유값 ~1e-4)에서 중심을 1e-4 상대만큼 끌어당겼다.
     let sol = a.lu().solve(&b)?;
     Some(
         (0..m)
@@ -601,14 +601,21 @@ mod tests {
         c.coords + f * (-c.z / f.z)
     }
 
-    /// 짝: 같은 카메라 1~4칸 이웃 + 바닥 시야 중심이 22 m 안인(시야 폭 약 35 m) 다른 카메라.
+    /// 다른 카메라끼리 짝을 맺는 바닥 시야 중심 거리 문턱(m).
+    /// 고도 30 m·내려다보는 각 60° 이면 시야 중심은 카메라에서 수평 30/tan60° ≈ 17.3 m 앞이다.
+    /// F(0°)·L(−116°) 시야 중심은 서로 가깝지만 R(+125°) 은 다른 드론 시야 중심과 약 20 m 떨어진다
+    /// (가로 간격 10 m 와 방위 차로 계산). 12 m 로 두면 R 80대가 통째로 끊기므로, 20 m 에 시야 폭
+    /// (약 35 m)의 겹침이 남는 2 m 여유를 더한 22 m 를 쓴다.
+    const CROSS_PAIR_RADIUS_M: f64 = 22.0;
+
+    /// 짝: 같은 카메라 1~4칸 이웃 + 바닥 시야 중심이 CROSS_PAIR_RADIUS_M 안인 다른 카메라.
     fn pairs(poses: &[Pose]) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         for a in 0..poses.len() {
             for b in a + 1..poses.len() {
                 let same = a % 3 == b % 3 && (b / 3 - a / 3) <= 4;
-                let cross =
-                    a % 3 != b % 3 && (footprint(&poses[a]) - footprint(&poses[b])).norm() < 22.0;
+                let cross = a % 3 != b % 3
+                    && (footprint(&poses[a]) - footprint(&poses[b])).norm() < CROSS_PAIR_RADIUS_M;
                 if same || cross {
                     out.push((a, b));
                 }
@@ -687,6 +694,8 @@ mod tests {
         let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
         let (rms, max) = stats(&similarity_aligned_errors(&res.centers, &truth));
         assert_eq!(res.registered(), 240);
+        // 무잡음·정확한 회전이면 해는 닮음 변환을 빼고 유일하다. 장면 크기 ~80 m 에 대해 1e-6 m
+        // 은 상대 ~1e-8 로, 배정밀도 선형 풀이 오차에 여유를 둔 값이다.
         assert!(max < 1e-6, "rms {rms} max {max}");
     }
 
