@@ -506,3 +506,51 @@ fn sloped_ground_with_different_extent_passes() {
     assert_eq!(status(&out, "preview_vs_refined"), "PASS", "{out}");
     assert!(out.contains("높이 차 중앙 최대 1.990 m"), "{out}");
 }
+
+/// F-089: SPEC §2 출력만 있는 폴더(report.json 없음) → 1~3 판정 불가, 4~7 은 측정값으로 PASS, 종료 코드 2.
+#[test]
+fn spec_outputs_only_marks_report_items_undecided() {
+    let (code, out) = run_with("noreport", &Fixture::default(), |d| {
+        std::fs::remove_file(d.join("report.json")).unwrap();
+    });
+    assert_eq!(code, 2, "{out}");
+    for it in &ITEMS[..3] {
+        let line = out
+            .lines()
+            .find(|l| l.starts_with(&format!("| {it} |")))
+            .unwrap();
+        assert!(line.contains("| 판정 불가 |"), "{it}\n{out}");
+    }
+    for it in &ITEMS[3..] {
+        assert_eq!(status(&out, it), "PASS", "{it}\n{out}");
+    }
+    assert!(out.contains("결과: 4/7 통과"), "{out}");
+    assert!(out.contains("판정 불가: 3개"), "{out}");
+    assert!(out.contains("최근접 중앙 최대 1.990 m"), "{out}");
+}
+
+/// F-089: report.json 없이 판정 가능한 항목이 FAIL 이면 종료 코드 1.
+#[test]
+fn spec_outputs_only_with_failure_exits_one() {
+    let f = Fixture {
+        preview_dz: 2.5,
+        ..Fixture::default()
+    };
+    let (code, out) = run_with("noreport_fail", &f, |d| {
+        std::fs::remove_file(d.join("report.json")).unwrap();
+    });
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(status(&out, "preview_vs_refined"), "FAIL", "{out}");
+}
+
+/// F-089: 형식이 깨진 report.json 은 판정 불가가 아니라 FAIL.
+#[test]
+fn broken_report_json_fails() {
+    let (code, out) = run_with("badreport", &Fixture::default(), |d| {
+        std::fs::write(d.join("report.json"), "{not json").unwrap();
+    });
+    assert_eq!(code, 1, "{out}");
+    for it in &ITEMS[..3] {
+        assert_eq!(status(&out, it), "FAIL", "{it}\n{out}");
+    }
+}

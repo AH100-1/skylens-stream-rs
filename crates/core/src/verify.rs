@@ -1,8 +1,7 @@
 //! 출력 폴더 검증 (SPEC §2 출력 구조, §4 검증 기준 일곱 항목).
 //!
 //! 읽는 파일:
-//! - `report.json` (출력 폴더 바로 아래): 포즈 단계 기록. SPEC §2 에 아직 없는 형식이라
-//!   스트림 출력이 이 파일을 쓰지 않으면 항목 1~3 은 "report.json 없음" 으로 FAIL 한다.
+//! - `report.json` (출력 폴더 바로 아래, 선택): 포즈 단계 기록. SPEC §2 출력 목록에 없는 파일이다.
 //!   ```json
 //!   {"registered": {"total": 240, "preview": 240, "refined": 240},
 //!    "reprojection_px": {"preview": 4.5, "refined": 0.59},
@@ -11,6 +10,17 @@
 //!   `registered.total` 은 입력 사진 수, `preview`/`refined` 는 초벌·정밀 포즈에 등록된 사진 수.
 //!   `reprojection_px` 는 재투영 오차 RMS(px). `regions[].positions` 는 구역의 위치 수,
 //!   `images` 는 구역 밀집 단계에 쓴 사진 수.
+//!
+//! SPEC §2 출력만으로 판정할 수 있는 항목과 없는 항목:
+//! - 판정 가능(4~7): `preview_align`(manifest `align`), `preview_vs_refined`·`refined_overlap`
+//!   (구역 PLY), `snapshots`(manifest `snapshots` + step PLY).
+//! - 판정 불가(1~3): `registered`(등록 사진 수), `region_images`(구역에 쓴 사진 수 — 파일 이름의
+//!   `pos{lo}-{hi}` 로 위치 수는 알지만 사진 수는 출력에 없음), `refined_reprojection`(재투영 오차).
+//!   세 값 모두 SPEC §2 의 어떤 파일에도 없다. `report.json` 이 없으면 이 셋은 FAIL 이 아니라
+//!   "판정 불가" 로 표시하고, 있으면 그 값으로 판정한다. 형식이 깨진 `report.json` 은 FAIL.
+//!   출력 폴더 자체가 없으면 모든 항목 FAIL.
+//!
+//! 종료 코드: FAIL 이 하나라도 있으면 1, FAIL 은 없고 판정 불가가 있으면 2, 모두 PASS 면 0.
 //! - `snapshots/manifest.json`: SPEC §2 형식. `snapshots[].step` 은 1부터 세는 정수,
 //!   최종만 문자열 `"final"`. 그 밖의 형(예: 문자열 `"01"`)은 형식 오류로 FAIL.
 //! - `preview/preview_{k:02}_*.ply`, `refined/refined_{k:02}_*.ply`, `snapshots/step_*.ply`.
@@ -63,7 +73,10 @@ const EPS: f64 = 1e-9;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Item {
     pub name: &'static str,
+    /// 판정했고 통과. 판정 불가면 false.
     pub pass: bool,
+    /// false 면 SPEC §2 출력만으로는 판정할 수 없는 항목(입력 파일 없음).
+    pub decided: bool,
     pub measured: String,
     pub criterion: &'static str,
 }
@@ -78,6 +91,27 @@ impl Report {
         !self.items.is_empty() && self.items.iter().all(|i| i.pass)
     }
 
+    /// 판정했는데 통과하지 못한 항목이 있음.
+    pub fn any_fail(&self) -> bool {
+        self.items.iter().any(|i| i.decided && !i.pass)
+    }
+
+    /// 판정 불가 항목 수.
+    pub fn undecided(&self) -> usize {
+        self.items.iter().filter(|i| !i.decided).count()
+    }
+
+    /// 0 = 모두 PASS, 1 = FAIL 있음(또는 항목 없음), 2 = FAIL 없고 판정 불가 있음.
+    pub fn exit_code(&self) -> u8 {
+        if self.items.is_empty() || self.any_fail() {
+            1
+        } else if self.undecided() > 0 {
+            2
+        } else {
+            0
+        }
+    }
+
     pub fn item(&self, name: &str) -> Option<&Item> {
         self.items.iter().find(|i| i.name == name)
     }
@@ -86,7 +120,13 @@ impl Report {
     pub fn to_table(&self) -> String {
         let mut s = String::from("| 항목 | 결과 | 측정값 | 기준 |\n|---|---|---|---|\n");
         for i in &self.items {
-            let r = if i.pass { "PASS" } else { "FAIL" };
+            let r = if !i.decided {
+                "판정 불가"
+            } else if i.pass {
+                "PASS"
+            } else {
+                "FAIL"
+            };
             let _ = writeln!(
                 s,
                 "| {} | {} | {} | {} |",
@@ -99,19 +139,19 @@ impl Report {
             self.items.iter().filter(|i| i.pass).count(),
             self.items.len()
         );
+        let u = self.undecided();
+        if u > 0 {
+            let _ = writeln!(s, "판정 불가: {u}개 (SPEC §2 출력에 없는 값)");
+        }
         s
     }
 }
 
-/// `skylens-stream verify <출력 폴더>`: 표를 찍고 모두 통과면 0, 아니면 1.
+/// `skylens-stream verify <출력 폴더>`: 표를 찍고 종료 코드는 [`Report::exit_code`].
 pub fn run_cli(dir: &str) -> ExitCode {
     let report = verify_dir(Path::new(dir));
     print!("{}", report.to_table());
-    if report.all_pass() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    ExitCode::from(report.exit_code())
 }
 
 pub const ITEM_REGISTERED: &str = "registered";
@@ -127,21 +167,65 @@ fn item(name: &'static str, criterion: &'static str, r: Result<(bool, String), S
         Ok((pass, measured)) => Item {
             name,
             pass,
+            decided: true,
             measured,
             criterion,
         },
         Err(e) => Item {
             name,
             pass: false,
+            decided: true,
             measured: format!("오류: {e}"),
             criterion,
         },
     }
 }
 
+/// `report.json` 에서만 얻는 항목(1~3). 파일이 없고 출력 폴더는 있으면 판정 불가.
+fn report_item(
+    name: &'static str,
+    criterion: &'static str,
+    report: &ReportJson,
+    check: fn(&Json) -> Result<(bool, String), String>,
+) -> Item {
+    match report {
+        ReportJson::Absent => Item {
+            name,
+            pass: false,
+            decided: false,
+            measured: "report.json 없음 (SPEC §2 출력에 없는 값)".into(),
+            criterion,
+        },
+        ReportJson::Read(r) => item(
+            name,
+            criterion,
+            r.as_ref().map_err(Clone::clone).and_then(check),
+        ),
+    }
+}
+
+/// `report.json` 읽기 결과: 출력 폴더는 있는데 파일만 없으면 `Absent`.
+enum ReportJson {
+    Absent,
+    Read(Result<Json, String>),
+}
+
+fn read_report(dir: &Path) -> ReportJson {
+    let path = dir.join("report.json");
+    if dir.is_dir() && !path.exists() {
+        ReportJson::Absent
+    } else {
+        ReportJson::Read(read_json(&path))
+    }
+}
+
 /// 출력 폴더 전체를 검증한다.
 pub fn verify_dir(dir: &Path) -> Report {
-    let report = read_json(&dir.join("report.json"));
+    let report_src = read_report(dir);
+    let report = match &report_src {
+        ReportJson::Absent => Err("report.json 없음".to_string()),
+        ReportJson::Read(r) => r.clone(),
+    };
     let manifest = read_json(&dir.join("snapshots").join("manifest.json"));
     let steps = manifest
         .as_ref()
@@ -169,27 +253,9 @@ pub fn verify_dir(dir: &Path) -> Report {
     }
 
     let items = vec![
-        item(
-            ITEM_REGISTERED,
-            "초벌·정밀 모두 전체 등록 (240/240)",
-            report
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(check_registered),
-        ),
-        item(
-            ITEM_REGION_IMAGES,
-            "구역 사진 수 = 3 × 위치 수",
-            report
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(check_region_images),
-        ),
-        item(
-            ITEM_REPROJ,
-            "정밀 재투영 ≤ 0.7 px",
-            report.as_ref().map_err(Clone::clone).and_then(check_reproj),
-        ),
+        report_item(ITEM_REGISTERED, "초벌·정밀 모두 전체 등록 (240/240)", &report_src, check_registered),
+        report_item(ITEM_REGION_IMAGES, "구역 사진 수 = 3 × 위치 수", &report_src, check_region_images),
+        report_item(ITEM_REPROJ, "정밀 재투영 ≤ 0.7 px", &report_src, check_reproj),
         item(
             ITEM_ALIGN,
             "점쌍 ≥ 1000, 구역 간 스케일 차(최대/최소 − 1) ≤ 10%, 잔차 중앙 < 6 m",
