@@ -9,6 +9,8 @@ pub mod math;
 pub mod ply;
 pub mod rotation_averaging;
 pub mod synth;
+pub mod translation_averaging;
+pub mod triangulation;
 pub mod two_view;
 
 pub use nalgebra;
