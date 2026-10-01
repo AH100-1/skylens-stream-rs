@@ -209,9 +209,18 @@ fn homography_error(
 /// 주어진 대응 가운데 한 호모그래피가 문턱 `th_px` 안에서 설명하는 최대 개수(근사).
 /// 전체로 맞춘 뒤 문턱을 줄여 가며 정상 짝으로 다시 맞춘다(호모그래피는 평면이면 대응 전체를 설명한다).
 pub fn homography_support(x1: &[Vector2<f64>], x2: &[Vector2<f64>], th_px: f64) -> usize {
+    fit_homography(x1, x2, th_px).map_or(0, |(_, _, c)| c)
+}
+
+/// [`homography_support`] 의 반복 적합. (H, H⁻¹, 문턱 안 개수) 중 개수가 가장 많은 것.
+fn fit_homography(
+    x1: &[Vector2<f64>],
+    x2: &[Vector2<f64>],
+    th_px: f64,
+) -> Option<(Matrix3<f64>, Matrix3<f64>, usize)> {
     let n = x1.len();
     let mut sel: Vec<usize> = (0..n).collect();
-    let mut best = 0;
+    let mut best: Option<(Matrix3<f64>, Matrix3<f64>, usize)> = None;
     for m in [8.0, 4.0, 2.0, 1.0, 1.0] {
         let s1: Vec<_> = sel.iter().map(|&i| x1[i]).collect();
         let s2: Vec<_> = sel.iter().map(|&i| x2[i]).collect();
@@ -224,13 +233,99 @@ pub fn homography_support(x1: &[Vector2<f64>], x2: &[Vector2<f64>], th_px: f64) 
         let err: Vec<f64> = (0..n)
             .map(|i| homography_error(&h, &hi, &x1[i], &x2[i]))
             .collect();
-        best = best.max(err.iter().filter(|&&e| e < th_px).count());
+        let c = err.iter().filter(|&&e| e < th_px).count();
+        if best.as_ref().is_none_or(|b| c > b.2) {
+            best = Some((h, hi, c));
+        }
         sel = (0..n).filter(|&i| err[i] < th_px * m).collect();
         if sel.len() < 4 {
             break;
         }
     }
     best
+}
+
+/// 두 시점 기하 모델.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwoViewModel {
+    /// 일반 장면: 기본 행렬이 정해진다.
+    Fundamental,
+    /// 평면(또는 시차 없는) 장면: 호모그래피로 충분하고 F 는 정해지지 않는다.
+    Homography,
+}
+
+/// [`select_two_view_model`] 의 결과.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelSelection {
+    pub model: TwoViewModel,
+    /// Torr GRIC 점수(작을수록 좋음).
+    pub gric_f: f64,
+    pub gric_h: f64,
+    /// 호모그래피 잔차가 χ²₂ 99.9% 분위(13.8σ²)를 넘고 F 잔차는 χ²₁ 99.9% 분위(10.8σ²) 안인 짝 수
+    /// (평면 밖 시차가 있는 정상 짝).
+    pub parallax: usize,
+    /// 평면으로 판정하지 않는 데 필요한 최소 시차 짝 수.
+    pub parallax_needed: usize,
+}
+
+/// 정상 짝(x1, x2)과 그 F 에 대해 F/H 모델을 고른다. `sigma_px` 는 좌표 잡음 표준편차.
+///
+/// GRIC(Torr 1998): Σ min(e²/σ², λ₃(r−d)) + λ₁ d n + λ₂ k, r = 4, λ₁ = ln r, λ₂ = ln(r n), λ₃ = 2,
+/// F: d = 3, k = 7(e² = 제곱 Sampson 거리), H: d = 2, k = 8(e² = 두 방향 전달 오차 제곱 평균의 절반,
+/// 양쪽 잡음 σ 에서 기댓값 2σ² 로 4차원 기하 오차와 맞춘다).
+/// 순수 GRIC 는 평면 밖 짝 비율이 약 19% 미만이면(평면 위 짝마다 F 가 ln 4 를 더 내고 평면 밖 짝마다 H 가
+/// 약 3 을 더 내므로 ln4 − 1 ≈ 0.39 ≈ 2·비율) H 를 고른다. 그러나 F 는 호모그래피 + 평면 밖 두 점으로 정해지므로
+/// 지면 위주 장면에서 건물 몇 %만 있어도 F 가 정해진다. 그래서 GRIC 가 H 를 고르더라도 시차 짝 수가
+/// 순수 평면에서 우연히 나올 수 있는 수(기대 0.001n + 3√(0.001n), 여기에 고정 8)를 넘으면 F 를 고른다.
+/// 정상 짝이 8개 미만이거나 호모그래피를 맞출 수 없으면 None.
+pub fn select_two_view_model(
+    x1: &[Vector2<f64>],
+    x2: &[Vector2<f64>],
+    f: &Matrix3<f64>,
+    sigma_px: f64,
+) -> Option<ModelSelection> {
+    let n = x1.len();
+    if n < 8 || n != x2.len() || sigma_px.is_nan() || sigma_px <= 0.0 {
+        return None;
+    }
+    let s2 = sigma_px * sigma_px;
+    let (h, hi, _) = fit_homography(x1, x2, 3.0 * sigma_px)?;
+    let tr = |m: &Matrix3<f64>, x: &Vector2<f64>, y: &Vector2<f64>| -> f64 {
+        let v = m * Vector3::new(x.x, x.y, 1.0);
+        if v.z.abs() < 1e-12 {
+            f64::INFINITY
+        } else {
+            (Vector2::new(v.x / v.z, v.y / v.z) - y).norm_squared()
+        }
+    };
+    let (mut rho_f, mut rho_h, mut parallax) = (0.0, 0.0, 0usize);
+    for (p, q) in x1.iter().zip(x2) {
+        let ef = sampson_error(f, p, q) / s2;
+        let eh = 0.25 * (tr(&h, p, q) + tr(&hi, q, p)) / s2;
+        rho_f += ef.min(2.0 * (4.0 - 3.0));
+        rho_h += eh.min(2.0 * (4.0 - 2.0));
+        if eh > 13.8 && ef < 10.8 {
+            parallax += 1;
+        }
+    }
+    let nf = n as f64;
+    let (l1, l2) = (4f64.ln(), (4.0 * nf).ln());
+    let gric_f = rho_f + l1 * 3.0 * nf + l2 * 7.0;
+    let gric_h = rho_h + l1 * 2.0 * nf + l2 * 8.0;
+    let mu = 0.001 * nf;
+    let parallax_needed = 8 + (mu + 3.0 * mu.sqrt()).ceil() as usize;
+    let model = if gric_h < gric_f && parallax < parallax_needed {
+        TwoViewModel::Homography
+    } else {
+        TwoViewModel::Fundamental
+    };
+    Some(ModelSelection {
+        model,
+        gric_f,
+        gric_h,
+        parallax,
+        parallax_needed,
+    })
 }
 
 pub(crate) fn all_finite(p: &[Vector2<f64>]) -> bool {
@@ -324,9 +419,65 @@ fn rank2_unit(f: &Matrix3<f64>) -> Option<Matrix3<f64>> {
     (n.is_finite() && n > 0.0).then(|| g / n)
 }
 
+/// 픽셀 F 에 대한 부호 있는 Sampson 잔차 r = e / √d 와 그 해석적 기울기 ∂r/∂F (3×3).
+/// e = bᵀF a, d = (Fa)₀² + (Fa)₁² + (Fᵀb)₀² + (Fᵀb)₁² 이고
+/// ∂e/∂F_lm = b_l a_m, ∂d/∂F_lm = 2 (Fa)_l a_m [l<2] + 2 (Fᵀb)_m b_l [m<2],
+/// ∂r/∂F = ∂e/√d − e ∂d / (2 d^{3/2}). d = 0 이면 잔차 0·기울기 0(잔차 함수와 같은 규약).
+pub(crate) fn sampson_residual_grad(
+    f: &Matrix3<f64>,
+    p: &Vector2<f64>,
+    q: &Vector2<f64>,
+) -> (f64, Matrix3<f64>) {
+    let a = Vector3::new(p.x, p.y, 1.0);
+    let b = Vector3::new(q.x, q.y, 1.0);
+    let fa = f * a;
+    let ftb = f.transpose() * b;
+    let e = b.dot(&fa);
+    let d = fa.x * fa.x + fa.y * fa.y + ftb.x * ftb.x + ftb.y * ftb.y;
+    if d <= 0.0 {
+        return (0.0, Matrix3::zeros());
+    }
+    let sd = d.sqrt();
+    let c = e / (2.0 * d * sd);
+    let mut g = Matrix3::zeros();
+    for l in 0..3 {
+        for mm in 0..3 {
+            let mut dd = 0.0;
+            if l < 2 {
+                dd += 2.0 * fa[l] * a[mm];
+            }
+            if mm < 2 {
+                dd += 2.0 * ftb[mm] * b[l];
+            }
+            g[(l, mm)] = b[l] * a[mm] / sd - c * dd;
+        }
+    }
+    (e / sd, g)
+}
+
+/// 정규화 좌표 F 성분 g(행 우선 9개)에 대한 픽셀 Sampson 잔차의 야코비안.
+/// F_px = T2ᵀ G T1 이므로 ∂r/∂G = T2 (∂r/∂F_px) T1ᵀ.
+fn sampson_jacobian_normalized(
+    g: &Matrix3<f64>,
+    t1: &Matrix3<f64>,
+    t2: &Matrix3<f64>,
+    x1: &[Vector2<f64>],
+    x2: &[Vector2<f64>],
+    jac: &mut [[f64; 9]],
+) {
+    let fp = t2.transpose() * g * t1;
+    for ((p, q), row) in x1.iter().zip(x2).zip(jac.iter_mut()) {
+        let (_, gp) = sampson_residual_grad(&fp, p, q);
+        let gn = t2 * gp * t1.transpose();
+        for k in 0..9 {
+            row[k] = gn[(k / 3, k % 3)];
+        }
+    }
+}
+
 /// 주어진 대응에서 Sampson 거리 제곱합을 줄이도록 F 를 Levenberg–Marquardt 로 정밀화한다
-/// (Hartley & Zisserman 11.4.3 의 Sampson 비용). 매개변수는 Hartley 정규화 좌표의 F 성분 9개이고,
-/// 걸음마다 계수 2·노름 1 로 투영해 7 자유도를 유지한다. 비용이 줄지 않으면 시작 F 를 그대로 돌려준다.
+/// (Hartley & Zisserman 11.4.3 의 Sampson 비용). 매개변수는 Hartley 정규화 좌표의 F 성분 9개이고
+/// 야코비안은 해석적([`sampson_residual_grad`]), 걸음마다 계수 2·노름 1 로 투영해 7 자유도를 유지한다. 비용이 줄지 않으면 시작 F 를 그대로 돌려준다.
 fn refine_sampson(
     f: &Matrix3<f64>,
     x1: &[Vector2<f64>],
@@ -364,15 +515,7 @@ fn refine_sampson(
     let m = r.len();
     let mut jac = vec![[0.0f64; 9]; m];
     for _ in 0..iters {
-        let h = 1e-7;
-        for k in 0..9 {
-            let mut gh = g;
-            gh[(k / 3, k % 3)] += h;
-            resid(&gh, &mut rh);
-            for i in 0..m {
-                jac[i][k] = (rh[i] - r[i]) / h;
-            }
-        }
+        sampson_jacobian_normalized(&g, &t1, &t2, x1, x2, &mut jac);
         let mut jtj = SMatrix::<f64, 9, 9>::zeros();
         let mut jtr = SMatrix::<f64, 9, 1>::zeros();
         for i in 0..m {
@@ -467,10 +610,18 @@ pub fn adaptive_iterations(w: f64, sample: i32, confidence: f64, max_iters: usiz
 /// 적응형 종료가 허용하는 최소 반복 수.
 pub const MIN_RANSAC_ITERS: usize = 50;
 
+/// 국소 최적화 시작 조건: 가설의 정상 수 `cnt` 가 8 이상이고 지금까지 최고 정상 수 `best_cnt` 의
+/// **4분의 1 이상**이다. 절반 기준에서는 최소 표본 F 가 부정확해(에피폴이 먼 쌍) 정상 짝 일부만 설명하는
+/// 올바른 골짜기 가설이 LO 를 받지 못해 다중 시드 재현율이 미달했고, 4분의 1 로 낮추어 500/500 이 되었다.
+pub(crate) fn lo_should_start(cnt: usize, best_cnt: usize) -> bool {
+    cnt >= 8 && 4 * cnt >= best_cnt
+}
+
 /// RANSAC(Fischler & Bolles 1981) + 8점 기본 행렬로 기하 검증.
 /// 반환: (정상 짝으로 다시 맞춘 F, 정상 여부 표시).
 /// 정상 짝이 8개 미만이거나 정상 비율이 `min_inlier_ratio` 미만이면 None.
 /// 정상 짝이 거의 한 직선 위(짧은 축/긴 축 표준편차 비 0.02 미만)이면 퇴화로 보고 None.
+/// 평면·순수 회전 판정은 하지 않는다 — 정상 짝에 [`select_two_view_model`] 을 따로 적용한다.
 /// 길이가 다르거나 유한하지 않은 좌표가 있으면 None.
 pub fn ransac_fundamental(
     x1: &[Vector2<f64>],
@@ -519,10 +670,10 @@ pub fn ransac_fundamental(
         let mut inl = inliers_of(&f);
         let mut cnt = inl.iter().filter(|&&b| b).count();
         // 국소 최적화(Chum et al. 2003): 잡음 섞인 최소 표본의 F 는 정상 짝 일부만 설명하므로
-        // 최고 가설의 절반 이상을 설명하는 가설은 정상 짝 전체로 다시 맞춰 개선이 멈출 때까지 반복한다.
-        // 이동이 영상면과 거의 평행해 에피폴이 멀면 최소 표본 F 가 특히 부정확하다.
+        // 최고 가설의 4분의 1 이상을 설명하는 가설은 정상 짝 전체로 다시 맞춰 개선이 멈출 때까지 반복한다
+        // (조건은 [`lo_should_start`]). 이동이 영상면과 거의 평행해 에피폴이 멀면 최소 표본 F 가 특히 부정확하다.
         let best_cnt = best.as_ref().map_or(0, |b| b.2);
-        if cnt >= 8 && 4 * cnt >= best_cnt {
+        if lo_should_start(cnt, best_cnt) {
             // 문턱을 넓게 시작해 줄여 가며(×3, ×2, ×1.5, ×1) 다시 맞춘다: 부정확한 시작 F 의 좁은 띠
             // 밖에 있는 정상 짝도 끌어들이기 위해서다. 문턱 ×1 의 정상 수가 늘어날 때만 받아들인다.
             let mut f_lo = f;
@@ -604,13 +755,14 @@ pub fn ransac_fundamental(
         return None;
     }
     // 퇴화 판정: 정상 짝이 거의 한 직선 위이면 F 가 정해지지 않으므로 확정하지 않는다.
-    // 평면 배치 지표([`homography_support`])는 지면 위주 합성 장면의 정상 짝도 대부분 설명해
-    // 여기서는 거부에 쓰지 않는다(평면 경로 분리는 남은 문제).
     let s1: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| x1[i]).collect();
     let s2: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| x2[i]).collect();
     if nearly_collinear(&s1) || nearly_collinear(&s2) {
         return None;
     }
+    // 평면 판정은 여기서 하지 않는다: 같은 위치에서 회전만 한 짝(시선 90° 차이 등)도 호모그래피로
+    // 설명되며 그 짝의 회전은 쓸모가 있다. 호출자가 정상 짝으로 [`select_two_view_model`] 을 불러
+    // 호모그래피가 선택되면 F 에서 이동을 꺼내지 않는다.
     Some((f, inl))
 }
 
@@ -1392,5 +1544,178 @@ mod tests {
             assert!(cnt < 40, "우연 정상 비율이 0.2 이상: {cnt}/200");
             assert!(r.is_none(), "무작위 대응에서 F 확정");
         }
+    }
+    #[test]
+    fn lo_start_condition_is_one_quarter_of_best() {
+        // 주석의 "최고 가설의 4분의 1 이상" 과 일치해야 한다.
+        assert!(lo_should_start(8, 0));
+        assert!(!lo_should_start(7, 0));
+        assert!(lo_should_start(25, 100));
+        assert!(!lo_should_start(24, 100));
+        assert!(lo_should_start(30, 100)); // 절반 기준이었다면 거짓
+    }
+
+    #[test]
+    fn sampson_jacobian_matches_central_difference() {
+        // 해석적 야코비안 ↔ 중앙 차분(오차 O(h²), h = 1e-6 에서 상대 ~1e-10 수준)이 상대 1e-6 안에서 일치.
+        let (x1, x2, _, c1, c2) = correspondences(60, 0.7, 0.0, 3);
+        let f0 = fundamental_from_cameras(&c1, &c2);
+        let (t1, t2) = (normalizer(&x1), normalizer(&x2));
+        let g =
+            rank2_unit(&(t2.try_inverse().unwrap().transpose() * f0 * t1.try_inverse().unwrap()))
+                .unwrap();
+        // 정답에서 조금 벗어난 점(잔차가 0 이 아닌 곳)에서 비교.
+        let g = g + Matrix3::new(1e-3, -2e-3, 5e-4, 3e-4, 1e-3, -1e-3, 2e-3, 1e-3, -5e-4);
+        let mut jac = vec![[0.0; 9]; x1.len()];
+        sampson_jacobian_normalized(&g, &t1, &t2, &x1, &x2, &mut jac);
+        let r = |gg: &Matrix3<f64>, i: usize| {
+            sampson_residual_grad(&(t2.transpose() * gg * t1), &x1[i], &x2[i]).0
+        };
+        let h = 1e-6;
+        for (i, row) in jac.iter().enumerate() {
+            let scale = row.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            for k in 0..9 {
+                let (mut gp, mut gm) = (g, g);
+                gp[(k / 3, k % 3)] += h;
+                gm[(k / 3, k % 3)] -= h;
+                let num = (r(&gp, i) - r(&gm, i)) / (2.0 * h);
+                let err = (row[k] - num).abs() / scale;
+                assert!(
+                    err < 1e-6,
+                    "점 {i} 성분 {k}: 해석 {} 수치 {num} 상대 {err:e}",
+                    row[k]
+                );
+            }
+        }
+    }
+
+    /// 지면(z = 0) 위 점과 그보다 카메라 쪽으로 1~3 m 솟은 건물 점(비율 `bld`)을 섞은 대응(σ px).
+    fn ground_with_buildings(
+        n: usize,
+        bld: f64,
+        sigma: f64,
+        seed: u64,
+    ) -> (Vec<Vector2<f64>>, Vec<Vector2<f64>>) {
+        let (c1, c2) = two_cameras();
+        let mut g = Lcg(seed);
+        let (mut x1, mut x2) = (vec![], vec![]);
+        let nb = (n as f64 * bld).round() as usize;
+        while x1.len() < n {
+            let z = if x1.len() < nb {
+                -1.0 - 2.0 * g.next()
+            } else {
+                0.0
+            };
+            let p = Point3::new(g.next() * 14.0 - 7.0, g.next() * 8.0 - 4.0, z);
+            let (Some(a), Some(b)) = (c1.project(&p), c2.project(&p)) else {
+                continue;
+            };
+            if !c1.intrinsics.contains(&a) || !c2.intrinsics.contains(&b) {
+                continue;
+            }
+            x1.push(a + Vector2::new(g.gauss(), g.gauss()) * sigma);
+            x2.push(b + Vector2::new(g.gauss(), g.gauss()) * sigma);
+        }
+        (x1, x2)
+    }
+
+    #[test]
+    fn planar_scene_selects_homography() {
+        let cfg = RansacConfig::default();
+        for seed in 1..=5u64 {
+            // 모든 점 z = 0, σ = 0.5 px: RANSAC 이 낸 F 와 정상 짝으로 모델을 고르면 호모그래피.
+            let (x1, x2) = planar_correspondences(200, 0.5, seed);
+            if let Some((f, inl)) = ransac_fundamental(&x1, &x2, &cfg) {
+                let s1: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x1[i]).collect();
+                let s2: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x2[i]).collect();
+                let m = select_two_view_model(&s1, &s2, &f, cfg.threshold_px / 3.0).unwrap();
+                assert_eq!(
+                    m.model,
+                    TwoViewModel::Homography,
+                    "seed {seed}: RANSAC F {m:?}"
+                );
+            }
+            // 정답 F 를 주어도 모델 선택은 호모그래피.
+            let (c1, c2) = two_cameras();
+            let m =
+                select_two_view_model(&x1, &x2, &fundamental_from_cameras(&c1, &c2), 0.5).unwrap();
+            eprintln!("평면 seed {seed}: {m:?}");
+            assert_eq!(m.model, TwoViewModel::Homography, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn ground_scene_with_few_buildings_keeps_fundamental() {
+        // 건물 5%·10%(순수 GRIC 는 약 19% 미만에서 H 를 고른다): 시차 짝이 있으므로 F 를 유지한다.
+        let cfg = RansacConfig::default();
+        let (c1, c2) = two_cameras();
+        let f0 = fundamental_from_cameras(&c1, &c2);
+        for bld in [0.05, 0.1] {
+            for seed in 1..=5u64 {
+                let (x1, x2) = ground_with_buildings(300, bld, 0.5, seed);
+                let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+                eprintln!("건물 {bld} seed {seed}: {m:?}");
+                assert_eq!(m.model, TwoViewModel::Fundamental, "건물 {bld} seed {seed}");
+                let (f, inl) = ransac_fundamental(&x1, &x2, &cfg).expect("지면+건물 장면에서 None");
+                let s1: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x1[i]).collect();
+                let s2: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x2[i]).collect();
+                let me = select_two_view_model(&s1, &s2, &f, cfg.threshold_px / 3.0).unwrap();
+                assert_eq!(
+                    me.model,
+                    TwoViewModel::Fundamental,
+                    "건물 {bld} seed {seed}: RANSAC F {me:?}"
+                );
+                // 정답 F 기준 정상 짝(Sampson < 문턱)을 추정 F 도 95% 이상 정상으로 본다.
+                let th2 = cfg.threshold_px * cfg.threshold_px;
+                let truth: Vec<bool> = (0..x1.len())
+                    .map(|i| sampson_error(&f0, &x1[i], &x2[i]) < th2)
+                    .collect();
+                let tp = (0..x1.len()).filter(|&i| truth[i] && inl[i]).count();
+                let nt = truth.iter().filter(|&&b| b).count();
+                assert!(
+                    tp as f64 >= 0.95 * nt as f64,
+                    "건물 {bld} seed {seed}: {tp}/{nt}"
+                );
+                // 건물 점(앞쪽 nb 개)에서 추정 F 의 Sampson 오차가 문턱 안: 평면 밖 기하도 맞는다.
+                let nb = (300.0 * bld).round() as usize;
+                let ok = (0..nb)
+                    .filter(|&i| sampson_error(&f, &x1[i], &x2[i]) < th2)
+                    .count();
+                assert!(
+                    ok as f64 >= 0.9 * nb as f64,
+                    "건물 {bld} seed {seed}: 건물 {ok}/{nb}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn general_scene_selects_fundamental() {
+        let (c1, c2) = two_cameras();
+        let f0 = fundamental_from_cameras(&c1, &c2);
+        for seed in 1..=5u64 {
+            let (x1, x2, _, _, _) = correspondences(200, 0.5, 0.0, seed);
+            let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+            assert_eq!(m.model, TwoViewModel::Fundamental, "seed {seed}: {m:?}");
+            assert!(m.gric_f < m.gric_h, "seed {seed}: {m:?}");
+        }
+    }
+
+    /// 대응 4000개(정상 50%) RANSAC 1회 시간. 단독·직렬로 잰다: `cargo test --release -- --ignored ransac_4000_timing --test-threads=1 --nocapture`.
+    #[test]
+    #[ignore]
+    fn ransac_4000_timing() {
+        let (x1, x2, _, _, _) = correspondences(4000, 0.5, 0.5, 7);
+        let cfg = RansacConfig::default();
+        let _ = ransac_fundamental(&x1, &x2, &cfg);
+        let mut ts = vec![];
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let r = ransac_fundamental(&x1, &x2, &cfg);
+            ts.push(t.elapsed().as_secs_f64());
+            assert!(r.is_some());
+        }
+        ts.sort_by(f64::total_cmp);
+        eprintln!("4000 대응 RANSAC 중앙 {:.4} s, 최소 {:.4} s", ts[2], ts[0]);
     }
 }
