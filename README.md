@@ -20,25 +20,29 @@ cargo build --release
 # 실행 파일: target/release/skylens-stream
 ```
 
-Rust stable(1.80 이상)이 필요하다.
+Rust stable 1.88 이상이 필요하다.
 
 ### 입력
 
 ```
 <데이터>/
-  images/camF/camF_0000.jpg ...   # 앞 카메라
-  images/camR/camR_0000.jpg ...   # 오른쪽
-  images/camL/camL_0000.jpg ...   # 왼쪽
-  gps.txt                         # 한 줄에: 이미지이름 위도 경도 고도
+  images/camF_0000.jpg ...   # 앞 카메라 (camF_<위치 번호 4자리>.jpg)
+  images/camR_0000.jpg ...   # 오른쪽
+  images/camL_0000.jpg ...   # 왼쪽
+  gps.txt                    # 한 줄에: 이미지이름 위도 경도 고도
 ```
+
+`synth` 출력도 같은 구조이며, 정답 카메라 `truth/cameras.txt`(한 줄에: 이름 fx fy cx cy 폭 높이, R 행 우선 9개, t 3개)가 더 있다.
 
 ### 사용법
 
 ```bash
-# 점군 파일 정보 보기
+# 점군 파일의 점 개수와 NaN 여부 출력 ("points <개수>", "nan <true|false>")
+# 읽을 수 없거나 잘린 파일이면 오류 메시지와 종료 코드 1
 skylens-stream ply-info <파일.ply>
 
-# 시험용 합성 장면 만들기 (정답 카메라·점·GPS 포함, 기본 해상도는 작게)
+# 시험용 합성 장면 만들기 (영상 + GPS + 정답 카메라, 기본 960×540, 3대 × 80위치 = 240장)
+# 폭·높이는 16..=8192 정수이며 둘 다 주거나 둘 다 생략한다. 아니면 사용법과 종료 코드 2
 skylens-stream synth <출력 폴더> [폭 높이]
 
 # 점진적 점군 생성 (개발 중)
@@ -53,10 +57,13 @@ skylens-stream verify <출력>
 ```rust
 use skylens_core::features::{detect_and_describe, DetectorConfig, GrayImage};
 
-let img = GrayImage::from_rgb(width, height, &rgb_bytes);
+// 버퍼 길이가 폭×높이×3 이 아니면 Err(ImageSizeError). 회색조·RGBA 는 try_from_gray·try_from_rgba.
+// from_rgb 는 같은 검사를 하되 길이가 틀리면 메시지와 함께 패닉한다.
+let img = GrayImage::try_from_rgb(width, height, &rgb_bytes)?;
 let feats = detect_and_describe(&img, &DetectorConfig::default());
 for f in &feats {
-    // f.kp: x, y(화소), sigma(스케일), angle(라디안), response
+    // f.kp: x, y(화소 번호 규약: 화소 (i, j) 의 중심이 (i, j)), sigma(스케일), angle(라디안), response
+    //       카메라 픽셀 좌표(화소 중심 = i + 0.5)로는 +0.5, 정규 좌표로는 k.index_to_normalized
     // f.desc: 단위 길이 128차원 기술자
 }
 // 흐림·극값 탐색·기술자는 rayon 으로 병렬 실행된다(스레드 수와 무관하게 결과가 같다).
@@ -68,6 +75,7 @@ for f in &feats {
 ```rust
 use skylens_core::matching::{candidate_pairs, ratio_match, ransac_fundamental, RansacConfig};
 use skylens_core::matching::{PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL};
+use skylens_core::features::Feature;
 
 // 매칭할 영상 짝: views[k] = (카메라 번호, 촬영 위치 번호).
 // 같은 카메라는 위치 차 1..=5 와 2의 거듭제곱(8, 16, 32, …), 다른 카메라는 위치 차 0..=4.
@@ -75,8 +83,10 @@ let image_pairs = candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_M
 
 // 비율 0.8, 양방향 확인. 결과는 a 인덱스 순, 거리 계산은 한 번만 하며 병렬로 돈다.
 let pairs = ratio_match(&feats_a, &feats_b, 0.8, true);
-let x1: Vec<_> = pairs.iter().map(|&(i, _)| nalgebra::Vector2::new(feats_a[i].kp.x as f64, feats_a[i].kp.y as f64)).collect();
-let x2: Vec<_> = pairs.iter().map(|&(_, j)| nalgebra::Vector2::new(feats_b[j].kp.x as f64, feats_b[j].kp.y as f64)).collect();
+// 특징점 좌표(화소 번호) → 카메라 픽셀 좌표(화소 중심 = i + 0.5)
+let px = |f: &Feature| nalgebra::Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
+let x1: Vec<_> = pairs.iter().map(|&(i, _)| px(&feats_a[i])).collect();
+let x2: Vec<_> = pairs.iter().map(|&(_, j)| px(&feats_b[j])).collect();
 if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default()) {
     // f: 기본 행렬(x2ᵀ F x1 = 0), inliers[k]: pairs[k] 가 기하적으로 맞는지
 }
@@ -93,7 +103,8 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 use skylens_core::two_view::{essential_from_fundamental, refine_relative_pose, triangulate};
 // 최소 해법이 필요하면 essential_5pt(&n1[..5], &n2[..5]) 가 본질 행렬 후보(최대 10개)를 준다.
 
-// f, inliers: 위 RANSAC 결과. k: 카메라 내부 파라미터(Intrinsics).
+// f, inliers: 위 RANSAC 결과. k: 카메라 내부 파라미터(Intrinsics, 왜곡 없음).
+// 렌즈 왜곡이 있는 영상은 k.with_distortion(d).unproject(p) 로 정규화한다.
 let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let e = essential_from_fundamental(&f, &k, &k);
@@ -166,25 +177,29 @@ cargo build --release
 # binary: target/release/skylens-stream
 ```
 
-Requires stable Rust 1.80 or newer.
+Requires stable Rust 1.88 or newer.
 
 ### Input
 
 ```
 <data>/
-  images/camF/camF_0000.jpg ...   # front camera
-  images/camR/camR_0000.jpg ...   # right camera
-  images/camL/camL_0000.jpg ...   # left camera
-  gps.txt                         # one line per image: name latitude longitude altitude
+  images/camF_0000.jpg ...   # front camera (camF_<4-digit position>.jpg)
+  images/camR_0000.jpg ...   # right camera
+  images/camL_0000.jpg ...   # left camera
+  gps.txt                    # one line per image: name latitude longitude altitude
 ```
+
+`synth` writes the same layout plus ground-truth cameras in `truth/cameras.txt` (one line per image: name fx fy cx cy width height, 9 entries of R row-major, 3 entries of t).
 
 ### Usage
 
 ```bash
-# Show point count and bounds of a PLY file
+# Print the point count and whether any NaN is present ("points <count>", "nan <true|false>")
+# Unreadable or truncated files print an error and exit with code 1
 skylens-stream ply-info <file.ply>
 
-# Generate a synthetic test scene (ground-truth cameras, points and GPS; small default resolution)
+# Generate a synthetic test scene (images + GPS + ground-truth cameras; default 960×540, 3 cameras × 80 positions = 240 images)
+# width and height are integers in 16..=8192, given together or both omitted; otherwise usage and exit code 2
 skylens-stream synth <output dir> [width height]
 
 # Build the progressive point cloud (in progress)
@@ -199,10 +214,13 @@ skylens-stream verify <output>
 ```rust
 use skylens_core::features::{detect_and_describe, DetectorConfig, GrayImage};
 
-let img = GrayImage::from_rgb(width, height, &rgb_bytes);
+// Err(ImageSizeError) unless the buffer length is width×height×3. Use try_from_gray / try_from_rgba for
+// other layouts. from_rgb performs the same check but panics with a message on a length mismatch.
+let img = GrayImage::try_from_rgb(width, height, &rgb_bytes)?;
 let feats = detect_and_describe(&img, &DetectorConfig::default());
 for f in &feats {
-    // f.kp: x, y (pixels), sigma (scale), angle (radians), response
+    // f.kp: x, y (pixel-index convention: the centre of pixel (i, j) is (i, j)), sigma (scale), angle (radians), response
+    //       add 0.5 for camera pixel coordinates (pixel centre = i + 0.5), or use k.index_to_normalized
     // f.desc: unit-length 128-dim descriptor
 }
 // Blurring, extremum search and descriptors run in parallel with rayon (results do not depend on the
@@ -214,6 +232,7 @@ for f in &feats {
 ```rust
 use skylens_core::matching::{candidate_pairs, ratio_match, ransac_fundamental, RansacConfig};
 use skylens_core::matching::{PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL};
+use skylens_core::features::Feature;
 
 // Image pairs to match: views[k] = (camera index, capture position index).
 // Same camera: position gap 1..=5 plus powers of two (8, 16, 32, …); different cameras: gap 0..=4.
@@ -221,8 +240,10 @@ let image_pairs = candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_M
 
 // ratio 0.8, mutual check. Results are in a-index order; distances are computed once, in parallel.
 let pairs = ratio_match(&feats_a, &feats_b, 0.8, true);
-let x1: Vec<_> = pairs.iter().map(|&(i, _)| nalgebra::Vector2::new(feats_a[i].kp.x as f64, feats_a[i].kp.y as f64)).collect();
-let x2: Vec<_> = pairs.iter().map(|&(_, j)| nalgebra::Vector2::new(feats_b[j].kp.x as f64, feats_b[j].kp.y as f64)).collect();
+// keypoint coordinates (pixel index) → camera pixel coordinates (pixel centre = i + 0.5)
+let px = |f: &Feature| nalgebra::Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
+let x1: Vec<_> = pairs.iter().map(|&(i, _)| px(&feats_a[i])).collect();
+let x2: Vec<_> = pairs.iter().map(|&(_, j)| px(&feats_b[j])).collect();
 if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default()) {
     // f: fundamental matrix (x2ᵀ F x1 = 0), inliers[k]: whether pairs[k] is geometrically consistent
 }
@@ -239,7 +260,8 @@ Timing (detection on one 1920×1080 image, 7300×7300 matching): `cargo test --r
 use skylens_core::two_view::{essential_from_fundamental, refine_relative_pose, triangulate};
 // For a minimal solver, essential_5pt(&n1[..5], &n2[..5]) returns essential-matrix candidates (up to 10).
 
-// f, inliers: the RANSAC result above. k: camera intrinsics (Intrinsics).
+// f, inliers: the RANSAC result above. k: camera intrinsics (Intrinsics, no distortion).
+// For images with lens distortion, normalize with k.with_distortion(d).unproject(p).
 let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let e = essential_from_fundamental(&f, &k, &k);

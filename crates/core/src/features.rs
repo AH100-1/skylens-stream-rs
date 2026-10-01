@@ -4,6 +4,27 @@
 
 use rayon::prelude::*;
 
+/// 영상 버퍼 길이가 `폭 × 높이 × 채널` 과 다를 때의 오류.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageSizeError {
+    pub width: usize,
+    pub height: usize,
+    pub channels: usize,
+    pub len: usize,
+}
+
+impl std::fmt::Display for ImageSizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "영상 버퍼 길이 {} 가 {}x{}x{} 와 맞지 않음",
+            self.len, self.width, self.height, self.channels
+        )
+    }
+}
+
+impl std::error::Error for ImageSizeError {}
+
 /// 단일 채널 f32 영상(행 우선).
 #[derive(Clone, Debug)]
 pub struct GrayImage {
@@ -21,19 +42,59 @@ impl GrayImage {
         }
     }
 
-    /// RGB 8비트 → [0,1] 밝기.
+    /// RGB 8비트 → [0,1] 밝기. `rgb.len()` 이 `width * height * 3` 이 아니면 패닉한다
+    /// (오류로 받으려면 [`GrayImage::try_from_rgb`]).
     pub fn from_rgb(width: usize, height: usize, rgb: &[u8]) -> Self {
-        let data = rgb
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|c| (0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32) / 255.0)
+        Self::try_from_rgb(width, height, rgb).unwrap_or_else(|e| panic!("from_rgb: {e}"))
+    }
+
+    /// RGB 8비트 → [0,1] 밝기. 버퍼 길이가 맞지 않으면 오류.
+    pub fn try_from_rgb(width: usize, height: usize, rgb: &[u8]) -> Result<Self, ImageSizeError> {
+        Self::from_interleaved(width, height, rgb, 3)
+    }
+
+    /// RGBA 8비트 → [0,1] 밝기(알파 무시). 버퍼 길이가 맞지 않으면 오류.
+    pub fn try_from_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<Self, ImageSizeError> {
+        Self::from_interleaved(width, height, rgba, 4)
+    }
+
+    /// 회색조 8비트 → [0,1] 밝기. 버퍼 길이가 맞지 않으면 오류.
+    pub fn try_from_gray(width: usize, height: usize, gray: &[u8]) -> Result<Self, ImageSizeError> {
+        Self::from_interleaved(width, height, gray, 1)
+    }
+
+    fn from_interleaved(
+        width: usize,
+        height: usize,
+        buf: &[u8],
+        channels: usize,
+    ) -> Result<Self, ImageSizeError> {
+        let expected = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(channels));
+        if expected != Some(buf.len()) {
+            return Err(ImageSizeError {
+                width,
+                height,
+                channels,
+                len: buf.len(),
+            });
+        }
+        let data = buf
+            .chunks_exact(channels)
+            .map(|c| {
+                if channels >= 3 {
+                    (0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32) / 255.0
+                } else {
+                    c[0] as f32 / 255.0
+                }
+            })
             .collect();
-        Self {
+        Ok(Self {
             width,
             height,
             data,
-        }
+        })
     }
 
     #[inline]
@@ -548,6 +609,42 @@ pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature
     out.sort_by(|a, b| b.kp.response.abs().total_cmp(&a.kp.response.abs()));
     out.truncate(cfg.max_features);
     out
+}
+
+#[cfg(test)]
+mod image_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_mismatched_buffer_lengths() {
+        let e = GrayImage::try_from_rgb(10, 10, &[0u8; 30]).unwrap_err();
+        assert_eq!((e.len, e.channels), (30, 3));
+        assert!(GrayImage::try_from_rgb(10, 10, &[0u8; 301]).is_err());
+        assert!(GrayImage::try_from_rgba(10, 10, &[0u8; 300]).is_err());
+        assert!(GrayImage::try_from_gray(10, 10, &[0u8; 99]).is_err());
+        assert!(GrayImage::try_from_rgb(usize::MAX, 2, &[]).is_err());
+    }
+
+    #[test]
+    fn channel_layouts_agree() {
+        let gray: Vec<u8> = (0..12).map(|i| (i * 20) as u8).collect();
+        let rgb: Vec<u8> = gray.iter().flat_map(|&v| [v, v, v]).collect();
+        let rgba: Vec<u8> = gray.iter().flat_map(|&v| [v, v, v, 7]).collect();
+        let a = GrayImage::try_from_gray(4, 3, &gray).unwrap();
+        let b = GrayImage::try_from_rgb(4, 3, &rgb).unwrap();
+        let c = GrayImage::try_from_rgba(4, 3, &rgba).unwrap();
+        for i in 0..12 {
+            assert!((a.data[i] - b.data[i]).abs() < 1e-6);
+            assert!((a.data[i] - c.data[i]).abs() < 1e-6);
+        }
+        assert!((a.data[11] - 220.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "영상 버퍼 길이 30")]
+    fn from_rgb_panics_with_message() {
+        let _ = GrayImage::from_rgb(10, 10, &[0u8; 30]);
+    }
 }
 
 #[cfg(test)]

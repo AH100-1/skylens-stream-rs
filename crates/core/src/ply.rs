@@ -189,8 +189,18 @@ pub fn read_ply<R: Read>(r: R) -> io::Result<PointCloud> {
     let n_idx = ["nx", "ny", "nz"].map(find);
     let c_idx = ["red", "green", "blue"].map(find);
 
-    let mut data = vec![0u8; count * stride];
-    r.read_exact(&mut data)?;
+    // 헤더의 개수를 믿고 한 번에 할당하지 않는다: 크기를 넘침 검사하고,
+    // 실제로 읽힌 만큼만 버퍼를 키운다(잘린 파일·거대한 개수 → InvalidData).
+    let total = count
+        .checked_mul(stride)
+        .ok_or_else(|| invalid(format!("vertex 개수가 너무 큼: {count}")))?;
+    let mut data = Vec::with_capacity(total.min(1 << 24));
+    let got = r.by_ref().take(total as u64).read_to_end(&mut data)?;
+    if got < total {
+        return Err(invalid(format!(
+            "vertex 데이터가 잘림: {total} 바이트 필요, {got} 바이트 있음"
+        )));
+    }
     let get = |row: &[u8], i: usize| props[i].1.read(&row[offsets[i]..]);
     let points = data
         .chunks_exact(stride.max(1))
@@ -322,6 +332,37 @@ property double z\nproperty double x\nproperty double y\nend_header\n"
         write_ply(&mut buf, &cloud).unwrap();
         buf.truncate(buf.len() - 5);
         assert!(read_ply(&buf[..]).is_err());
+    }
+
+    fn header_only(count: &str, props: &str) -> Vec<u8> {
+        format!("ply\nformat binary_little_endian 1.0\nelement vertex {count}\n{props}end_header\n")
+            .into_bytes()
+    }
+
+    #[test]
+    fn rejects_huge_vertex_count_without_allocating() {
+        let xyz = "property float x\nproperty float y\nproperty float z\n";
+        // 120 GB 를 요구하는 헤더 + 데이터 없음.
+        let e = read_ply(&header_only("10000000000", xyz)[..]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("잘림"), "{e}");
+        // count * 12 가 usize 를 넘는 헤더.
+        let e = read_ply(&header_only("683212743470724134000", xyz)[..]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let e = read_ply(&header_only("1537228672809129302", xyz)[..]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("너무 큼"), "{e}");
+    }
+
+    #[test]
+    fn rejects_short_vertex_data() {
+        let xyz = "property float x\nproperty float y\nproperty float z\n";
+        let mut buf = header_only("3", xyz);
+        buf.extend_from_slice(&[0u8; 35]); // 36 바이트 필요
+        let e = read_ply(&buf[..]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        buf.push(0);
+        assert_eq!(read_ply(&buf[..]).unwrap().len(), 3);
     }
 
     #[test]
