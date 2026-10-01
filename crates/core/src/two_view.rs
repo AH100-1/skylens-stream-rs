@@ -599,6 +599,8 @@ pub fn ransac_essential(
 }
 
 /// 5점 RANSAC 으로 서로 다른 본질 행렬 후보를 최대 `ESSENTIAL_CANDIDATES` 개 돌려준다.
+/// 표본 단계에서는 최고 정상 수의 0.7 배 이상인 가설을 최대 `ESSENTIAL_CANDIDATES + 6` 개 보관한다
+/// (잡음 섞인 최소 표본에서는 정답 골짜기의 가설이 정상 수로 뒤처질 수 있다).
 ///
 /// 최소 표본의 후보 E 마다 Sampson 거리로 정상 수를 세고, 정규화한 E 끼리 거리(부호 무관 프로베니우스)가
 /// 0.1 보다 먼 가설만 따로 보관한다. 평면 장면에서는 정답과 그 쌍둥이 해(이동이 평면 법선 쪽인 해)가
@@ -660,7 +662,7 @@ pub fn ransac_essential_candidates(
         for e in essential_5pt(&s1, &s2) {
             let cnt = count(&inliers_of(&e));
             let best = pool.first().map_or(0, |p| p.1);
-            if cnt < 5 || 10 * cnt < 9 * best {
+            if cnt < 5 || 10 * cnt < 7 * best {
                 continue;
             }
             match pool.iter().position(|(p, _)| !distinct(p, &e)) {
@@ -669,7 +671,7 @@ pub fn ransac_essential_candidates(
                 None => pool.push((e, cnt)),
             }
             pool.sort_by_key(|p| std::cmp::Reverse(p.1));
-            pool.truncate(ESSENTIAL_CANDIDATES + 2);
+            pool.truncate(ESSENTIAL_CANDIDATES + 6);
             if cnt > best {
                 // 쌍둥이 해도 표본에 나오도록 최소 반복을 넉넉히 둔다.
                 iters =
@@ -723,7 +725,7 @@ pub fn ransac_essential_candidates(
 }
 
 /// [`ransac_essential_candidates`] 가 돌려주는 최대 후보 수.
-pub const ESSENTIAL_CANDIDATES: usize = 2;
+pub const ESSENTIAL_CANDIDATES: usize = 4;
 
 /// 5점 RANSAC 의 최소 반복 수.
 pub const ESSENTIAL_MIN_ITERS: usize = 300;
