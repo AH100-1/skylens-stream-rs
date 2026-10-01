@@ -393,6 +393,14 @@ mod tests {
     /// 합성 드론 장면 같은 카메라 두 장: 특징 → 비율 매칭 → RANSAC.
     /// 정답 깊이로 각 짝의 참·거짓을 판정해 (RANSAC 전 정답 비율, 후 정밀도, 재현율, 정상 수).
     fn scene_pair(step: usize) -> (f64, f64, f64, usize) {
+        scene_pair_cams(crate::synth::CamId::F, crate::synth::CamId::F, step)
+    }
+
+    fn scene_pair_cams(
+        cam_a: crate::synth::CamId,
+        cam_b: crate::synth::CamId,
+        step: usize,
+    ) -> (f64, f64, f64, usize) {
         use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
         use crate::synth::{Scene, SceneConfig};
         let (w, h) = (480usize, 270usize);
@@ -401,11 +409,15 @@ mod tests {
             height: h as u32,
             ..SceneConfig::default()
         });
-        let va = &scene.views[0];
+        let va = scene
+            .views
+            .iter()
+            .find(|v| v.cam == cam_a && v.position == 0)
+            .unwrap();
         let vb = scene
             .views
             .iter()
-            .find(|v| v.cam == va.cam && v.position == va.position + step)
+            .find(|v| v.cam == cam_b && v.position == va.position + step)
             .unwrap();
         let (ia, da) = scene.render(va);
         let (ib, _) = scene.render(vb);
@@ -430,7 +442,10 @@ mod tests {
                         .is_some_and(|e| (e - q).norm() < 2.0)
             })
             .collect();
-        let (_, inl) = ransac_fundamental(&x1, &x2, &RansacConfig::default()).unwrap();
+        let Some((_, inl)) = ransac_fundamental(&x1, &x2, &RansacConfig::default()) else {
+            let pos = truth.iter().filter(|&&t| t).count();
+            return (pos as f64 / m.len().max(1) as f64, 0.0, 0.0, 0);
+        };
         let n = m.len();
         let pos = truth.iter().filter(|&&t| t).count();
         let tp = (0..n).filter(|&i| inl[i] && truth[i]).count();
@@ -453,6 +468,23 @@ mod tests {
             assert!(ni >= 250, "정상 수 {ni}");
             assert!(prec >= 0.98, "정밀도 {prec}");
             assert!(rec >= 0.98, "재현율 {rec}");
+        }
+    }
+
+    #[test]
+    fn ransac_on_cross_camera_views() {
+        // 앞 카메라 위치 0 과 옆 카메라 위치 0·4(10 m 앞): 시선이 90° 다른 짝.
+        use crate::synth::CamId;
+        for b in [CamId::R, CamId::L] {
+            for step in [0usize, 4] {
+                let (before, prec, rec, ni) = scene_pair_cams(CamId::F, b, step);
+                eprintln!(
+                    "F->{b:?} step={step} correct_before={before:.3} precision={prec:.3} recall={rec:.3} inliers={ni}"
+                );
+                assert!(ni >= 40, "정상 수 {ni}");
+                assert!(prec >= 0.95, "정밀도 {prec}");
+                assert!(rec >= 0.95, "재현율 {rec}");
+            }
         }
     }
 
