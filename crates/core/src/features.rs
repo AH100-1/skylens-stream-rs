@@ -189,6 +189,11 @@ impl Default for DetectorConfig {
 
 /// 특징점: 원본 영상 좌표, 스케일(σ), DoG 응답.
 ///
+/// (x, y) 는 카메라 모형([`crate::camera`])과 같은 화소 중심 규약의 연속 좌표다:
+/// 화소 (i, j) 의 중심이 (i + 0.5, j + 0.5), 영상 전체는 [0, w] × [0, h].
+/// 그래서 [`crate::camera::Intrinsics::to_normalized`] 에 보정 없이 넣는다
+/// ([`Keypoint::pixel`]). 정수 화소 번호(배열 첨자)가 필요하면 `x.floor()` 다.
+///
 /// σ 는 극값이 난 DoG 층 D = G(kσ) − G(σ) 의 아래쪽 가우시안 σ 다.
 /// 반지름 σ_b 인 가우시안 덩어리에서는 σ ≈ σ_b·k^(-1/2) 로 나온다.
 #[derive(Clone, Copy, Debug)]
@@ -201,12 +206,20 @@ pub struct Keypoint {
     pub angle: f32,
 }
 
+impl Keypoint {
+    /// 화소 중심 규약 연속 좌표 (x, y). `Intrinsics::to_normalized`·`Camera::unproject` 의 입력 규약과 같다.
+    pub fn pixel(&self) -> nalgebra::Vector2<f64> {
+        nalgebra::Vector2::new(self.x as f64, self.y as f64)
+    }
+}
+
 /// 방향 히스토그램 칸 수 (10° 간격).
 const ORI_BINS: usize = 36;
 
 /// 특징점 주변 기울기 방향 히스토그램에서 주 방향들을 구한다 (Lowe 2004 §5).
 ///
-/// `img` 는 특징점 스케일로 흐린 영상, (x, y)·`sigma` 는 그 영상의 화소 단위.
+/// `img` 는 특징점 스케일로 흐린 영상, (x, y)·`sigma` 는 그 영상의 화소 단위이며
+/// (x, y) 는 화소 번호 규약(화소 (i, j) 의 중심이 (i, j))이다. [`Keypoint`] 좌표를 넣으려면 0.5 를 뺀다.
 /// 가중치 창 σ_w = 1.5σ, 반지름 3σ_w. 36칸 히스토그램을 [1,1,1]/3 로 6번 평활하고,
 /// 최댓값의 80% 이상인 극대마다 포물선 보간한 방향을 낸다.
 pub fn dominant_orientations(img: &GrayImage, x: f32, y: f32, sigma: f32) -> Vec<f32> {
@@ -404,6 +417,7 @@ pub struct Feature {
 /// 주 방향으로 돌린 4×4 칸(칸 너비 3σ), 칸마다 8방향 히스토그램.
 /// 가우시안 가중(σ = 칸 2개 = 창 너비의 절반), 위치 2축·방향 1축 삼선형 보간.
 /// 단위 길이로 정규화 → 0.2 로 자르기 → 다시 정규화.
+/// (x, y) 는 [`dominant_orientations`] 와 같이 `img` 의 화소 번호 규약이다.
 pub fn describe(img: &GrayImage, x: f32, y: f32, sigma: f32, angle: f32) -> [f32; DESC_LEN] {
     describe_with(
         img.width,
@@ -483,6 +497,10 @@ fn describe_with(
 }
 
 /// DoG 극값 검출 + 방향 + 기술자. 입력은 이미 σ≈0.5 로 흐려진 영상으로 가정한다.
+///
+/// 특징점 좌표는 화소 중심 규약([`Keypoint`])으로 내보낸다. 옥타브 o 의 화소 j 는
+/// 원본 화소 2^o·j 를 뽑은 것([`GrayImage::downsample`])이라 그 중심은 원본 연속 좌표
+/// 2^o·j + 0.5 에 있다. 따라서 옥타브 안 화소 번호 좌표 u 는 2^o·u + 0.5 로 옮긴다.
 pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature> {
     let s = cfg.scales;
     let kstep = 2f32.powf(1.0 / s as f32);
@@ -589,8 +607,8 @@ pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature
                         for angle in orientations_with(w, h, grad, r.x, r.y, sig_oct) {
                             out.push(Feature {
                                 kp: Keypoint {
-                                    x: r.x * scale,
-                                    y: r.y * scale,
+                                    x: r.x * scale + 0.5,
+                                    y: r.y * scale + 0.5,
                                     sigma: sig_oct * scale,
                                     response: r.value,
                                     angle,
@@ -650,13 +668,15 @@ mod image_buffer_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::Vector2;
 
-    /// 중심 (cx,cy), 표준편차 s 인 밝은 가우시안 덩어리.
+    /// 중심 (cx,cy), 표준편차 s 인 밝은 가우시안 덩어리. 카메라 규약으로 그린다:
+    /// 화소 (x, y) 의 값은 연속 좌표 (x + 0.5, y + 0.5) 에서 잰다.
     fn blob(w: usize, h: usize, cx: f32, cy: f32, s: f32) -> GrayImage {
         let mut img = GrayImage::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                let r2 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
+                let r2 = (x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2);
                 img.data[y * w + x] = 0.2 + 0.6 * (-r2 / (2.0 * s * s)).exp();
             }
         }
@@ -708,6 +728,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn keypoints_follow_camera_pixel_convention() {
+        // 카메라 규약으로 그린 덩어리의 검출 좌표가 보정 없이 연속 좌표 중심과 0.1 px 안에서 맞는다.
+        // 주점 (w/2, h/2) 은 화소 경계라 화소 번호 규약 출력이면 오차가 √2·0.5 = 0.71 px 가 된다.
+        // 주점에서 벗어난 점은 카메라 투영으로 만든다(세 번째는 둘째 옥타브(σ_b = 8)에서 나온다).
+        use crate::camera::{Camera, Intrinsics, Pose};
+        use crate::math::{Point3, Rotation3};
+        let (w, h) = (160u32, 120u32);
+        let k = Intrinsics::from_hfov(w, h, 60f64.to_radians());
+        let cam = Camera {
+            intrinsics: k,
+            pose: Pose::from_center(Rotation3::identity(), &Point3::origin()),
+        };
+        let off = cam.project(&Point3::new(0.83, -0.41, 10.0)).unwrap();
+        let cases = [
+            (k.cx, k.cy, 4.0f32),
+            (off.x, off.y, 4.0),
+            (k.cx + 3.25, k.cy - 1.75, 8.0),
+        ];
+        for (cx, cy, sb) in cases {
+            let img = blob(w as usize, h as usize, cx as f32, cy as f32, sb);
+            let best = detect(&img, &DetectorConfig::default())[0];
+            let err = (best.pixel() - Vector2::new(cx, cy)).norm();
+            eprintln!("camera convention ({cx:.3},{cy:.3}) σ_b={sb} err={err:.4}");
+            assert!(err < 0.1, "({cx}, {cy}) 위치 오차 {err} px");
+            // 정규 좌표도 투영 전 방향과 맞는다.
+            let n = k.to_normalized(&best.pixel());
+            let n0 = k.to_normalized(&Vector2::new(cx, cy));
+            assert!((n - n0).norm() * k.fx < 0.1);
+        }
+    }
+
     fn angle_diff(a: f32, b: f32) -> f32 {
         let d = (a - b).rem_euclid(std::f32::consts::TAU);
         d.min(std::f32::consts::TAU - d)
@@ -720,7 +772,8 @@ mod tests {
         for k in 0..12 {
             let th = k as f32 * 30f32.to_radians() + 0.1;
             let (cx, cy) = (64.0f32, 64.0f32);
-            let mut img = blob(128, 128, cx, cy, 6.0);
+            // dominant_orientations 는 화소 번호 규약이라 덩어리 중심을 화소 (64, 64) 의 중심에 둔다.
+            let mut img = blob(128, 128, cx + 0.5, cy + 0.5, 6.0);
             for y in 0..128 {
                 for x in 0..128 {
                     let t = (x as f32 - cx) * th.cos() + (y as f32 - cy) * th.sin();
@@ -797,6 +850,12 @@ mod tests {
         img
     }
 
+    /// `texture_warped` 의 회전·축척 중심을 특징점 좌표(화소 중심 규약)로 적은 것.
+    /// 영상은 화소 번호 (w/2, h/2) 를 중심으로 다시 그렸으므로 연속 좌표로는 +0.5 다.
+    fn warp_center(w: usize, h: usize) -> (f32, f32) {
+        (w as f32 / 2.0 + 0.5, h as f32 / 2.0 + 0.5)
+    }
+
     /// 최근접/차근접 비율 검사 매칭 → (정답 2 px 이내 비율, 매칭 수, 원본 특징 수).
     fn match_accuracy(th: f32, sc: f32) -> (f32, usize, usize) {
         let (w, h) = (240usize, 240usize);
@@ -826,11 +885,9 @@ mod tests {
                 continue;
             }
             n += 1;
-            let (fx, fy) = (fa.kp.x - w as f32 / 2.0, fa.kp.y - h as f32 / 2.0);
-            let (ex, ey) = (
-                sc * (c * fx - s * fy) + w as f32 / 2.0,
-                sc * (s * fx + c * fy) + h as f32 / 2.0,
-            );
+            let (ox, oy) = warp_center(w, h);
+            let (fx, fy) = (fa.kp.x - ox, fa.kp.y - oy);
+            let (ex, ey) = (sc * (c * fx - s * fy) + ox, sc * (s * fx + c * fy) + oy);
             let kb = b[best.2].kp;
             if ((kb.x - ex).powi(2) + (kb.y - ey).powi(2)).sqrt() < 2.0 {
                 good += 1;
@@ -848,12 +905,10 @@ mod tests {
         let b = detect(&texture_warped(w, h, 7, th, sc), &cfg);
         let (c, s) = (th.cos(), th.sin());
         let (mut hit, mut n) = (0, 0);
+        let (ox, oy) = warp_center(w, h);
         for ka in &a {
-            let (fx, fy) = (ka.x - w as f32 / 2.0, ka.y - h as f32 / 2.0);
-            let (ex, ey) = (
-                sc * (c * fx - s * fy) + w as f32 / 2.0,
-                sc * (s * fx + c * fy) + h as f32 / 2.0,
-            );
+            let (fx, fy) = (ka.x - ox, ka.y - oy);
+            let (ex, ey) = (sc * (c * fx - s * fy) + ox, sc * (s * fx + c * fy) + oy);
             if ex < 16.0 || ey < 16.0 || ex > w as f32 - 16.0 || ey > h as f32 - 16.0 {
                 continue;
             }
@@ -915,7 +970,6 @@ mod tests {
     /// 옮긴 위치와 비교한다 → (정답 2 px 이내 비율, 매칭 수).
     fn scene_match_accuracy(step: usize) -> (f32, usize) {
         use crate::synth::{Scene, SceneConfig};
-        use nalgebra::Vector2;
         let scene = Scene::new(SceneConfig {
             width: 480,
             height: 270,
@@ -951,20 +1005,19 @@ mod tests {
             if best.0 >= 0.8 * 0.8 * best.1 {
                 continue;
             }
-            let (px, py) = (f.kp.x.round() as usize, f.kp.y.round() as usize);
+            let (px, py) = (f.kp.x.floor() as usize, f.kp.y.floor() as usize);
             let z = da[py.min(269) * 480 + px.min(479)];
             if !z.is_finite() {
                 continue;
             }
-            // 특징점 좌표는 화소 인덱스 기준, 카메라 모형은 화소 중심이 +0.5.
-            let pa = Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
+            // 특징점 좌표는 카메라 모형과 같은 화소 중심 규약이라 그대로 넣는다.
+            let pa = f.kp.pixel();
             let Some(e) = vb.camera.project(&va.camera.unproject(&pa, z as f64)) else {
                 continue;
             };
             n += 1;
             let k = fb[best.2].kp;
-            let (dx, dy) = (k.x as f64 + 0.5 - e.x, k.y as f64 + 0.5 - e.y);
-            if (dx * dx + dy * dy).sqrt() < 2.0 {
+            if (k.pixel() - e).norm() < 2.0 {
                 good += 1;
             }
         }
@@ -1036,6 +1089,43 @@ mod tests {
         );
         assert!(dt <= 0.4, "검출 {dt:.3} s > 0.4 s");
     }
+
+    /// 검출 결과의 FNV-1a 64비트 해시: 특징마다 x, y(각각 `off` 를 더한 f32), σ, 응답, 방향,
+    /// 기술자 128개의 비트를 차례로 섞는다(순서 포함).
+    fn features_hash(f: &[Feature], off: f32) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |v: f32| {
+            for byte in v.to_bits().to_le_bytes() {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        for x in f {
+            let k = &x.kp;
+            for v in [k.x + off, k.y + off, k.sigma, k.response, k.angle] {
+                mix(v);
+            }
+            x.desc.iter().for_each(|&v| mix(v));
+        }
+        h
+    }
+
+    #[test]
+    fn detection_regression_hash() {
+        // 고정 합성 영상(scene_image 480×270, 첫 시점)의 검출 결과(개수 + 좌표·σ·응답·방향·기술자 비트,
+        // 순서 포함)를 상수로 고정한다. 흐림 누산 순서·극값 판정·정밀화·방향·기술자 계산을 바꾸면
+        // 비트가 달라져 이 시험이 실패한다(스레드 비교 시험은 이전 구현과의 차이를 잡지 못한다).
+        //
+        // 기대값의 근거: 화소 중심 규약 출력(x, y 에 +0.5)을 넣은 커밋의 구현으로 계산했다.
+        // 그 직전 main(08d5248, 화소 번호 규약)의 출력은 745개, 해시 0x45f7_d13c_594d_4054 이고,
+        // 그 출력의 x, y 에 f32 로 0.5 를 더해 같은 방식으로 섞은 해시가 아래 기대값과 같다.
+        // 즉 규약 변경은 좌표를 정확히 +0.5 옮긴 것뿐이고 개수·순서·σ·응답·방향·기술자는 그대로다.
+        let f = detect_and_describe(&scene_image(480, 270), &DetectorConfig::default());
+        let got = (f.len(), features_hash(&f, 0.0));
+        eprintln!("detection hash: {} {:#x}", got.0, got.1);
+        assert_eq!(got, EXPECT_DETECTION);
+    }
+    const EXPECT_DETECTION: (usize, u64) = (745, 0x2a1c_72f3_9c5e_a950);
 
     #[test]
     fn flat_image_has_no_features() {

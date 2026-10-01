@@ -987,7 +987,7 @@ mod tests {
         let fa = detect_and_describe(&GrayImage::from_rgb(w, h, &ia.data), &cfg);
         let fb = detect_and_describe(&GrayImage::from_rgb(w, h, &ib.data), &cfg);
         let m = ratio_match(&fa, &fb, 0.8, true);
-        let px = |f: &Feature| Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
+        let px = |f: &Feature| f.kp.pixel();
         let x1: Vec<_> = m.iter().map(|&(i, _)| px(&fa[i])).collect();
         let x2: Vec<_> = m.iter().map(|&(_, j)| px(&fb[j])).collect();
         let truth: Vec<bool> = m
