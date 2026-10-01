@@ -1,4 +1,4 @@
-//! 방사·접선 왜곡(k1,k2,p1,p2)과 투영 야코비안. 유도는 `docs/derivations/camera-jacobian.md`.
+//! 방사·접선 왜곡(k1,k2,p1,p2)과 투영 야코비안. 모델: r²=x²+y², x_d = x(1+k1 r²+k2 r⁴) + 2p1 xy + p2(r²+2x²), y_d = y(1+k1 r²+k2 r⁴) + p1(r²+2y²) + 2p2 xy.
 
 use crate::camera::Pose;
 use crate::math::{skew, Matrix2, Point3, SMatrix, Vector2, Vector3};
