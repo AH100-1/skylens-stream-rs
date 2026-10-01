@@ -1,6 +1,6 @@
 //! 다중 스케일 가우시안 차분(DoG) 극값 검출 (Lowe 2004, SPEC §3.1).
 //!
-//! 진행 상황: 검출기(부화소·부스케일 정밀화)와 방향 할당까지. 128차원 기술자는 다음 단계.
+//! 검출기(부화소·부스케일 정밀화) → 방향 할당 → 128차원 기술자.
 
 /// 단일 채널 f32 영상(행 우선).
 #[derive(Clone, Debug)]
@@ -253,8 +253,92 @@ fn refine_extremum(
     None
 }
 
-/// DoG 극값 검출. 입력은 이미 σ≈0.5 로 흐려진 영상으로 가정한다.
+/// DoG 극값 검출 (기술자 없이 특징점만).
 pub fn detect(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Keypoint> {
+    detect_and_describe(img, cfg)
+        .into_iter()
+        .map(|f| f.kp)
+        .collect()
+}
+
+/// 기술자 길이: 4×4 칸 × 8 방향.
+pub const DESC_LEN: usize = 128;
+
+/// 특징점 + 단위 길이 기술자.
+#[derive(Clone, Debug)]
+pub struct Feature {
+    pub kp: Keypoint,
+    pub desc: [f32; DESC_LEN],
+}
+
+/// 128차원 기울기 방향 기술자 (Lowe 2004 §6).
+///
+/// 주 방향으로 돌린 4×4 칸(칸 너비 3σ), 칸마다 8방향 히스토그램.
+/// 가우시안 가중(σ = 칸 2개 = 창 너비의 절반), 위치 2축·방향 1축 삼선형 보간.
+/// 단위 길이로 정규화 → 0.2 로 자르기 → 다시 정규화.
+pub fn describe(img: &GrayImage, x: f32, y: f32, sigma: f32, angle: f32) -> [f32; DESC_LEN] {
+    const NC: usize = 4;
+    const NO: usize = 8;
+    let cell = 3.0 * sigma;
+    let r = (cell * std::f32::consts::SQRT_2 * (NC as f32 + 1.0) * 0.5).round() as isize;
+    let (c, sn) = (angle.cos(), angle.sin());
+    let (xi, yi) = (x.round() as isize, y.round() as isize);
+    let (w, h) = (img.width as isize, img.height as isize);
+    let two_pi = std::f32::consts::TAU;
+    let mut hist = [0f32; DESC_LEN];
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let (px, py) = (xi + dx, yi + dy);
+            if px < 1 || py < 1 || px >= w - 1 || py >= h - 1 {
+                continue;
+            }
+            let (fx, fy) = (px as f32 - x, py as f32 - y);
+            // 특징점 틀로 회전(−angle), 칸 단위로.
+            let u = (c * fx + sn * fy) / cell;
+            let v = (-sn * fx + c * fy) / cell;
+            let (bu, bv) = (u + NC as f32 / 2.0 - 0.5, v + NC as f32 / 2.0 - 0.5);
+            if bu <= -1.0 || bv <= -1.0 || bu >= NC as f32 || bv >= NC as f32 {
+                continue;
+            }
+            let (ux, uy) = (px as usize, py as usize);
+            let gx = img.at(ux + 1, uy) - img.at(ux - 1, uy);
+            let gy = img.at(ux, uy + 1) - img.at(ux, uy - 1);
+            let mag = (gx * gx + gy * gy).sqrt();
+            let ori = (gy.atan2(gx) - angle).rem_euclid(two_pi);
+            let bo = ori / two_pi * NO as f32;
+            let wgt = (-(u * u + v * v) / (2.0 * (NC as f32 / 2.0).powi(2))).exp();
+            let m = mag * wgt;
+            let (u0, v0, o0) = (bu.floor(), bv.floor(), bo.floor());
+            let (du, dv, dob) = (bu - u0, bv - v0, bo - o0);
+            for (iv, wv) in [(v0 as isize, 1.0 - dv), (v0 as isize + 1, dv)] {
+                if iv < 0 || iv >= NC as isize {
+                    continue;
+                }
+                for (iu, wu) in [(u0 as isize, 1.0 - du), (u0 as isize + 1, du)] {
+                    if iu < 0 || iu >= NC as isize {
+                        continue;
+                    }
+                    for (io, wo) in [(o0 as usize % NO, 1.0 - dob), ((o0 as usize + 1) % NO, dob)] {
+                        hist[(iv as usize * NC + iu as usize) * NO + io] += m * wv * wu * wo;
+                    }
+                }
+            }
+        }
+    }
+    let normalize = |h: &mut [f32; DESC_LEN]| {
+        let n = h.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if n > 0.0 {
+            h.iter_mut().for_each(|v| *v /= n);
+        }
+    };
+    normalize(&mut hist);
+    hist.iter_mut().for_each(|v| *v = v.min(0.2));
+    normalize(&mut hist);
+    hist
+}
+
+/// DoG 극값 검출 + 방향 + 기술자. 입력은 이미 σ≈0.5 로 흐려진 영상으로 가정한다.
+pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature> {
     let s = cfg.scales;
     let kstep = 2f32.powf(1.0 / s as f32);
     let mut base = gaussian_blur(img, (cfg.sigma0 * cfg.sigma0 - 0.25).max(0.01).sqrt());
@@ -337,13 +421,17 @@ pub fn detect(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Keypoint> {
                         continue;
                     }
                     let sig_oct = cfg.sigma0 * kstep.powf(r.s);
-                    for angle in dominant_orientations(&gauss[r.layer], r.x, r.y, sig_oct) {
-                        out.push(Keypoint {
-                            x: r.x * scale,
-                            y: r.y * scale,
-                            sigma: sig_oct * scale,
-                            response: r.value,
-                            angle,
+                    let g = &gauss[r.layer];
+                    for angle in dominant_orientations(g, r.x, r.y, sig_oct) {
+                        out.push(Feature {
+                            kp: Keypoint {
+                                x: r.x * scale,
+                                y: r.y * scale,
+                                sigma: sig_oct * scale,
+                                response: r.value,
+                                angle,
+                            },
+                            desc: describe(g, r.x, r.y, sig_oct, angle),
                         });
                     }
                 }
@@ -351,7 +439,7 @@ pub fn detect(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Keypoint> {
         }
         base = gauss[s].downsample();
     }
-    out.sort_by(|a, b| b.response.abs().total_cmp(&a.response.abs()));
+    out.sort_by(|a, b| b.kp.response.abs().total_cmp(&a.kp.response.abs()));
     out.truncate(cfg.max_features);
     out
 }
@@ -450,6 +538,130 @@ mod tests {
             "방향 오차 {}°",
             worst.to_degrees()
         );
+    }
+
+    /// 결정적 난수 덩어리 무늬 (선형 합동 생성기).
+    fn texture(w: usize, h: usize, seed: u64) -> GrayImage {
+        let mut st = seed;
+        let mut rnd = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 33) as f32 / (1u64 << 31) as f32
+        };
+        let blobs: Vec<[f32; 4]> = (0..400)
+            .map(|_| [rnd() * 400.0, rnd() * 400.0, 1.5 + rnd() * 5.0, rnd() - 0.5])
+            .collect();
+        let mut img = GrayImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                // 영상 중심 기준 정답 좌표계(-200..200).
+                let (px, py) = (
+                    x as f32 - w as f32 / 2.0 + 200.0,
+                    y as f32 - h as f32 / 2.0 + 200.0,
+                );
+                let mut v = 0.5;
+                for b in &blobs {
+                    let d2 = (px - b[0]).powi(2) + (py - b[1]).powi(2);
+                    if d2 < 16.0 * b[2] * b[2] {
+                        v += 0.5 * b[3] * (-d2 / (2.0 * b[2] * b[2])).exp();
+                    }
+                }
+                img.data[y * w + x] = v;
+            }
+        }
+        img
+    }
+
+    /// 중심 기준 회전 θ·축척 sc 로 다시 그린다(정답 좌표 함수 사용, 보간 오차 없음).
+    fn texture_warped(w: usize, h: usize, seed: u64, th: f32, sc: f32) -> GrayImage {
+        let big = texture(800, 800, seed);
+        let mut img = GrayImage::new(w, h);
+        let (c, s) = (th.cos(), th.sin());
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f32 - w as f32 / 2.0, y as f32 - h as f32 / 2.0);
+                // 역사상: 원본 좌표 = R(−θ)·p / sc.
+                let ox = (c * fx + s * fy) / sc + 400.0;
+                let oy = (-s * fx + c * fy) / sc + 400.0;
+                let (x0, y0) = (ox.floor() as usize, oy.floor() as usize);
+                let (ax, ay) = (ox - x0 as f32, oy - y0 as f32);
+                let at = |xx: usize, yy: usize| big.at(xx.min(799), yy.min(799));
+                img.data[y * w + x] = (1.0 - ay) * ((1.0 - ax) * at(x0, y0) + ax * at(x0 + 1, y0))
+                    + ay * ((1.0 - ax) * at(x0, y0 + 1) + ax * at(x0 + 1, y0 + 1));
+            }
+        }
+        img
+    }
+
+    /// 최근접/차근접 비율 검사 매칭 → (정답 2 px 이내 비율, 매칭 수, 원본 특징 수).
+    fn match_accuracy(th: f32, sc: f32) -> (f32, usize, usize) {
+        let (w, h) = (240usize, 240usize);
+        let a = detect_and_describe(
+            &texture_warped(w, h, 7, 0.0, 1.0),
+            &DetectorConfig::default(),
+        );
+        let b = detect_and_describe(&texture_warped(w, h, 7, th, sc), &DetectorConfig::default());
+        let (c, s) = (th.cos(), th.sin());
+        let (mut good, mut n) = (0, 0);
+        for fa in &a {
+            let mut best = (f32::INFINITY, f32::INFINITY, 0usize);
+            for (j, fb) in b.iter().enumerate() {
+                let d: f32 = fa
+                    .desc
+                    .iter()
+                    .zip(&fb.desc)
+                    .map(|(p, q)| (p - q).powi(2))
+                    .sum();
+                if d < best.0 {
+                    best = (d, best.0, j);
+                } else if d < best.1 {
+                    best.1 = d;
+                }
+            }
+            if best.0 >= 0.8 * 0.8 * best.1 {
+                continue;
+            }
+            n += 1;
+            let (fx, fy) = (fa.kp.x - w as f32 / 2.0, fa.kp.y - h as f32 / 2.0);
+            let (ex, ey) = (
+                sc * (c * fx - s * fy) + w as f32 / 2.0,
+                sc * (s * fx + c * fy) + h as f32 / 2.0,
+            );
+            let kb = b[best.2].kp;
+            if ((kb.x - ex).powi(2) + (kb.y - ey).powi(2)).sqrt() < 2.0 {
+                good += 1;
+            }
+        }
+        (good as f32 / n.max(1) as f32, n, a.len())
+    }
+
+    #[test]
+    fn descriptor_unit_length() {
+        let img = texture_warped(160, 160, 3, 0.0, 1.0);
+        let f = detect_and_describe(&img, &DetectorConfig::default());
+        assert!(!f.is_empty());
+        for x in &f {
+            let n: f32 = x.desc.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((n - 1.0).abs() < 1e-4);
+            assert!(x.desc.iter().all(|&v| v >= 0.0));
+        }
+    }
+
+    #[test]
+    fn matching_under_rotation_and_scale() {
+        for (deg, sc) in [
+            (0.0f32, 1.0f32),
+            (30.0, 1.0),
+            (90.0, 1.0),
+            (45.0, 0.8),
+            (0.0, 1.25),
+        ] {
+            let (acc, n, total) = match_accuracy(deg.to_radians(), sc);
+            eprintln!("rot={deg} scale={sc} matches={n}/{total} precision={acc:.3}");
+            assert!(n >= 40, "매칭 수 {n}");
+            assert!(acc >= 0.95, "정확도 {acc}");
+        }
     }
 
     #[test]
