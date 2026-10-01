@@ -1,7 +1,8 @@
 //! 특징 매칭과 기하 검증: 비율 검사, 정규화 8점 기본 행렬, RANSAC.
 
-use crate::features::Feature;
+use crate::features::{Feature, DESC_LEN};
 use nalgebra::{Matrix3, SMatrix, Vector2, Vector3};
+use rayon::prelude::*;
 
 /// SPEC 기본값: 같은 카메라 시간 이웃 위치 차 1..=5.
 pub const PAIR_TEMPORAL: usize = 5;
@@ -38,35 +39,70 @@ pub fn candidate_pairs(
     out
 }
 
-/// 최근접/차근접 거리 비율 검사 매칭(L2, 전수 탐색). 결과는 (a 인덱스, b 인덱스).
+/// 기술자 제곱 L2 거리. 8칸 누산기로 나눠 더해 벡터화되게 한다.
+#[inline]
+fn sq_dist(p: &[f32; DESC_LEN], r: &[f32; DESC_LEN]) -> f32 {
+    let mut acc = [0f32; 8];
+    for (pc, rc) in p.as_chunks::<8>().0.iter().zip(r.as_chunks::<8>().0) {
+        for k in 0..8 {
+            let t = pc[k] - rc[k];
+            acc[k] += t * t;
+        }
+    }
+    acc.iter().sum()
+}
+
+/// `a` 를 이 크기의 묶음으로 나눠 병렬 처리한다(묶음 기술자 64×512 B 가 L1·L2 에 머문다).
+const MATCH_BLOCK: usize = 64;
+
+/// 최근접/차근접 거리 비율 검사 매칭(L2, 전수 탐색). 결과는 (a 인덱스, b 인덱스), a 인덱스 순.
 /// `mutual` 이면 b→a 최근접도 같은 짝인 것만 남긴다.
+///
+/// 거리 행렬을 한 번만 계산한다: `a` 묶음마다(rayon 병렬) 모든 `b` 와의 거리로 행 최근접·차근접과
+/// 열(b→a) 최근접을 함께 갱신하고, 열 최근접은 묶음 순서대로 합친다. 같은 거리면 앞 인덱스가 이긴다.
 pub fn ratio_match(a: &[Feature], b: &[Feature], ratio: f32, mutual: bool) -> Vec<(usize, usize)> {
-    let nearest = |q: &Feature, set: &[Feature]| -> Option<(usize, f32, f32)> {
-        let mut best = (usize::MAX, f32::INFINITY, f32::INFINITY);
-        for (j, f) in set.iter().enumerate() {
-            let d: f32 = q
-                .desc
-                .iter()
-                .zip(&f.desc)
-                .map(|(p, r)| (p - r).powi(2))
-                .sum();
-            if d < best.1 {
-                best = (j, d, best.1);
-            } else if d < best.2 {
-                best.2 = d;
+    type Blk = (Vec<(usize, f32, f32)>, Vec<(f32, usize)>);
+    let blocks: Vec<Blk> = a
+        .par_chunks(MATCH_BLOCK)
+        .enumerate()
+        .map(|(bi, chunk)| {
+            let mut row = vec![(usize::MAX, f32::INFINITY, f32::INFINITY); chunk.len()];
+            let mut col = if mutual {
+                vec![(f32::INFINITY, usize::MAX); b.len()]
+            } else {
+                Vec::new()
+            };
+            for (j, fb) in b.iter().enumerate() {
+                for (r, fa) in chunk.iter().enumerate() {
+                    let d = sq_dist(&fa.desc, &fb.desc);
+                    let best = &mut row[r];
+                    if d < best.1 {
+                        *best = (j, d, best.1);
+                    } else if d < best.2 {
+                        best.2 = d;
+                    }
+                    if mutual && d < col[j].0 {
+                        col[j] = (d, bi * MATCH_BLOCK + r);
+                    }
+                }
+            }
+            (row, col)
+        })
+        .collect();
+    let mut col_best = vec![(f32::INFINITY, usize::MAX); if mutual { b.len() } else { 0 }];
+    for (_, col) in &blocks {
+        for (cb, c) in col_best.iter_mut().zip(col) {
+            if c.0 < cb.0 {
+                *cb = *c;
             }
         }
-        (best.0 != usize::MAX).then_some(best)
-    };
+    }
     let mut out = Vec::new();
-    for (i, fa) in a.iter().enumerate() {
-        let Some((j, d1, d2)) = nearest(fa, b) else {
-            continue;
-        };
-        if d1 >= ratio * ratio * d2 {
+    for (i, &(j, d1, d2)) in blocks.iter().flat_map(|(row, _)| row).enumerate() {
+        if j == usize::MAX || d1 >= ratio * ratio * d2 {
             continue;
         }
-        if mutual && nearest(&b[j], a).map(|r| r.0) != Some(i) {
+        if mutual && col_best[j].1 != i {
             continue;
         }
         out.push((i, j));
@@ -887,6 +923,119 @@ mod tests {
             angle: 0.0,
         };
         Feature { kp, desc }
+    }
+
+    /// 이전 구현(행마다 b 전수 탐색, 상호 확인 때 b→a 재탐색) 그대로. 동치 비교용 기준.
+    fn ratio_match_reference(
+        a: &[Feature],
+        b: &[Feature],
+        ratio: f32,
+        mutual: bool,
+    ) -> Vec<(usize, usize)> {
+        let nearest = |q: &Feature, set: &[Feature]| -> Option<(usize, f32, f32)> {
+            let mut best = (usize::MAX, f32::INFINITY, f32::INFINITY);
+            for (j, f) in set.iter().enumerate() {
+                let d: f32 = q
+                    .desc
+                    .iter()
+                    .zip(&f.desc)
+                    .map(|(p, r)| (p - r).powi(2))
+                    .sum();
+                if d < best.1 {
+                    best = (j, d, best.1);
+                } else if d < best.2 {
+                    best.2 = d;
+                }
+            }
+            (best.0 != usize::MAX).then_some(best)
+        };
+        let mut out = Vec::new();
+        for (i, fa) in a.iter().enumerate() {
+            let Some((j, d1, d2)) = nearest(fa, b) else {
+                continue;
+            };
+            if d1 >= ratio * ratio * d2 {
+                continue;
+            }
+            if mutual && nearest(&b[j], a).map(|r| r.0) != Some(i) {
+                continue;
+            }
+            out.push((i, j));
+        }
+        out
+    }
+
+    /// b = a 일부의 잡음 섞인 복사 + 쌍둥이 + 무관한 기술자. 묶음 경계를 걸치도록 크기를 고른다.
+    fn match_fixture(seed: u64, na: usize, extra: usize) -> (Vec<Feature>, Vec<Feature>) {
+        let mut g = Lcg(seed);
+        let a: Vec<Feature> = (0..na).map(|_| feature(&mut g)).collect();
+        let mut b = Vec::new();
+        for (i, f) in a.iter().enumerate() {
+            if i % 3 == 2 {
+                continue;
+            }
+            for _ in 0..1 + usize::from(i % 7 == 0) {
+                let mut h = f.clone();
+                h.desc
+                    .iter_mut()
+                    .for_each(|v| *v += 0.03 * g.gauss() as f32);
+                b.push(h);
+            }
+        }
+        b.extend((0..extra).map(|_| feature(&mut g)));
+        (a, b)
+    }
+
+    #[test]
+    fn ratio_match_equals_reference() {
+        // 블록·병렬 구현의 결과 짝 집합이 이전 전수 탐색과 같다(상호·비상호, 여러 비율, 빈 입력).
+        for (seed, na, extra) in [
+            (1, 1, 0),
+            (2, 63, 5),
+            (3, 64, 64),
+            (4, 65, 10),
+            (5, 700, 300),
+        ] {
+            let (a, b) = match_fixture(seed, na, extra);
+            for mutual in [true, false] {
+                for ratio in [0.6f32, 0.8, 1.0] {
+                    let fast = ratio_match(&a, &b, ratio, mutual);
+                    let slow = ratio_match_reference(&a, &b, ratio, mutual);
+                    assert_eq!(fast, slow, "seed {seed} mutual {mutual} ratio {ratio}");
+                    // 반대 방향도.
+                    let fast = ratio_match(&b, &a, ratio, mutual);
+                    let slow = ratio_match_reference(&b, &a, ratio, mutual);
+                    assert_eq!(fast, slow, "rev seed {seed} mutual {mutual} ratio {ratio}");
+                }
+            }
+        }
+        let (a, _) = match_fixture(9, 10, 0);
+        assert!(ratio_match(&a, &[], 0.8, true).is_empty());
+        assert!(ratio_match(&[], &a, 0.8, true).is_empty());
+    }
+
+    #[test]
+    #[ignore = "시간 측정: cargo test --release -- --ignored --test-threads=1 ratio_match_timing"]
+    fn ratio_match_timing() {
+        // F-014 확인 기준 크기(7300×7300). 같은 크기에서 이전 구현과 결과 짝 집합도 비교한다.
+        let (a, mut b) = match_fixture(21, 7300, 3000);
+        b.truncate(7300);
+        let t = std::time::Instant::now();
+        let m = ratio_match(&a, &b, 0.8, true);
+        let dt = t.elapsed().as_secs_f64();
+        println!(
+            "ratio_match {}x{}: {:.3} s, 짝 {}, 스레드 {}",
+            a.len(),
+            b.len(),
+            dt,
+            m.len(),
+            rayon::current_num_threads()
+        );
+        let t = std::time::Instant::now();
+        let slow = ratio_match_reference(&a, &b, 0.8, true);
+        println!("이전 구현: {:.3} s", t.elapsed().as_secs_f64());
+        assert_eq!(m, slow);
+        assert!(dt <= 0.5, "매칭 {dt:.3} s > 0.5 s");
     }
 
     #[test]
