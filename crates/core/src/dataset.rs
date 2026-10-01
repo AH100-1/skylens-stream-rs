@@ -1,6 +1,8 @@
 //! 입력 데이터셋 읽기: 세 카메라 사진 폴더와 GPS 텍스트, 구역 분할.
 //!
-//! 폴더 구조: `images/cam{F,R,L}/cam{F,R,L}_{번호:04}.jpg`, `gps.txt`.
+//! 폴더 구조: 사진은 `images/cam{F,R,L}_{번호:04}.jpg`(평평한 구조, 합성 출력·README 형식) 또는
+//! `images/cam{F,R,L}/cam{F,R,L}_{번호:04}.jpg`(카메라별 하위 폴더) 중 어느 쪽이든, 둘을 섞어도
+//! 읽는다. 같은 카메라·같은 프레임 사진이 두 곳에 다 있으면 오류. 그리고 `gps.txt`.
 //! `gps.txt` 는 `이름 위도 경도 고도` 한 줄씩이며, 이름 끝의 숫자를 프레임 번호로 본다
 //! (`camF_0003.jpg`, `0003` 모두 프레임 3). 빈 줄과 `#` 로 시작하는 줄은 건너뛴다.
 
@@ -55,6 +57,11 @@ pub enum DatasetError {
     Config(String),
     /// 쓸 수 있는 위치가 없음.
     Empty,
+    /// 같은 카메라·프레임의 사진이 두 경로에 있음(평평한 구조와 하위 폴더 양쪽 등).
+    DuplicateImage {
+        first: PathBuf,
+        second: PathBuf,
+    },
 }
 
 impl fmt::Display for DatasetError {
@@ -66,6 +73,12 @@ impl fmt::Display for DatasetError {
             Self::GpsMissing { frame } => write!(f, "GPS 누락: 프레임 {frame}"),
             Self::Config(m) => write!(f, "설정 오류: {m}"),
             Self::Empty => write!(f, "세 카메라가 모두 있는 위치가 없음"),
+            Self::DuplicateImage { first, second } => write!(
+                f,
+                "같은 사진이 두 곳에 있음: {} , {}",
+                first.display(),
+                second.display()
+            ),
         }
     }
 }
@@ -187,14 +200,12 @@ pub fn parse_gps(text: &str) -> Result<Vec<GpsRecord>, DatasetError> {
     Ok(out)
 }
 
-/// 카메라 폴더에서 `{cam}_{번호}.jpg` 프레임 번호 모음.
-fn scan_camera(dir: &Path, cam: &str) -> Result<BTreeSet<u32>, DatasetError> {
-    if !dir.is_dir() {
-        return Err(DatasetError::Missing(dir.to_path_buf()));
-    }
+/// 폴더 하나에서 `{cam}_{번호}.jpg` 파일을 찾아 프레임 번호 → 경로 모음에 더한다.
+/// 이미 있는 프레임이면 `DuplicateImage`.
+fn scan_into(dir: &Path, cam: &str, out: &mut BTreeMap<u32, PathBuf>) -> Result<(), DatasetError> {
     let rd = std::fs::read_dir(dir).map_err(|e| DatasetError::Io(dir.to_path_buf(), e))?;
     let prefix = format!("{cam}_");
-    let mut set = BTreeSet::new();
+    let mut found: Vec<(u32, PathBuf)> = Vec::new();
     for ent in rd {
         let ent = ent.map_err(|e| DatasetError::Io(dir.to_path_buf(), e))?;
         let name = ent.file_name();
@@ -205,16 +216,45 @@ fn scan_camera(dir: &Path, cam: &str) -> Result<BTreeSet<u32>, DatasetError> {
         else {
             continue;
         };
-        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(n) = num.parse() {
-                set.insert(n);
-            }
+        if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+            continue;
         }
+        let Ok(n) = num.parse() else { continue };
+        let path = ent.path();
+        if !path.is_file() {
+            continue;
+        }
+        found.push((n, path));
     }
-    Ok(set)
+    // 디렉터리 순서에 기대지 않도록 정렬해 오류 메시지를 결정적으로 만든다.
+    found.sort();
+    for (n, path) in found {
+        if let Some(first) = out.get(&n) {
+            return Err(DatasetError::DuplicateImage {
+                first: first.clone(),
+                second: path,
+            });
+        }
+        out.insert(n, path);
+    }
+    Ok(())
 }
 
-/// 사진 경로.
+/// 한 카메라의 사진: 평평한 `images/{cam}_*.jpg` 와 하위 폴더 `images/{cam}/{cam}_*.jpg` 를 함께 본다.
+/// 하위 폴더가 없고 평평한 사진도 하나 없으면 `Missing(images/{cam})`.
+fn scan_camera(images: &Path, cam: &str) -> Result<BTreeMap<u32, PathBuf>, DatasetError> {
+    let mut map = BTreeMap::new();
+    scan_into(images, cam, &mut map)?;
+    let sub = images.join(cam);
+    if sub.is_dir() {
+        scan_into(&sub, cam, &mut map)?;
+    } else if map.is_empty() {
+        return Err(DatasetError::Missing(sub));
+    }
+    Ok(map)
+}
+
+/// 카메라별 하위 폴더 구조에서의 사진 경로. 실제로 읽은 경로는 `Position::images`.
 pub fn image_path(root: &Path, cam: &str, frame: u32) -> PathBuf {
     root.join("images")
         .join(cam)
@@ -239,7 +279,7 @@ pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, Datas
     }
     let mut sets = Vec::with_capacity(3);
     for cam in CAMERAS {
-        sets.push(scan_camera(&images.join(cam), cam)?);
+        sets.push(scan_camera(&images, cam)?);
     }
     let gps_path = root.join("gps.txt");
     if !gps_path.is_file() {
@@ -265,13 +305,13 @@ pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, Datas
         }
     }
 
-    let all: BTreeSet<u32> = sets.iter().flatten().copied().collect();
+    let all: BTreeSet<u32> = sets.iter().flat_map(|m| m.keys()).copied().collect();
     let (Some(&first), Some(&last)) = (all.first(), all.last()) else {
         return Err(DatasetError::Empty);
     };
     let mut positions = Vec::new();
     for frame in (first..=last).step_by(config.stride) {
-        if !sets.iter().all(|s| s.contains(&frame)) {
+        if !sets.iter().all(|s| s.contains_key(&frame)) {
             continue;
         }
         let g = by_frame
@@ -280,7 +320,7 @@ pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, Datas
         positions.push(Position {
             index: positions.len(),
             frame,
-            images: CAMERAS.map(|c| image_path(root, c, frame)),
+            images: [0, 1, 2].map(|c| sets[c][&frame].clone()),
             geo: g.geo,
             enu: geodetic_to_enu(&g.geo, &origin),
         });
@@ -472,6 +512,94 @@ mod tests {
         assert!(matches!(
             load_dataset(&t.0, cfg),
             Err(DatasetError::Config(_))
+        ));
+    }
+
+    /// 하위 폴더 사진을 평평한 위치로 옮긴다(카메라 하나만, 또는 모두).
+    fn flatten(root: &Path, cams: &[&str]) {
+        for cam in cams {
+            let d = root.join("images").join(cam);
+            for e in std::fs::read_dir(&d).unwrap() {
+                let e = e.unwrap();
+                std::fs::rename(e.path(), root.join("images").join(e.file_name())).unwrap();
+            }
+            std::fs::remove_dir(&d).unwrap();
+        }
+    }
+
+    #[test]
+    fn flat_and_mixed_layouts_read_same() {
+        // 프레임 0..9, STRIDE 3 → 0,3,6 의 3곳.
+        let t = TempDir::new("flat");
+        make(&t.0, 9, &[], &[]);
+        // 읽은 직후에 경로가 실제 파일인지 본다(다음 단계에서 파일을 옮기므로).
+        let check = |d: &Dataset| {
+            assert_eq!(
+                d.positions.iter().map(|p| p.frame).collect::<Vec<_>>(),
+                vec![0, 3, 6]
+            );
+            assert_eq!(d.image_count(), 9);
+            for p in &d.positions {
+                for (c, img) in p.images.iter().enumerate() {
+                    assert!(img.is_file(), "{}", img.display());
+                    let want = format!("{}_{:04}.jpg", CAMERAS[c], p.frame);
+                    assert_eq!(img.file_name().unwrap().to_str().unwrap(), want);
+                }
+            }
+        };
+        let sub = load_dataset(&t.0, DatasetConfig::default()).unwrap();
+        check(&sub);
+        flatten(&t.0, &["camR"]);
+        let mixed = load_dataset(&t.0, DatasetConfig::default()).unwrap();
+        check(&mixed);
+        flatten(&t.0, &["camF", "camL"]);
+        let flat = load_dataset(&t.0, DatasetConfig::default()).unwrap();
+        check(&flat);
+        assert_eq!(
+            mixed.positions[1].images[1],
+            t.0.join("images/camR_0003.jpg")
+        );
+        assert_eq!(
+            mixed.positions[1].images[0],
+            t.0.join("images/camF/camF_0003.jpg")
+        );
+        assert_eq!(
+            flat.positions[2].images[2],
+            t.0.join("images/camL_0006.jpg")
+        );
+    }
+
+    #[test]
+    fn same_image_in_both_layouts_is_error() {
+        let t = TempDir::new("dup");
+        make(&t.0, 4, &[], &[]);
+        std::fs::write(t.0.join("images/camR_0002.jpg"), b"x").unwrap();
+        match load_dataset(&t.0, DatasetConfig::default()) {
+            Err(DatasetError::DuplicateImage { first, second }) => {
+                let mut v = [first, second];
+                v.sort();
+                assert_eq!(
+                    v,
+                    [
+                        t.0.join("images/camR/camR_0002.jpg"),
+                        t.0.join("images/camR_0002.jpg")
+                    ]
+                );
+            }
+            other => panic!("중복 오류가 아님: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flat_layout_missing_camera() {
+        // 평평한 구조에서 camL 사진이 하나도 없으면 Missing(images/camL).
+        let t = TempDir::new("flatmiss");
+        make(&t.0, 4, &[], &[]);
+        flatten(&t.0, &["camF", "camR"]);
+        std::fs::remove_dir_all(t.0.join("images/camL")).unwrap();
+        assert!(matches!(
+            load_dataset(&t.0, DatasetConfig::default()),
+            Err(DatasetError::Missing(p)) if p.ends_with("camL")
         ));
     }
 }
