@@ -4,7 +4,9 @@
 //! 첫 카메라를 [I | 0], 둘째를 [R | t] 로 둘 때 n2ᵀ E n1 = 0, E = [t]× R.
 
 use crate::camera::Intrinsics;
-use crate::matching::{all_finite, fundamental_8pt, sampson_error};
+use crate::matching::{
+    adaptive_iterations, all_finite, fundamental_8pt, sampson_error, RansacConfig,
+};
 use crate::math::{skew, Matrix3, Point3, Rotation3, SMatrix, Vector2, Vector3};
 
 /// 정규화 좌표 대응으로 본질 행렬을 구한다(정규화 8점 + 특이값 (1,1,0) 투영).
@@ -579,6 +581,289 @@ pub fn refine_relative_pose(
     recover_pose(&essential_from_pose(&r, &t), n1, n2)
 }
 
+/// 보정된 카메라 짝의 기하 검증: RANSAC(Fischler & Bolles 1981) + 5점 본질 행렬 최소 해(Nistér 2004).
+///
+/// 8점 F 는 장면이 평면에 가까우면 퇴화하지만 5점 해는 평면에서도 유효하다.
+/// `n1`·`n2` 는 정규화 좌표, `focal_px` 는 픽셀 문턱 `cfg.threshold_px` 를 정규화 단위로 바꾸는 초점 거리(px).
+/// 반환: [`ransac_essential_candidates`] 의 첫 후보(정상 수가 가장 많고 같으면 Sampson 비용이 가장 작은 해).
+/// 장면이 평면이면 두 번째 후보가 같은 정도로 대응을 설명할 수 있다(평면 두 겹 모호성).
+pub fn ransac_essential(
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    focal_px: f64,
+    cfg: &RansacConfig,
+) -> Option<(Matrix3<f64>, Vec<bool>)> {
+    ransac_essential_candidates(n1, n2, focal_px, cfg)
+        .into_iter()
+        .next()
+}
+
+/// 정규화 좌표 대응 4개 이상에서 직접 선형 변환(DLT)으로 호모그래피 H(b ≃ H a)를 구한다.
+/// AᵀA(9×9)의 최소 고유벡터를 쓴다. 대응이 4개 미만이거나 결과가 유한하지 않으면 None.
+pub fn homography_dlt(a: &[Vector2<f64>], b: &[Vector2<f64>]) -> Option<Matrix3<f64>> {
+    if a.len() < 4 || a.len() != b.len() {
+        return None;
+    }
+    let mut ata = SMatrix::<f64, 9, 9>::zeros();
+    for (p, q) in a.iter().zip(b) {
+        let (x, y, u, v) = (p.x, p.y, q.x, q.y);
+        let r1 = SMatrix::<f64, 9, 1>::from_column_slice(&[
+            -x,
+            -y,
+            -1.0,
+            0.0,
+            0.0,
+            0.0,
+            u * x,
+            u * y,
+            u,
+        ]);
+        let r2 = SMatrix::<f64, 9, 1>::from_column_slice(&[
+            0.0,
+            0.0,
+            0.0,
+            -x,
+            -y,
+            -1.0,
+            v * x,
+            v * y,
+            v,
+        ]);
+        ata += r1 * r1.transpose() + r2 * r2.transpose();
+    }
+    let eig = ata.symmetric_eigen();
+    let h = eig.eigenvectors.column(eig.eigenvalues.imin());
+    let m = Matrix3::new(h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]);
+    m.iter().all(|v| v.is_finite()).then_some(m)
+}
+
+/// 호모그래피 전달 오차 ‖b − H a‖(정규화 단위). 무한원으로 가면 무한대.
+fn homography_transfer(h: &Matrix3<f64>, a: &Vector2<f64>, b: &Vector2<f64>) -> f64 {
+    let p = h * Vector3::new(a.x, a.y, 1.0);
+    if p.z.abs() < 1e-12 {
+        return f64::INFINITY;
+    }
+    (Vector2::new(p.x / p.z, p.y / p.z) - b).norm()
+}
+
+/// 표시된 정상 짝 가운데 한 평면(호모그래피)으로 설명되는 짝을 4점 RANSAC 으로 찾는다.
+/// 문턱 `th`(정규화 단위)는 한쪽 전달 오차 기준이다. 반환: 호모그래피 정상 표시(정상 짝이 4개 미만이면 None).
+fn planar_inliers(
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    inl: &[bool],
+    th: f64,
+    seed: u64,
+) -> Option<Vec<bool>> {
+    let idx: Vec<usize> = (0..inl.len()).filter(|&i| inl[i]).collect();
+    if idx.len() < 4 {
+        return None;
+    }
+    let mut st = seed ^ 0xD1B5_4A32_D192_ED03;
+    let mut rnd = |m: usize| {
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((st >> 33) as usize) % m
+    };
+    let mark = |h: &Matrix3<f64>| -> Vec<bool> {
+        (0..inl.len())
+            .map(|i| inl[i] && homography_transfer(h, &n1[i], &n2[i]) < th)
+            .collect()
+    };
+    let count = |v: &[bool]| v.iter().filter(|&&b| b).count();
+    let mut best: Option<Vec<bool>> = None;
+    for _ in 0..PLANAR_RANSAC_ITERS {
+        let mut pick = [0usize; 4];
+        let mut k = 0;
+        while k < 4 {
+            let c = idx[rnd(idx.len())];
+            if !pick[..k].contains(&c) {
+                pick[k] = c;
+                k += 1;
+            }
+        }
+        let a: Vec<_> = pick.iter().map(|&i| n1[i]).collect();
+        let b: Vec<_> = pick.iter().map(|&i| n2[i]).collect();
+        let Some(h) = homography_dlt(&a, &b) else {
+            continue;
+        };
+        let m = mark(&h);
+        if best.as_ref().is_none_or(|bm| count(&m) > count(bm)) {
+            best = Some(m);
+        }
+    }
+    // 최소 표본 해를 정상 짝 전체로 다시 맞추고, 다시 맞춘 H 로는 모든 대응을 판정한다
+    // (에피폴라 문턱 밖으로 밀려난 정상 짝도 평면 위에 있으면 되찾는다).
+    let m = best?;
+    let a: Vec<_> = (0..inl.len()).filter(|&i| m[i]).map(|i| n1[i]).collect();
+    let b: Vec<_> = (0..inl.len()).filter(|&i| m[i]).map(|i| n2[i]).collect();
+    Some(homography_dlt(&a, &b).map_or(m, |h| {
+        (0..inl.len())
+            .map(|i| homography_transfer(&h, &n1[i], &n2[i]) < th)
+            .collect()
+    }))
+}
+
+/// 5점 RANSAC 으로 서로 다른 본질 행렬 후보를 최대 `ESSENTIAL_CANDIDATES` 개 돌려준다.
+/// 표본 단계에서는 최고 정상 수의 0.7 배 이상인 가설을 최대 `ESSENTIAL_CANDIDATES + 6` 개 보관한다
+/// (잡음 섞인 최소 표본에서는 정답 골짜기의 가설이 정상 수로 뒤처질 수 있다).
+///
+/// 최소 표본의 후보 E 마다 Sampson 거리로 정상 수를 세고, 정규화한 E 끼리 거리(부호 무관 프로베니우스)가
+/// 0.1 보다 먼 가설만 따로 보관한다. 평면 장면에서는 정답과 그 쌍둥이 해(이동이 평면 법선 쪽인 해)가
+/// 모든 대응을 똑같이 설명하므로 하나만 남기면 절반 확률로 쌍둥이를 고른다.
+/// 각 후보는 정상 짝으로 키랄리티 분해 → `refine_pose` 정밀화 → 정상 집합 갱신을 두 번 한다.
+/// 정상 짝의 `PLANAR_MIN_SHARE` 이상이 한 호모그래피로 설명되면(평면 장면) 정상 집합을 그 호모그래피의
+/// 정상 짝(전달 오차 < `PLANAR_TRANSFER_FACTOR` × 문턱)으로 바꾸고 한 번 더 정밀화한다. 그 뒤
+/// 정상 수 내림차순(같으면 Sampson 비용 오름차순)으로 정렬한다. 최고 정상 수의 0.9 배 미만 후보는 버린다.
+/// 정상 짝이 5개 미만이거나 정상 비율이 `cfg.min_inlier_ratio` 미만, 길이가 다르거나
+/// 유한하지 않은 좌표가 있으면 빈 목록.
+pub fn ransac_essential_candidates(
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    focal_px: f64,
+    cfg: &RansacConfig,
+) -> Vec<(Matrix3<f64>, Vec<bool>)> {
+    let n = n1.len();
+    if n < 5
+        || n != n2.len()
+        || !all_finite(n1)
+        || !all_finite(n2)
+        || focal_px.is_nan()
+        || focal_px <= 0.0
+    {
+        return vec![];
+    }
+    let th = cfg.threshold_px / focal_px;
+    let inliers_of = |e: &Matrix3<f64>| -> Vec<bool> {
+        (0..n)
+            .map(|i| sampson_residual(e, &n1[i], &n2[i]).abs() < th)
+            .collect()
+    };
+    let count = |v: &[bool]| v.iter().filter(|&&b| b).count();
+    let distinct = |a: &Matrix3<f64>, b: &Matrix3<f64>| {
+        let (a, b) = (a / a.norm(), b / b.norm());
+        (a - b).norm().min((a + b).norm()) > 0.1
+    };
+    let mut st = cfg.seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut rnd = |m: usize| {
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((st >> 33) as usize) % m
+    };
+    let mut pool: Vec<(Matrix3<f64>, usize)> = Vec::new();
+    let mut iters = cfg.max_iters;
+    let mut it = 0;
+    while it < iters {
+        it += 1;
+        let mut idx = [0usize; 5];
+        let mut k = 0;
+        while k < 5 {
+            let c = rnd(n);
+            if !idx[..k].contains(&c) {
+                idx[k] = c;
+                k += 1;
+            }
+        }
+        let s1: Vec<_> = idx.iter().map(|&i| n1[i]).collect();
+        let s2: Vec<_> = idx.iter().map(|&i| n2[i]).collect();
+        for e in essential_5pt(&s1, &s2) {
+            let cnt = count(&inliers_of(&e));
+            let best = pool.first().map_or(0, |p| p.1);
+            if cnt < 5 || 10 * cnt < 7 * best {
+                continue;
+            }
+            match pool.iter().position(|(p, _)| !distinct(p, &e)) {
+                Some(j) if pool[j].1 >= cnt => {}
+                Some(j) => pool[j] = (e, cnt),
+                None => pool.push((e, cnt)),
+            }
+            pool.sort_by_key(|p| std::cmp::Reverse(p.1));
+            pool.truncate(ESSENTIAL_CANDIDATES + 6);
+            if cnt > best {
+                // 쌍둥이 해도 표본에 나오도록 최소 반복을 넉넉히 둔다.
+                iters =
+                    adaptive_iterations(cnt as f64 / n as f64, 5, cfg.confidence, cfg.max_iters)
+                        .max(ESSENTIAL_MIN_ITERS.min(cfg.max_iters));
+            }
+        }
+    }
+    let cost = |e: &Matrix3<f64>, inl: &[bool]| -> f64 {
+        (0..n)
+            .filter(|&i| inl[i])
+            .map(|i| sampson_residual(e, &n1[i], &n2[i]).powi(2))
+            .sum()
+    };
+    let mut out: Vec<(Matrix3<f64>, Vec<bool>, usize, f64)> = Vec::new();
+    for (start, _) in pool {
+        let (mut e, mut inl) = (start, inliers_of(&start));
+        for _ in 0..2 {
+            let s1: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| n1[i]).collect();
+            let s2: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| n2[i]).collect();
+            // 후보 자신의 골짜기 안에서만 다듬는다(다중 시작은 쌍둥이 둘을 한 해로 합쳐 버린다).
+            let Some(pose) = recover_pose(&e, &s1, &s2) else {
+                break;
+            };
+            if !pose.translation_observable {
+                break;
+            }
+            let (r, t) = refine_pose(&pose.rotation, &pose.translation, &s1, &s2, 30);
+            let g = essential_from_pose(&r, &t);
+            let gi = inliers_of(&g);
+            if count(&gi) < count(&inl) {
+                break;
+            }
+            (e, inl) = (g, gi);
+        }
+        // 평면 장면: 정상 짝 대부분이 한 호모그래피로 설명되면 그 호모그래피에서 벗어난 짝을 뺀다.
+        // 에피폴라 문턱(1차원 제약) 안에 우연히 든 이상치가 평면의 얕은 골짜기를 크게 기울이기 때문이다.
+        if let Some(hm) = planar_inliers(n1, n2, &inl, PLANAR_TRANSFER_FACTOR * th, cfg.seed) {
+            let (hc, ec) = (count(&hm), count(&inl));
+            if hm != inl && hc as f64 >= PLANAR_MIN_SHARE * ec as f64 {
+                let s1: Vec<_> = (0..n).filter(|&i| hm[i]).map(|i| n1[i]).collect();
+                let s2: Vec<_> = (0..n).filter(|&i| hm[i]).map(|i| n2[i]).collect();
+                if let Some(pose) = recover_pose(&e, &s1, &s2).filter(|p| p.translation_observable)
+                {
+                    let (r, t) = refine_pose(&pose.rotation, &pose.translation, &s1, &s2, 30);
+                    (e, inl) = (essential_from_pose(&r, &t), hm);
+                }
+            }
+        }
+        // 정밀화 뒤 같은 골짜기로 모인 후보는 하나만 남긴다.
+        if out.iter().all(|o| distinct(&o.0, &e)) {
+            let (c, k) = (count(&inl), cost(&e, &inl));
+            out.push((e, inl, c, k));
+        }
+    }
+    out.sort_by(|a, b| b.2.cmp(&a.2).then(a.3.total_cmp(&b.3)));
+    let top = out.first().map_or(0, |o| o.2);
+    out.into_iter()
+        .filter(|o| {
+            o.2 >= 5 && 10 * o.2 >= 9 * top && o.2 as f64 >= cfg.min_inlier_ratio * n as f64
+        })
+        .take(ESSENTIAL_CANDIDATES)
+        .map(|o| (o.0, o.1))
+        .collect()
+}
+
+/// [`ransac_essential_candidates`] 가 돌려주는 최대 후보 수.
+pub const ESSENTIAL_CANDIDATES: usize = 4;
+
+/// 평면 판정용 호모그래피 4점 RANSAC 반복 수.
+pub const PLANAR_RANSAC_ITERS: usize = 200;
+
+/// 호모그래피 전달 오차 문턱 = 이 배수 × 에피폴라 문턱. 전달 오차는 두 영상 잡음이 2차원으로 더해져
+/// 에피폴라 거리보다 크다. 띠를 넓혀도 무작위 이상치가 한 점 둘레 원에 들 확률은 매우 작다(1920×1080 에서
+/// 반지름 3.75 px 원 ≈ 2e-5)이므로 정상 짝을 놓치지 않는 쪽으로 넉넉히 둔다.
+pub const PLANAR_TRANSFER_FACTOR: f64 = 2.5;
+
+/// 에피폴라 정상 짝 중 이 비율 이상이 한 호모그래피로 설명되면 평면 장면으로 보고 거른다.
+pub const PLANAR_MIN_SHARE: f64 = 0.8;
+
+/// 5점 RANSAC 의 최소 반복 수.
+pub const ESSENTIAL_MIN_ITERS: usize = 300;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +892,11 @@ mod tests {
 
     /// 기선 길이를 b(m)로 바꾼 같은 장면(둘째 중심 = (b, 0.8b/3, −40 − b/6)).
     fn scene_with_baseline(n: usize, sigma_px: f64, seed: u64, b: f64) -> Scene {
+        scene_full(n, sigma_px, seed, b, 10.0)
+    }
+
+    /// 점 높이 범위를 h(m)로 바꾼 같은 장면(h = 0 이면 평면).
+    fn scene_full(n: usize, sigma_px: f64, seed: u64, b: f64, h: f64) -> Scene {
         let k = Intrinsics::from_hfov(960, 540, 70f64.to_radians());
         let r1 = Rotation3::from_euler_angles(0.04, -0.03, 0.2);
         let r2 = Rotation3::from_euler_angles(-0.05, 0.06, 0.28);
@@ -624,7 +914,7 @@ mod tests {
             let x = Point3::new(
                 (rng.next() - 0.5) * 40.0,
                 (rng.next() - 0.5) * 24.0,
-                (rng.next() - 0.5) * 10.0,
+                (rng.next() - 0.5) * h,
             );
             if let (Some(p), Some(q)) = (c1.project(&x), c2.project(&x)) {
                 let noise = |r: &mut Lcg| Vector2::new(r.gauss(), r.gauss()) * sigma_px;
@@ -1116,5 +1406,167 @@ mod tests {
             ));
         }
         st
+    }
+
+    /// 평면 장면(σ0.5px, 200점)에 이상치 비율 `out` 만큼 둘째 좌표를 무작위로 바꾼 자료와 이상치 표시.
+    fn planar_case_scene(seed: u64, out: f64) -> (Scene, Vec<bool>) {
+        let mut s = scene_full(200, 0.5, seed, 3.0, 0.0);
+        let k = s.c1.intrinsics;
+        let mut rng = Lcg(seed ^ 0xABCD);
+        let mut bad = vec![false; s.x2.len()];
+        for (x, b) in s.x2.iter_mut().zip(bad.iter_mut()) {
+            if rng.next() < out {
+                let u = Vector2::new(rng.next() * 960.0, rng.next() * 540.0);
+                *x = k.to_normalized(&u);
+                *b = true;
+            }
+        }
+        (s, bad)
+    }
+
+    /// 자료 하한: 이상치가 아닌 대응만으로 정답 자세에서 시작한 Sampson 정밀화의 회전 오차(도).
+    fn planar_floor(s: &Scene, bad: &[bool]) -> f64 {
+        let (r, t) = s.rel();
+        let s1: Vec<_> = (0..bad.len())
+            .filter(|&i| !bad[i])
+            .map(|i| s.x1[i])
+            .collect();
+        let s2: Vec<_> = (0..bad.len())
+            .filter(|&i| !bad[i])
+            .map(|i| s.x2[i])
+            .collect();
+        let (rr, _) = refine_pose(&r, &t, &s1, &s2, 50);
+        rotation_angle_between(&rr, &r).to_degrees()
+    }
+
+    /// 평면 장면에서 5점 RANSAC 후보 중 정답에 가장 가까운 것의 (회전, 방향, 거짓 정상, 놓친 정상).
+    fn planar_ransac_case(s: &Scene, bad: &[bool]) -> (f64, f64, usize, usize) {
+        let k = s.c1.intrinsics;
+        let cfg = RansacConfig {
+            threshold_px: 1.5,
+            ..RansacConfig::default()
+        };
+        let cands = ransac_essential_candidates(&s.x1, &s.x2, k.fx, &cfg);
+        assert!(!cands.is_empty(), "RANSAC 실패");
+        let (r, t) = s.rel();
+        // 후보 중 정답에 가장 가까운 것(평면이면 정답과 쌍둥이 둘이 나온다).
+        cands
+            .iter()
+            .map(|(e, inl)| {
+                let s1: Vec<_> = (0..inl.len())
+                    .filter(|&i| inl[i])
+                    .map(|i| s.x1[i])
+                    .collect();
+                let s2: Vec<_> = (0..inl.len())
+                    .filter(|&i| inl[i])
+                    .map(|i| s.x2[i])
+                    .collect();
+                let pose = recover_pose(e, &s1, &s2).expect("자세 없음");
+                let rot = rotation_angle_between(&pose.rotation, &r).to_degrees();
+                let dir = angle_between(&pose.translation, &t).to_degrees();
+                let false_in = (0..inl.len()).filter(|&i| inl[i] && bad[i]).count();
+                let missed = (0..inl.len()).filter(|&i| !inl[i] && !bad[i]).count();
+                (rot, dir, false_in, missed)
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .unwrap()
+    }
+
+    /// 시드 1..=20 에서 시드마다 최선 후보 회전 ≤ 그 시드의 자료 하한 + 0.1° 인지 확인하고 최대 초과량을 돌려준다.
+    fn planar_against_floor(out: f64) -> f64 {
+        let mut fails = vec![];
+        let mut worst_excess = f64::NEG_INFINITY;
+        for seed in 1..=20 {
+            let (s, bad) = planar_case_scene(seed, out);
+            let floor = planar_floor(&s, &bad);
+            let (rot, dir, false_in, missed) = planar_ransac_case(&s, &bad);
+            eprintln!(
+                "평면 이상치 {out} 시드 {seed}: 최선 후보 회전 {rot:.4}° 하한 {floor:.4}° 방향 {dir:.3}° 거짓정상 {false_in} 놓침 {missed}"
+            );
+            worst_excess = worst_excess.max(rot - floor);
+            if rot > floor + 0.1 {
+                fails.push(seed);
+            }
+        }
+        eprintln!("평면 이상치 {out}: 하한 대비 최대 초과 {worst_excess:.4}°");
+        assert!(
+            fails.is_empty(),
+            "이상치 {out}: 하한 + 0.1° 초과 시드 {fails:?}"
+        );
+        worst_excess
+    }
+
+    #[test]
+    fn ransac_essential_planar_rotation() {
+        planar_against_floor(0.0);
+    }
+
+    #[test]
+    fn ransac_essential_planar_with_outliers() {
+        planar_against_floor(0.3);
+    }
+
+    /// 자료 한계: 정답 자세에서 시작한 Sampson 정밀화의 회전 오차(평면 σ0.5px 에서도 0.3° 를 넘는다).
+    #[test]
+    fn planar_sampson_floor_from_truth() {
+        let mut floor0: f64 = 0.0;
+        for h in [0.0, 1.0, 10.0] {
+            let mut worst: f64 = 0.0;
+            for seed in 1..=20 {
+                let s = scene_full(200, 0.5, seed, 3.0, h);
+                let (r, t) = s.rel();
+                let (rr, _) = refine_pose(&r, &t, &s.x1, &s.x2, 50);
+                worst = worst.max(rotation_angle_between(&rr, &r).to_degrees());
+            }
+            eprintln!("높이 {h} m: 정답에서 시작한 정밀화 최악 회전 {worst:.4}°");
+            if h == 0.0 {
+                floor0 = worst;
+            }
+        }
+        // 측정값 0.430°. 이 값보다 작은 회전 오차 기준은 평면 σ0.5px 에서 달성할 수 없다.
+        assert!(floor0 > 0.3 && floor0 < 0.5, "평면 하한 {floor0}°");
+    }
+
+    #[test]
+    fn ransac_essential_planar_noise_free_contains_truth() {
+        for seed in 1..=10 {
+            let s = scene_full(100, 0.0, seed, 3.0, 0.0);
+            let k = s.c1.intrinsics;
+            let cands = ransac_essential_candidates(&s.x1, &s.x2, k.fx, &RansacConfig::default());
+            let (r, _) = s.rel();
+            let best = cands
+                .iter()
+                .filter_map(|(e, _)| recover_pose(e, &s.x1, &s.x2))
+                .map(|p| rotation_angle_between(&p.rotation, &r).to_degrees())
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                best < 1e-3,
+                "시드 {seed}: 잡음 없는 평면 최선 후보 회전 {best}°"
+            );
+        }
+    }
+
+    #[test]
+    fn homography_dlt_recovers_plane_transfer() {
+        // 평면 장면(높이 범위 0)의 잡음 없는 대응은 한 호모그래피로 정확히 옮겨진다.
+        let s = scene_full(50, 0.0, 7, 3.0, 0.0);
+        let h = homography_dlt(&s.x1, &s.x2).expect("H 없음");
+        let worst =
+            s.x1.iter()
+                .zip(&s.x2)
+                .map(|(a, b)| homography_transfer(&h, a, b))
+                .fold(0.0, f64::max);
+        assert!(worst < 1e-9, "평면 전달 오차 {worst}");
+        assert!(homography_dlt(&s.x1[..3], &s.x2[..3]).is_none());
+    }
+
+    #[test]
+    fn ransac_essential_rejects_bad_input() {
+        let cfg = RansacConfig::default();
+        let a = vec![Vector2::new(0.1, 0.2); 4];
+        assert!(ransac_essential(&a, &a, 800.0, &cfg).is_none());
+        let s = scene(20, 0.0, 3);
+        assert!(ransac_essential(&s.x1, &s.x2[..19], 800.0, &cfg).is_none());
+        assert!(ransac_essential(&s.x1, &s.x2, 0.0, &cfg).is_none());
     }
 }
