@@ -6,12 +6,12 @@
 
 ## 한국어
 
-드론 편대(카메라 3대) 영상에서 **점진적으로 나아지는 3D 점군**을 만드는 Rust 도구.
+드론 3대 편대(드론마다 카메라 1대, 모두 3대) 영상에서 **점진적으로 나아지는 3D 점군**을 만드는 Rust 도구.
 
 새 구역이 들어올 때마다 빠른 초벌 점군을 먼저 보여 주고, 정밀 계산이 끝난 구역은 정밀본으로 바꿔 끼운다.
 화면에는 단계마다 "이전 구역은 정밀본 + 최신 구역은 초벌" 점군이 나간다.
 
-> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth` 만 있고, 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정 → 밀집 준비·융합 → 점진 스트림)를 묶어 만들어 가는 중이다.
+> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth` 만 있고, 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정 → GPS 정렬 → 구역 분할 → 밀집 준비·융합 → 초벌 정렬·스냅샷 = 점진 스트림)를 묶어 만들어 가는 중이다.
 
 ### 설치
 
@@ -106,7 +106,7 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 
 시간 측정(1920×1080 한 장 검출, 7300×7300 매칭): `cargo test --release -- --ignored --test-threads=1 --nocapture timing`
 구간별 시간(합성 240장: 검출·매칭·검증·회전 평균·번들 조정): `cargo bench --bench pipeline -- --quick`(인자 설명은 `crates/core/benches/pipeline.rs` 머리말),
-또는 `cargo run --release -p skylens-core --example bench_stages -- --json <파일>`.
+표를 파일로도 남기려면 `cargo bench --bench pipeline -- --quick --json <파일>`.
 
 ### 라이브러리: 두 시점 상대 자세와 삼각측량
 
@@ -189,6 +189,12 @@ println!("RMS {:.3} → {:.3} px, {} 회", report.initial_rms, report.final_rms,
 
 명령행에는 아직 묶여 있지 않은 단계들이다.
 
+- `skylens_core::align`: 닮음 변환 `Similarity { s, r, t }`(`identity`·`apply_point`·`apply_normal`(회전만)·`inverse`·`compose`·`to_matrix4`).
+  `umeyama(&src, &dst)` 는 대응점 최소제곱 닮음 변환, `robust_similarity(&src, &dst, iters, floor_m)` 는 반복 트리밍
+  (임계 max(3 × 잔차 중앙값, `floor_m`))으로 `(변환, 정상 표시, 잔차 중앙값)` 을 준다.
+  `align_to_enu(&centers, &enu, max_residual_m)` 은 정밀 포즈의 카메라 중심을 동-북-위 좌표에 1회 정렬하고 잔차가 상한을 넘는 대응을 빼고 다시 푼다.
+  `gps_align(&centers, &gps, &origin)` 은 위경도(`geo::Geodetic`)를 `origin` 기준 동-북-위로 바꾼 뒤 상한 `GPS_MAX_RESIDUAL_M`(3 m)로 `align_to_enu` 를 부른다.
+  결과 `GpsAlignment` 에는 `sim`·`inliers`·`residuals`·`median_residual` 이 있다. 합성 장면의 원점은 `truth/origin.txt` 다.
 - `skylens_core::undistort`: `undistort_to_long_side(&img, &k, long_side)` 가 왜곡 있는 사진을 긴 변 `long_side` 화소의 핀홀 사진과 새 `Intrinsics` 로 바꾼다(원본 밖 화소는 0, 쌍선형 보간).
 - `skylens_core::view_selection`: `select_neighbors(&views, &points, k)` 가 희소 점을 함께 본 사진들 가운데 사진마다 이웃 최대 k 장(기본 `DEFAULT_NEIGHBORS` = 8)을 고르고, `depth_range(&view, &points)` 가 깊이 탐색 범위를 준다.
 - `skylens_core::fusion`: `fuse(&views, &depth_maps, FusionConfig)` 가 사진별 깊이 맵을 왕복 재투영 검사로 합쳐 `PointCloud` 를 만든다(동의 사진 수 `min_views` 이상).
@@ -215,12 +221,12 @@ println!("RMS {:.3} → {:.3} px, {} 회", report.initial_rms, report.final_rms,
 
 ## English
 
-A Rust tool that builds a **progressively refined 3D point cloud** from drone-formation video (three cameras per drone).
+A Rust tool that builds a **progressively refined 3D point cloud** from the video of a three-drone formation (one camera per drone, three cameras in all).
 
 Each time a new region arrives, a fast preview cloud is shown first; once the accurate solve for a region finishes, its preview is swapped for the refined cloud.
 At every step the output is "refined clouds for earlier regions + preview for the newest region".
 
-> Work in progress. The command-line tool currently has only `ply-info` and `synth`; the progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment → dense preparation and fusion → progressive stream).
+> Work in progress. The command-line tool currently has only `ply-info` and `synth`; the progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment → GPS alignment → region split → dense preparation and fusion → preview alignment and snapshots = progressive stream).
 
 ### Build
 
@@ -315,7 +321,7 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 
 Timing (detection on one 1920×1080 image, 7300×7300 matching): `cargo test --release -- --ignored --test-threads=1 --nocapture timing`
 Per-stage timing (synthetic 240 images: detection, matching, verification, rotation averaging, bundle adjustment): `cargo bench --bench pipeline -- --quick` (arguments are described at the top of `crates/core/benches/pipeline.rs`),
-or `cargo run --release -p skylens-core --example bench_stages -- --json <file>`.
+to also save the table as a file, `cargo bench --bench pipeline -- --quick --json <file>`.
 
 ### Library: two-view relative pose and triangulation
 
@@ -398,6 +404,12 @@ With `max_iterations = 0` the cost is only evaluated (`report.refined = false`);
 
 These stages are not wired into the command line yet.
 
+- `skylens_core::align`: the similarity transform `Similarity { s, r, t }` (`identity`, `apply_point`, `apply_normal` (rotation only), `inverse`, `compose`, `to_matrix4`).
+  `umeyama(&src, &dst)` is the least-squares similarity from point correspondences, and `robust_similarity(&src, &dst, iters, floor_m)` trims iteratively
+  (threshold max(3 × median residual, `floor_m`)) and returns `(transform, inlier flags, median residual)`.
+  `align_to_enu(&centers, &enu, max_residual_m)` aligns the camera centres of the refined poses to east-north-up coordinates once, drops correspondences whose residual exceeds the limit and solves again.
+  `gps_align(&centers, &gps, &origin)` converts latitude/longitude (`geo::Geodetic`) to east-north-up about `origin` and calls `align_to_enu` with the limit `GPS_MAX_RESIDUAL_M` (3 m).
+  The result `GpsAlignment` holds `sim`, `inliers`, `residuals` and `median_residual`. For the synthetic scene the origin is `truth/origin.txt`.
 - `skylens_core::undistort`: `undistort_to_long_side(&img, &k, long_side)` turns a distorted image into a pinhole image whose long side is `long_side` pixels, plus the new `Intrinsics` (pixels outside the source are 0, bilinear interpolation).
 - `skylens_core::view_selection`: `select_neighbors(&views, &points, k)` picks up to k neighbours per image among the images that share sparse points (default `DEFAULT_NEIGHBORS` = 8), and `depth_range(&view, &points)` gives the depth search range.
 - `skylens_core::fusion`: `fuse(&views, &depth_maps, FusionConfig)` merges per-image depth maps with a round-trip reprojection check into a `PointCloud` (at least `min_views` agreeing images).
