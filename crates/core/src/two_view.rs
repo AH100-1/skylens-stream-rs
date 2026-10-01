@@ -127,6 +127,171 @@ pub fn essential_from_pose(r: &Rotation3<f64>, t: &Vector3<f64>) -> Matrix3<f64>
     skew(t) * r.matrix()
 }
 
+/// 3변수 3차 이하 다항식: 계수 c[a][b][d] 는 xᵃ yᵇ zᵈ 의 계수(a+b+d ≤ 3).
+type Poly = [[[f64; 4]; 4]; 4];
+
+fn pmul(p: &Poly, q: &Poly) -> Poly {
+    let mut r = [[[0.0; 4]; 4]; 4];
+    for a in 0..4 {
+        for b in 0..4 - a {
+            for d in 0..4 - a - b {
+                if p[a][b][d] == 0.0 {
+                    continue;
+                }
+                for e in 0..4 - a - b - d {
+                    for f in 0..4 - a - b - d - e {
+                        for g in 0..4 - a - b - d - e - f {
+                            r[a + e][b + f][d + g] += p[a][b][d] * q[e][f][g];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    r
+}
+
+fn padd(p: &Poly, q: &Poly, s: f64) -> Poly {
+    let mut r = *p;
+    for a in 0..4 {
+        for b in 0..4 {
+            for d in 0..4 {
+                r[a][b][d] += s * q[a][b][d];
+            }
+        }
+    }
+    r
+}
+
+/// 5점 최소 해법: 정규화 좌표 대응 5개 → 본질 행렬 후보(최대 10개).
+/// E = xX + yY + zZ + W (5×9 계의 영공간) 에 det E = 0, 2EEᵀE − tr(EEᵀ)E = 0 을 넣고,
+/// z 를 숨은 변수로 둔 10×10 다항 행렬 M(z) 의 다항 고윳값 문제(동반 행렬)로 푼다.
+#[allow(clippy::needless_range_loop)] // 행렬 첨자식이 수식과 그대로 대응한다.
+pub fn essential_5pt(n1: &[Vector2<f64>], n2: &[Vector2<f64>]) -> Vec<Matrix3<f64>> {
+    if n1.len() < 5 || n2.len() < 5 {
+        return vec![];
+    }
+    let mut ata = SMatrix::<f64, 9, 9>::zeros();
+    for (a, b) in n1.iter().zip(n2).take(5) {
+        let (p, q) = (Vector3::new(a.x, a.y, 1.0), Vector3::new(b.x, b.y, 1.0));
+        let mut row = SMatrix::<f64, 9, 1>::zeros();
+        for i in 0..3 {
+            for j in 0..3 {
+                row[3 * i + j] = q[i] * p[j];
+            }
+        }
+        ata += row * row.transpose();
+    }
+    let eig = ata.symmetric_eigen();
+    let mut idx: Vec<usize> = (0..9).collect();
+    idx.sort_by(|&i, &j| eig.eigenvalues[i].total_cmp(&eig.eigenvalues[j]));
+    let basis: Vec<SMatrix<f64, 9, 1>> = idx[..4]
+        .iter()
+        .map(|&k| eig.eigenvectors.column(k).into())
+        .collect();
+    // 각 성분 E_ij 를 x, y, z, 1 의 1차 다항식으로.
+    let mut e = [[[[[0.0; 4]; 4]; 4]; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            let k = 3 * i + j;
+            e[i][j][1][0][0] = basis[0][k];
+            e[i][j][0][1][0] = basis[1][k];
+            e[i][j][0][0][1] = basis[2][k];
+            e[i][j][0][0][0] = basis[3][k];
+        }
+    }
+    let mut eqs: Vec<Poly> = Vec::with_capacity(10);
+    // det E
+    let mut det = [[[0.0; 4]; 4]; 4];
+    for (j, sgn) in [(0usize, 1.0), (1, -1.0), (2, 1.0)] {
+        let (u, v) = match j {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        let minor = padd(&pmul(&e[1][u], &e[2][v]), &pmul(&e[1][v], &e[2][u]), -1.0);
+        det = padd(&det, &pmul(&e[0][j], &minor), sgn);
+    }
+    eqs.push(det);
+    // EEᵀ (2차)
+    let zero = [[[0.0; 4]; 4]; 4];
+    let mut eet = [[zero; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 {
+                eet[i][j] = padd(&eet[i][j], &pmul(&e[i][k], &e[j][k]), 1.0);
+            }
+        }
+    }
+    let tr = padd(&padd(&eet[0][0], &eet[1][1], 1.0), &eet[2][2], 1.0);
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut v = zero;
+            for k in 0..3 {
+                v = padd(&v, &pmul(&eet[i][k], &e[k][j]), 2.0);
+            }
+            eqs.push(padd(&v, &pmul(&tr, &e[i][j]), -1.0));
+        }
+    }
+    // x,y 단항식 열: x³ y³ x²y xy² x² y² xy x y 1, 각 계수는 z 의 다항식(차수 ≤ 3).
+    let cols: [(usize, usize); 10] = [
+        (3, 0),
+        (0, 3),
+        (2, 1),
+        (1, 2),
+        (2, 0),
+        (0, 2),
+        (1, 1),
+        (1, 0),
+        (0, 1),
+        (0, 0),
+    ];
+    let mut m = [SMatrix::<f64, 10, 10>::zeros(); 4];
+    for (r, q) in eqs.iter().enumerate() {
+        for (c, &(a, b)) in cols.iter().enumerate() {
+            for d in 0..4 - a - b {
+                m[d][(r, c)] = q[a][b][d];
+            }
+        }
+    }
+    // μ = 1/z: μ³M0 + μ²M1 + μM2 + M3 = 0 → 동반 행렬(30×30).
+    let Some(m0inv) = m[0].try_inverse() else {
+        return vec![];
+    };
+    let a: Vec<SMatrix<f64, 10, 10>> = (1..4).map(|k| m0inv * m[k]).collect();
+    let mut comp = nalgebra::DMatrix::<f64>::zeros(30, 30);
+    for k in 0..3 {
+        comp.view_mut((0, 10 * k), (10, 10)).copy_from(&(-a[k]));
+    }
+    for k in 0..20 {
+        comp[(10 + k, k)] = 1.0;
+    }
+    let mut out = vec![];
+    for mu in comp.complex_eigenvalues().iter() {
+        if mu.im.abs() > 1e-6 * mu.norm().max(1e-12) || mu.re.abs() < 1e-10 {
+            continue;
+        }
+        let z = 1.0 / mu.re;
+        let mz = m[0] + m[1] * z + m[2] * (z * z) + m[3] * (z * z * z);
+        let svd = mz.svd(false, true);
+        let vt = svd.v_t.unwrap();
+        let v = vt.row(svd.singular_values.imin());
+        if v[9].abs() < 1e-12 {
+            continue;
+        }
+        let (x, y) = (v[7] / v[9], v[8] / v[9]);
+        let ev = basis[0] * x + basis[1] * y + basis[2] * z + basis[3];
+        let em = Matrix3::new(
+            ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8],
+        );
+        let n = em.norm();
+        if n.is_finite() && n > 0.0 {
+            out.push(em / n);
+        }
+    }
+    out
+}
+
 /// 정규화 좌표에서 부호 있는 Sampson 잔차 e / ‖∇e‖.
 fn sampson_residual(e: &Matrix3<f64>, a: &Vector2<f64>, b: &Vector2<f64>) -> f64 {
     let (p, q) = (Vector3::new(a.x, a.y, 1.0), Vector3::new(b.x, b.y, 1.0));
@@ -456,5 +621,29 @@ mod tests {
             assert!(dir_err < max_dir, "이동 방향 오차 {dir_err} 도");
             assert!(front > 0.95, "앞쪽 비율 {front}");
         }
+    }
+
+    #[test]
+    fn five_point_contains_true_essential() {
+        let mut worst: f64 = 0.0;
+        for seed in [1u64, 2, 3, 4, 5, 6, 7, 8] {
+            let s = scene(5, 0.0, seed);
+            let (r, t) = s.rel();
+            let g = essential_from_pose(&r, &t);
+            let g = g / g.norm();
+            let sols = essential_5pt(&s.x1, &s.x2);
+            assert!(
+                !sols.is_empty() && sols.len() <= 10,
+                "해 개수 {}",
+                sols.len()
+            );
+            let best = sols
+                .iter()
+                .map(|e| (e - g).norm().min((e + g).norm()))
+                .fold(f64::INFINITY, f64::min);
+            eprintln!("5pt seed={seed} sols={} best_diff={best:.2e}", sols.len());
+            worst = worst.max(best);
+        }
+        assert!(worst < 1e-6, "정답 E 와 최소 차이 {worst}");
     }
 }

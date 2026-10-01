@@ -73,6 +73,7 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 
 ```rust
 use skylens_core::two_view::{essential_from_fundamental, recover_pose, refine_pose, triangulate};
+// 최소 해법이 필요하면 essential_5pt(&n1[..5], &n2[..5]) 가 본질 행렬 후보(최대 10개)를 준다.
 
 // f, inliers: 위 RANSAC 결과. k: 카메라 내부 파라미터(Intrinsics).
 let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
