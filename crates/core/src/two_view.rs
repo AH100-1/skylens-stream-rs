@@ -127,6 +127,98 @@ pub fn essential_from_pose(r: &Rotation3<f64>, t: &Vector3<f64>) -> Matrix3<f64>
     skew(t) * r.matrix()
 }
 
+/// 정규화 좌표에서 부호 있는 Sampson 잔차 e / ‖∇e‖.
+fn sampson_residual(e: &Matrix3<f64>, a: &Vector2<f64>, b: &Vector2<f64>) -> f64 {
+    let (p, q) = (Vector3::new(a.x, a.y, 1.0), Vector3::new(b.x, b.y, 1.0));
+    let (ep, etq) = (e * p, e.transpose() * q);
+    let den = (ep.x * ep.x + ep.y * ep.y + etq.x * etq.x + etq.y * etq.y).sqrt();
+    if den > 0.0 {
+        q.dot(&ep) / den
+    } else {
+        0.0
+    }
+}
+
+/// 상대 자세 (R, 단위 t) 를 Sampson 잔차 제곱합 최소화로 정밀화한다(Levenberg–Marquardt, 5 자유도).
+/// R ← R·exp([ω]×), t ← normalize(t + B β) (B 는 t 에 수직인 두 축). 야코비안은 중앙 차분.
+pub fn refine_pose(
+    rotation: &Rotation3<f64>,
+    translation: &Vector3<f64>,
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    iters: usize,
+) -> (Rotation3<f64>, Vector3<f64>) {
+    let (mut r, mut t) = (*rotation, translation.normalize());
+    let apply = |r: &Rotation3<f64>, t: &Vector3<f64>, d: &SMatrix<f64, 5, 1>| {
+        let b1 = t
+            .cross(&if t.x.abs() < 0.9 {
+                Vector3::x()
+            } else {
+                Vector3::y()
+            })
+            .normalize();
+        let b2 = t.cross(&b1);
+        let rn = r * Rotation3::new(Vector3::new(d[0], d[1], d[2]));
+        (rn, (t + b1 * d[3] + b2 * d[4]).normalize())
+    };
+    let cost_vec = |r: &Rotation3<f64>, t: &Vector3<f64>| -> Vec<f64> {
+        let e = essential_from_pose(r, t);
+        n1.iter()
+            .zip(n2)
+            .map(|(a, b)| sampson_residual(&e, a, b))
+            .collect()
+    };
+    let sq = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>();
+    let mut res = cost_vec(&r, &t);
+    let mut lambda = 1e-3;
+    for _ in 0..iters {
+        let h = 1e-7;
+        let mut jac = vec![SMatrix::<f64, 1, 5>::zeros(); res.len()];
+        for k in 0..5 {
+            let mut d = SMatrix::<f64, 5, 1>::zeros();
+            d[k] = h;
+            let (rp, tp) = apply(&r, &t, &d);
+            d[k] = -h;
+            let (rm, tm) = apply(&r, &t, &d);
+            let (fp, fm) = (cost_vec(&rp, &tp), cost_vec(&rm, &tm));
+            for i in 0..res.len() {
+                jac[i][k] = (fp[i] - fm[i]) / (2.0 * h);
+            }
+        }
+        let mut jtj = SMatrix::<f64, 5, 5>::zeros();
+        let mut jtr = SMatrix::<f64, 5, 1>::zeros();
+        for (j, &e) in jac.iter().zip(&res) {
+            jtj += j.transpose() * j;
+            jtr += j.transpose() * e;
+        }
+        let c0 = sq(&res);
+        let mut improved = false;
+        for _ in 0..10 {
+            let mut a = jtj;
+            for k in 0..5 {
+                a[(k, k)] *= 1.0 + lambda;
+            }
+            let Some(d) = a.cholesky().map(|c| -c.solve(&jtr)) else {
+                lambda *= 10.0;
+                continue;
+            };
+            let (rn, tn) = apply(&r, &t, &d);
+            let rn_res = cost_vec(&rn, &tn);
+            if sq(&rn_res) < c0 {
+                (r, t, res) = (rn, tn, rn_res);
+                lambda = (lambda * 0.3).max(1e-12);
+                improved = true;
+                break;
+            }
+            lambda *= 10.0;
+        }
+        if !improved || (c0 - sq(&res)) < 1e-15 * c0.max(1e-300) {
+            break;
+        }
+    }
+    (r, t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +367,35 @@ mod tests {
         let g = project_to_essential(&essential_from_pose(&r, &t));
         let d = (e - g).norm().min((e + g).norm());
         assert!(d < 1e-9, "E 차이 {d}");
+    }
+
+    #[test]
+    fn refinement_reduces_pose_error() {
+        // (σ px, 정밀화 후 회전 상한 도, 이동 방향 상한 도). 상한은 시드 세 개 측정 최댓값의 약 1.5 배.
+        for (sigma, max_rot, max_dir) in [(0.5, 0.18, 1.3), (1.0, 0.35, 2.9)] {
+            let mut worst = (0.0f64, 0.0f64);
+            for seed in [7u64, 11, 23] {
+                let s = scene(200, sigma, seed);
+                let e = essential_8pt(&s.x1, &s.x2).unwrap();
+                let rp = recover_pose(&e, &s.x1, &s.x2).unwrap();
+                let (r, t) = s.rel();
+                let (rr, tr) = refine_pose(&rp.rotation, &rp.translation, &s.x1, &s.x2, 50);
+                let errs = |rot: &Rotation3<f64>, tv: &Vector3<f64>| {
+                    (
+                        rotation_angle_between(rot, &r).to_degrees(),
+                        tv.angle(&t.normalize()).to_degrees(),
+                    )
+                };
+                let (b, a) = (errs(&rp.rotation, &rp.translation), errs(&rr, &tr));
+                eprintln!(
+                    "refine sigma={sigma} seed={seed} rot {:.4}->{:.4} deg dir {:.3}->{:.3} deg",
+                    b.0, a.0, b.1, a.1
+                );
+                assert!(a.0 < b.0 && a.1 < b.1, "정밀화가 오차를 줄이지 못함");
+                worst = (worst.0.max(a.0), worst.1.max(a.1));
+            }
+            assert!(worst.0 < max_rot, "정밀화 후 회전 오차 {} 도", worst.0);
+            assert!(worst.1 < max_dir, "정밀화 후 이동 방향 오차 {} 도", worst.1);
+        }
     }
 }

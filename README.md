@@ -69,6 +69,22 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 }
 ```
 
+### 라이브러리: 두 시점 상대 자세와 삼각측량
+
+```rust
+use skylens_core::two_view::{essential_from_fundamental, recover_pose, refine_pose, triangulate};
+
+// f, inliers: 위 RANSAC 결과. k: 카메라 내부 파라미터(Intrinsics).
+let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
+let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
+let e = essential_from_fundamental(&f, &k, &k);
+if let Some(rp) = recover_pose(&e, &n1, &n2) {
+    // 카메라 1 = [I|0], 카메라 2 = [R|t] (t 는 단위 길이, 스케일 미정)
+    let (r, t) = refine_pose(&rp.rotation, &rp.translation, &n1, &n2, 50);
+    let x = triangulate(&r, &t, &n1[0], &n2[0]); // 카메라 1 좌표계의 3D 점
+}
+```
+
 ## 출력
 
 ```
