@@ -96,6 +96,20 @@ if let Some(rp) = recover_pose(&e, &n1, &n2) {
 // recover_pose 는 길이 불일치, NaN 입력, 순수 회전(이동 방향을 관측할 수 없음)에서 None.
 ```
 
+### 라이브러리: 회전 평균
+
+```rust
+use skylens_core::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
+
+// 간선 (i, j): rotation = R_j R_iᵀ (recover_pose 의 회전과 같은 규약), weight = 정상 대응 수 등
+let edges = vec![RelativeRotation { i: 0, j: 1, rotation: pose01.rotation, weight: 120.0 } /* ... */];
+if let Some(res) = average_rotations(num_views, &edges, &AveragingConfig::default()) {
+    // res.rotations[v]: 세계→카메라 v 회전(기준 정점 = 단위 회전). 기준과 이어지지 않으면 None
+    // res.inliers[k], res.residuals_rad[k]: 간선별 정상 표시와 잔차 각(rad), 기본 이상치 문턱 5°
+}
+// None: 정점 0개, 범위 밖 번호, 쓸 수 있는 간선 없음. NaN 회전·0 이하 가중치·자기 간선은 무시.
+```
+
 ### 출력
 
 ```
@@ -202,6 +216,20 @@ if let Some(rp) = recover_pose(&e, &n1, &n2) {
     let x = triangulate(&r, &t, &n1[0], &n2[0]); // 3D point in camera 1 coordinates
 }
 // recover_pose returns None on length mismatch, NaN input, or pure rotation (translation unobservable).
+```
+
+### Library: rotation averaging
+
+```rust
+use skylens_core::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
+
+// edge (i, j): rotation = R_j R_iᵀ (same convention as recover_pose), weight = e.g. inlier count
+let edges = vec![RelativeRotation { i: 0, j: 1, rotation: pose01.rotation, weight: 120.0 } /* ... */];
+if let Some(res) = average_rotations(num_views, &edges, &AveragingConfig::default()) {
+    // res.rotations[v]: world→camera rotation of view v (reference view = identity), None if not connected
+    // res.inliers[k], res.residuals_rad[k]: per-edge inlier flag and residual angle (rad), default outlier threshold 5°
+}
+// None: zero views, out-of-range index, or no usable edge. NaN rotations, non-positive weights and self edges are ignored.
 ```
 
 ### Output
