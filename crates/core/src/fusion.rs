@@ -54,6 +54,10 @@ pub struct FusionConfig {
     pub min_views: usize,
     /// 기준 법선과 이웃 법선 사이 각 상한(도, (0, 180]). 법선이 없는 화소는 검사하지 않는다.
     pub normal_deg: f64,
+    /// 투영이 화면 안 유효 깊이에 닿는 이웃 사진 중 동의해야 하는 비율([0, 1]).
+    /// 같은 높이에서 나란히 찍은 사진들은 깊이가 같은 배율로 틀리면 지면 아래
+    /// 가상 평면에서 서로 맞아떨어지므로, 동의 수만으로는 그런 점을 거를 수 없다.
+    pub min_ratio: f64,
 }
 
 impl Default for FusionConfig {
@@ -63,6 +67,7 @@ impl Default for FusionConfig {
             depth_rel: 0.01,
             min_views: 3,
             normal_deg: 30.0,
+            min_ratio: 0.5,
         }
     }
 }
@@ -124,6 +129,9 @@ fn check(
     if cfg.min_views == 0 {
         return Err(FusionError::BadConfig("min_views"));
     }
+    if !(cfg.min_ratio >= 0.0 && cfg.min_ratio <= 1.0) {
+        return Err(FusionError::BadConfig("min_ratio"));
+    }
     if !(cfg.normal_deg > 0.0 && cfg.normal_deg <= 180.0) {
         return Err(FusionError::BadConfig("normal_deg"));
     }
@@ -173,7 +181,17 @@ fn check(
 }
 
 /// 기준 화소 하나의 후보: 기준 화소 번호, 기준 3D 점, 동의한 (사진, 화소, 3D 점).
-type Candidate = (usize, Point3<f64>, Vec<(usize, usize, Point3<f64>)>);
+/// 마지막 값은 필요한 동의 사진 수(기준 포함).
+type Candidate = (usize, Point3<f64>, Vec<(usize, usize, Point3<f64>)>, usize);
+
+/// 시험용 기록: 점마다 (기준 사진, 기준 화소, 동의 (사진, 화소)).
+#[cfg(test)]
+type Trace = Vec<(usize, usize, Vec<(usize, usize)>)>;
+
+#[cfg(test)]
+thread_local! {
+    static TRACE: std::cell::RefCell<Trace> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// 깊이 맵들을 일관성 검사로 걸러 점군 하나로 합친다. 입력이 어긋나면 패닉한다
 /// (오류를 받으려면 [`try_fuse`]).
@@ -234,6 +252,7 @@ pub fn try_fuse(
                     let nr = world_normal(r, ridx);
                     let nr_ok = nr.norm() > 1e-6;
                     let mut agree = Vec::new();
+                    let mut seen = 0usize;
                     for &j in &nbrs {
                         let jm = &depth_maps[j];
                         let jc = &views[j].camera;
@@ -242,10 +261,11 @@ pub fn try_fuse(
                             continue;
                         };
                         let jidx = qy * jm.w + qx;
+                        let Some(dj) = jm.get(qx, qy) else { continue };
+                        seen += 1;
                         if used_ref[j][jidx] {
                             continue;
                         }
-                        let Some(dj) = jm.get(qx, qy) else { continue };
                         let yw = jc.unproject(&center(qx, qy), dj as f64);
                         let yc = rc.pose.transform(&yw);
                         if yc.z <= 0.0 {
@@ -269,18 +289,21 @@ pub fn try_fuse(
                         }
                         agree.push((j, jidx, yw));
                     }
-                    if agree.len() + 1 >= cfg.min_views {
-                        out.push((ridx, xw, agree));
+                    let need = cfg
+                        .min_views
+                        .max((cfg.min_ratio * (seen + 1) as f64).ceil() as usize);
+                    if agree.len() + 1 >= need {
+                        out.push((ridx, xw, agree, need));
                     }
                 }
                 out
             })
             .collect();
 
-        for (ridx, xw, mut agree) in rows.into_iter().flatten() {
+        for (ridx, xw, mut agree, need) in rows.into_iter().flatten() {
             // 같은 기준 사진의 앞 화소가 먼저 쓴 이웃 화소는 뺀다.
             agree.retain(|&(j, jidx, _)| !used[j][jidx]);
-            if agree.len() + 1 < cfg.min_views {
+            if agree.len() + 1 < need {
                 continue;
             }
             let k = (agree.len() + 1) as f64;
@@ -307,6 +330,11 @@ pub fn try_fuse(
             for &(j, jidx, _) in &agree {
                 used[j][jidx] = true;
             }
+            #[cfg(test)]
+            TRACE.with(|t| {
+                t.borrow_mut()
+                    .push((r, ridx, agree.iter().map(|a| (a.0, a.1)).collect()))
+            });
             cloud.points.push(PointRecord {
                 xyz: [pos.x as f32, pos.y as f32, pos.z as f32],
                 normal: [nor.x as f32, nor.y as f32, nor.z as f32],
@@ -1079,7 +1107,7 @@ mod tests {
 
     /// F-069·F-070: 실측 편대 42장(14곳), 480×270, 잡음 σ 0.1%, 이상치 10%.
     #[test]
-    #[ignore = "이웃 8장 제한 뒤에도 0.3 m 초과 101점·최대 11.9 m (전체 대조 223점), 원인 미확인"]
+    #[ignore = "동의 비율 0.5 뒤 0.3 m 초과 5점·최대 11.5 m: 같은 높이 사진들의 같은 배율 이상치가 지면 아래 가상 평면에서 맞아떨어짐"]
     fn formation_noisy_with_outliers() {
         let cams = formation(14, 480, 270);
         let mut rng = Rng(0x0bad_cafe_1234_5678);
@@ -1099,6 +1127,39 @@ mod tests {
             v.neighbors = n.clone();
         }
         let cfg = FusionConfig::default();
+        super::TRACE.with(|t| t.borrow_mut().clear());
+        let dbg = fuse(&vs, &maps, cfg);
+        let tr = super::TRACE.with(|t| t.borrow().clone());
+        let mut order: Vec<usize> = (0..dbg.len()).collect();
+        order.sort_by(|&a, &b| {
+            surface_dist(&FORM, &pt(&dbg.points[b]))
+                .partial_cmp(&surface_dist(&FORM, &pt(&dbg.points[a])))
+                .unwrap()
+        });
+        let truth: Vec<DepthMap> = cams.iter().map(|c| render(&FORM, c)).collect();
+        for &i in order.iter().take(4) {
+            let (r, ridx, ag) = &tr[i];
+            let w = maps[*r].w;
+            println!(
+                "WORST p {:?} dist {:.3} ref {r} px ({},{}) d {} true {} nbrs {:?}",
+                dbg.points[i].xyz,
+                surface_dist(&FORM, &pt(&dbg.points[i])),
+                ridx % w,
+                ridx / w,
+                maps[*r].depth[*ridx],
+                truth[*r].depth[*ridx],
+                nb[*r]
+            );
+            for (j, jidx) in ag {
+                println!(
+                    "   agree {j} px ({},{}) d {} true {}",
+                    jidx % w,
+                    jidx / w,
+                    maps[*j].depth[*jidx],
+                    truth[*j].depth[*jidx]
+                );
+            }
+        }
         let all = fuse(&views(&cams), &maps, cfg);
         let (amed, amax, afar) = errors(&FORM, &all);
         let cloud = fuse(&vs, &maps, cfg);
