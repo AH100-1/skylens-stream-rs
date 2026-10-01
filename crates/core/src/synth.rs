@@ -348,35 +348,34 @@ impl Scene {
         let (w, h) = (k.width as usize, k.height as usize);
         let rt = view.camera.pose.rotation.inverse();
         let o = view.camera.pose.center();
-        let mut img = RgbImage {
+        use rayon::prelude::*;
+        let mut data = vec![0u8; w * h * 3];
+        let mut depth = vec![f32::NAN; w * h];
+        data.par_chunks_mut(w * 3)
+            .zip(depth.par_chunks_mut(w))
+            .enumerate()
+            .for_each(|(y, (row, drow))| {
+                for x in 0..w {
+                    let n = k.to_normalized(&Vector2::new(x as f64 + 0.5, y as f64 + 0.5));
+                    let d = rt * Vector3::new(n.x, n.y, 1.0);
+                    if let Some(hit) = self.intersect(&o, &d) {
+                        // d 의 카메라 z 성분이 1 이므로 t 가 곧 깊이.
+                        drow[x] = hit.t as f32;
+                        let light = Vector3::new(0.3, 0.2, 0.93).normalize();
+                        let shade = 0.55 + 0.45 * hit.normal.dot(&light).max(0.0);
+                        for c in 0..3 {
+                            row[3 * x + c] = (hit.rgb[c] as f64 * shade).min(255.0) as u8;
+                        }
+                    } else {
+                        row[3 * x..3 * x + 3].copy_from_slice(&[150, 190, 235]);
+                    }
+                }
+            });
+        let img = RgbImage {
             width: k.width,
             height: k.height,
-            data: vec![0; w * h * 3],
+            data,
         };
-        let mut depth = vec![f32::NAN; w * h];
-        for y in 0..h {
-            for x in 0..w {
-                let n = k.to_normalized(&Vector2::new(x as f64 + 0.5, y as f64 + 0.5));
-                let dc = Vector3::new(n.x, n.y, 1.0);
-                let d = rt * dc;
-                let i = y * w + x;
-                if let Some(hit) = self.intersect(&o, &d) {
-                    // d 의 카메라 z 성분이 1 이므로 t 가 곧 깊이.
-                    depth[i] = hit.t as f32;
-                    let shade = 0.55
-                        + 0.45
-                            * hit
-                                .normal
-                                .dot(&Vector3::new(0.3, 0.2, 0.93).normalize())
-                                .max(0.0);
-                    for c in 0..3 {
-                        img.data[3 * i + c] = (hit.rgb[c] as f64 * shade).min(255.0) as u8;
-                    }
-                } else {
-                    img.data[3 * i..3 * i + 3].copy_from_slice(&[150, 190, 235]);
-                }
-            }
-        }
         (img, depth)
     }
 }
@@ -537,5 +536,95 @@ mod tests {
             }
         }
         assert!(found);
+    }
+}
+
+/// 기준 GPS 원점(임의의 위경도). 장면 ENU 원점이 여기다.
+pub const GPS_ORIGIN: crate::geo::Geodetic = crate::geo::Geodetic {
+    lat_deg: 37.5,
+    lon_deg: 127.0,
+    alt: 50.0,
+};
+
+impl Scene {
+    /// SPEC §1 입력 형식으로 폴더에 쓴다:
+    /// `images/cam{F,R,L}_{번호:04}.jpg`, `gps.txt`(이름 위도 경도 고도),
+    /// 정답 `truth/cameras.txt`(이름 fx fy cx cy w h, R 행 우선 9개, t 3개).
+    pub fn write_dataset(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let img_dir = dir.join("images");
+        let truth_dir = dir.join("truth");
+        std::fs::create_dir_all(&img_dir)?;
+        std::fs::create_dir_all(&truth_dir)?;
+        let mut gps = std::fs::File::create(dir.join("gps.txt"))?;
+        let mut cams = std::fs::File::create(truth_dir.join("cameras.txt"))?;
+        for v in &self.views {
+            let (img, _) = self.render(v);
+            image::RgbImage::from_raw(img.width, img.height, img.data)
+                .expect("버퍼 크기")
+                .save(img_dir.join(format!("{}.jpg", v.name)))
+                .map_err(std::io::Error::other)?;
+            let g = crate::geo::enu_to_geodetic(&self.gps_enu[v.position].coords, &GPS_ORIGIN);
+            writeln!(
+                gps,
+                "{} {:.9} {:.9} {:.3}",
+                v.name, g.lat_deg, g.lon_deg, g.alt
+            )?;
+            let k = &v.camera.intrinsics;
+            let r = v.camera.pose.rotation.matrix();
+            let t = v.camera.pose.translation;
+            write!(
+                cams,
+                "{} {} {} {} {} {} {}",
+                v.name, k.fx, k.fy, k.cx, k.cy, k.width, k.height
+            )?;
+            for i in 0..3 {
+                for j in 0..3 {
+                    write!(cams, " {}", r[(i, j)])?;
+                }
+            }
+            writeln!(cams, " {} {} {}", t.x, t.y, t.z)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dataset_tests {
+    use super::*;
+    use crate::geo::{geodetic_to_enu, Geodetic};
+
+    #[test]
+    fn written_gps_converts_back_to_enu() {
+        let s = Scene::new(SceneConfig {
+            positions: 4,
+            width: 64,
+            height: 36,
+            ..SceneConfig::default()
+        });
+        let dir = std::env::temp_dir().join(format!("skylens_synth_{}", std::process::id()));
+        s.write_dataset(&dir).unwrap();
+        let gps = std::fs::read_to_string(dir.join("gps.txt")).unwrap();
+        let lines: Vec<&str> = gps.lines().collect();
+        assert_eq!(lines.len(), 12);
+        let mut worst: f64 = 0.0;
+        for (l, v) in lines.iter().zip(&s.views) {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            assert_eq!(f[0], v.name);
+            let g = Geodetic {
+                lat_deg: f[1].parse().unwrap(),
+                lon_deg: f[2].parse().unwrap(),
+                alt: f[3].parse().unwrap(),
+            };
+            let e = geodetic_to_enu(&g, &GPS_ORIGIN);
+            worst = worst.max((e - s.gps_enu[v.position].coords).norm());
+        }
+        // 위경도 소수 9자리(≈0.1mm) + 고도 1mm 반올림.
+        assert!(worst < 2e-3, "GPS 왕복 오차 {worst} m");
+        let img = image::open(dir.join("images/camR_0002.jpg")).unwrap();
+        assert_eq!((img.width(), img.height()), (64, 36));
+        let cams = std::fs::read_to_string(dir.join("truth/cameras.txt")).unwrap();
+        assert_eq!(cams.lines().count(), 12);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
