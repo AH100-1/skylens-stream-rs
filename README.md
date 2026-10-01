@@ -33,7 +33,9 @@ Rust stable 1.88 이상이 필요하다.
   gps.txt                    # 한 줄에: 확장자 없는 이미지 이름(camF_0000) 위도 경도(도) 고도(m)
 ```
 
-`synth` 출력도 같은 구조이며, 정답 카메라 `truth/cameras.txt`(한 줄에: 이름 fx fy cx cy 폭 높이, 세계→카메라 R 행 우선 9개, t 3개)가 더 있다.
+`gps.txt` 의 이름에는 확장자를 붙이지 않는다(`camF_0000.jpg` 가 아니라 `camF_0000`).
+`synth` 출력도 같은 구조이며, 정답 카메라 `truth/cameras.txt`(한 줄에: 이름 fx fy cx cy 폭 높이, 세계→카메라 R 행 우선 9개, t 3개)와
+정답 좌표 원점 `truth/origin.txt`(`위도 경도 고도` 한 줄)가 더 있다.
 
 ### 사용법
 
@@ -43,12 +45,16 @@ Rust stable 1.88 이상이 필요하다.
 skylens-stream ply-info <파일.ply>
 
 # 시험용 합성 장면 만들기 (영상 + GPS + 정답 카메라, 기본 960×540, 3대 × 80위치 = 240장)
-# 폭·높이는 16..=8192 정수이며 둘 다 주거나 둘 다 생략한다. 아니면 사용법과 종료 코드 2
+# 폭·높이는 16..=8192 이며 숫자만 쓴다(`+20`·`-20` 불가). 둘 다 주거나 둘 다 생략한다
+# 출력 폴더가 빈 문자열이거나 폭·높이가 맞지 않으면 아무것도 쓰지 않고 사용법과 종료 코드 2
 # 끝나면 만든 영상 수를 출력 ("views 240"). 쓰기 실패면 오류 메시지와 종료 코드 1
 skylens-stream synth <출력 폴더> [폭 높이]
 
 # 판 번호 출력 ("skylens-stream 0.1.0")
 skylens-stream --version
+
+# 사용법을 표준 출력으로 내고 종료 코드 0 (-h 도 같음)
+skylens-stream --help
 ```
 
 인자 없이 실행하거나 모르는 명령이면 사용법을 표준 오류로 내고 종료 코드 2 로 끝난다.
@@ -60,6 +66,8 @@ use skylens_core::features::{detect_and_describe, DetectorConfig, GrayImage};
 
 // 버퍼 길이가 폭×높이×3 이 아니면 Err(ImageSizeError). 회색조·RGBA 는 try_from_gray·try_from_rgba.
 // from_rgb 는 같은 검사를 하되 길이가 틀리면 메시지와 함께 패닉한다.
+// 밝기 값(f32) 버퍼가 이미 있으면 try_from_vec(폭, 높이, data). 필드는 비공개이고
+// width()·height()·data() 로 읽는다(길이가 폭×높이와 다른 영상은 만들 수 없다).
 let img = GrayImage::try_from_rgb(width, height, &rgb_bytes)?;
 let feats = detect_and_describe(&img, &DetectorConfig::default());
 for f in &feats {
@@ -79,7 +87,7 @@ use skylens_core::matching::{PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL};
 use skylens_core::features::Feature;
 
 // 매칭할 영상 짝: views[k] = (카메라 번호, 촬영 위치 번호).
-// 같은 카메라는 위치 차 1..=5 와 2의 거듭제곱(8, 16, 32, …), 다른 카메라는 위치 차 0..=4.
+// 같은 카메라는 위치 차 1..=5 와 PAIR_POW2_MAX(16) 이하의 2의 거듭제곱(8, 16), 다른 카메라는 위치 차 0..=4.
 let image_pairs = candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX);
 
 // 비율 0.8, 양방향 확인. 결과는 a 인덱스 순, 거리 계산은 한 번만 하며 병렬로 돈다.
@@ -97,6 +105,8 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 ```
 
 시간 측정(1920×1080 한 장 검출, 7300×7300 매칭): `cargo test --release -- --ignored --test-threads=1 --nocapture timing`
+구간별 시간(합성 240장: 검출·매칭·검증·회전 평균·번들 조정): `cargo bench --bench pipeline -- --quick`(인자 설명은 `crates/core/benches/pipeline.rs` 머리말),
+또는 `cargo run --release -p skylens-core --example bench_stages -- --json <파일>`.
 
 ### 라이브러리: 두 시점 상대 자세와 삼각측량
 
@@ -142,7 +152,8 @@ use skylens_core::rotation_averaging::{average_rotations, AveragingConfig, Relat
 let edges = vec![RelativeRotation { i: 0, j: 1, rotation: pose01.rotation, weight: 120.0 } /* ... */];
 if let Some(res) = average_rotations(num_views, &edges, &AveragingConfig::default()) {
     // res.rotations[v]: 세계→카메라 v 회전(기준 정점 = 단위 회전). 기준과 이어지지 않으면 None
-    // res.inliers[k], res.residuals_rad[k]: 간선별 정상 표시와 잔차 각(rad), 기본 이상치 문턱 5°
+    // res.inliers[k], res.residuals_rad[k]: 간선별 정상 표시와 잔차 각(rad)
+    // 이상치 문턱은 max(5°, 6 × 잔차로 추정한 잡음 σ̂) 이고 실제 값은 res.outlier_threshold_rad
 }
 // None: 정점 0개, 범위 밖 번호, 쓸 수 있는 간선 없음. NaN 회전·0 이하 가중치·자기 간선은 무시.
 ```
@@ -197,6 +208,8 @@ println!("RMS {:.3} → {:.3} px, {} 회", report.initial_rms, report.final_rms,
 `ply-info` 가 읽고 라이브러리(`skylens_core::ply`)가 쓰는 형식은 이진 little-endian PLY 다.
 쓸 때는 점마다 `x y z nx ny nz`(float32) + `red green blue`(uint8) 이다. 읽을 때는 `vertex` 원소가 첫 원소여야 하고,
 속성을 이름으로 찾으므로 순서가 달라도 되며, 법선·색이 없으면 0 으로 채운다.
+헤더에는 `format binary_little_endian 1.0` 줄이 정확히 한 번 있어야 하고, 헤더 한 줄은 4096 바이트,
+헤더 전체는 64 KiB 를 넘을 수 없다(넘으면 그 이상 읽지 않고 오류).
 
 ---
 
@@ -229,7 +242,9 @@ Requires stable Rust 1.88 or newer.
   gps.txt                    # one line per image: image name without extension (camF_0000) latitude longitude (deg) altitude (m)
 ```
 
-`synth` writes the same layout plus ground-truth cameras in `truth/cameras.txt` (one line per image: name fx fy cx cy width height, 9 entries of the world→camera R row-major, 3 entries of t).
+Names in `gps.txt` carry no extension (`camF_0000`, not `camF_0000.jpg`).
+`synth` writes the same layout plus ground-truth cameras in `truth/cameras.txt` (one line per image: name fx fy cx cy width height, 9 entries of the world→camera R row-major, 3 entries of t) and
+the ground-truth coordinate origin in `truth/origin.txt` (one line: `latitude longitude altitude`).
 
 ### Usage
 
@@ -239,12 +254,16 @@ Requires stable Rust 1.88 or newer.
 skylens-stream ply-info <file.ply>
 
 # Generate a synthetic test scene (images + GPS + ground-truth cameras; default 960×540, 3 cameras × 80 positions = 240 images)
-# width and height are integers in 16..=8192, given together or both omitted; otherwise usage and exit code 2
+# width and height are in 16..=8192, digits only (no `+20` or `-20`), given together or both omitted
+# An empty output path or invalid width/height writes nothing and prints usage with exit code 2
 # Prints the number of images written when done ("views 240"); write errors print a message and exit with code 1
 skylens-stream synth <output dir> [width height]
 
 # Print the version ("skylens-stream 0.1.0")
 skylens-stream --version
+
+# Print the usage to standard output and exit with code 0 (-h does the same)
+skylens-stream --help
 ```
 
 Running with no arguments or an unknown command prints the usage to standard error and exits with code 2.
@@ -256,6 +275,8 @@ use skylens_core::features::{detect_and_describe, DetectorConfig, GrayImage};
 
 // Err(ImageSizeError) unless the buffer length is width×height×3. Use try_from_gray / try_from_rgba for
 // other layouts. from_rgb performs the same check but panics with a message on a length mismatch.
+// For an existing f32 intensity buffer use try_from_vec(width, height, data). Fields are private;
+// read them with width(), height() and data() (an image whose length differs from width×height cannot be built).
 let img = GrayImage::try_from_rgb(width, height, &rgb_bytes)?;
 let feats = detect_and_describe(&img, &DetectorConfig::default());
 for f in &feats {
@@ -275,7 +296,7 @@ use skylens_core::matching::{PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL};
 use skylens_core::features::Feature;
 
 // Image pairs to match: views[k] = (camera index, capture position index).
-// Same camera: position gap 1..=5 plus powers of two (8, 16, 32, …); different cameras: gap 0..=4.
+// Same camera: position gap 1..=5 plus powers of two up to PAIR_POW2_MAX (16), i.e. 8 and 16; different cameras: gap 0..=4.
 let image_pairs = candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX);
 
 // ratio 0.8, mutual check. Results are in a-index order; distances are computed once, in parallel.
@@ -293,6 +314,8 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 ```
 
 Timing (detection on one 1920×1080 image, 7300×7300 matching): `cargo test --release -- --ignored --test-threads=1 --nocapture timing`
+Per-stage timing (synthetic 240 images: detection, matching, verification, rotation averaging, bundle adjustment): `cargo bench --bench pipeline -- --quick` (arguments are described at the top of `crates/core/benches/pipeline.rs`),
+or `cargo run --release -p skylens-core --example bench_stages -- --json <file>`.
 
 ### Library: two-view relative pose and triangulation
 
@@ -338,7 +361,8 @@ use skylens_core::rotation_averaging::{average_rotations, AveragingConfig, Relat
 let edges = vec![RelativeRotation { i: 0, j: 1, rotation: pose01.rotation, weight: 120.0 } /* ... */];
 if let Some(res) = average_rotations(num_views, &edges, &AveragingConfig::default()) {
     // res.rotations[v]: world→camera rotation of view v (reference view = identity), None if not connected
-    // res.inliers[k], res.residuals_rad[k]: per-edge inlier flag and residual angle (rad), default outlier threshold 5°
+    // res.inliers[k], res.residuals_rad[k]: per-edge inlier flag and residual angle (rad)
+    // the outlier threshold is max(5°, 6 × noise σ̂ estimated from residuals); the value used is res.outlier_threshold_rad
 }
 // None: zero views, out-of-range index, or no usable edge. NaN rotations, non-positive weights and self edges are ignored.
 ```
@@ -393,6 +417,8 @@ These stages are not wired into the command line yet.
 `ply-info` reads, and the library (`skylens_core::ply`) writes, binary little-endian PLY.
 Written files have `x y z nx ny nz` (float32) + `red green blue` (uint8) per point. When reading, `vertex` must be the first element;
 properties are looked up by name, so their order may differ, and missing normals or colours are filled with 0.
+The header must contain the line `format binary_little_endian 1.0` exactly once; a header line may not exceed 4096 bytes
+and the whole header may not exceed 64 KiB (reading stops there with an error).
 
 ---
 
