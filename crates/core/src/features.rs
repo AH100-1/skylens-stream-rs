@@ -1,6 +1,6 @@
 //! 다중 스케일 가우시안 차분(DoG) 극값 검출 (Lowe 2004, SPEC §3.1).
 //!
-//! 진행 상황: 검출기(부화소·부스케일 정밀화 포함)만 있다. 방향 할당·128차원 기술자는 다음 단계.
+//! 진행 상황: 검출기(부화소·부스케일 정밀화)와 방향 할당까지. 128차원 기술자는 다음 단계.
 
 /// 단일 채널 f32 영상(행 우선).
 #[derive(Clone, Debug)]
@@ -121,6 +121,65 @@ pub struct Keypoint {
     pub y: f32,
     pub sigma: f32,
     pub response: f32,
+    /// 주 방향(라디안, 영상 좌표 x→y, [0, 2π)).
+    pub angle: f32,
+}
+
+/// 방향 히스토그램 칸 수 (10° 간격).
+const ORI_BINS: usize = 36;
+
+/// 특징점 주변 기울기 방향 히스토그램에서 주 방향들을 구한다 (Lowe 2004 §5).
+///
+/// `img` 는 특징점 스케일로 흐린 영상, (x, y)·`sigma` 는 그 영상의 화소 단위.
+/// 가중치 창 σ_w = 1.5σ, 반지름 3σ_w. 36칸 히스토그램을 [1,1,1]/3 로 6번 평활하고,
+/// 최댓값의 80% 이상인 극대마다 포물선 보간한 방향을 낸다.
+pub fn dominant_orientations(img: &GrayImage, x: f32, y: f32, sigma: f32) -> Vec<f32> {
+    let sw = 1.5 * sigma;
+    let r = (3.0 * sw).round() as isize;
+    let (xi, yi) = (x.round() as isize, y.round() as isize);
+    let (w, h) = (img.width as isize, img.height as isize);
+    let mut hist = [0f32; ORI_BINS];
+    let two_pi = std::f32::consts::TAU;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let (px, py) = (xi + dx, yi + dy);
+            if px < 1 || py < 1 || px >= w - 1 || py >= h - 1 {
+                continue;
+            }
+            let (ux, uy) = (px as usize, py as usize);
+            let gx = img.at(ux + 1, uy) - img.at(ux - 1, uy);
+            let gy = img.at(ux, uy + 1) - img.at(ux, uy - 1);
+            let (fx, fy) = (px as f32 - x, py as f32 - y);
+            let wgt = (-(fx * fx + fy * fy) / (2.0 * sw * sw)).exp();
+            let ang = gy.atan2(gx).rem_euclid(two_pi);
+            let bin = ((ang / two_pi * ORI_BINS as f32).round() as usize) % ORI_BINS;
+            hist[bin] += wgt * (gx * gx + gy * gy).sqrt();
+        }
+    }
+    for _ in 0..6 {
+        let prev = hist;
+        for i in 0..ORI_BINS {
+            hist[i] =
+                (prev[(i + ORI_BINS - 1) % ORI_BINS] + prev[i] + prev[(i + 1) % ORI_BINS]) / 3.0;
+        }
+    }
+    let max = hist.iter().cloned().fold(0.0, f32::max);
+    if max <= 0.0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..ORI_BINS {
+        let (l, c, rr) = (
+            hist[(i + ORI_BINS - 1) % ORI_BINS],
+            hist[i],
+            hist[(i + 1) % ORI_BINS],
+        );
+        if c >= 0.8 * max && c > l && c > rr {
+            let off = 0.5 * (l - rr) / (l - 2.0 * c + rr);
+            out.push(((i as f32 + off) / ORI_BINS as f32 * two_pi).rem_euclid(two_pi));
+        }
+    }
+    out
 }
 
 /// 부화소·부스케일로 정밀화한 극값.
@@ -277,12 +336,16 @@ pub fn detect(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Keypoint> {
                     if det <= 0.0 || tr * tr / det >= edge_thr {
                         continue;
                     }
-                    out.push(Keypoint {
-                        x: r.x * scale,
-                        y: r.y * scale,
-                        sigma: cfg.sigma0 * kstep.powf(r.s) * scale,
-                        response: r.value,
-                    });
+                    let sig_oct = cfg.sigma0 * kstep.powf(r.s);
+                    for angle in dominant_orientations(&gauss[r.layer], r.x, r.y, sig_oct) {
+                        out.push(Keypoint {
+                            x: r.x * scale,
+                            y: r.y * scale,
+                            sigma: sig_oct * scale,
+                            response: r.value,
+                            angle,
+                        });
+                    }
                 }
             }
         }
@@ -352,6 +415,41 @@ mod tests {
             eprintln!("subpixel ({cx},{cy}) err={err:.3}");
             assert!(err < 0.1, "부화소 오차 {err}");
         }
+    }
+
+    fn angle_diff(a: f32, b: f32) -> f32 {
+        let d = (a - b).rem_euclid(std::f32::consts::TAU);
+        d.min(std::f32::consts::TAU - d)
+    }
+
+    #[test]
+    fn orientation_follows_rotation() {
+        // 밝기가 θ 방향으로 증가하는 경사면 + 무관한 덩어리 → 주 방향 ≈ θ.
+        let mut worst = 0f32;
+        for k in 0..12 {
+            let th = k as f32 * 30f32.to_radians() + 0.1;
+            let (cx, cy) = (64.0f32, 64.0f32);
+            let mut img = blob(128, 128, cx, cy, 6.0);
+            for y in 0..128 {
+                for x in 0..128 {
+                    let t = (x as f32 - cx) * th.cos() + (y as f32 - cy) * th.sin();
+                    img.data[y * 128 + x] += 0.02 * t;
+                }
+            }
+            let g = gaussian_blur(&img, 2.0);
+            let oris = dominant_orientations(&g, cx, cy, 4.0);
+            let best = oris
+                .iter()
+                .map(|&a| angle_diff(a, th))
+                .fold(f32::INFINITY, f32::min);
+            worst = worst.max(best);
+        }
+        eprintln!("orientation worst err={:.2} deg", worst.to_degrees());
+        assert!(
+            worst.to_degrees() < 3.0,
+            "방향 오차 {}°",
+            worst.to_degrees()
+        );
     }
 
     #[test]
