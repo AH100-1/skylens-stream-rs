@@ -6,13 +6,18 @@ use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
 
 const USAGE: &str = "사용법:\n  skylens-stream ply-info <파일.ply>\n  skylens-stream synth <출력 폴더> [폭 높이]\n  \
-     (폭·높이는 16..=8192 정수, 둘 다 주거나 둘 다 생략)";
+     skylens-stream --version\n  skylens-stream --help\n  \
+     (출력 폴더는 빈 문자열 불가, 폭·높이는 16..=8192 의 숫자만(부호 불가), 둘 다 주거나 둘 다 생략)";
 
 /// 합성 영상 폭·높이 하한(특징 검출 최소 크기)과 상한.
 const MIN_SIDE: u32 = 16;
 const MAX_SIDE: u32 = 8192;
 
+/// 폭·높이 해석: ASCII 숫자만 허용(`+20`·`-20`·공백 거부), 범위 밖은 `None`.
 fn parse_side(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     s.parse::<u32>()
         .ok()
         .filter(|v| (MIN_SIDE..=MAX_SIDE).contains(v))
@@ -43,6 +48,9 @@ fn main() -> ExitCode {
             }
         },
         ["synth", out, rest @ ..] => {
+            if out.is_empty() {
+                return usage_error("synth 출력 폴더가 빈 문자열임");
+            }
             let mut cfg = SceneConfig::default();
             match rest {
                 [] => {}
@@ -72,6 +80,10 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        ["--help" | "-h"] => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
         }
         ["--version"] => {
             println!("skylens-stream {}", env!("CARGO_PKG_VERSION"));
