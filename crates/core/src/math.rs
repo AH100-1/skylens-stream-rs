@@ -1,6 +1,8 @@
 //! 공용 수학 타입과 보조 함수.
 
-pub use nalgebra::{Matrix3, Point3, Rotation3, UnitQuaternion, Vector2, Vector3};
+pub use nalgebra::{
+    Matrix2, Matrix3, Point3, Rotation3, SMatrix, UnitQuaternion, Vector2, Vector3,
+};
 
 /// 벡터 a 에 대한 반대칭 행렬 [a]_x (a × b = [a]_x b).
 pub fn skew(a: &Vector3<f64>) -> Matrix3<f64> {
