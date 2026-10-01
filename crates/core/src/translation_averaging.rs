@@ -239,10 +239,8 @@ fn constrained_ls(m: usize, edges: &[Edge], w: &[f64]) -> Option<Vec<Vector3<f64
         total += 1.0;
     }
     b[dim - 1] = total;
-    // 작은 정칙화(성분 내 수치 안정).
-    for k in 0..dim - 1 {
-        a[(k, k)] += 1e-9;
-    }
+    // 게이지(c_0 = 0)와 축척 제약으로 해가 하나로 정해지므로 정칙화는 넣지 않는다
+    // (대각에 작은 값을 더하면 해가 원점 쪽으로 끌려 무잡음에서도 1e-4 m 수준의 편향이 남는다).
     let sol = a.lu().solve(&b)?;
     Some(
         (0..m)
@@ -254,40 +252,42 @@ fn constrained_ls(m: usize, edges: &[Edge], w: &[f64]) -> Option<Vec<Vector3<f64
     )
 }
 
-/// 가중 라플라스 연립 L c = rhs (c_0 = 0) 을 푼다.
-fn laplacian_solve(m: usize, edges: &[Edge], w: &[f64], s: &[f64]) -> Option<Vec<Vector3<f64>>> {
-    let dim = m - 1;
-    let mut l = DMatrix::<f64>::zeros(dim, dim);
-    let mut rhs = DMatrix::<f64>::zeros(dim, 3);
-    for ((e, &we), &se) in edges.iter().zip(w).zip(s) {
-        let t = e.d * se * we;
-        let (i, j) = (e.i.checked_sub(1), e.j.checked_sub(1));
-        if let Some(i) = i {
-            l[(i, i)] += we;
-            for r in 0..3 {
-                rhs[(i, r)] += t[r];
+/// 고정 가중치에서 min Σ w |c_i − c_j − s d|² 를 c 와 s 에 대해 함께 푼다(c_0 = 0).
+/// `clamped` 간선은 s = 1 로 고정(항 w|c_i − c_j − d|²), 나머지는 s 를 소거해 w|(I − d dᵀ)(c_i − c_j)|².
+fn joint_solve(m: usize, edges: &[Edge], w: &[f64], clamped: &[bool]) -> Option<Vec<Vector3<f64>>> {
+    let dim = 3 * (m - 1);
+    let mut a = DMatrix::<f64>::zeros(dim, dim);
+    let mut b = DVector::<f64>::zeros(dim);
+    let col = |v: usize| (v > 0).then(|| 3 * (v - 1));
+    for ((e, &we), &cl) in edges.iter().zip(w).zip(clamped) {
+        let p = if cl {
+            Matrix3::identity() * we
+        } else {
+            (Matrix3::identity() - e.d * e.d.transpose()) * we
+        };
+        let (ci, cj) = (col(e.i), col(e.j));
+        for (x, sx) in [(ci, 1.0), (cj, -1.0)] {
+            if let Some(x) = x {
+                for (y, sy) in [(ci, 1.0), (cj, -1.0)] {
+                    if let Some(y) = y {
+                        let mut blk = a.view_mut((x, y), (3, 3));
+                        blk += p * (sx * sy);
+                    }
+                }
+                if cl {
+                    for r in 0..3 {
+                        b[x + r] += sx * we * e.d[r];
+                    }
+                }
             }
-        }
-        if let Some(j) = j {
-            l[(j, j)] += we;
-            for r in 0..3 {
-                rhs[(j, r)] -= t[r];
-            }
-        }
-        if let (Some(i), Some(j)) = (i, j) {
-            l[(i, j)] -= we;
-            l[(j, i)] -= we;
         }
     }
-    let sol = l.cholesky()?.solve(&rhs);
+    let sol = a.lu().solve(&b)?;
     Some(
         (0..m)
-            .map(|v| {
-                if v == 0 {
-                    Vector3::zeros()
-                } else {
-                    Vector3::new(sol[(v - 1, 0)], sol[(v - 1, 1)], sol[(v - 1, 2)])
-                }
+            .map(|v| match col(v) {
+                Some(x) => Vector3::new(sol[x], sol[x + 1], sol[x + 2]),
+                None => Vector3::zeros(),
             })
             .collect(),
     )
@@ -433,7 +433,23 @@ pub fn average_translations(
                     e.w / r.max(1e-3 * se)
                 })
                 .collect();
-            match laplacian_solve(m, &ledges, &w, &s) {
+            // s 와 c 를 함께 푼다(교대 갱신은 80칸 사슬에서 수렴이 매우 느리다).
+            // 하한 s ≥ 1 에 걸린 간선만 s = 1 로 고정하고, 나머지는 s 를 소거한 사영 항으로 둔다.
+            let mut clamped: Vec<bool> = ledges
+                .iter()
+                .map(|e| e.d.dot(&(cc[e.i] - cc[e.j])) < 1.0)
+                .collect();
+            if !clamped.iter().any(|&b| b) {
+                // 축척 게이지: 가장 짧은 간선 하나는 고정한다.
+                if let Some(k) = (0..ledges.len()).min_by(|&a, &b| {
+                    let la = ledges[a].d.dot(&(cc[ledges[a].i] - cc[ledges[a].j]));
+                    let lb = ledges[b].d.dot(&(cc[ledges[b].i] - cc[ledges[b].j]));
+                    la.total_cmp(&lb)
+                }) {
+                    clamped[k] = true;
+                }
+            }
+            match joint_solve(m, &ledges, &w, &clamped) {
                 Some(next) => cc = next,
                 None => break,
             }
@@ -659,7 +675,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "미해결: 끝 정점 등록·축척 수렴 (239/240, 중심 오차 수 m)"]
     fn noiseless_exact() {
         let case = Case {
             noise_deg: 0.0,
@@ -676,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "미해결: 끝 정점 등록·축척 수렴 (239/240, 중심 오차 수 m)"]
+    #[ignore = "미해결: F 줄 끝(위치 74~79)이 같은 줄 간선뿐이라 위치가 정해지지 않음, 중심 RMS 1.8 m"]
     fn noisy_outliers_register_all_seeds() {
         for (frac, rms_lim, max_lim) in [(0.10, 0.15, 0.5), (0.20, 0.15, 0.5)] {
             for seed in 1..=5u64 {
@@ -697,7 +712,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "미해결: 끝 정점 등록·축척 수렴 (239/240, 중심 오차 수 m)"]
     fn rotation_inconsistent_pairs_are_dropped() {
         let case = Case {
             noise_deg: 1.0,
@@ -747,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "미해결: 끝 정점 등록·축척 수렴 (239/240, 중심 오차 수 m)"]
+    #[ignore = "미해결: F 줄 끝(위치 74~79)이 같은 줄 간선뿐이라 위치가 정해지지 않음, 중심 RMS 1.8 m"]
     fn rough_model_from_averaged_poses() {
         let case = Case {
             noise_deg: 1.0,
