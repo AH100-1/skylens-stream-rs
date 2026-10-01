@@ -11,7 +11,7 @@
 새 구역이 들어올 때마다 빠른 초벌 점군을 먼저 보여 주고, 정밀 계산이 끝난 구역은 정밀본으로 바꿔 끼운다.
 화면에는 단계마다 "이전 구역은 정밀본 + 최신 구역은 초벌" 점군이 나간다.
 
-> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth` 만 있고, 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정)를 묶어 만들어 가는 중이다.
+> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth` 만 있고, 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정 → 밀집 준비·융합 → 점진 스트림)를 묶어 만들어 가는 중이다.
 
 ### 설치
 
@@ -174,6 +174,24 @@ println!("RMS {:.3} → {:.3} px, {} 회", report.initial_rms, report.final_rms,
 `max_iterations = 0` 이면 비용만 평가하고(`report.refined = false`), 1 이상이면 고친다.
 `report` 에는 그 밖에 쓴 카메라·트랙·관측 수, 처음·마지막 비용, 수렴 여부가 있다.
 
+### 라이브러리: 밀집 준비·융합·점진 스트림
+
+명령행에는 아직 묶여 있지 않은 단계들이다.
+
+- `skylens_core::undistort`: `undistort_to_long_side(&img, &k, long_side)` 가 왜곡 있는 사진을 긴 변 `long_side` 화소의 핀홀 사진과 새 `Intrinsics` 로 바꾼다(원본 밖 화소는 0, 쌍선형 보간).
+- `skylens_core::view_selection`: `select_neighbors(&views, &points, k)` 가 희소 점을 함께 본 사진들 가운데 사진마다 이웃 최대 k 장(기본 `DEFAULT_NEIGHBORS` = 8)을 고르고, `depth_range(&view, &points)` 가 깊이 탐색 범위를 준다.
+- `skylens_core::fusion`: `fuse(&views, &depth_maps, FusionConfig)` 가 사진별 깊이 맵을 왕복 재투영 검사로 합쳐 `PointCloud` 를 만든다(동의 사진 수 `min_views` 이상).
+- `skylens_core::stream`: `split_regions(위치 수, span, overlap)` 로 구역을 나누고, `align_region` 으로 초벌 구역을 정밀본에 닮음 변환 정렬, `build_snapshots` 로 단계별 점군("이전 구역 정밀본 + 최신 구역 초벌")을 만든 뒤 `write_outputs(출력 폴더, ...)` 가 다음을 쓴다.
+
+```
+<출력>/
+  preview/preview_00_pos0-14.ply ...   # 구역별 초벌 (pos<시작>-<끝, 끝 미포함>)
+  refined/refined_00_pos0-14.ply ...   # 구역별 정밀본
+  snapshots/step_01_1regions.ply ...   # 단계별 화면용 점군
+  snapshots/step_final_all_refined.ply
+  snapshots/manifest.json              # 단계별 점 수, 정렬 수치
+```
+
 ### PLY 형식
 
 `ply-info` 가 읽고 라이브러리(`skylens_core::ply`)가 쓰는 형식은 이진 little-endian PLY 다.
@@ -189,7 +207,7 @@ A Rust tool that builds a **progressively refined 3D point cloud** from drone-fo
 Each time a new region arrives, a fast preview cloud is shown first; once the accurate solve for a region finishes, its preview is swapped for the refined cloud.
 At every step the output is "refined clouds for earlier regions + preview for the newest region".
 
-> Work in progress. The command-line tool currently has only `ply-info` and `synth`; the progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment).
+> Work in progress. The command-line tool currently has only `ply-info` and `synth`; the progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment → dense preparation and fusion → progressive stream).
 
 ### Build
 
@@ -351,6 +369,24 @@ For a per-group mask set `free_intrinsics[g]` (when empty, `default_free_intrins
 Only `max_tracks` points are used, those with the most observations first (ties by index); unselected points are left unchanged.
 With `max_iterations = 0` the cost is only evaluated (`report.refined = false`); with 1 or more the problem is refined.
 `report` also holds the numbers of cameras, tracks and observations used, the initial and final cost, and whether it converged.
+
+### Library: dense preparation, fusion and progressive stream
+
+These stages are not wired into the command line yet.
+
+- `skylens_core::undistort`: `undistort_to_long_side(&img, &k, long_side)` turns a distorted image into a pinhole image whose long side is `long_side` pixels, plus the new `Intrinsics` (pixels outside the source are 0, bilinear interpolation).
+- `skylens_core::view_selection`: `select_neighbors(&views, &points, k)` picks up to k neighbours per image among the images that share sparse points (default `DEFAULT_NEIGHBORS` = 8), and `depth_range(&view, &points)` gives the depth search range.
+- `skylens_core::fusion`: `fuse(&views, &depth_maps, FusionConfig)` merges per-image depth maps with a round-trip reprojection check into a `PointCloud` (at least `min_views` agreeing images).
+- `skylens_core::stream`: `split_regions(positions, span, overlap)` splits regions, `align_region` aligns a preview region to the refined clouds with a similarity transform, `build_snapshots` builds the per-step clouds ("refined earlier regions + preview of the newest region"), and `write_outputs(output dir, ...)` writes:
+
+```
+<output>/
+  preview/preview_00_pos0-14.ply ...   # per-region preview (pos<start>-<end, exclusive>)
+  refined/refined_00_pos0-14.ply ...   # per-region refined cloud
+  snapshots/step_01_1regions.ply ...   # per-step clouds for display
+  snapshots/step_final_all_refined.ply
+  snapshots/manifest.json              # point counts per step, alignment figures
+```
 
 ### PLY format
 
