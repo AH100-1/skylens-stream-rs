@@ -821,9 +821,11 @@ pub fn ransac_essential_candidates(
         }
         // 평면 장면: 정상 짝 대부분이 한 호모그래피로 설명되면 그 호모그래피에서 벗어난 짝을 뺀다.
         // 에피폴라 문턱(1차원 제약) 안에 우연히 든 이상치가 평면의 얕은 골짜기를 크게 기울이기 때문이다.
+        let mut planar = false;
         if let Some(hm) = planar_inliers(n1, n2, &inl, PLANAR_TRANSFER_FACTOR * th, cfg.seed) {
             let (hc, ec) = (count(&hm), count(&inl));
-            if hm != inl && hc as f64 >= PLANAR_MIN_SHARE * ec as f64 {
+            planar = hc as f64 >= PLANAR_MIN_SHARE * ec as f64;
+            if hm != inl && planar {
                 let s1: Vec<_> = (0..n).filter(|&i| hm[i]).map(|i| n1[i]).collect();
                 let s2: Vec<_> = (0..n).filter(|&i| hm[i]).map(|i| n2[i]).collect();
                 if let Some(pose) = recover_pose(&e, &s1, &s2).filter(|p| p.translation_observable)
@@ -845,6 +847,28 @@ pub fn ransac_essential_candidates(
                         rt = refine_pose(&r, &t, &s1, &s2, 30);
                     }
                     e = essential_from_pose(&rt.0, &rt.1);
+                    inl = inliers_of(&e);
+                }
+            }
+        }
+        // 비평면: 최소 표본 가설에서 시작한 정밀화는 국소 최소에 갇힐 수 있어(정상 집합이 맞아도 회전 0.4° 초과)
+        // 정상 집합 전체로 다중 시작 정밀화를 한 번 더 하고 비용이 줄면 받는다. 평면은 다중 시작이 쌍둥이를
+        // 한 해로 합치므로 하지 않는다.
+        if !planar {
+            let s1: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| n1[i]).collect();
+            let s2: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| n2[i]).collect();
+            let sc = |e: &Matrix3<f64>| -> f64 {
+                s1.iter()
+                    .zip(&s2)
+                    .map(|(a, b)| sampson_residual(e, a, b).powi(2))
+                    .sum()
+            };
+            if let Some(p) =
+                refine_relative_pose(&e, &s1, &s2, 30).filter(|p| p.translation_observable)
+            {
+                let g = essential_from_pose(&p.rotation, &p.translation);
+                if sc(&g) < sc(&e) {
+                    e = g;
                     inl = inliers_of(&e);
                 }
             }
@@ -892,6 +916,73 @@ pub fn ransac_essential_candidates(
         .map(|k| (k.0, k.1))
         .collect()
 }
+
+/// 두 시점 짝의 자세 신뢰도.
+#[derive(Clone, Copy, Debug)]
+pub struct PairReliability {
+    /// 정상 짝의 회전 보정 광선 사이 각(시차) 중앙값(도). 삼각측량 각과 같은 크기다.
+    pub parallax_deg: f64,
+    /// 회전이 다른 다음 후보의 MSAC 비용 / 첫 후보의 MSAC 비용(후보가 하나면 무한대).
+    pub cost_ratio: f64,
+    /// 시차와 비용 차가 모두 문턱 이상이면 true. false 인 짝의 이동 방향은 회전·위치 평균에 넣지 않는다.
+    pub reliable: bool,
+}
+
+/// [`ransac_essential_candidates`] 의 후보 목록으로 첫 후보 자세를 믿을 수 있는지 판정한다.
+///
+/// 짧은 기선(실측 편대 위치 1칸: 기선 1.0 m, 거리 약 35 m, 시차 약 1.5°)에서는 이동 방향이 90° 다른 해가
+/// 정답과 거의 같은 비용으로 대응을 설명해 첫 후보가 그쪽일 수 있다. 시차가 `MIN_PARALLAX_DEG` 미만이거나
+/// 다음 후보와의 비용 비가 `MIN_COST_RATIO` 미만이면 신뢰 불가로 표시한다. 후보가 없으면 None.
+pub fn assess_pair(
+    cands: &[(Matrix3<f64>, Vec<bool>)],
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    focal_px: f64,
+    cfg: &RansacConfig,
+) -> Option<PairReliability> {
+    let (e, inl) = cands.first()?;
+    let n = n1.len();
+    if inl.len() != n || n2.len() != n {
+        return None;
+    }
+    let s1: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| n1[i]).collect();
+    let s2: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| n2[i]).collect();
+    let pose = recover_pose(e, &s1, &s2)?;
+    let ray = |v: &Vector2<f64>| Vector3::new(v.x, v.y, 1.0).normalize();
+    let parallax_deg = median(
+        s1.iter()
+            .zip(&s2)
+            .map(|(a, b)| angle_between(&(pose.rotation * ray(a)), &ray(b)))
+            .collect(),
+    )
+    .to_degrees();
+    let th = cfg.threshold_px / focal_px;
+    let msac = |e: &Matrix3<f64>| -> f64 {
+        (0..n)
+            .map(|i| sampson_residual(e, &n1[i], &n2[i]).powi(2).min(th * th))
+            .sum()
+    };
+    let first = msac(e);
+    let cost_ratio = cands[1..]
+        .iter()
+        .map(|c| msac(&c.0) / first.max(1e-300))
+        .fold(f64::INFINITY, f64::min);
+    let reliable = pose.translation_observable
+        && parallax_deg >= MIN_PARALLAX_DEG
+        && cost_ratio >= MIN_COST_RATIO;
+    Some(PairReliability {
+        parallax_deg,
+        cost_ratio,
+        reliable,
+    })
+}
+
+/// [`assess_pair`] 의 최소 시차(도). 실측 편대 위치 1칸(기하 시차 약 1.5°)의 맞는 해는 1.48~1.63°,
+/// 이동 방향이 90° 틀린 해는 회전이 시차를 흡수해 0.24~0.46° 로 재진다(시드 1~3 × F/R/L).
+pub const MIN_PARALLAX_DEG: f64 = 1.0;
+
+/// [`assess_pair`] 의 최소 비용 비(다음 후보 / 첫 후보). 1 미만이면 다른 후보가 대응을 더 잘 설명한다.
+pub const MIN_COST_RATIO: f64 = 1.0;
 
 /// 후보끼리 이 회전 차(도) 안이면 같은 해로 본다. 평면 쌍둥이의 회전 차는 시험 장면(기선/깊이 0.075)에서
 /// 4.4° 이고, 같은 골짜기의 두 해는 평면 하한(0.43°) 정도 떨어진다.
@@ -1167,11 +1258,11 @@ mod tests {
                     .find(|v| v.cam == cam && v.position == pos)
                     .unwrap()
             };
-            // 기준: 시드 1~3 × F/R/L 측정 최대(간격 3·6: 회전 0.069°, 이동 방향 0.329°)의 약 2 배.
-            // 예전 기준(간격 1·3, 0.06°·0.4°)은 위치 간 2.5 m 배치 값이었다. 실측 배치의 간격 1
-            // (기선 1.0 m, 삼각측량 각 약 1.4°)은 7 경우 중 2 경우(시드 1 F, 시드 3 R)가 회전 약 2°·
-            // 이동 방향 약 90° 의 다른 해로 떨어져 정확도 기준을 둘 수 없다 — 연구 노트의 남은 문제.
-            for (step, max_rot, max_dir) in [(3usize, 0.15, 0.7), (6, 0.15, 0.7)] {
+            // 기준: 간격 3·6 은 시드 1~3 × F/R/L 측정 최대(회전 0.069°, 이동 방향 0.47°)에 여유를 둔 0.15°·0.7°.
+            // 간격 1(기선 1.0 m, 삼각측량 각 약 1.5°)은 9 경우 중 2 경우(시드 1 F, 시드 3 R)가 회전 약 2°·
+            // 이동 방향 약 90° 의 다른 해로 떨어진다. 그 해는 `assess_pair` 가 신뢰 불가로 표시해야 하고
+            // 나머지는 회전 < 0.15°·이동 방향 < 2°(F-114 확인 기준)여야 한다.
+            for (step, max_rot, max_dir) in [(1usize, 0.15, 2.0), (3, 0.15, 0.7), (6, 0.15, 0.7)] {
                 let (va, vb) = (view(0), view(step));
                 let (ia, _) = scene.render(va);
                 let (ib, _) = scene.render(vb);
@@ -1187,7 +1278,10 @@ mod tests {
                 let (ka, kb) = (&va.camera.intrinsics, &vb.camera.intrinsics);
                 let a1: Vec<_> = x1.iter().map(|p| ka.to_normalized(p)).collect();
                 let a2: Vec<_> = x2.iter().map(|p| kb.to_normalized(p)).collect();
-                let (e, inl) = ransac_essential(&a1, &a2, ka.fx, &RansacConfig::default()).unwrap();
+                let rcfg = RansacConfig::default();
+                let cands = ransac_essential_candidates(&a1, &a2, ka.fx, &rcfg);
+                let rel = assess_pair(&cands, &a1, &a2, ka.fx, &rcfg).unwrap();
+                let (e, inl) = cands[0].clone();
                 let sel = |x: &[Vector2<f64>]| -> Vec<Vector2<f64>> {
                     x.iter()
                         .zip(&inl)
@@ -1204,9 +1298,18 @@ mod tests {
                 let dir_err = tr.angle(&t.normalize()).to_degrees();
                 let front = rp.in_front.iter().filter(|&&b| b).count() as f64 / n1.len() as f64;
                 eprintln!(
-                "render seed={seed} cam={cam:?} step={step} inliers={} rot_err={rot_err:.4} deg dir_err={dir_err:.3} deg front={front:.3}",
-                n1.len()
-            );
+                    "render seed={seed} cam={cam:?} step={step} inliers={} rot_err={rot_err:.4} deg dir_err={dir_err:.3} deg front={front:.3} cands={} parallax={:.3} ratio={:.3} reliable={}",
+                    n1.len(), cands.len(), rel.parallax_deg, rel.cost_ratio, rel.reliable
+                );
+                // F-114: 간격 1 은 맞는 해이거나 신뢰 불가로 표시되어야 한다(틀린 해를 믿을 수 있다고 내보내지 않는다).
+                if step == 1 {
+                    assert!(
+                        (rot_err < max_rot && dir_err < max_dir) || !rel.reliable,
+                        "간격 1 틀린 해가 신뢰 가능으로 표시됨: 회전 {rot_err}° 방향 {dir_err}°"
+                    );
+                    continue;
+                }
+                assert!(rel.reliable, "간격 {step} 신뢰 불가 판정");
                 assert!(rot_err < max_rot, "회전 오차 {rot_err} 도");
                 assert!(dir_err < max_dir, "이동 방향 오차 {dir_err} 도");
                 assert!(front > 0.95, "앞쪽 비율 {front}");
