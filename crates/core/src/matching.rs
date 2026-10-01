@@ -3,6 +3,32 @@
 use crate::features::Feature;
 use nalgebra::{Matrix3, SMatrix, Vector2, Vector3};
 
+/// 매칭할 영상 짝 후보를 만든다. `views[k] = (카메라 번호, 촬영 위치 번호)`.
+/// 같은 카메라는 위치 차이 1..=`temporal`, 다른 카메라는 위치 차이 0..=`cross` 인 짝.
+/// 결과 (i, j) 는 i < j, 중복 없음, 정렬됨.
+pub fn candidate_pairs(
+    views: &[(usize, usize)],
+    temporal: usize,
+    cross: usize,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for i in 0..views.len() {
+        for j in i + 1..views.len() {
+            let ((ca, pa), (cb, pb)) = (views[i], views[j]);
+            let d = pa.abs_diff(pb);
+            let ok = if ca == cb {
+                d >= 1 && d <= temporal
+            } else {
+                d <= cross
+            };
+            if ok {
+                out.push((i, j));
+            }
+        }
+    }
+    out
+}
+
 /// 최근접/차근접 거리 비율 검사 매칭(L2, 전수 탐색). 결과는 (a 인덱스, b 인덱스).
 /// `mutual` 이면 b→a 최근접도 같은 짝인 것만 남긴다.
 pub fn ratio_match(a: &[Feature], b: &[Feature], ratio: f32, mutual: bool) -> Vec<(usize, usize)> {
@@ -348,6 +374,85 @@ mod tests {
             assert!(prec >= 0.97, "정밀도 {prec}");
             assert!(rec >= 0.98, "재현율 {rec}");
             assert!(rms(&f) < 0.6, "Sampson RMS {}", rms(&f));
+        }
+    }
+
+    #[test]
+    fn candidate_pairs_counts() {
+        // 카메라 3대 × 위치 10개.
+        let views: Vec<(usize, usize)> =
+            (0..10).flat_map(|p| (0..3).map(move |c| (c, p))).collect();
+        let pairs = candidate_pairs(&views, 2, 1);
+        // 같은 카메라: 카메라마다 (9 + 8) 짝 → 51. 다른 카메라: 위치 차 0 → 10×3, 차 1 → 9×6 → 84.
+        assert_eq!(pairs.len(), 51 + 84);
+        assert!(pairs.iter().all(|&(i, j)| i < j));
+        let (ca, pa) = views[pairs[0].0];
+        assert_eq!((ca, pa), (0, 0));
+    }
+
+    /// 합성 드론 장면 같은 카메라 두 장: 특징 → 비율 매칭 → RANSAC.
+    /// 정답 깊이로 각 짝의 참·거짓을 판정해 (RANSAC 전 정답 비율, 후 정밀도, 재현율, 정상 수).
+    fn scene_pair(step: usize) -> (f64, f64, f64, usize) {
+        use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
+        use crate::synth::{Scene, SceneConfig};
+        let (w, h) = (480usize, 270usize);
+        let scene = Scene::new(SceneConfig {
+            width: w as u32,
+            height: h as u32,
+            ..SceneConfig::default()
+        });
+        let va = &scene.views[0];
+        let vb = scene
+            .views
+            .iter()
+            .find(|v| v.cam == va.cam && v.position == va.position + step)
+            .unwrap();
+        let (ia, da) = scene.render(va);
+        let (ib, _) = scene.render(vb);
+        let cfg = DetectorConfig::default();
+        let fa = detect_and_describe(&GrayImage::from_rgb(w, h, &ia.data), &cfg);
+        let fb = detect_and_describe(&GrayImage::from_rgb(w, h, &ib.data), &cfg);
+        let m = ratio_match(&fa, &fb, 0.8, true);
+        let px = |f: &Feature| Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
+        let x1: Vec<_> = m.iter().map(|&(i, _)| px(&fa[i])).collect();
+        let x2: Vec<_> = m.iter().map(|&(_, j)| px(&fb[j])).collect();
+        let truth: Vec<bool> = m
+            .iter()
+            .zip(&x2)
+            .map(|(&(i, _), q)| {
+                let k = &fa[i].kp;
+                let z =
+                    da[(k.y.round() as usize).min(h - 1) * w + (k.x.round() as usize).min(w - 1)];
+                z.is_finite()
+                    && vb
+                        .camera
+                        .project(&va.camera.unproject(&px(&fa[i]), z as f64))
+                        .is_some_and(|e| (e - q).norm() < 2.0)
+            })
+            .collect();
+        let (_, inl) = ransac_fundamental(&x1, &x2, &RansacConfig::default()).unwrap();
+        let n = m.len();
+        let pos = truth.iter().filter(|&&t| t).count();
+        let tp = (0..n).filter(|&i| inl[i] && truth[i]).count();
+        let ni = inl.iter().filter(|&&b| b).count();
+        (
+            pos as f64 / n as f64,
+            tp as f64 / ni as f64,
+            tp as f64 / pos as f64,
+            ni,
+        )
+    }
+
+    #[test]
+    fn ransac_on_synthetic_drone_views() {
+        for step in [1usize, 3] {
+            let (before, prec, rec, ni) = scene_pair(step);
+            eprintln!(
+                "scene step={step} correct_before={before:.3} precision={prec:.3} recall={rec:.3} inliers={ni}"
+            );
+            assert!(ni >= 250, "정상 수 {ni}");
+            assert!(prec >= 0.98, "정밀도 {prec}");
+            assert!(rec >= 0.98, "재현율 {rec}");
         }
     }
 
