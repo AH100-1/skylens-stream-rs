@@ -189,6 +189,9 @@ impl Default for DetectorConfig {
 
 /// 특징점: 원본 영상 좌표, 스케일(σ), DoG 응답.
 ///
+/// `x, y` 는 카메라 모형(`camera`)과 같은 연속 좌표다: 화소 (i, j) 의 중심이
+/// (i + 0.5, j + 0.5). 따라서 `Intrinsics::to_normalized` 에 보정 없이 넣는다.
+///
 /// σ 는 극값이 난 DoG 층 D = G(kσ) − G(σ) 의 아래쪽 가우시안 σ 다.
 /// 반지름 σ_b 인 가우시안 덩어리에서는 σ ≈ σ_b·k^(-1/2) 로 나온다.
 #[derive(Clone, Copy, Debug)]
@@ -404,13 +407,14 @@ pub struct Feature {
 /// 주 방향으로 돌린 4×4 칸(칸 너비 3σ), 칸마다 8방향 히스토그램.
 /// 가우시안 가중(σ = 칸 2개 = 창 너비의 절반), 위치 2축·방향 1축 삼선형 보간.
 /// 단위 길이로 정규화 → 0.2 로 자르기 → 다시 정규화.
+/// `x, y` 는 [`Keypoint`] 와 같은 연속 좌표(화소 중심 = 번호 + 0.5).
 pub fn describe(img: &GrayImage, x: f32, y: f32, sigma: f32, angle: f32) -> [f32; DESC_LEN] {
     describe_with(
         img.width,
         img.height,
         |ux, uy| pixel_grad(img, ux, uy),
-        x,
-        y,
+        x - 0.5,
+        y - 0.5,
         sigma,
         angle,
     )
@@ -589,8 +593,10 @@ pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature
                         for angle in orientations_with(w, h, grad, r.x, r.y, sig_oct) {
                             out.push(Feature {
                                 kp: Keypoint {
-                                    x: r.x * scale,
-                                    y: r.y * scale,
+                                    // 옥타브 표본 i 는 원본 화소 i·2^o (downsample 이
+                                    // 짝수 화소를 고름) 의 중심 → 연속 좌표 + 0.5.
+                                    x: r.x * scale + 0.5,
+                                    y: r.y * scale + 0.5,
                                     sigma: sig_oct * scale,
                                     response: r.value,
                                     angle,
@@ -651,12 +657,13 @@ mod image_buffer_tests {
 mod tests {
     use super::*;
 
-    /// 중심 (cx,cy), 표준편차 s 인 밝은 가우시안 덩어리.
+    /// 연속 좌표 중심 (cx,cy), 표준편차 s 인 밝은 가우시안 덩어리.
+    /// 카메라 규약대로 화소 (x, y) 의 값은 그 중심 (x + 0.5, y + 0.5) 에서 잰다.
     fn blob(w: usize, h: usize, cx: f32, cy: f32, s: f32) -> GrayImage {
         let mut img = GrayImage::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                let r2 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
+                let r2 = (x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2);
                 img.data[y * w + x] = 0.2 + 0.6 * (-r2 / (2.0 * s * s)).exp();
             }
         }
@@ -708,6 +715,66 @@ mod tests {
         }
     }
 
+    /// 카메라 규약(화소 중심 = 번호 + 0.5)으로 렌더한 덩어리 격자의 정답 중심과
+    /// 검출 위치를 보정 없이 비교한다. 규약이 반 화소 어긋나면 평균 치우침이
+    /// 성분마다 0.5 px 로 나오므로 0.05 px(어긋남의 1/10) 를 기준으로 둔다.
+    /// 개별 오차 기준 0.1 px 는 refines_subpixel_center 와 같은 정밀화 한계.
+    #[test]
+    fn keypoints_use_camera_pixel_convention() {
+        let (w, h) = (320usize, 240usize);
+        let s = 3.0f32;
+        let mut truth = Vec::new();
+        let mut img = GrayImage::new(w, h);
+        img.data.iter_mut().for_each(|v| *v = 0.2);
+        for gy in 0..4 {
+            for gx in 0..6 {
+                // 격자마다 다른 부화소 위치(0.0~0.9 px). 가장자리에서 기술자 창(≈32 px)만큼 띄운다.
+                let cx = 50.0 + 44.0 * gx as f32 + 0.13 * ((gx * 3 + gy * 5) % 7) as f32;
+                let cy = 50.0 + 45.0 * gy as f32 + 0.11 * ((gx * 5 + gy * 2) % 8) as f32;
+                truth.push((cx, cy));
+                for y in 0..h {
+                    for x in 0..w {
+                        let r2 = (x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2);
+                        img.data[y * w + x] += 0.6 * (-r2 / (2.0 * s * s)).exp();
+                    }
+                }
+            }
+        }
+        let kps = detect(&img, &DetectorConfig::default());
+        let (mut mx, mut my, mut worst, mut found) = (0f64, 0f64, 0f32, 0usize);
+        for &(cx, cy) in &truth {
+            // 정답 중심에 가장 가까운 검출.
+            let k = kps
+                .iter()
+                .min_by(|a, b| {
+                    let da = (a.x - cx).powi(2) + (a.y - cy).powi(2);
+                    let db = (b.x - cx).powi(2) + (b.y - cy).powi(2);
+                    da.total_cmp(&db)
+                })
+                .expect("덩어리 검출 없음");
+            let e = ((k.x - cx).powi(2) + (k.y - cy).powi(2)).sqrt();
+            // 덩어리 간격 44 px: 1 px 밖이면 이 덩어리는 검출되지 않은 것(이웃과 짝지음).
+            if e > 1.0 {
+                continue;
+            }
+            found += 1;
+            mx += (k.x - cx) as f64;
+            my += (k.y - cy) as f64;
+            worst = worst.max(((k.x - cx).powi(2) + (k.y - cy).powi(2)).sqrt());
+        }
+        // 이 시험은 좌표 규약을 본다. 검출률은 다른 시험의 몫이라 24개 중 22개(≈90%)
+        // 이상이면 충분하다(현재 하나가 극값 정밀화에서 빠진다, 노트 남은 문제).
+        assert!(found >= 22, "검출된 덩어리 {found}/{}", truth.len());
+        let n = found as f64;
+        let (mx, my) = (mx / n, my / n);
+        eprintln!("keypoint bias ({mx:.4}, {my:.4}) px, worst {worst:.4} px, found {found}/24");
+        assert!(
+            mx.abs() < 0.05 && my.abs() < 0.05,
+            "평균 치우침 ({mx}, {my})"
+        );
+        assert!(worst < 0.1, "최대 위치 오차 {worst}");
+    }
+
     fn angle_diff(a: f32, b: f32) -> f32 {
         let d = (a - b).rem_euclid(std::f32::consts::TAU);
         d.min(std::f32::consts::TAU - d)
@@ -719,8 +786,10 @@ mod tests {
         let mut worst = 0f32;
         for k in 0..12 {
             let th = k as f32 * 30f32.to_radians() + 0.1;
+            // dominant_orientations 는 화소 번호 좌표를 받는다: 화소 (64, 64) 의 중심
+            // = 연속 좌표 (64.5, 64.5) 에 덩어리를 둔다.
             let (cx, cy) = (64.0f32, 64.0f32);
-            let mut img = blob(128, 128, cx, cy, 6.0);
+            let mut img = blob(128, 128, cx + 0.5, cy + 0.5, 6.0);
             for y in 0..128 {
                 for x in 0..128 {
                     let t = (x as f32 - cx) * th.cos() + (y as f32 - cy) * th.sin();
@@ -826,11 +895,10 @@ mod tests {
                 continue;
             }
             n += 1;
-            let (fx, fy) = (fa.kp.x - w as f32 / 2.0, fa.kp.y - h as f32 / 2.0);
-            let (ex, ey) = (
-                sc * (c * fx - s * fy) + w as f32 / 2.0,
-                sc * (s * fx + c * fy) + h as f32 / 2.0,
-            );
+            // texture_warped 는 화소 번호 x 를 w/2 둘레로 돌린다 → 연속 좌표로는 w/2 + 0.5 둘레.
+            let (ox, oy) = (w as f32 / 2.0 + 0.5, h as f32 / 2.0 + 0.5);
+            let (fx, fy) = (fa.kp.x - ox, fa.kp.y - oy);
+            let (ex, ey) = (sc * (c * fx - s * fy) + ox, sc * (s * fx + c * fy) + oy);
             let kb = b[best.2].kp;
             if ((kb.x - ex).powi(2) + (kb.y - ey).powi(2)).sqrt() < 2.0 {
                 good += 1;
@@ -849,11 +917,10 @@ mod tests {
         let (c, s) = (th.cos(), th.sin());
         let (mut hit, mut n) = (0, 0);
         for ka in &a {
-            let (fx, fy) = (ka.x - w as f32 / 2.0, ka.y - h as f32 / 2.0);
-            let (ex, ey) = (
-                sc * (c * fx - s * fy) + w as f32 / 2.0,
-                sc * (s * fx + c * fy) + h as f32 / 2.0,
-            );
+            // 회전 중심: 연속 좌표로 w/2 + 0.5 (texture_warped 참고 주석과 같음).
+            let (ox, oy) = (w as f32 / 2.0 + 0.5, h as f32 / 2.0 + 0.5);
+            let (fx, fy) = (ka.x - ox, ka.y - oy);
+            let (ex, ey) = (sc * (c * fx - s * fy) + ox, sc * (s * fx + c * fy) + oy);
             if ex < 16.0 || ey < 16.0 || ex > w as f32 - 16.0 || ey > h as f32 - 16.0 {
                 continue;
             }
@@ -951,19 +1018,19 @@ mod tests {
             if best.0 >= 0.8 * 0.8 * best.1 {
                 continue;
             }
-            let (px, py) = (f.kp.x.round() as usize, f.kp.y.round() as usize);
+            let (px, py) = (f.kp.x as usize, f.kp.y as usize);
             let z = da[py.min(269) * 480 + px.min(479)];
             if !z.is_finite() {
                 continue;
             }
-            // 특징점 좌표는 화소 인덱스 기준, 카메라 모형은 화소 중심이 +0.5.
-            let pa = Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
+            // 특징점 좌표와 카메라 모형은 같은 연속 좌표 규약.
+            let pa = Vector2::new(f.kp.x as f64, f.kp.y as f64);
             let Some(e) = vb.camera.project(&va.camera.unproject(&pa, z as f64)) else {
                 continue;
             };
             n += 1;
             let k = fb[best.2].kp;
-            let (dx, dy) = (k.x as f64 + 0.5 - e.x, k.y as f64 + 0.5 - e.y);
+            let (dx, dy) = (k.x as f64 - e.x, k.y as f64 - e.y);
             if (dx * dx + dy * dy).sqrt() < 2.0 {
                 good += 1;
             }

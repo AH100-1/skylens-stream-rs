@@ -1,21 +1,30 @@
-//! 왜곡 없는 핀홀 내부 파라미터 [`Intrinsics`], 자세 [`Pose`], 둘을 묶은 [`Camera`].
+//! 카메라 내부 파라미터 [`Intrinsics`](초점·주점·렌즈 왜곡), 자세 [`Pose`], 둘을 묶은 [`Camera`].
 //!
 //! 규약: 세계 점 X 의 카메라 좌표 = R·X + t, 카메라 중심 C = -Rᵀt.
 //! 카메라 좌표계는 x 오른쪽, y 아래, z 앞(광축).
 //!
 //! 픽셀 좌표는 연속 좌표다: 화소 (i, j) 의 중심이 (i + 0.5, j + 0.5) 이고,
 //! [`Intrinsics::from_hfov`] 의 주점 (w/2, h/2) 은 영상의 기하 중심이다.
-//! 정수 화소 번호로 주어진 위치는 [`Intrinsics::index_to_normalized`] 로 정규화한다.
+//! 특징점 검출기(`features::Keypoint`)도 같은 연속 좌표를 내보내므로 보정 없이
+//! [`Intrinsics::to_normalized`] 에 넣는다. 정수 화소 번호로 적은 위치만
+//! [`Intrinsics::index_to_normalized`] 를 쓴다.
 //!
-//! 렌즈 왜곡(k1,k2,p1,p2)은 [`crate::distortion::DistortedIntrinsics`] 가 다룬다.
-//! 왜곡 없는 [`Intrinsics`] 는 그 특수형(계수 0)이며 [`Intrinsics::with_distortion`] 으로
-//! 바꾼다. 실제 렌즈 영상의 관측은 `DistortedIntrinsics::unproject` 로 정규화해야 하며,
-//! [`Intrinsics::to_normalized`] 는 왜곡이 없다고 알려진 영상(합성 등)에만 쓴다.
+//! 카메라 형은 하나다. [`Intrinsics`] 는 방사·접선 왜곡 계수(k1,k2,p1,p2, 모델은
+//! [`crate::distortion`])를 가지며 계수가 모두 0 이면 핀홀이다.
+//! - 투영 [`Intrinsics::to_pixel`]·[`Camera::project`] 는 왜곡을 적용한다.
+//! - 정규화 [`Intrinsics::to_normalized`]·[`Intrinsics::unproject`] 는 왜곡을 되돌린
+//!   광선 방향 (x, y, 1) 을 준다. 매칭·두 시점·번들 조정 초기값이 모두 이 경로를 쓰면
+//!   같은 관측이 한 규약으로만 정규화된다.
+//! - 왜곡을 무시한 선형 정규화는 [`Intrinsics::pinhole_normalized`] 로 따로 둔다.
+//!
+//! [`crate::distortion::DistortedIntrinsics`] 는 번들 조정이 고치는 8개 값
+//! [fx, fy, cx, cy, k1, k2, p1, p2] 묶음(영상 크기 없음)으로 남아 있으며
+//! [`Intrinsics::params`]·[`Intrinsics::from_params`] 로 오간다.
 
 use crate::distortion::{DistortedIntrinsics, Distortion};
 use crate::math::{Point3, Rotation3, Vector2, Vector3};
 
-/// 핀홀 내부 파라미터(픽셀 단위).
+/// 카메라 내부 파라미터(픽셀 단위) + 렌즈 왜곡. 왜곡 계수가 0 이면 핀홀.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Intrinsics {
     pub fx: f64,
@@ -24,10 +33,12 @@ pub struct Intrinsics {
     pub cy: f64,
     pub width: u32,
     pub height: u32,
+    /// 정규 좌표 왜곡 계수. 기본값(0)은 왜곡 없음.
+    pub dist: Distortion,
 }
 
 impl Intrinsics {
-    /// 수평 화각(라디안)으로 만든다. 주점은 영상 중심, 정사각 화소.
+    /// 수평 화각(라디안)으로 만든다. 주점은 영상 중심, 정사각 화소, 왜곡 없음.
     pub fn from_hfov(width: u32, height: u32, hfov: f64) -> Self {
         let f = 0.5 * width as f64 / (0.5 * hfov).tan();
         Self {
@@ -37,38 +48,86 @@ impl Intrinsics {
             cy: 0.5 * height as f64,
             width,
             height,
+            dist: Distortion::default(),
         }
     }
 
-    /// 정규 좌표 (x/z, y/z) → 픽셀.
-    pub fn to_pixel(&self, n: &Vector2<f64>) -> Vector2<f64> {
-        Vector2::new(self.fx * n.x + self.cx, self.fy * n.y + self.cy)
+    /// 번들 조정 파라미터 묶음과 영상 크기로 만든다.
+    pub fn from_params(p: &DistortedIntrinsics, width: u32, height: u32) -> Self {
+        Self {
+            fx: p.fx,
+            fy: p.fy,
+            cx: p.cx,
+            cy: p.cy,
+            width,
+            height,
+            dist: p.dist,
+        }
     }
 
-    /// 픽셀 → 정규 좌표.
-    pub fn to_normalized(&self, p: &Vector2<f64>) -> Vector2<f64> {
-        Vector2::new((p.x - self.cx) / self.fx, (p.y - self.cy) / self.fy)
-    }
-
-    /// 화소 번호 규약 위치(화소 (i, j) 의 중심을 (i, j) 로 적음, 특징점 `Keypoint::x, y` 가 이 규약)
-    /// → 정규 좌표. 화소 중심 규약으로 +0.5 를 더한 뒤 [`Self::to_normalized`] 와 같다.
-    pub fn index_to_normalized(&self, p: &Vector2<f64>) -> Vector2<f64> {
-        self.to_normalized(&Vector2::new(p.x + 0.5, p.y + 0.5))
-    }
-
-    /// 같은 초점·주점에 왜곡 계수를 붙인 내부 파라미터.
-    pub fn with_distortion(&self, dist: Distortion) -> DistortedIntrinsics {
+    /// 번들 조정 파라미터 묶음 [fx, fy, cx, cy, k1, k2, p1, p2].
+    pub fn params(&self) -> DistortedIntrinsics {
         DistortedIntrinsics {
             fx: self.fx,
             fy: self.fy,
             cx: self.cx,
             cy: self.cy,
-            dist,
+            dist: self.dist,
         }
+    }
+
+    /// 같은 초점·주점·크기에 왜곡 계수를 바꾼 내부 파라미터.
+    pub fn with_distortion(&self, dist: Distortion) -> Self {
+        Self { dist, ..*self }
+    }
+
+    /// 왜곡 계수가 모두 0 인가.
+    pub fn is_pinhole(&self) -> bool {
+        self.dist == Distortion::default()
+    }
+
+    /// 정규 좌표 (x/z, y/z) → 픽셀. 왜곡을 적용한다.
+    pub fn to_pixel(&self, n: &Vector2<f64>) -> Vector2<f64> {
+        let d = self.dist.distort(n);
+        Vector2::new(self.fx * d.x + self.cx, self.fy * d.y + self.cy)
+    }
+
+    /// 픽셀 → 왜곡을 되돌린 정규 좌표. 역변환이 수렴하지 않으면(시야 밖 강한 왜곡) None.
+    pub fn unproject(&self, p: &Vector2<f64>) -> Option<Vector2<f64>> {
+        self.dist.undistort(&self.pinhole_normalized(p))
+    }
+
+    /// 픽셀 → 왜곡을 되돌린 정규 좌표. 왜곡이 0 이면 선형 (p − c)/f 와 같다.
+    /// 역변환이 수렴하지 않는 드문 경우에는 선형 정규화 값을 돌려준다
+    /// (실패를 구별해야 하면 [`Self::unproject`]).
+    pub fn to_normalized(&self, p: &Vector2<f64>) -> Vector2<f64> {
+        let n = self.pinhole_normalized(p);
+        if self.is_pinhole() {
+            return n;
+        }
+        self.dist.undistort(&n).unwrap_or(n)
+    }
+
+    /// 왜곡을 무시한 선형 정규화 (p − c)/f.
+    pub fn pinhole_normalized(&self, p: &Vector2<f64>) -> Vector2<f64> {
+        Vector2::new((p.x - self.cx) / self.fx, (p.y - self.cy) / self.fy)
+    }
+
+    /// 화소 번호 규약 위치(화소 (i, j) 의 중심을 (i, j) 로 적음) → 정규 좌표.
+    /// 화소 중심 규약으로 +0.5 를 더한 뒤 [`Self::to_normalized`] 와 같다.
+    /// 특징점 좌표는 이미 연속 좌표이므로 여기에 넣지 않는다.
+    pub fn index_to_normalized(&self, p: &Vector2<f64>) -> Vector2<f64> {
+        self.to_normalized(&Vector2::new(p.x + 0.5, p.y + 0.5))
     }
 
     pub fn contains(&self, p: &Vector2<f64>) -> bool {
         p.x >= 0.0 && p.y >= 0.0 && p.x < self.width as f64 && p.y < self.height as f64
+    }
+}
+
+impl From<Intrinsics> for DistortedIntrinsics {
+    fn from(k: Intrinsics) -> Self {
+        k.params()
     }
 }
 
@@ -113,7 +172,7 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// 세계 점을 픽셀로 투영. 카메라 뒤(z ≤ 0)면 None.
+    /// 세계 점을 픽셀로 투영(왜곡 적용). 카메라 뒤(z ≤ 0)면 None.
     pub fn project(&self, x: &Point3<f64>) -> Option<Vector2<f64>> {
         let xc = self.pose.transform(x);
         if xc.z <= 0.0 {
@@ -125,7 +184,7 @@ impl Camera {
         )
     }
 
-    /// 픽셀과 깊이(카메라 z)로 세계 점을 복원.
+    /// 픽셀과 깊이(카메라 z)로 세계 점을 복원(왜곡 되돌림).
     pub fn unproject(&self, p: &Vector2<f64>, depth: f64) -> Point3<f64> {
         let n = self.intrinsics.to_normalized(p);
         let xc = Vector3::new(n.x * depth, n.y * depth, depth);
@@ -201,8 +260,60 @@ mod tests {
             let b = d.unproject(&px).unwrap();
             assert!((a - b).norm() < 1e-12);
             let xc = Vector3::new(a.x * 4.0, a.y * 4.0, 4.0);
-            assert!((d.project_camera(&xc) - px).norm() < 1e-9);
+            assert!((d.params().project_camera(&xc) - px).norm() < 1e-9);
         }
+    }
+
+    /// 실제 렌즈 수준 왜곡(k1 = −0.12 등)에서 투영 → 정규화가 정답 광선을 되돌리고,
+    /// 선형 정규화는 가장자리에서 화소 단위로 어긋남을 확인한다.
+    #[test]
+    fn distorted_normalization_recovers_true_ray() {
+        let k = Intrinsics::from_hfov(1920, 1080, 70f64.to_radians()).with_distortion(Distortion {
+            k1: -0.12,
+            k2: 0.03,
+            p1: 0.001,
+            p2: -0.0015,
+        });
+        assert!(!k.is_pinhole());
+        let mut worst: f64 = 0.0;
+        let mut edge_lin: f64 = 0.0;
+        for i in 0..40 {
+            // 영상 전체에 퍼진 정답 광선(정규 좌표 |x| ≤ 0.65, |y| ≤ 0.37 ≈ 화각 안).
+            let n = Vector2::new(
+                -0.65 + 1.3 * (i as f64 / 39.0),
+                0.37 * ((i * 7 % 40) as f64 / 20.0 - 1.0),
+            );
+            let px = k.to_pixel(&n);
+            let back = k.to_normalized(&px);
+            assert_eq!(Some(back), k.unproject(&px));
+            worst = worst.max((back - n).norm() * k.fx);
+            edge_lin = edge_lin.max((k.pinhole_normalized(&px) - n).norm() * k.fx);
+        }
+        // 뉴턴 역변환은 1e-14 정규 단위까지 수렴(distortion::undistort) → 화소로 1e-9 미만.
+        assert!(worst < 1e-9, "왕복 오차 {worst} px");
+        // k1 = −0.12, r ≈ 0.75 에서 r³k1·f ≈ 0.05·1370 ≈ 69 px: 왜곡 무시 정규화는 수십 px 틀린다.
+        assert!(edge_lin > 20.0, "선형 정규화 가장자리 오차 {edge_lin} px");
+        // 카메라 왕복도 왜곡을 포함해 맞는다.
+        let cam = Camera {
+            intrinsics: k,
+            pose: test_camera().pose,
+        };
+        let px = Vector2::new(37.25, 1003.5);
+        let x = cam.unproject(&px, 12.0);
+        assert!((cam.project(&x).unwrap() - px).norm() < 1e-9);
+    }
+
+    #[test]
+    fn params_roundtrip() {
+        let k = Intrinsics::from_hfov(640, 480, 60f64.to_radians()).with_distortion(Distortion {
+            k1: 0.1,
+            ..Distortion::default()
+        });
+        let p: DistortedIntrinsics = k.into();
+        assert_eq!(Intrinsics::from_params(&p, 640, 480), k);
+        let xc = Vector3::new(0.3, -0.2, 2.0);
+        let n = Vector2::new(0.15, -0.1);
+        assert!((p.project_camera(&xc) - k.to_pixel(&n)).norm() < 1e-12);
     }
 
     #[test]
