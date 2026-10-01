@@ -824,7 +824,7 @@ pub fn write_outputs(
     }
     for a in &align {
         if let Some(m) = a.fit_median_m {
-            if !(m < FIT_MEDIAN_LIMIT_M) {
+            if m.is_nan() || m >= FIT_MEDIAN_LIMIT_M {
                 issues.push(format!(
                     "구역 {}: 정렬 잔차 중앙 {m:.3} m ≥ {FIT_MEDIAN_LIMIT_M} m",
                     a.region
