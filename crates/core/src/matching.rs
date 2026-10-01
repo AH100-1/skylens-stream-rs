@@ -3,13 +3,22 @@
 use crate::features::Feature;
 use nalgebra::{Matrix3, SMatrix, Vector2, Vector3};
 
+/// SPEC 기본값: 같은 카메라 시간 이웃 위치 차 1..=5.
+pub const PAIR_TEMPORAL: usize = 5;
+/// SPEC 기본값: 다른 카메라 위치 차 0..=4.
+pub const PAIR_CROSS: usize = 4;
+/// 같은 카메라 2의 거듭제곱 간격 상한 기본값(제한 없음).
+pub const PAIR_POW2_MAX: usize = usize::MAX;
+
 /// 매칭할 영상 짝 후보를 만든다. `views[k] = (카메라 번호, 촬영 위치 번호)`.
-/// 같은 카메라는 위치 차이 1..=`temporal`, 다른 카메라는 위치 차이 0..=`cross` 인 짝.
+/// 같은 카메라는 위치 차이 1..=`temporal` 이거나 `pow2_max` 이하의 2의 거듭제곱(긴 경로의 먼 제약),
+/// 다른 카메라는 위치 차이 0..=`cross` 인 짝. `pow2_max = 0` 이면 거듭제곱 간격을 쓰지 않는다.
 /// 결과 (i, j) 는 i < j, 중복 없음, 정렬됨.
 pub fn candidate_pairs(
     views: &[(usize, usize)],
     temporal: usize,
     cross: usize,
+    pow2_max: usize,
 ) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for i in 0..views.len() {
@@ -17,7 +26,7 @@ pub fn candidate_pairs(
             let ((ca, pa), (cb, pb)) = (views[i], views[j]);
             let d = pa.abs_diff(pb);
             let ok = if ca == cb {
-                d >= 1 && d <= temporal
+                d >= 1 && (d <= temporal || (d.is_power_of_two() && d <= pow2_max))
             } else {
                 d <= cross
             };
@@ -724,12 +733,45 @@ mod tests {
         // 카메라 3대 × 위치 10개.
         let views: Vec<(usize, usize)> =
             (0..10).flat_map(|p| (0..3).map(move |c| (c, p))).collect();
-        let pairs = candidate_pairs(&views, 2, 1);
+        let pairs = candidate_pairs(&views, 2, 1, 0);
         // 같은 카메라: 카메라마다 (9 + 8) 짝 → 51. 다른 카메라: 위치 차 0 → 10×3, 차 1 → 9×6 → 84.
         assert_eq!(pairs.len(), 51 + 84);
         assert!(pairs.iter().all(|&(i, j)| i < j));
         let (ca, pa) = views[pairs[0].0];
         assert_eq!((ca, pa), (0, 0));
+    }
+
+    #[test]
+    fn candidate_pairs_power_of_two_gaps() {
+        // 위치 80 × 카메라 3, SPEC 기본값.
+        let views: Vec<(usize, usize)> =
+            (0..80).flat_map(|p| (0..3).map(move |c| (c, p))).collect();
+        let pairs = candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX);
+        let mut same = std::collections::BTreeSet::new();
+        for &(i, j) in &pairs {
+            let ((ca, pa), (cb, pb)) = (views[i], views[j]);
+            if ca == cb {
+                same.insert(pa.abs_diff(pb));
+            } else {
+                assert!(
+                    pa.abs_diff(pb) <= 4,
+                    "다른 카메라 위치 차 {}",
+                    pa.abs_diff(pb)
+                );
+            }
+        }
+        assert_eq!(
+            same.into_iter().collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 8, 16, 32, 64]
+        );
+        // 같은 카메라: (79+78+77+76+75) + (72+64+48+16) = 585, 카메라 3대 → 1755.
+        // 다른 카메라: 카메라 짝마다 80 + 2(79+78+77+76) = 700, 3 짝 → 2100.
+        assert_eq!(pairs.len(), 1755 + 2100);
+        // 상한 16 이면 32·64 간격이 빠진다: 카메라마다 48 + 16 = 64 짝 감소.
+        assert_eq!(
+            candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, 16).len(),
+            1755 + 2100 - 3 * 64
+        );
     }
 
     /// 합성 드론 장면 같은 카메라 두 장: 특징 → 비율 매칭 → RANSAC.

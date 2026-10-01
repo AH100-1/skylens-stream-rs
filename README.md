@@ -64,7 +64,12 @@ for f in &feats {
 ### 라이브러리: 매칭과 기하 검증
 
 ```rust
-use skylens_core::matching::{ratio_match, ransac_fundamental, RansacConfig};
+use skylens_core::matching::{candidate_pairs, ratio_match, ransac_fundamental, RansacConfig};
+use skylens_core::matching::{PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL};
+
+// 매칭할 영상 짝: views[k] = (카메라 번호, 촬영 위치 번호).
+// 같은 카메라는 위치 차 1..=5 와 2의 거듭제곱(8, 16, 32, …), 다른 카메라는 위치 차 0..=4.
+let image_pairs = candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX);
 
 // 비율 0.8, 양방향 확인
 let pairs = ratio_match(&feats_a, &feats_b, 0.8, true);
@@ -190,7 +195,12 @@ for f in &feats {
 ### Library: matching and geometric verification
 
 ```rust
-use skylens_core::matching::{ratio_match, ransac_fundamental, RansacConfig};
+use skylens_core::matching::{candidate_pairs, ratio_match, ransac_fundamental, RansacConfig};
+use skylens_core::matching::{PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL};
+
+// Image pairs to match: views[k] = (camera index, capture position index).
+// Same camera: position gap 1..=5 plus powers of two (8, 16, 32, …); different cameras: gap 0..=4.
+let image_pairs = candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX);
 
 // ratio 0.8, mutual check
 let pairs = ratio_match(&feats_a, &feats_b, 0.8, true);
