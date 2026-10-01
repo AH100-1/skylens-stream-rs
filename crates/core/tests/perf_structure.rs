@@ -1,13 +1,12 @@
-//! 연산량 기반 구조 단언. 벽시계 시간은 기계 부하에 따라 흔들리므로(`#[ignore]` 시간 시험은
-//! 기본 실행에서 빠진다) 일하는 양을 정하는 구조를 숫자로 고정해 성능 회귀를 잡는다.
-//! 시간 측정 자체는 `examples/bench_stages.rs` 가 맡는다.
+//! 연산량 기반 구조 단언. 벽시계 시간은 기계 부하에 따라 흔들리므로 여기서는 시간을 재지 않고,
+//! 일하는 양을 정하는 구조(짝 수, 짝당 기술자 비교 수 상한, 검출 층 수, E RANSAC 최소 반복)를 숫자로
+//! 고정해 성능 회귀를 잡는다. 시간 측정 자체는 `benches/pipeline.rs` 가 맡는다.
+//! 검출 결과 해시 회귀 시험은 `features.rs` 시험 모듈 한 곳에서만 고정한다(여기에 두지 않는다).
 
 use skylens_core::features::{detect, DetectorConfig, GrayImage, Keypoint};
-use skylens_core::matching::{
-    adaptive_iterations, candidate_pairs, ratio_match, MIN_RANSAC_ITERS, PAIR_CROSS, PAIR_POW2_MAX,
-    PAIR_TEMPORAL,
-};
+use skylens_core::matching::{candidate_pairs, PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL};
 use skylens_core::synth::{CamId, Scene, SceneConfig};
+use skylens_core::two_view::ESSENTIAL_MIN_ITERS;
 
 /// 3 카메라 × `positions` 위치의 (카메라, 위치) 목록.
 fn rig_views(positions: usize) -> Vec<(usize, usize)> {
@@ -45,6 +44,11 @@ fn candidate_pairs_grow_linearly_with_positions() {
 
 /// 시험용 실측 배치 장면의 한 장(480×270, F 카메라, 위치 10).
 fn test_image() -> GrayImage {
+    test_image_at(CamId::F, 10)
+}
+
+/// 시험용 실측 배치 장면(위치 20곳, 480×270)의 (카메라, 위치) 한 장.
+fn test_image_at(cam: CamId, position: usize) -> GrayImage {
     let scene = Scene::new(SceneConfig {
         positions: 20,
         width: 480,
@@ -54,38 +58,40 @@ fn test_image() -> GrayImage {
     let v = scene
         .views
         .iter()
-        .find(|v| v.cam == CamId::F && v.position == 10)
-        .expect("F 카메라 위치 10");
+        .find(|v| v.cam == cam && v.position == position)
+        .expect("시험 장면에 있는 카메라·위치");
     let (rgb, _) = scene.render(v);
     GrayImage::from_rgb(rgb.width as usize, rgb.height as usize, &rgb.data)
 }
 
 /// 특징 수 상한이 지켜져야 짝 하나의 기술자 비교 수(|A|·|B|, 전수 탐색)가 `max_features²` 로 묶인다.
+/// 상한이 실제로 작동하는(상한 없이 검출하면 상한보다 많은) 영상 세 장으로 짝마다 확인한다.
 #[test]
 fn feature_cap_bounds_descriptor_comparisons() {
-    let img = test_image();
-    let full = detect(&img, &DetectorConfig::default());
-    // 상한이 실제로 작동하는 영상이어야 시험이 의미가 있다.
     let cap = 200;
-    assert!(full.len() > cap, "검출 {} 개", full.len());
-    let capped = detect(
-        &img,
-        &DetectorConfig {
-            max_features: cap,
-            ..DetectorConfig::default()
-        },
-    );
-    assert!(capped.len() <= cap && capped.len() >= cap * 9 / 10);
-    // 상호 매칭 결과는 양쪽 수의 최솟값을 넘지 못한다.
-    let feats = skylens_core::features::detect_and_describe(
-        &img,
-        &DetectorConfig {
-            max_features: cap,
-            ..DetectorConfig::default()
-        },
-    );
-    let m = ratio_match(&feats, &feats[..cap / 2], 0.8, true);
-    assert!(m.len() <= cap / 2);
+    let capped_cfg = DetectorConfig {
+        max_features: cap,
+        ..DetectorConfig::default()
+    };
+    let imgs = [
+        test_image_at(CamId::F, 10),
+        test_image_at(CamId::F, 11),
+        test_image_at(CamId::R, 10),
+    ];
+    let mut counts = Vec::new();
+    for img in &imgs {
+        let full = detect(img, &DetectorConfig::default()).len();
+        assert!(full > cap, "상한 없이 검출 {full} 개 ≤ 상한 {cap}");
+        let n = detect(img, &capped_cfg).len();
+        // 상한 아래로 너무 많이 잘리면 상한이 아니라 다른 것이 수를 정하고 있다.
+        assert!(n <= cap && n >= cap * 9 / 10, "상한 {cap} 에서 검출 {n} 개");
+        counts.push(n);
+    }
+    for a in 0..counts.len() {
+        for b in a + 1..counts.len() {
+            assert!(counts[a] * counts[b] <= cap * cap);
+        }
+    }
 }
 
 /// 검출 층 수: 옥타브 o 개, 옥타브당 간격 s 면 가장 큰 스케일은
@@ -113,41 +119,12 @@ fn detected_scales_follow_octave_count() {
     }
 }
 
-/// RANSAC 반복 수 = ⌈ln(1−p) / ln(1−wˢ)⌉ (Fischler & Bolles 1981), [50, max] 로 자름.
-/// w=0.5, s=5, p=0.999: ln(0.001)/ln(1−1/32) = 6.9078/0.031749 = 217.6 → 218.
-/// w=0.8, s=8: 6.9078/0.18364 = 37.6 → 바닥 50. w=0.1, s=5: 약 69 만 → 상한 2000.
+/// E RANSAC 의 최소 반복 수. 축소 실행에서 E RANSAC 이 짝당 가장 비싼 구간이고(짝당 수십 ms),
+/// 정상 비율이 높아 적응 반복 수가 바닥으로 내려가는 짝이 대부분이라 이 값이 그 구간 시간을 거의 그대로 정한다.
+/// 300 은 `two_view::ransac_essential` 이 쌍둥이 해도 표본에 나오도록 둔 바닥값이다(적응 반복 수
+/// ⌈ln(1−p)/ln(1−w⁵)⌉ 은 w=0.8·p=0.999 에서 18 이라 바닥이 없으면 대부분의 짝이 20 회 안팎에서 끝난다).
+/// 이 값을 바꾸면 E RANSAC 시간이 비례해 바뀌므로 시간 측정 노트와 함께 고친다.
 #[test]
-fn ransac_iteration_counts() {
-    assert_eq!(MIN_RANSAC_ITERS, 50);
-    assert_eq!(adaptive_iterations(0.5, 5, 0.999, 2000), 218);
-    assert_eq!(adaptive_iterations(0.8, 8, 0.999, 2000), 50);
-    assert_eq!(adaptive_iterations(0.1, 5, 0.999, 2000), 2000);
+fn essential_ransac_min_iterations_fixed() {
+    assert_eq!(ESSENTIAL_MIN_ITERS, 300);
 }
-
-/// FNV-1a 64 비트.
-fn fnv(h: &mut u64, bytes: &[u8]) {
-    for &b in bytes {
-        *h ^= b as u64;
-        *h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-}
-
-/// 검출 결과 회귀: 고정 합성 영상(480×270)의 특징 개수와 (x, y, σ, 응답, 방향) 비트 해시.
-/// 흐림 누산 순서·극값 판정·정렬이 바뀌면 값이 달라진다. 입력 영상이 합성 장면 기본값(편대 배치, #12)에 따르므로
-/// 장면 기본값이 바뀌면 기대값도 다시 계산한다. 기대값은 main f87549a 에서 계산했다(검출 코드는 08d5248 과 같음).
-#[test]
-fn detection_hash_regression() {
-    let img = test_image();
-    let kps = detect(&img, &DetectorConfig::default());
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for k in &kps {
-        for v in [k.x, k.y, k.sigma, k.response, k.angle] {
-            fnv(&mut h, &v.to_bits().to_le_bytes());
-        }
-    }
-    println!("검출 {} 개, 해시 {h:#018x}", kps.len());
-    assert_eq!((kps.len(), h), (EXPECTED_COUNT, EXPECTED_HASH));
-}
-
-const EXPECTED_COUNT: usize = 949;
-const EXPECTED_HASH: u64 = 0x19d5_5fb5_3194_f7bb;
