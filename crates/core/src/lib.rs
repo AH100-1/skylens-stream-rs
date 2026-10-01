@@ -8,5 +8,6 @@ pub mod matching;
 pub mod math;
 pub mod ply;
 pub mod synth;
+pub mod two_view;
 
 pub use nalgebra;
