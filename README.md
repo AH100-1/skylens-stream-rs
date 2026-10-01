@@ -75,6 +75,23 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 }
 ```
 
+### 라이브러리: 두 시점 상대 자세와 삼각측량
+
+```rust
+use skylens_core::two_view::{essential_from_fundamental, recover_pose, refine_pose, triangulate};
+// 최소 해법이 필요하면 essential_5pt(&n1[..5], &n2[..5]) 가 본질 행렬 후보(최대 10개)를 준다.
+
+// f, inliers: 위 RANSAC 결과. k: 카메라 내부 파라미터(Intrinsics).
+let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
+let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
+let e = essential_from_fundamental(&f, &k, &k);
+if let Some(rp) = recover_pose(&e, &n1, &n2) {
+    // 카메라 1 = [I|0], 카메라 2 = [R|t] (t 는 단위 길이, 스케일 미정)
+    let (r, t) = refine_pose(&rp.rotation, &rp.translation, &n1, &n2, 50);
+    let x = triangulate(&r, &t, &n1[0], &n2[0]); // 카메라 1 좌표계의 3D 점
+}
+```
+
 ### 출력
 
 ```
@@ -159,6 +176,23 @@ let x1: Vec<_> = pairs.iter().map(|&(i, _)| nalgebra::Vector2::new(feats_a[i].kp
 let x2: Vec<_> = pairs.iter().map(|&(_, j)| nalgebra::Vector2::new(feats_b[j].kp.x as f64, feats_b[j].kp.y as f64)).collect();
 if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default()) {
     // f: fundamental matrix (x2ᵀ F x1 = 0), inliers[k]: whether pairs[k] is geometrically consistent
+}
+```
+
+### Library: two-view relative pose and triangulation
+
+```rust
+use skylens_core::two_view::{essential_from_fundamental, recover_pose, refine_pose, triangulate};
+// For a minimal solver, essential_5pt(&n1[..5], &n2[..5]) returns essential-matrix candidates (up to 10).
+
+// f, inliers: the RANSAC result above. k: camera intrinsics (Intrinsics).
+let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
+let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
+let e = essential_from_fundamental(&f, &k, &k);
+if let Some(rp) = recover_pose(&e, &n1, &n2) {
+    // camera 1 = [I|0], camera 2 = [R|t] (t has unit length; scale is unknown)
+    let (r, t) = refine_pose(&rp.rotation, &rp.translation, &n1, &n2, 50);
+    let x = triangulate(&r, &t, &n1[0], &n2[0]); // 3D point in camera 1 coordinates
 }
 ```
 
