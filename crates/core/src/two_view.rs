@@ -569,11 +569,13 @@ pub fn refine_relative_pose(
             .sum()
     };
     let axes = [Vector3::x(), Vector3::y(), Vector3::z()];
+    // 프로크루스테스 회전은 축 시작점 셋이 함께 쓴다(한 번만 계산).
+    let procrustes = rotation_only_fit(n1, n2).0;
     let (r, t) = decompose_essential(e)
         .into_iter()
         .flat_map(|(r, t)| [(r, t), (r, -t)])
         .chain(axes.into_iter().map(|t| (linear.rotation, t)))
-        .chain(axes.into_iter().map(|t| (rotation_only_fit(n1, n2).0, t)))
+        .chain(axes.into_iter().map(|t| (procrustes, t)))
         .map(|(r, t)| refine_pose(&r, &t, n1, n2, iters))
         .min_by(|a, b| cost(&a.0, &a.1).total_cmp(&cost(&b.0, &b.1)))?;
     // 관측 가능 여부도 정밀화된 E 로 다시 판정한다. 선형 E 가 틀린 골짜기에 있으면 에피폴라 잔차가
