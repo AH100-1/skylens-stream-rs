@@ -89,15 +89,22 @@ pub struct RelativePose {
     pub translation: Vector3<f64>,
     /// 두 카메라 앞에 삼각측량된 대응의 표시.
     pub in_front: Vec<bool>,
+    /// 이동 방향을 관측할 수 있는지. false 이면 대응이 회전 하나로 설명되어
+    /// (순수 회전 또는 기선이 잡음에 묻힘) `rotation` 만 믿을 수 있고
+    /// `translation` 은 0 벡터, `in_front` 는 모두 false 다.
+    pub translation_observable: bool,
 }
 
 /// 순수 회전 판정 배수: 회전만으로 설명한 각 잔차 중앙값이
 /// 에피폴라 잔차 중앙값의 이 배수 이하이면 이동 방향을 관측할 수 없다고 본다.
 const ROTATION_ONLY_FACTOR: f64 = 3.0;
 
-/// 대응을 회전 하나로 설명했을 때의 각 잔차(rad) 중앙값.
+/// 이동 방향 미정일 때 E 분해 회전을 프로크루스테스 회전 대신 쓰는 최대 차이(5°).
+const ROTATION_SNAP_RAD: f64 = 5.0 * std::f64::consts::PI / 180.0;
+
+/// 대응을 회전 하나로 설명했을 때의 회전과 각 잔차(rad) 중앙값.
 /// 단위 광선 u1, u2 에 대해 Σ‖u2 − R u1‖² 를 최소화하는 R(직교 프로크루스테스) 을 쓴다.
-fn rotation_only_residual(n1: &[Vector2<f64>], n2: &[Vector2<f64>]) -> f64 {
+fn rotation_only_fit(n1: &[Vector2<f64>], n2: &[Vector2<f64>]) -> (Rotation3<f64>, f64) {
     let ray = |n: &Vector2<f64>| Vector3::new(n.x, n.y, 1.0).normalize();
     let h = n1.iter().zip(n2).fold(Matrix3::zeros(), |h, (a, b)| {
         h + ray(a) * ray(b).transpose()
@@ -106,12 +113,18 @@ fn rotation_only_residual(n1: &[Vector2<f64>], n2: &[Vector2<f64>]) -> f64 {
     let (u, vt) = (svd.u.unwrap(), svd.v_t.unwrap());
     let d = (vt.transpose() * u.transpose()).determinant().signum();
     let r = vt.transpose() * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, d)) * u.transpose();
-    median(
+    let res = median(
         n1.iter()
             .zip(n2)
-            .map(|(a, b)| (r * ray(a)).cross(&ray(b)).norm().asin())
+            .map(|(a, b)| angle_between(&(r * ray(a)), &ray(b)))
             .collect(),
-    )
+    );
+    (Rotation3::from_matrix_unchecked(r), res)
+}
+
+/// 두 벡터 사이 각(rad). atan2 를 써서 반올림으로 |sin| > 1 이 되어도 NaN 이 나지 않는다.
+fn angle_between(a: &Vector3<f64>, b: &Vector3<f64>) -> f64 {
+    a.cross(b).norm().atan2(a.dot(b))
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -123,8 +136,9 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 /// E 의 네 후보 중 두 카메라 앞(양의 깊이)에 놓이는 점이 가장 많은 것을 고른다.
-/// 길이가 다르거나, 유한하지 않은 값이 있거나, 대응이 순수 회전으로 설명되면
-/// (이동 방향 미정) None.
+/// 길이가 다르거나 유한하지 않은 값이 있으면 None.
+/// 대응이 회전 하나로 설명되면(이동 방향 미정) `translation_observable = false` 로
+/// 회전만 돌려준다.
 pub fn recover_pose(
     e: &Matrix3<f64>,
     n1: &[Vector2<f64>],
@@ -145,8 +159,37 @@ pub fn recover_pose(
             .map(|(a, b)| sampson_error(e, a, b).sqrt())
             .collect(),
     );
-    if rotation_only_residual(n1, n2) <= ROTATION_ONLY_FACTOR * epi + 1e-12 {
-        return None;
+    let (r_only, rot_res) = rotation_only_fit(n1, n2);
+    let observable = rot_res > ROTATION_ONLY_FACTOR * epi + 1e-12;
+    if !observable {
+        // 프로크루스테스 회전은 기선이 만든 평균 시차까지 회전으로 흡수해 기선/깊이 비만큼
+        // 치우친다. E 분해의 회전 후보 중 그것과 가까운 것이 있으면 그쪽을 쓴다.
+        // 선형 E 는 짧은 기선에서 회전도 흔들리므로 Sampson LM 으로 다듬은 회전을 쓴다.
+        // 네 후보와 (프로크루스테스 회전, 각 축 이동) 에서 시작해 Sampson 비용이 가장 작은 해를 쓴다.
+        let cost = |r: &Rotation3<f64>, t: &Vector3<f64>| -> f64 {
+            let e = essential_from_pose(r, t);
+            n1.iter()
+                .zip(n2)
+                .map(|(a, b)| sampson_residual(&e, a, b).powi(2))
+                .sum()
+        };
+        let starts = decompose_essential(e).into_iter().chain(
+            [Vector3::x(), Vector3::y(), Vector3::z()]
+                .into_iter()
+                .map(|t| (r_only, t)),
+        );
+        let rotation = starts
+            .map(|(r, t)| refine_pose(&r, &t, n1, n2, 100))
+            .filter(|(r, _)| r.angle_to(&r_only) < ROTATION_SNAP_RAD)
+            .min_by(|a, b| cost(&a.0, &a.1).total_cmp(&cost(&b.0, &b.1)))
+            .map(|(r, _)| r)
+            .unwrap_or(r_only);
+        return Some(RelativePose {
+            rotation,
+            translation: Vector3::zeros(),
+            in_front: vec![false; n1.len()],
+            translation_observable: false,
+        });
     }
     let mut best: Option<RelativePose> = None;
     let mut best_n = 0;
@@ -167,6 +210,7 @@ pub fn recover_pose(
                 rotation: r,
                 translation: t,
                 in_front,
+                translation_observable: true,
             });
         }
     }
@@ -458,6 +502,11 @@ mod tests {
 
     /// 드론처럼 아래를 보는 두 카메라(기선 3 m, 고도 ~40 m)와 지면 근처 점.
     fn scene(n: usize, sigma_px: f64, seed: u64) -> Scene {
+        scene_with_baseline(n, sigma_px, seed, 3.0)
+    }
+
+    /// 기선 길이를 b(m)로 바꾼 같은 장면(둘째 중심 = (b, 0.8b/3, −40 − b/6)).
+    fn scene_with_baseline(n: usize, sigma_px: f64, seed: u64, b: f64) -> Scene {
         let k = Intrinsics::from_hfov(960, 540, 70f64.to_radians());
         let r1 = Rotation3::from_euler_angles(0.04, -0.03, 0.2);
         let r2 = Rotation3::from_euler_angles(-0.05, 0.06, 0.28);
@@ -467,7 +516,7 @@ mod tests {
         };
         let c2 = Camera {
             intrinsics: k,
-            pose: Pose::from_center(r2, &Point3::new(3.0, 0.8, -40.5)),
+            pose: Pose::from_center(r2, &Point3::new(b, 0.8 * b / 3.0, -40.0 - b / 6.0)),
         };
         let mut rng = Lcg(seed);
         let (mut x1, mut x2, mut pts) = (vec![], vec![], vec![]);
@@ -753,20 +802,86 @@ mod tests {
                 }
             }
             let r = r2 * r1.inverse();
-            // 임의 방향 t 로 만든 E 와 대응에서 맞춘 E 모두 이동 방향을 확정하면 안 된다.
-            for t in [Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.3, -0.8, 0.5)] {
-                let e = essential_from_pose(&r, &t.normalize());
+            // 임의 방향 t 로 만든 E 와 대응에서 맞춘 E 모두 이동 방향을 확정하면 안 되고,
+            // 회전은 정답과 맞아야 한다.
+            let check = |e: &Matrix3<f64>, what: &str| {
+                let rp = recover_pose(e, &x1, &x2).unwrap();
                 assert!(
-                    recover_pose(&e, &x1, &x2).is_none(),
-                    "σ={sigma}: 순수 회전에서 t 확정"
+                    !rp.translation_observable,
+                    "σ={sigma}: {what} 순수 회전에서 t 확정"
                 );
+                assert_eq!(rp.translation, Vector3::zeros());
+                assert!(rp.in_front.iter().all(|&b| !b));
+                let err = rotation_angle_between(&rp.rotation, &r).to_degrees();
+                assert!(err < 0.15, "σ={sigma}: {what} 회전 오차 {err}°");
+            };
+            for t in [Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.3, -0.8, 0.5)] {
+                check(&essential_from_pose(&r, &t.normalize()), "임의 t 의 E");
             }
             if let Some(e) = essential_8pt(&x1, &x2) {
-                assert!(
-                    recover_pose(&e, &x1, &x2).is_none(),
-                    "σ={sigma}: 맞춘 E 로 순수 회전에서 t 확정"
+                check(&e, "맞춘 E");
+            }
+        }
+    }
+
+    /// 기선/깊이 비 훑기(대응 200개, 8점 E): 관측 가능 판정, r = 회전 잔차/에피폴라 잔차,
+    /// 회전 오차(도). 실험 노트 표의 출처.
+    fn baseline_sweep(b: f64, sigma: f64, seed: u64) -> (bool, f64, f64) {
+        let s = scene_with_baseline(200, sigma, seed, b);
+        let (r, _) = s.rel();
+        let e = essential_8pt(&s.x1, &s.x2).unwrap();
+        let rp = recover_pose(&e, &s.x1, &s.x2).unwrap();
+        let (_, rot_res) = rotation_only_fit(&s.x1, &s.x2);
+        let epi = median(
+            s.x1.iter()
+                .zip(&s.x2)
+                .map(|(a, b)| sampson_error(&e, a, b).sqrt())
+                .collect(),
+        );
+        // 관측 가능하면 사용 경로대로 refine_pose 를 거친 회전을 잰다.
+        let rot = if rp.translation_observable {
+            refine_pose(&rp.rotation, &rp.translation, &s.x1, &s.x2, 50).0
+        } else {
+            rp.rotation
+        };
+        (
+            rp.translation_observable,
+            rot_res / epi,
+            rotation_angle_between(&rot, &r).to_degrees(),
+        )
+    }
+
+    #[test]
+    fn small_baseline_keeps_rotation() {
+        // 기선/깊이 0.025(1 m / 40 m), σ=1 px: 이동 방향 판정과 무관하게 회전은 0.5° 이내.
+        for seed in 1..=10u64 {
+            let (obs, ratio, err) = baseline_sweep(1.0, 1.0, seed);
+            println!("b=1 m seed={seed}: 관측={obs} r={ratio:.2} 회전 오차 {err:.3}°");
+            assert!(err < 0.5, "seed {seed}: 회전 오차 {err}°");
+        }
+        for b in [0.4, 0.6, 1.0, 1.5, 2.0, 3.0, 4.0] {
+            for sigma in [0.5, 1.0] {
+                let rows: Vec<_> = (1..=10u64).map(|s| baseline_sweep(b, sigma, s)).collect();
+                let obs = rows.iter().filter(|r| r.0).count();
+                let rmin = rows.iter().map(|r| r.1).fold(f64::INFINITY, f64::min);
+                let rmax = rows.iter().map(|r| r.1).fold(0.0, f64::max);
+                let emax = rows.iter().map(|r| r.2).fold(0.0, f64::max);
+                println!(
+                    "b/d={:.3} σ={sigma}: 관측 {obs}/10, r {rmin:.2}~{rmax:.2}, 최대 회전 오차 {emax:.3}°",
+                    b / 40.0
                 );
             }
         }
+    }
+
+    #[test]
+    fn angle_between_is_finite_near_right_angle() {
+        let a = Vector3::new(1.0, 0.0, 0.0);
+        for eps in [0.0, 1e-17, 1e-12] {
+            let b = Vector3::new(eps, 1.0, 0.0).normalize();
+            let ang = angle_between(&a, &b);
+            assert!((ang - std::f64::consts::FRAC_PI_2).abs() < 1e-9, "{ang}");
+        }
+        assert!(angle_between(&a, &a).abs() < 1e-12);
     }
 }
