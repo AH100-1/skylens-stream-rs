@@ -5,11 +5,15 @@
 //! - θ: X 에서 두 카메라 중심으로 가는 광선 사이 각. 목표 θ₀ = 10° 근처에서 1,
 //!   θ < θ₀ 이면 폭 σ = 5°, θ > θ₀ 이면 σ = 15° 인 가우스 꼴로 줄어든다
 //!   (작은 각은 깊이 분해능이 나쁘고 큰 각은 겉모습이 달라 정합이 어렵다).
-//! - ρ: 두 사진에서 X 한 점이 차지하는 화소 크기(깊이 / 초점 거리)의 비.
-//!   `w_scale = (min/max)²` 이라 축척이 같을 때 1.
+//! - ρ: 두 사진에서 X 한 점이 차지하는 화소 크기의 비. 화소 크기는 **카메라 z(광축 방향 깊이) / 초점 거리**
+//!   로 정한다(광선 길이가 아니다). 핀홀에서 X 근처 정면 평면 조각의 화소 축척이 z/f 이기 때문이다.
+//!   `w_scale = (min/max)²` 이라 축척이 같을 때 1, 깊이가 2배면 0.25.
 //!
 //! 점수 상위 k 장(기본 [`DEFAULT_NEIGHBORS`] = 8)을 고른다. 점수 0 인 후보는 빼므로
-//! 공유 점이 적으면 k 장보다 적을 수 있다.
+//! 공유 점이 적으면 k 장보다 적을 수 있다. 좌표가 유한하지 않은 점이나 유한하지 않은 쌍 점수는 0 으로 친다.
+//!
+//! 깊이 범위는 [`try_depth_range`] 가 관측 점이 없으면 None 을 돌려주고, [`dense_jobs`] 는 그런 사진을
+//! 밀집 깊이 작업에서 뺀다.
 use std::collections::HashMap;
 
 use crate::camera::Camera;
@@ -72,7 +76,8 @@ pub fn scale_weight(a: f64, b: f64) -> f64 {
 fn footprint(view: &View, x: &Point3<f64>) -> Option<f64> {
     let z = view.cam.pose.transform(x).z;
     let k = &view.cam.intrinsics;
-    (z > 0.0).then(|| z / (0.5 * (k.fx + k.fy)))
+    let f = z / (0.5 * (k.fx + k.fy));
+    (z > 0.0 && f.is_finite()).then_some(f)
 }
 
 /// 두 사진이 함께 본 점 하나의 쌍 점수.
@@ -83,7 +88,12 @@ pub fn pair_score(a: &View, b: &View, x: &Point3<f64>) -> f64 {
     let ra = a.cam.pose.center() - x;
     let rb = b.cam.pose.center() - x;
     let c = (ra.dot(&rb) / (ra.norm() * rb.norm())).clamp(-1.0, 1.0);
-    angle_weight(c.acos()) * scale_weight(fa, fb)
+    let s = angle_weight(c.acos()) * scale_weight(fa, fb);
+    if s.is_finite() {
+        s
+    } else {
+        0.0
+    }
 }
 
 /// 사진마다 이웃 k 장을 고른다.
@@ -96,6 +106,9 @@ pub fn select_neighbors(views: &[View], points: &[SparsePoint], k: usize) -> Vec
     let mut score = vec![0.0f64; n * n];
     let mut obs = Vec::new();
     for p in points {
+        if !(p.xyz.x.is_finite() && p.xyz.y.is_finite() && p.xyz.z.is_finite()) {
+            continue;
+        }
         obs.clear();
         obs.extend(p.observers.iter().filter_map(|id| pos.get(id).copied()));
         obs.sort_unstable();
@@ -131,30 +144,61 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
 
 /// 사진의 깊이 탐색 범위 (가까운 끝, 먼 끝). 깊이는 카메라 z.
 ///
-/// 그 사진(`view.id`)이 관측한 점 중 카메라 앞에 있는 점들의 깊이에서
-/// [`DEPTH_QUANTILES`] 분위를 잡고 [`DEPTH_MARGIN`] 만큼 넓힌다.
-/// 그런 점이 없으면 (0, 0).
-pub fn depth_range(view: &View, points: &[SparsePoint]) -> (f64, f64) {
+/// 그 사진(`view.id`)이 관측한 점 중 카메라 앞에 있고 깊이가 유한한 점들에서
+/// [`DEPTH_QUANTILES`] 분위를 잡고 [`DEPTH_MARGIN`] 만큼 넓힌다. 그런 점이 없으면 None.
+pub fn try_depth_range(view: &View, points: &[SparsePoint]) -> Option<(f64, f64)> {
     let mut d: Vec<f64> = points
         .iter()
         .filter(|p| p.observers.contains(&view.id))
         .map(|p| view.cam.pose.transform(&p.xyz).z)
-        .filter(|z| *z > 0.0)
+        .filter(|z| z.is_finite() && *z > 0.0)
         .collect();
     if d.is_empty() {
-        return (0.0, 0.0);
+        return None;
     }
     d.sort_by(f64::total_cmp);
     let near = quantile(&d, DEPTH_QUANTILES.0) * (1.0 - DEPTH_MARGIN);
     let far = quantile(&d, DEPTH_QUANTILES.1) * (1.0 + DEPTH_MARGIN);
-    (near, far)
+    Some((near, far))
+}
+
+/// [`try_depth_range`] 의 튜플 형태. 관측 점이 없으면 (0, 0) 이므로 호출 쪽은
+/// `near < far` 를 확인하거나 [`dense_jobs`] 를 쓴다.
+pub fn depth_range(view: &View, points: &[SparsePoint]) -> (f64, f64) {
+    try_depth_range(view, points).unwrap_or((0.0, 0.0))
+}
+
+/// 밀집 깊이 작업 하나: 기준 사진, 이웃, 깊이 범위(모두 `views` 안 색인).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DenseJob {
+    pub view: usize,
+    pub neighbors: Vec<usize>,
+    pub range: (f64, f64),
+}
+
+/// 사진마다 이웃 k 장과 깊이 범위를 묶는다. 깊이 범위가 없거나(관측 없음) 이웃이 없는 사진은 뺀다.
+pub fn dense_jobs(views: &[View], points: &[SparsePoint], k: usize) -> Vec<DenseJob> {
+    let nb = select_neighbors(views, points, k);
+    views
+        .iter()
+        .zip(nb)
+        .enumerate()
+        .filter_map(|(i, (v, neighbors))| {
+            let range = try_depth_range(v, points)?;
+            (!neighbors.is_empty()).then_some(DenseJob {
+                view: i,
+                neighbors,
+                range,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::camera::{Intrinsics, Pose};
-    use crate::math::{Matrix3, Rotation3};
+    use crate::math::{Matrix3, Rotation3, Vector3};
 
     struct Lcg(u64);
     impl Lcg {
@@ -267,5 +311,184 @@ mod tests {
         assert!(near <= q05 && far >= q95);
         assert!(near >= 0.85 * q05 && far <= 1.15 * q95);
         assert_eq!(depth_range(&View { id: 999, ..v }, &pts), (0.0, 0.0));
+        assert_eq!(try_depth_range(&View { id: 999, ..v }, &pts), None);
+    }
+
+    /// F-054: NaN 점 하나를 섞어도 이웃 목록이 같고, 관측 없는 사진은 밀집 작업에서 빠진다.
+    #[test]
+    fn non_finite_points_and_unobserved_views() {
+        let (mut views, mut pts) = line_flight(21);
+        let base = select_neighbors(&views, &pts, DEFAULT_NEIGHBORS);
+        let all_ids: Vec<usize> = views.iter().map(|v| v.id).collect();
+        pts.push(SparsePoint {
+            xyz: Point3::new(f64::NAN, 0.0, 0.0),
+            observers: all_ids.clone(),
+        });
+        pts.push(SparsePoint {
+            xyz: Point3::new(5.0, f64::INFINITY, 0.0),
+            observers: all_ids,
+        });
+        assert_eq!(select_neighbors(&views, &pts, DEFAULT_NEIGHBORS), base);
+        let r = try_depth_range(&views[10], &pts).unwrap();
+        assert!(r.0.is_finite() && r.1.is_finite() && r.0 < r.1);
+        // 관측이 하나도 없는 사진.
+        let mut lone = views[0];
+        lone.id = 999;
+        views.push(lone);
+        let jobs = dense_jobs(&views, &pts, DEFAULT_NEIGHBORS);
+        assert_eq!(jobs.len(), 21);
+        assert!(jobs.iter().all(|j| j.view != 21 && j.range.0 < j.range.1));
+    }
+
+    /// 카메라 중심 `c` 에서 `target` 을 보는 회전(카메라 z = 보는 방향, y 는 아래쪽 성분).
+    fn look_at(c: &Point3<f64>, target: &Point3<f64>, z_dir: Option<Vector3<f64>>) -> Pose {
+        let z = z_dir.unwrap_or(target - c).normalize();
+        let down = Vector3::new(0.0, 0.0, -1.0);
+        let mut x = z.cross(&down);
+        if x.norm() < 1e-9 {
+            x = Vector3::x();
+        }
+        let x = x.normalize();
+        let y = z.cross(&x);
+        let r = Rotation3::from_matrix_unchecked(Matrix3::from_rows(&[
+            x.transpose(),
+            y.transpose(),
+            z.transpose(),
+        ]));
+        Pose::from_center(r, c)
+    }
+
+    /// F-110: 각은 같고(10°) 점까지 거리만 30 m 와 60 m 인 두 후보. 기준 사진은 점을 광축에서 25° 벗어나
+    /// 보므로 z(30 m) 와 광선 길이(33.1 m)가 다르다. z 축척이면 점수 비 0.25, 광선 길이면 0.37.
+    #[test]
+    fn scale_ratio_uses_camera_depth() {
+        let k = Intrinsics::from_hfov(1600, 1200, 70f64.to_radians());
+        let x = Point3::origin();
+        let alpha = 25f64.to_radians();
+        let cr = Point3::new(0.0, 0.0, 30.0 / alpha.cos());
+        let axis = Vector3::new(alpha.sin(), 0.0, -alpha.cos());
+        let reference = View {
+            cam: Camera {
+                intrinsics: k,
+                pose: look_at(&cr, &x, Some(axis)),
+            },
+            id: 0,
+        };
+        let t = 10f64.to_radians();
+        let dir = Vector3::new(0.0, t.sin(), t.cos());
+        let cand = |d: f64, id: usize| {
+            let c = x + dir * d;
+            View {
+                cam: Camera {
+                    intrinsics: k,
+                    pose: look_at(&c, &x, None),
+                },
+                id,
+            }
+        };
+        let (near, far) = (cand(30.0, 1), cand(60.0, 2));
+        assert!((reference.cam.pose.transform(&x).z - 30.0).abs() < 1e-9);
+        assert!(reference.cam.project(&x).is_some_and(|p| k.contains(&p)));
+        let ratio = pair_score(&reference, &far, &x) / pair_score(&reference, &near, &x);
+        eprintln!("scale_ratio far/near {ratio:.4}");
+        assert!((ratio - 0.25).abs() <= 0.02, "{ratio}");
+    }
+
+    /// F-052: SPEC §1 실측 편대(드론 3대 약 10 m 간격, F −3°·R +125°·L −116°, 기울기 60°, 화각 65°,
+    /// 위치 간 1 m) 40곳 × 3대. 가운데 위치 각 카메라 사진의 이웃 순위.
+    #[test]
+    fn formation_neighbors() {
+        use crate::synth::{CamId, Scene, SceneConfig};
+        let scene = Scene::new(SceneConfig {
+            positions: 40,
+            ..SceneConfig::default()
+        });
+        let views: Vec<View> = scene
+            .views
+            .iter()
+            .enumerate()
+            .map(|(i, v)| View {
+                cam: v.camera,
+                id: i,
+            })
+            .collect();
+        let mut rng = Lcg(11);
+        let mut pts = Vec::new();
+        for _ in 0..40000 {
+            let (gx, gy) = (-40.0 + 120.0 * rng.next(), -60.0 + 120.0 * rng.next());
+            let x = Point3::new(gx, gy, scene.surface_height(gx, gy));
+            let observers: Vec<usize> = views
+                .iter()
+                .filter(|v| {
+                    let k = &v.cam.intrinsics;
+                    v.cam.project(&x).is_some_and(|p| k.contains(&p))
+                })
+                .map(|v| v.id)
+                .collect();
+            if observers.len() >= 2 {
+                pts.push(SparsePoint { xyz: x, observers });
+            }
+        }
+        let nb = select_neighbors(&views, &pts, DEFAULT_NEIGHBORS);
+        let c = 20;
+        for cam in CamId::ALL {
+            let me = scene
+                .views
+                .iter()
+                .position(|v| v.cam == cam && v.position == c)
+                .unwrap();
+            let label: Vec<String> = nb[me]
+                .iter()
+                .map(|&j| {
+                    let v = &scene.views[j];
+                    format!("{}{:+}", v.cam.letter(), v.position as i64 - c as i64)
+                })
+                .collect();
+            // 기하 예측: 사진 가운데 광선이 닿는 지면 점에서 같은 카메라가 b m 움직였을 때
+            // 광선 사이 각이 10° 가 되는 b.
+            let v0 = &scene.views[me];
+            let c0 = v0.camera.pose.center();
+            let dir = scene.config.view_dir(cam);
+            let g = c0 + dir * ((c0.z - scene.surface_height(c0.x, c0.y)) / -dir.z);
+            let step = Vector3::new(scene.config.spacing, 0.0, 0.0);
+            let angle = |b: f64| {
+                let (ra, rb) = (c0 - g, c0 + step * b - g);
+                (ra.dot(&rb) / (ra.norm() * rb.norm())).acos().to_degrees()
+            };
+            let pred = (1..=20)
+                .min_by(|&a, &b| {
+                    (angle(a as f64) - TARGET_ANGLE_DEG)
+                        .abs()
+                        .total_cmp(&(angle(b as f64) - TARGET_ANGLE_DEG).abs())
+                })
+                .unwrap() as i64;
+            eprintln!(
+                "{} center neighbors {:?} predicted |offset| {pred} (1 step {:.2} deg, 8 steps {:.2} deg)",
+                cam.letter(),
+                label,
+                angle(1.0),
+                angle(8.0)
+            );
+            let same: Vec<i64> = nb[me]
+                .iter()
+                .filter(|&&j| scene.views[j].cam == cam)
+                .map(|&j| scene.views[j].position as i64 - c as i64)
+                .collect();
+            assert!(same.len() >= 6, "같은 카메라 {}", same.len());
+            assert!(
+                !same.contains(&1) && !same.contains(&-1),
+                "1칸 이웃이 상위 8"
+            );
+            let top3 = &nb[me][..3];
+            assert!(
+                top3.iter().any(|&j| scene.views[j].cam == cam
+                    && (6..=9).contains(&(scene.views[j].position as i64 - c as i64).abs())),
+                "6~9칸 이웃이 상위 3 밖"
+            );
+            let first = &scene.views[nb[me][0]];
+            assert_eq!(first.cam, cam);
+            let d0 = (first.position as i64 - c as i64).abs();
+            assert!((d0 - pred).abs() <= 1, "1위 간격 {d0} 예측 {pred}");
+        }
     }
 }
