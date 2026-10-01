@@ -55,6 +55,20 @@ for f in &feats {
 }
 ```
 
+### 라이브러리: 매칭과 기하 검증
+
+```rust
+use skylens_core::matching::{ratio_match, ransac_fundamental, RansacConfig};
+
+// 비율 0.8, 양방향 확인
+let pairs = ratio_match(&feats_a, &feats_b, 0.8, true);
+let x1: Vec<_> = pairs.iter().map(|&(i, _)| nalgebra::Vector2::new(feats_a[i].kp.x as f64, feats_a[i].kp.y as f64)).collect();
+let x2: Vec<_> = pairs.iter().map(|&(_, j)| nalgebra::Vector2::new(feats_b[j].kp.x as f64, feats_b[j].kp.y as f64)).collect();
+if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default()) {
+    // f: 기본 행렬(x2ᵀ F x1 = 0), inliers[k]: pairs[k] 가 기하적으로 맞는지
+}
+```
+
 ## 출력
 
 ```
