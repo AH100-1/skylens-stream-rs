@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+    branches: [main, "experiment/**"]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: skip if no workspace yet
+        id: ws
+        run: test -f Cargo.toml && echo "has=1" >> "$GITHUB_OUTPUT" || echo "has=0" >> "$GITHUB_OUTPUT"
+      - if: steps.ws.outputs.has == '1'
+        run: cargo fmt --all --check
+      - if: steps.ws.outputs.has == '1'
+        run: cargo clippy --all-targets -- -D warnings
+      - if: steps.ws.outputs.has == '1'
+        run: cargo test --release
