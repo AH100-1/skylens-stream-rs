@@ -6,7 +6,7 @@ use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
 
 const USAGE: &str =
-    "사용법:\n  skylens-stream ply-info <파일.ply>\n  skylens-stream synth <출력 폴더> [폭 높이]";
+    "사용법:\n  skylens-stream ply-info <파일.ply>\n  skylens-stream synth <출력 폴더> [폭 높이]\n  skylens-stream verify <출력 폴더>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48,6 +48,15 @@ fn main() -> ExitCode {
                     eprintln!("{out}: {e}");
                     ExitCode::FAILURE
                 }
+            }
+        }
+        ["verify", dir] => {
+            let report = skylens_core::verify::verify_dir(std::path::Path::new(dir));
+            print!("{}", report.to_table());
+            if report.all_pass() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
             }
         }
         ["--version"] => {
