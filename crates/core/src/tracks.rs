@@ -9,8 +9,9 @@
 //!   내림차순으로(같으면 노드 번호 순) 하나씩 합치되, 합치면 같은 영상의 특징이 둘이 되는 간선은 건너뛴다.
 //!   한 트랙 안의 참 대응은 길이 L 트랙에서 지지도가 최대 L−2 이고, 우연한 오대응은 공통 이웃이 거의
 //!   없어 지지도가 0 에 가깝다. 따라서 오대응이 마지막에 처리되고 충돌을 만들면 버려진다.
-//!   또 지지도 0 간선은 두 끝이 모두 관측 2 개 이상인 트랙에 속하면 잇지 않는다(영상이 겹치지 않는
-//!   두 점을 잇는 오대응은 충돌로 드러나지 않으므로).
+//!   지지도 0 간선은 지지도가 있는 간선을 모두 처리한 뒤 성분 쌍 단위로 모아, 이미 자란 두 성분은
+//!   서로 다른 간선 2 개 이상으로 이어질 때만 잇는다(영상이 겹치지 않는 두 점을 잇는 우연한 오대응은
+//!   충돌로 드러나지 않지만 대개 한 개뿐이고, 대응이 성긴 참 트랙 조각은 여러 간선으로 이어진다).
 //!   충돌이 없는 성분은 어느 정책이든 같은 결과다.
 //!
 //! 결정성: 간선을 (작은 노드, 큰 노드) 로 정규화·정렬·중복 제거한 뒤 처리하므로 짝 순서, 짝 안 대응 순서,
@@ -33,14 +34,21 @@ pub struct PairMatches {
     pub matches: Vec<(usize, usize)>,
 }
 
-/// `ratio_match` 결과에서 RANSAC 정상 표시가 참인 짝만 남긴다(길이가 다르면 짧은 쪽까지).
-pub fn verified_matches(matches: &[(usize, usize)], inliers: &[bool]) -> Vec<(usize, usize)> {
-    matches
+/// `ratio_match` 결과에서 RANSAC 정상 표시가 참인 짝만 남긴다.
+/// 대응과 정상 표시의 길이가 다르면 (대응 수, 표시 수) 를 오류로 돌려준다.
+pub fn verified_matches(
+    matches: &[(usize, usize)],
+    inliers: &[bool],
+) -> Result<Vec<(usize, usize)>, (usize, usize)> {
+    if matches.len() != inliers.len() {
+        return Err((matches.len(), inliers.len()));
+    }
+    Ok(matches
         .iter()
         .zip(inliers)
         .filter(|(_, &ok)| ok)
         .map(|(&m, _)| m)
-        .collect()
+        .collect())
 }
 
 /// 트랙 관측 하나: 영상 번호, 특징 번호, 화소 좌표.
@@ -202,39 +210,95 @@ pub fn build_tracks(
             }
         }
         ConflictPolicy::Split => {
-            // 인접 목록(정렬됨)으로 간선마다 공통 이웃 수를 센다.
-            let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+            // 인접 목록(CSR: 오프셋 + 평탄 배열, 노드마다 정렬)으로 간선마다 공통 이웃 수를 센다.
+            let mut start = vec![0usize; n + 1];
             for &(u, v) in &edges {
-                adj[u].push(v);
-                adj[v].push(u);
+                start[u + 1] += 1;
+                start[v + 1] += 1;
             }
-            for a in &mut adj {
-                a.sort_unstable();
+            for i in 0..n {
+                start[i + 1] += start[i];
             }
+            let mut fill = start.clone();
+            let mut flat = vec![0usize; 2 * edges.len()];
+            for &(u, v) in &edges {
+                flat[fill[u]] = v;
+                fill[u] += 1;
+                flat[fill[v]] = u;
+                fill[v] += 1;
+            }
+            for i in 0..n {
+                flat[start[i]..start[i + 1]].sort_unstable();
+            }
+            let nb = |x: usize| &flat[start[x]..start[x + 1]];
             let mut order: Vec<(usize, usize, usize)> = edges
                 .iter()
-                .map(|&(u, v)| (common_count(&adj[u], &adj[v]), u, v))
+                .map(|&(u, v)| (common_count(nb(u), nb(v)), u, v))
                 .collect();
             order.sort_unstable_by(|a, b| b.0.cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2))));
-            // 대표마다 성분이 가진 영상 번호(정렬됨).
-            let mut images: HashMap<usize, Vec<usize>> = HashMap::new();
-            for (support, u, v) in order {
+            // 대표마다 성분이 가진 영상 번호(정렬됨). 비어 있으면 홀로인 노드.
+            let mut images: Vec<Vec<usize>> = vec![Vec::new(); n];
+            let imgs_of = |images: &mut Vec<Vec<usize>>, r: usize| {
+                let v = std::mem::take(&mut images[r]);
+                if v.is_empty() {
+                    vec![node_image[r]]
+                } else {
+                    v
+                }
+            };
+            // 1 단계: 지지도 > 0 간선을 지지도 내림차순으로 합친다(충돌이면 건너뜀).
+            let split = order.iter().position(|e| e.0 == 0).unwrap_or(order.len());
+            for &(_, u, v) in &order[..split] {
                 let (ru, rv) = (uf.find(u), uf.find(v));
                 if ru == rv {
                     continue;
                 }
-                let iu = images.remove(&ru).unwrap_or_else(|| vec![node_image[ru]]);
-                let iv = images.remove(&rv).unwrap_or_else(|| vec![node_image[rv]]);
-                // 지지도 0 간선은 한쪽이 아직 홀로인 노드일 때만 잇는다: 이미 자란 두 트랙을
-                // 공통 이웃 없이 잇는 간선은 오대응일 가능성이 크다(영상이 겹치지 않아 충돌로는 못 잡는다).
-                if common_count(&iu, &iv) > 0 || (support == 0 && iu.len() > 1 && iv.len() > 1) {
+                let iu = imgs_of(&mut images, ru);
+                let iv = imgs_of(&mut images, rv);
+                if common_count(&iu, &iv) > 0 {
                     stats.conflicts += 1;
-                    images.insert(ru, iu);
-                    images.insert(rv, iv);
+                    images[ru] = iu;
+                    images[rv] = iv;
                     continue;
                 }
                 let r = uf.link(ru, rv);
-                images.insert(r, merge_sorted(&iu, &iv));
+                images[r] = merge_sorted(&iu, &iv);
+            }
+            // 2 단계: 지지도 0 간선은 1 단계 뒤 성분 쌍마다 묶어, 두 성분을 잇는 서로 다른 간선 수가
+            // 많은 쌍부터 합친다. 이미 자란(관측 2 개 이상) 두 성분은 잇는 간선이 2 개 이상일 때만 잇는다:
+            // 대응이 성기면 참 트랙 조각 사이에도 공통 이웃이 없지만 잇는 간선은 여럿이고,
+            // 우연한 오대응은 대개 한 개뿐이다.
+            let mut groups: Vec<(usize, usize, usize)> = order[split..]
+                .iter()
+                .filter_map(|&(_, u, v)| {
+                    let (ru, rv) = (uf.find(u), uf.find(v));
+                    (ru != rv).then(|| (ru.min(rv), ru.max(rv), 0))
+                })
+                .collect();
+            groups.sort_unstable();
+            let mut counted: Vec<(usize, usize, usize)> = Vec::with_capacity(groups.len());
+            for (a, b, _) in groups {
+                match counted.last_mut() {
+                    Some(last) if last.0 == a && last.1 == b => last.2 += 1,
+                    _ => counted.push((a, b, 1)),
+                }
+            }
+            counted.sort_unstable_by(|x, y| y.2.cmp(&x.2).then((x.0, x.1).cmp(&(y.0, y.1))));
+            for (a, b, count) in counted {
+                let (ru, rv) = (uf.find(a), uf.find(b));
+                if ru == rv {
+                    continue;
+                }
+                let iu = imgs_of(&mut images, ru);
+                let iv = imgs_of(&mut images, rv);
+                if common_count(&iu, &iv) > 0 || (count < 2 && iu.len() > 1 && iv.len() > 1) {
+                    stats.conflicts += count;
+                    images[ru] = iu;
+                    images[rv] = iv;
+                    continue;
+                }
+                let r = uf.link(ru, rv);
+                images[r] = merge_sorted(&iu, &iv);
             }
         }
     }
@@ -306,11 +370,21 @@ fn common_count(a: &[usize], b: &[usize]) -> usize {
     c
 }
 
+/// 정렬된 두 목록을 정렬 없이 하나로 합친다.
 fn merge_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
     let mut out = Vec::with_capacity(a.len() + b.len());
-    out.extend_from_slice(a);
-    out.extend_from_slice(b);
-    out.sort_unstable();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] <= b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
     out
 }
 
@@ -370,8 +444,11 @@ mod tests {
         inliers: usize,
     }
 
-    /// `outlier_per_mille`: 짝마다 참 대응 1000 개당 섞는 오대응 수.
-    fn synthetic(outlier_per_mille: u64) -> Synthetic {
+    /// `outlier_per_mille`: 짝마다 참 대응 1000 개당 섞는 무작위 오대응 수.
+    /// `keep_percent`: 짝마다 남기는 참 대응 비율(%, 대응 재현율).
+    /// `swap_percent`: 정답 점 중 이 비율(%)을 1.5 m 옆 격자 점과 모든 짝에서 일관되게 바꿔
+    /// 대응시킨다(반복 무늬형 오대응).
+    fn synthetic(outlier_per_mille: u64, keep_percent: u64, swap_percent: u64) -> Synthetic {
         let scene = Scene::new(SceneConfig {
             positions: 12,
             ..SceneConfig::default()
@@ -418,13 +495,30 @@ mod tests {
         let mut pairs = Vec::new();
         let (mut outliers, mut inliers) = (0, 0);
         for (a, b) in candidate_pairs(&views, 5, 4, 16) {
-            let mut m: Vec<(usize, usize)> = gt[a]
+            let common: Vec<(usize, usize, usize)> = gt[a]
                 .iter()
                 .enumerate()
-                .filter_map(|(fa, p)| feat_of[b].get(p).map(|&fb| (fa, fb)))
+                .filter_map(|(fa, &p)| feat_of[b].get(&p).map(|&fb| (fa, fb, p)))
                 .collect();
-            if m.len() < 16 {
+            if common.len() < 16 {
                 continue;
+            }
+            let mut m = Vec::new();
+            for &(fa, fb, p) in &common {
+                if hash((a as u64) << 44 | (b as u64) << 24 | p as u64 | 1 << 63) % 100
+                    >= keep_percent
+                {
+                    continue;
+                }
+                // 바뀐 점: 같은 짝 b 에서 옆 격자 점(번호 + 1)의 특징과 대응시킨다.
+                if hash(p as u64 ^ 0x5A5A_0000_0000) % 100 < swap_percent {
+                    if let Some(&fq) = feat_of[b].get(&(p + 1)) {
+                        m.push((fa, fq));
+                        outliers += 1;
+                    }
+                    continue;
+                }
+                m.push((fa, fb));
             }
             inliers += m.len();
             let k = (m.len() as u64 * outlier_per_mille).div_ceil(1000);
@@ -489,17 +583,31 @@ mod tests {
                     id.entry(k).or_insert(n);
                 }
             }
-            let mut uf = UnionFind::new(id.len());
+            // 너비 우선 탐색으로 가장 큰 연결 무리(시험 대상 합집합-찾기를 쓰지 않음).
+            let mut adj = vec![Vec::new(); id.len()];
             for &(x, y) in es {
-                let (rx, ry) = (uf.find(id[&x]), uf.find(id[&y]));
-                if rx != ry {
-                    uf.link(rx, ry);
-                }
+                adj[id[&x]].push(id[&y]);
+                adj[id[&y]].push(id[&x]);
             }
-            let mut size = vec![0usize; id.len()];
-            for k in 0..id.len() {
-                let r = uf.find(k);
-                size[r] += 1;
+            let mut seen = vec![false; id.len()];
+            let mut size = Vec::new();
+            for s0 in 0..id.len() {
+                if seen[s0] {
+                    continue;
+                }
+                seen[s0] = true;
+                let mut queue = std::collections::VecDeque::from([s0]);
+                let mut c = 0;
+                while let Some(x) = queue.pop_front() {
+                    c += 1;
+                    for &y in &adj[x] {
+                        if !seen[y] {
+                            seen[y] = true;
+                            queue.push_back(y);
+                        }
+                    }
+                }
+                size.push(c);
             }
             reach.insert(p, *size.iter().max().unwrap());
         }
@@ -528,7 +636,7 @@ mod tests {
     #[test]
     fn clean_matches_give_exact_tracks() {
         // 오대응이 없으면 Drop 의 성분 = 정답 점: 순도·완전도 모두 정확히 1, 충돌 0.
-        let s = synthetic(0);
+        let s = synthetic(0, 100, 0);
         assert_eq!(s.outliers, 0);
         for policy in [ConflictPolicy::Drop, ConflictPolicy::Split] {
             let cfg = TrackConfig {
@@ -554,7 +662,7 @@ mod tests {
     #[test]
     fn purity_and_completeness_with_outliers() {
         // 짝마다 대응의 1% 를 무작위 오대응으로 섞는다(기하 검증 뒤 남는 오대응 비율로 넉넉한 값).
-        let s = synthetic(10);
+        let s = synthetic(10, 100, 0);
         assert!(s.outliers * 200 > s.inliers, "오대응이 충분히 섞여야 한다");
         let run = |policy| {
             let cfg = TrackConfig {
@@ -583,7 +691,80 @@ mod tests {
         assert!(cs >= 0.98, "Split 완전도 {cs}");
         // Drop 은 오대응에 닿은 트랙을 통째로 잃으므로 Split 보다 낮다(충돌 처리 규칙의 효과).
         assert!(cd < cs, "Drop {cd} / Split {cs}");
-        assert_eq!(ss.tracks, ss.tracks.min(MAX_TRACKS));
+        // 상한: 트랙 수보다 작은 상한이면 실제로 잘린다.
+        let cap = ss.tracks / 2;
+        let cfg = TrackConfig {
+            max_tracks: cap,
+            ..TrackConfig::default()
+        };
+        let (t, st) = build_tracks(&s.pairs, &s.keypoints, &cfg);
+        assert_eq!(t.len(), cap);
+        assert_eq!(st.truncated, ss.tracks - cap);
+        assert!(st.truncated > 0);
+    }
+
+    fn run_policy(s: &Synthetic, policy: ConflictPolicy) -> (f64, f64, TrackStats, f64) {
+        let cfg = TrackConfig {
+            policy,
+            ..TrackConfig::default()
+        };
+        let (t, st) = build_tracks(&s.pairs, &s.keypoints, &cfg);
+        let (p, c) = purity_completeness(s, &t);
+        let mean = t.iter().map(|x| x.len()).sum::<usize>() as f64 / t.len() as f64;
+        (p, c, st, mean)
+    }
+
+    #[test]
+    fn sparse_recall_keeps_tracks_whole() {
+        // 짝마다 참 대응의 50%·30% 만 남기고(대응 재현율) 오대응 0·1% 를 섞는다.
+        // 네 경우를 모두 잰 뒤 한꺼번에 판정한다.
+        let mut failures = Vec::new();
+        for keep in [50, 30] {
+            for opm in [0, 10] {
+                let s = synthetic(opm, keep, 0);
+                let (pd, cd, sd, md) = run_policy(&s, ConflictPolicy::Drop);
+                let (ps, cs, ss, ms) = run_policy(&s, ConflictPolicy::Split);
+                eprintln!(
+                    "keep {keep}% outlier {opm}permil edges {}: Drop tracks {} purity {pd:.4} completeness {cd:.4} mean {md:.2} | Split tracks {} purity {ps:.4} completeness {cs:.4} mean {ms:.2} conflicts {}",
+                    ss.edges, sd.tracks, ss.tracks, ss.conflicts
+                );
+                if ps < 0.99 {
+                    failures.push(format!("keep {keep} opm {opm}: Split 순도 {ps}"));
+                }
+                if cs < 0.97 {
+                    failures.push(format!("keep {keep} opm {opm}: Split 완전도 {cs}"));
+                }
+                if opm == 0 && cs < cd - 0.01 {
+                    failures.push(format!("keep {keep}: Split {cs} / Drop {cd}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn consistent_swaps_stay_pure() {
+        // 정답 점 1% 를 옆 격자 점과 모든 짝에서 일관되게 바꾼다(반복 무늬형 오대응).
+        let s = synthetic(0, 100, 1);
+        assert!(s.outliers > 0);
+        let (pd, cd, sd, _) = run_policy(&s, ConflictPolicy::Drop);
+        let (ps, cs, ss, _) = run_policy(&s, ConflictPolicy::Split);
+        eprintln!(
+            "consistent 1% outliers {}: Drop tracks {} purity {pd:.4} completeness {cd:.4} | Split tracks {} purity {ps:.4} completeness {cs:.4}",
+            s.outliers, sd.tracks, ss.tracks
+        );
+        assert!(ps >= 0.99, "Split 순도 {ps}");
+    }
+
+    #[test]
+    fn verified_matches_rejects_length_mismatch() {
+        let m = [(0, 1), (2, 3), (4, 5)];
+        assert_eq!(
+            verified_matches(&m, &[true, false, true]),
+            Ok(vec![(0, 1), (4, 5)])
+        );
+        assert_eq!(verified_matches(&m, &[true, false]), Err((3, 2)));
+        assert_eq!(verified_matches(&m[..1], &[true, true]), Err((1, 2)));
     }
 
     #[test]
@@ -680,7 +861,7 @@ mod tests {
 
     #[test]
     fn order_independent() {
-        let s = synthetic(10);
+        let s = synthetic(10, 100, 0);
         for policy in [ConflictPolicy::Drop, ConflictPolicy::Split] {
             let cfg = TrackConfig {
                 policy,
