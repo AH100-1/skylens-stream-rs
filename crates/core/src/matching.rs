@@ -287,6 +287,8 @@ pub struct ModelSelection {
     pub parallax: usize,
     /// 평면으로 판정하지 않는 데 필요한 최소 시차 짝 수.
     pub parallax_needed: usize,
+    /// 실제로 쓴 잡음 σ(px): 호출자 σ 와 강건 추정 중 큰 쪽.
+    pub sigma_px: f64,
 }
 
 /// 정상 짝(x1, x2)과 그 F 에 대해 F/H 모델을 고른다. `sigma_px` 는 좌표 잡음 표준편차.
@@ -298,7 +300,9 @@ pub struct ModelSelection {
 /// 약 3 을 더 내므로 ln4 − 1 ≈ 0.39 ≈ 2·비율) H 를 고른다. 그러나 F 는 호모그래피 + 평면 밖 두 점으로 정해지므로
 /// 지면 위주 장면에서 건물 몇 %만 있어도 F 가 정해진다. 그래서 GRIC 가 H 를 고르더라도 시차 짝 수가
 /// 순수 평면에서 우연히 나올 수 있는 수(기대 0.001n + 3√(0.001n), 여기에 고정 8)를 넘으면 F 를 고른다.
-/// 정상 짝이 8개 미만이거나 호모그래피를 맞출 수 없으면 None.
+/// 잡음 크기는 호출자 σ 와 정상 짝의 제곱 Sampson 거리 중앙값에서 구한 강건 추정
+/// σ̂ = √(중앙값 / 0.455)(χ²₁ 중앙값) 가운데 큰 쪽을 쓴다(σ 를 실제보다 작게 넘겨도 평면 밖 시차로 잘못 세지 않게).
+/// 정상 짝이 8개 미만이거나, σ 가 유한한 양수가 아니거나, 호모그래피를 맞출 수 없으면 None.
 pub fn select_two_view_model(
     x1: &[Vector2<f64>],
     x2: &[Vector2<f64>],
@@ -306,9 +310,21 @@ pub fn select_two_view_model(
     sigma_px: f64,
 ) -> Option<ModelSelection> {
     let n = x1.len();
-    if n < 8 || n != x2.len() || sigma_px.is_nan() || sigma_px <= 0.0 {
+    if n < 8 || n != x2.len() || !sigma_px.is_finite() || sigma_px <= 0.0 {
         return None;
     }
+    let mut es: Vec<f64> = x1
+        .iter()
+        .zip(x2)
+        .map(|(p, q)| sampson_error(f, p, q))
+        .filter(|e| e.is_finite())
+        .collect();
+    if es.len() < 8 {
+        return None;
+    }
+    es.sort_by(f64::total_cmp);
+    let sigma_hat = (es[es.len() / 2] / 0.455).sqrt();
+    let sigma_px = sigma_px.max(sigma_hat);
     let s2 = sigma_px * sigma_px;
     let (h, hi, _) = fit_homography(x1, x2, 3.0 * sigma_px)?;
     let tr = |m: &Matrix3<f64>, x: &Vector2<f64>, y: &Vector2<f64>| -> f64 {
@@ -346,6 +362,7 @@ pub fn select_two_view_model(
         gric_h,
         parallax,
         parallax_needed,
+        sigma_px,
     })
 }
 
@@ -1752,16 +1769,15 @@ mod tests {
         for seed in 1..=5u64 {
             // 모든 점 z = 0, σ = 0.5 px: RANSAC 이 낸 F 와 정상 짝으로 모델을 고르면 호모그래피.
             let (x1, x2) = planar_correspondences(200, 0.5, seed);
-            if let Some((f, inl)) = ransac_fundamental(&x1, &x2, &cfg) {
-                let s1: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x1[i]).collect();
-                let s2: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x2[i]).collect();
-                let m = select_two_view_model(&s1, &s2, &f, cfg.threshold_px / 3.0).unwrap();
-                assert_eq!(
-                    m.model,
-                    TwoViewModel::Homography,
-                    "seed {seed}: RANSAC F {m:?}"
-                );
-            }
+            let (f, inl) = ransac_fundamental(&x1, &x2, &cfg).expect("평면 장면에서 RANSAC None");
+            let s1: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x1[i]).collect();
+            let s2: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x2[i]).collect();
+            let m = select_two_view_model(&s1, &s2, &f, cfg.threshold_px / 3.0).unwrap();
+            assert_eq!(
+                m.model,
+                TwoViewModel::Homography,
+                "seed {seed}: RANSAC F {m:?}"
+            );
             // 정답 F 를 주어도 모델 선택은 호모그래피.
             let (c1, c2) = two_cameras();
             let m =
@@ -1769,6 +1785,57 @@ mod tests {
             eprintln!("평면 seed {seed}: {m:?}");
             assert_eq!(m.model, TwoViewModel::Homography, "seed {seed}");
         }
+    }
+
+    #[test]
+    fn model_selection_robust_to_underestimated_sigma() {
+        // 실제 잡음 σ 0.5·1.0·1.5 px 에 호출자는 0.5 만 넘긴다: 순수 평면 200점은 모두 H.
+        let (c1, c2) = two_cameras();
+        let f0 = fundamental_from_cameras(&c1, &c2);
+        for actual in [0.5, 1.0, 1.5] {
+            for seed in 1..=5u64 {
+                let (x1, x2) = planar_correspondences(200, actual, seed);
+                let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+                eprintln!("평면 실제 σ {actual} seed {seed}: {m:?}");
+                assert_eq!(
+                    m.model,
+                    TwoViewModel::Homography,
+                    "σ {actual} seed {seed}: {m:?}"
+                );
+                // 강건 추정 σ 는 실제의 0.7~1.4 배 안(작게 넘긴 σ 를 바로잡는다).
+                assert!(
+                    m.sigma_px > 0.7 * actual && m.sigma_px < 1.4 * actual.max(0.5),
+                    "σ {actual} seed {seed}: 추정 {}",
+                    m.sigma_px
+                );
+            }
+        }
+        // 지면 + 건물 5%, 실제 σ 0.5 에 0.5 를 넘기면 계속 F.
+        for seed in 1..=5u64 {
+            let (x1, x2) = ground_with_buildings(300, 0.05, 0.5, seed);
+            let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+            assert_eq!(
+                m.model,
+                TwoViewModel::Fundamental,
+                "건물 5% seed {seed}: {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_selection_rejects_non_finite_sigma() {
+        let (c1, c2) = two_cameras();
+        let f0 = fundamental_from_cameras(&c1, &c2);
+        let (x1, x2) = planar_correspondences(50, 0.5, 1);
+        for s in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 0.0, -1.0] {
+            assert!(select_two_view_model(&x1, &x2, &f0, s).is_none(), "σ {s}");
+        }
+        // 동일선상 20점에 σ = ∞ 도 None.
+        let l1: Vec<_> = (0..20)
+            .map(|i| Vector2::new(10.0 * i as f64, 5.0 * i as f64))
+            .collect();
+        let l2: Vec<_> = l1.iter().map(|p| p + Vector2::new(3.0, 1.0)).collect();
+        assert!(select_two_view_model(&l1, &l2, &f0, f64::INFINITY).is_none());
     }
 
     #[test]
