@@ -8,8 +8,8 @@ use rayon::prelude::*;
 pub const PAIR_TEMPORAL: usize = 5;
 /// SPEC 기본값: 다른 카메라 위치 차 0..=4.
 pub const PAIR_CROSS: usize = 4;
-/// 같은 카메라 2의 거듭제곱 간격 상한 기본값(제한 없음).
-pub const PAIR_POW2_MAX: usize = usize::MAX;
+/// SPEC 기본값: 같은 카메라 2의 거듭제곱 간격 상한(1, 2, 4, 8, 16).
+pub const PAIR_POW2_MAX: usize = 16;
 
 /// 매칭할 영상 짝 후보를 만든다. `views[k] = (카메라 번호, 촬영 위치 번호)`.
 /// 같은 카메라는 위치 차이 1..=`temporal` 이거나 `pow2_max` 이하의 2의 거듭제곱(긴 경로의 먼 제약),
@@ -57,6 +57,7 @@ const MATCH_BLOCK: usize = 64;
 
 /// 최근접/차근접 거리 비율 검사 매칭(L2, 전수 탐색). 결과는 (a 인덱스, b 인덱스), a 인덱스 순.
 /// `mutual` 이면 b→a 최근접도 같은 짝인 것만 남긴다.
+/// 차근접이 없으면(`b` 가 2개 미만) 비율을 잴 수 없으므로 짝을 만들지 않는다.
 ///
 /// 거리 행렬을 한 번만 계산한다: `a` 묶음마다(rayon 병렬) 모든 `b` 와의 거리로 행 최근접·차근접과
 /// 열(b→a) 최근접을 함께 갱신하고, 열 최근접은 묶음 순서대로 합친다. 같은 거리면 앞 인덱스가 이긴다.
@@ -99,7 +100,7 @@ pub fn ratio_match(a: &[Feature], b: &[Feature], ratio: f32, mutual: bool) -> Ve
     }
     let mut out = Vec::new();
     for (i, &(j, d1, d2)) in blocks.iter().flat_map(|(row, _)| row).enumerate() {
-        if j == usize::MAX || d1 >= ratio * ratio * d2 {
+        if j == usize::MAX || !d2.is_finite() || d1 >= ratio * ratio * d2 {
             continue;
         }
         if mutual && col_best[j].1 != i {
@@ -112,6 +113,125 @@ pub fn ratio_match(a: &[Feature], b: &[Feature], ratio: f32, mutual: bool) -> Ve
 
 /// 정규화된 8점 계(AᵀA)에서 둘째로 작은 고윳값 / 가장 큰 고윳값이 이보다 작으면 퇴화로 본다.
 const DEGENERATE_EIG_RATIO: f64 = 1e-10;
+
+/// 점 분포의 짧은 축 표준편차 / 긴 축 표준편차가 이보다 작으면 사실상 한 직선 위로 본다.
+/// 정상적인 8점 표본(영상 전체에 흩어짐)은 0.1 이상이고, 길이 수백 px 직선에 σ ≤ 1 px 잡음이면 0.01 미만이다.
+const COLLINEAR_AXIS_RATIO: f64 = 0.02;
+
+/// 점들의 2×2 공분산 고윳값으로 (짧은 축 표준편차, 긴 축 표준편차).
+fn axis_spread(p: &[Vector2<f64>]) -> (f64, f64) {
+    let n = p.len().max(1) as f64;
+    let c = p.iter().fold(Vector2::zeros(), |s, x| s + x) / n;
+    let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
+    for x in p {
+        let d = x - c;
+        sxx += d.x * d.x;
+        sxy += d.x * d.y;
+        syy += d.y * d.y;
+    }
+    let (sxx, sxy, syy) = (sxx / n, sxy / n, syy / n);
+    let tr = sxx + syy;
+    let disc = ((sxx - syy).powi(2) + 4.0 * sxy * sxy).sqrt();
+    let hi = 0.5 * (tr + disc);
+    let lo = (0.5 * (tr - disc)).max(0.0);
+    (lo.sqrt(), hi.sqrt())
+}
+
+/// 어느 한 영상에서라도 점들이 거의 한 직선 위에 있으면 참.
+fn nearly_collinear(p: &[Vector2<f64>]) -> bool {
+    let (lo, hi) = axis_spread(p);
+    !(hi > 0.0 && lo > COLLINEAR_AXIS_RATIO * hi)
+}
+
+/// 정규화 DLT 로 호모그래피 x2 ~ H x1 (최소제곱). 점 4개 미만이거나 풀리지 않으면 None.
+fn homography_dlt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matrix3<f64>> {
+    if x1.len() < 4 || x1.len() != x2.len() {
+        return None;
+    }
+    let (t1, t2) = (normalizer(x1), normalizer(x2));
+    let mut ata = SMatrix::<f64, 9, 9>::zeros();
+    for (p, q) in x1.iter().zip(x2) {
+        let a = t1 * Vector3::new(p.x, p.y, 1.0);
+        let b = t2 * Vector3::new(q.x, q.y, 1.0);
+        let r1 = SMatrix::<f64, 9, 1>::from_column_slice(&[
+            0.0,
+            0.0,
+            0.0,
+            -a.x,
+            -a.y,
+            -1.0,
+            b.y * a.x,
+            b.y * a.y,
+            b.y,
+        ]);
+        let r2 = SMatrix::<f64, 9, 1>::from_column_slice(&[
+            a.x,
+            a.y,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            -b.x * a.x,
+            -b.x * a.y,
+            -b.x,
+        ]);
+        ata += r1 * r1.transpose() + r2 * r2.transpose();
+    }
+    let eig = ata.symmetric_eigen();
+    let h = eig.eigenvectors.column(eig.eigenvalues.imin());
+    let hn = Matrix3::new(h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]);
+    let h = t2.try_inverse()? * hn * t1;
+    let n = h.norm();
+    (n.is_finite() && n > 0.0).then(|| h / n)
+}
+
+/// 대칭 전달 오차의 큰 쪽(px): max(|x2 − H x1|, |x1 − H⁻¹ x2|).
+fn homography_error(
+    h: &Matrix3<f64>,
+    hi: &Matrix3<f64>,
+    p: &Vector2<f64>,
+    q: &Vector2<f64>,
+) -> f64 {
+    let tr = |m: &Matrix3<f64>, x: &Vector2<f64>| {
+        let v = m * Vector3::new(x.x, x.y, 1.0);
+        if v.z.abs() < 1e-12 {
+            None
+        } else {
+            Some(Vector2::new(v.x / v.z, v.y / v.z))
+        }
+    };
+    match (tr(h, p), tr(hi, q)) {
+        (Some(a), Some(b)) => (a - q).norm().max((b - p).norm()),
+        _ => f64::INFINITY,
+    }
+}
+
+/// 주어진 대응 가운데 한 호모그래피가 문턱 `th_px` 안에서 설명하는 최대 개수(근사).
+/// 전체로 맞춘 뒤 문턱을 줄여 가며 정상 짝으로 다시 맞춘다(호모그래피는 평면이면 대응 전체를 설명한다).
+pub fn homography_support(x1: &[Vector2<f64>], x2: &[Vector2<f64>], th_px: f64) -> usize {
+    let n = x1.len();
+    let mut sel: Vec<usize> = (0..n).collect();
+    let mut best = 0;
+    for m in [8.0, 4.0, 2.0, 1.0, 1.0] {
+        let s1: Vec<_> = sel.iter().map(|&i| x1[i]).collect();
+        let s2: Vec<_> = sel.iter().map(|&i| x2[i]).collect();
+        let Some(h) = homography_dlt(&s1, &s2) else {
+            break;
+        };
+        let Some(hi) = h.try_inverse() else {
+            break;
+        };
+        let err: Vec<f64> = (0..n)
+            .map(|i| homography_error(&h, &hi, &x1[i], &x2[i]))
+            .collect();
+        best = best.max(err.iter().filter(|&&e| e < th_px).count());
+        sel = (0..n).filter(|&i| err[i] < th_px * m).collect();
+        if sel.len() < 4 {
+            break;
+        }
+    }
+    best
+}
 
 pub(crate) fn all_finite(p: &[Vector2<f64>]) -> bool {
     p.iter().all(|v| v.x.is_finite() && v.y.is_finite())
@@ -129,9 +249,14 @@ fn normalizer(p: &[Vector2<f64>]) -> Matrix3<f64> {
 /// 정규화 8점 알고리즘으로 기본 행렬 F (x2ᵀ F x1 = 0, 픽셀 좌표)를 구한다.
 /// 점이 8개 미만이거나, 길이가 다르거나, 유한하지 않은 좌표가 있거나,
 /// 해가 하나로 정해지지 않으면(영공간 2차원 이상: 동일선상 점, 순수 회전 등) None.
+/// 어느 한 영상의 점 분포가 짧은 축/긴 축 표준편차 비 0.02 미만(잡음 섞인 동일선상)이어도 None.
 /// 결과는 계수 2, 프로베니우스 노름 1.
 pub fn fundamental_8pt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matrix3<f64>> {
     if x1.len() < 8 || x1.len() != x2.len() || !all_finite(x1) || !all_finite(x2) {
+        return None;
+    }
+    // 잡음 섞인 동일선상 배치는 고윳값 비 검사로 걸러지지 않는다(둘째 고윳값이 잡음 크기만큼 커진다).
+    if nearly_collinear(x1) || nearly_collinear(x2) {
         return None;
     }
     let (t1, t2) = (normalizer(x1), normalizer(x2));
@@ -345,6 +470,7 @@ pub const MIN_RANSAC_ITERS: usize = 50;
 /// RANSAC(Fischler & Bolles 1981) + 8점 기본 행렬로 기하 검증.
 /// 반환: (정상 짝으로 다시 맞춘 F, 정상 여부 표시).
 /// 정상 짝이 8개 미만이거나 정상 비율이 `min_inlier_ratio` 미만이면 None.
+/// 정상 짝이 거의 한 직선 위(짧은 축/긴 축 표준편차 비 0.02 미만)이면 퇴화로 보고 None.
 /// 길이가 다르거나 유한하지 않은 좌표가 있으면 None.
 pub fn ransac_fundamental(
     x1: &[Vector2<f64>],
@@ -474,7 +600,18 @@ pub fn ransac_fundamental(
         inl = gi;
     }
     let cnt = inl.iter().filter(|&&b| b).count();
-    (cnt >= 8 && cnt as f64 >= cfg.min_inlier_ratio * n as f64).then_some((f, inl))
+    if cnt < 8 || (cnt as f64) < cfg.min_inlier_ratio * n as f64 {
+        return None;
+    }
+    // 퇴화 판정: 정상 짝이 거의 한 직선 위이면 F 가 정해지지 않으므로 확정하지 않는다.
+    // 평면 배치 지표([`homography_support`])는 지면 위주 합성 장면의 정상 짝도 대부분 설명해
+    // 여기서는 거부에 쓰지 않는다(평면 경로 분리는 남은 문제).
+    let s1: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| x1[i]).collect();
+    let s2: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| x2[i]).collect();
+    if nearly_collinear(&s1) || nearly_collinear(&s2) {
+        return None;
+    }
+    Some((f, inl))
 }
 
 /// 정답 카메라 두 대로부터 기본 행렬 F = K2⁻ᵀ [t]× R K1⁻¹ (상대 자세 2←1).
@@ -798,15 +935,20 @@ mod tests {
         }
         assert_eq!(
             same.into_iter().collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 8, 16, 32, 64]
+            vec![1, 2, 3, 4, 5, 8, 16]
         );
-        // 같은 카메라: (79+78+77+76+75) + (72+64+48+16) = 585, 카메라 3대 → 1755.
+        // 같은 카메라: (79+78+77+76+75) + (72+64) = 521, 카메라 3대 → 1563.
         // 다른 카메라: 카메라 짝마다 80 + 2(79+78+77+76) = 700, 3 짝 → 2100.
-        assert_eq!(pairs.len(), 1755 + 2100);
-        // 상한 16 이면 32·64 간격이 빠진다: 카메라마다 48 + 16 = 64 짝 감소.
+        assert_eq!(pairs.len(), 1563 + 2100);
+        // 상한을 인자로 넓히면 32·64 간격이 더해진다: 카메라마다 48 + 16 = 64 짝 증가.
         assert_eq!(
-            candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, 16).len(),
-            1755 + 2100 - 3 * 64
+            candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, usize::MAX).len(),
+            1563 + 2100 + 3 * 64
+        );
+        // 상한 0 이면 거듭제곱 간격 짝이 없다: 카메라마다 72 + 64 = 136 짝 감소.
+        assert_eq!(
+            candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, 0).len(),
+            1563 + 2100 - 3 * 136
         );
     }
 
@@ -954,7 +1096,7 @@ mod tests {
             let Some((j, d1, d2)) = nearest(fa, b) else {
                 continue;
             };
-            if d1 >= ratio * ratio * d2 {
+            if !d2.is_finite() || d1 >= ratio * ratio * d2 {
                 continue;
             }
             if mutual && nearest(&b[j], a).map(|r| r.0) != Some(i) {
@@ -1102,6 +1244,132 @@ mod tests {
         assert!(fundamental_8pt(&l1, &l2).is_none());
         assert!(ransac_fundamental(&l1, &l2, &cfg).is_none());
     }
+
+    #[test]
+    fn ratio_match_needs_second_neighbour() {
+        // b 에 특징이 하나뿐이면 차근접이 없어 비율을 잴 수 없다: 짝을 만들지 않는다.
+        let mut g = Lcg(5);
+        let a = vec![feature(&mut g), feature(&mut g)];
+        let b = vec![feature(&mut g)];
+        for mutual in [false, true] {
+            for ratio in [0.6f32, 0.8, 1.0] {
+                assert!(ratio_match(&a, &b, ratio, mutual).is_empty());
+            }
+        }
+        // b 에 a 의 복사가 둘이면 정상적으로 비율 검사를 한다.
+        let b2 = vec![a[0].clone(), feature(&mut g)];
+        assert_eq!(ratio_match(&a[..1], &b2, 0.8, false), vec![(0, 0)]);
+    }
+
+    /// 두 영상에서 각각 한 직선 위의 점 60개에 σ px 등방 잡음.
+    fn noisy_lines(sigma: f64, seed: u64) -> (Vec<Vector2<f64>>, Vec<Vector2<f64>>) {
+        let mut g = Lcg(seed);
+        let mut line = |a: f64, b: f64| -> Vec<Vector2<f64>> {
+            (0..60)
+                .map(|i| {
+                    let t = i as f64 + g.next();
+                    Vector2::new(100.0 + 13.0 * t, a + b * t)
+                        + Vector2::new(g.gauss(), g.gauss()) * sigma
+                })
+                .collect()
+        };
+        let l1 = line(200.0, 3.0);
+        let l2 = line(350.0, -2.0);
+        (l1, l2)
+    }
+
+    #[test]
+    fn noisy_collinear_points_are_rejected() {
+        // 잡음 섞인 동일선상(σ = 0.5, 1.0 px): 고윳값 비 검사만으로는 통과하던 배치.
+        let cfg = RansacConfig::default();
+        for sigma in [0.5, 1.0] {
+            for seed in 1..=5u64 {
+                let (l1, l2) = noisy_lines(sigma, seed);
+                assert!(fundamental_8pt(&l1, &l2).is_none(), "σ {sigma} seed {seed}");
+                assert!(
+                    ransac_fundamental(&l1, &l2, &cfg).is_none(),
+                    "σ {sigma} seed {seed}"
+                );
+            }
+        }
+    }
+
+    /// 두 카메라([`two_cameras`])로 본 평면 z = 0 위의 점 n 개(σ px 잡음).
+    fn planar_correspondences(
+        n: usize,
+        sigma: f64,
+        seed: u64,
+    ) -> (Vec<Vector2<f64>>, Vec<Vector2<f64>>) {
+        let (c1, c2) = two_cameras();
+        let mut g = Lcg(seed);
+        let (mut x1, mut x2) = (vec![], vec![]);
+        while x1.len() < n {
+            let p = Point3::new(g.next() * 14.0 - 7.0, g.next() * 8.0 - 4.0, 0.0);
+            let (Some(a), Some(b)) = (c1.project(&p), c2.project(&p)) else {
+                continue;
+            };
+            if !c1.intrinsics.contains(&a) || !c2.intrinsics.contains(&b) {
+                continue;
+            }
+            x1.push(a + Vector2::new(g.gauss(), g.gauss()) * sigma);
+            x2.push(b + Vector2::new(g.gauss(), g.gauss()) * sigma);
+        }
+        (x1, x2)
+    }
+
+    #[test]
+    fn homography_support_separates_planar_scene() {
+        // 평면 판정 지표: z = 0 평면 위 점(σ = 0.5 px)은 한 호모그래피가 거의 전부 설명하고,
+        // 깊이가 6 m 퍼진 일반 장면은 절반도 설명하지 못한다. 거부 규칙에는 아직 쓰지 않는다.
+        let th = RansacConfig::default().threshold_px;
+        for seed in 1..=5u64 {
+            let (x1, x2) = planar_correspondences(200, 0.5, seed);
+            let h = homography_support(&x1, &x2, th);
+            eprintln!("평면 seed {seed}: {h}/200");
+            // 양쪽 σ = 0.5 px 에서 대칭 전달 오차(두 방향 중 큰 쪽) < 1.5 px 일 확률은 약 0.85(기대 170),
+            // 이항 표준편차 약 5 → 4σ 아래인 150 을 기준으로 둔다.
+            assert!(h >= 150, "seed {seed}: 평면 호모그래피 설명 {h}/200");
+            let (x1, x2, _, _, _) = correspondences(200, 0.5, 0.0, seed);
+            let h = homography_support(&x1, &x2, th);
+            eprintln!("일반 seed {seed}: {h}/200");
+            assert!(h < 100, "seed {seed}: 일반 장면 호모그래피 설명 {h}/200");
+        }
+    }
+
+    /// 매칭 결과 짝 목록의 FNV-1a 64비트 해시.
+    fn pairs_hash(m: &[(usize, usize)]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &(i, j) in m {
+            for v in [i as u64, j as u64] {
+                for byte in v.to_le_bytes() {
+                    h ^= byte as u64;
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn ratio_match_regression_hash() {
+        // 고정 기술자(match_fixture 시드 21, a 2000개, b 약 1600 + 무관 700)의 매칭 결과를 상수로 고정한다.
+        // 거리 누산 순서·동률 처리·비율 비교를 바꾸면 짝이 달라져 이 시험이 실패한다.
+        // 기대값은 이 시험을 처음 넣은 커밋의 구현으로 한 번 계산한 값이다.
+        let (a, b) = match_fixture(21, 2000, 700);
+        let m = ratio_match(&a, &b, 0.8, true);
+        let n = ratio_match(&a, &b, 0.95, false);
+        eprintln!(
+            "mutual 0.8: {} {:#x}, 0.95: {} {:#x}",
+            m.len(),
+            pairs_hash(&m),
+            n.len(),
+            pairs_hash(&n)
+        );
+        assert_eq!((m.len(), pairs_hash(&m)), EXPECT_MUTUAL);
+        assert_eq!((n.len(), pairs_hash(&n)), EXPECT_LOOSE);
+    }
+    const EXPECT_MUTUAL: (usize, u64) = (1145, 0x22ca_99b8_6722_152d);
+    const EXPECT_LOOSE: (usize, u64) = (1282, 0x7d0c_d999_3d0c_89e5);
 
     #[test]
     fn random_correspondences_are_not_confirmed() {
