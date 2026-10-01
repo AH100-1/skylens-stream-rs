@@ -74,15 +74,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        ["verify", dir] => {
-            let report = skylens_core::verify::verify_dir(std::path::Path::new(dir));
-            print!("{}", report.to_table());
-            if report.all_pass() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
+        ["verify", dir] => skylens_core::verify::run_cli(dir),
         ["--version"] => {
             println!("skylens-stream {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS

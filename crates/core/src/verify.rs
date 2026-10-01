@@ -1,7 +1,8 @@
 //! 출력 폴더 검증 (SPEC §2 출력 구조, §4 검증 기준 일곱 항목).
 //!
 //! 읽는 파일:
-//! - `report.json` (출력 폴더 바로 아래): 포즈 단계 기록.
+//! - `report.json` (출력 폴더 바로 아래): 포즈 단계 기록. SPEC §2 에 아직 없는 형식이라
+//!   스트림 출력이 이 파일을 쓰지 않으면 항목 1~3 은 "report.json 없음" 으로 FAIL 한다.
 //!   ```json
 //!   {"registered": {"total": 240, "preview": 240, "refined": 240},
 //!    "reprojection_px": {"preview": 4.5, "refined": 0.59},
@@ -10,15 +11,28 @@
 //!   `registered.total` 은 입력 사진 수, `preview`/`refined` 는 초벌·정밀 포즈에 등록된 사진 수.
 //!   `reprojection_px` 는 재투영 오차 RMS(px). `regions[].positions` 는 구역의 위치 수,
 //!   `images` 는 구역 밀집 단계에 쓴 사진 수.
-//! - `snapshots/manifest.json`: SPEC §2 형식.
-//!   `snapshots[].step` 은 1부터 세는 정수(최종은 문자열 `"final"` 도 허용).
+//! - `snapshots/manifest.json`: SPEC §2 형식. `snapshots[].step` 은 1부터 세는 정수,
+//!   최종만 문자열 `"final"`. 그 밖의 형(예: 문자열 `"01"`)은 형식 오류로 FAIL.
 //! - `preview/preview_{k:02}_*.ply`, `refined/refined_{k:02}_*.ply`, `snapshots/step_*.ply`.
 //!
-//! 최근접 탐색은 격자 해시(셀 크기 고정, 바깥 껍질로 넓혀 가며 찾음)로 한다.
+//! 기대 파일 목록: 구역 집합 = report `regions` ∪ preview 구역 ∪ refined 구역 ∪ {0..마지막 정수 step}.
+//! 이 집합의 구역마다 preview·refined PLY 가 있어야 하고, 정수 step 은 1..=구역 수 가 모두
+//! 있어야 하며, manifest 단계마다 `step_{k:02}_{k}regions.ply`(최종 `step_final_all_refined.ply`)
+//! 파일이 있어야 한다. 하나라도 빠지면 해당 항목 FAIL 과 빠진 이름을 표시한다.
+//!
+//! 스냅샷 해석(SPEC §3.8): step_k = 정밀 0..k-2 + 초벌 k-1, final = 정밀 전부(간격 추출 뒤).
+//! 점 수 단조 증가는 정수 step 사이에만 적용한다(같은 수는 허용, 감소만 FAIL).
+//! final 은 마지막 step 보다 작을 수 있으므로 "정밀 구역 점 수를 e:1 간격 추출한 합과 같은
+//! e(1..=64)가 있음" 으로 대조한다.
+//!
+//! 최근접 탐색은 상자 경계가 붙은 k-d 트리로 하고, `NN_CAP_M`(판정 기준 3 m 의 2배)
+//! 너머는 찾지 않고 상한값으로 둔다(표기 "> 상한").
+//! |좌표| > `COORD_LIMIT_M` 인 점은 계산에서 뺀다.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
+use std::process::ExitCode;
 
 use crate::ply::{read_ply_file, PointCloud};
 
@@ -26,6 +40,7 @@ use crate::ply::{read_ply_file, PointCloud};
 
 pub const REPROJ_MAX_PX: f64 = 0.7;
 pub const ALIGN_MIN_PAIRS: f64 = 1000.0;
+/// 구역 간 스케일 차: max(s)/min(s) − 1 ≤ 이 값.
 pub const ALIGN_SCALE_TOL: f64 = 0.10;
 pub const ALIGN_FIT_MAX_M: f64 = 6.0;
 pub const NN_MEDIAN_MAX_M: f64 = 3.0;
@@ -33,10 +48,14 @@ pub const HEIGHT_PAIR_RADIUS_M: f64 = 2.0;
 pub const HEIGHT_MEDIAN_MAX_M: f64 = 2.0;
 pub const OVERLAP_PAIR_RADIUS_M: f64 = 1.0;
 pub const OVERLAP_MEDIAN_MAX_M: f64 = 0.3;
-/// 최근접 거리를 이 값에서 자른다 (중앙값 판정에는 영향 없음: 기준보다 충분히 큼).
-pub const NN_CAP_M: f64 = 20.0;
+/// 최근접 거리를 이 값에서 자른다 (판정 기준 3 m 의 2배: 중앙값 판정에는 영향 없음).
+pub const NN_CAP_M: f64 = 2.0 * NN_MEDIAN_MAX_M;
 /// 점군당 질의 점 상한 (넘으면 일정 간격으로 추림).
 pub const MAX_QUERIES: usize = 200_000;
+/// 이 값보다 큰 |좌표|(m)의 점은 계산에서 뺀다 (지역 직교 좌표에서 나올 수 없는 값).
+pub const COORD_LIMIT_M: f64 = 1e7;
+/// final 대조에 쓰는 간격 추출 비율 상한.
+pub const MAX_DECIMATION: usize = 64;
 const EPS: f64 = 1e-9;
 
 // ---------------------------------------------------------------- 결과
@@ -84,6 +103,17 @@ impl Report {
     }
 }
 
+/// `skylens-stream verify <출력 폴더>`: 표를 찍고 모두 통과면 0, 아니면 1.
+pub fn run_cli(dir: &str) -> ExitCode {
+    let report = verify_dir(Path::new(dir));
+    print!("{}", report.to_table());
+    if report.all_pass() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 pub const ITEM_REGISTERED: &str = "registered";
 pub const ITEM_REGION_IMAGES: &str = "region_images";
 pub const ITEM_REPROJ: &str = "refined_reprojection";
@@ -113,8 +143,30 @@ fn item(name: &'static str, criterion: &'static str, r: Result<(bool, String), S
 pub fn verify_dir(dir: &Path) -> Report {
     let report = read_json(&dir.join("report.json"));
     let manifest = read_json(&dir.join("snapshots").join("manifest.json"));
+    let steps = manifest
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(parse_steps);
     let preview = load_regions(&dir.join("preview"), "preview_");
     let refined = load_regions(&dir.join("refined"), "refined_");
+
+    // 기대 구역 집합.
+    let mut expected: BTreeSet<usize> = BTreeSet::new();
+    if let Ok(r) = &report {
+        if let Some(regs) = r.get("regions").and_then(Json::as_array) {
+            for (i, g) in regs.iter().enumerate() {
+                let k = g.get("region").and_then(as_index).unwrap_or(i);
+                expected.insert(k);
+            }
+        }
+    }
+    for m in [&preview, &refined].into_iter().flatten() {
+        expected.extend(m.keys().copied());
+    }
+    if let Ok(rows) = &steps {
+        let last = rows.iter().filter_map(|r| r.step).max().unwrap_or(0);
+        expected.extend(0..last);
+    }
 
     let items = vec![
         item(
@@ -140,7 +192,7 @@ pub fn verify_dir(dir: &Path) -> Report {
         ),
         item(
             ITEM_ALIGN,
-            "점쌍 ≥ 1000, 스케일 중앙 대비 ±10%, 잔차 중앙 < 6 m",
+            "점쌍 ≥ 1000, 구역 간 스케일 차(최대/최소 − 1) ≤ 10%, 잔차 중앙 < 6 m",
             manifest
                 .as_ref()
                 .map_err(Clone::clone)
@@ -148,27 +200,31 @@ pub fn verify_dir(dir: &Path) -> Report {
         ),
         item(
             ITEM_PREVIEW_REFINED,
-            "최근접 중앙 < 3 m, 수평 2 m 짝 높이 차 중앙 < 2 m",
+            "구역마다 초벌·정밀 있음, 최근접 중앙 < 3 m, 수평 2 m 짝 높이 차 중앙 < 2 m",
             match (&preview, &refined) {
-                (Ok(p), Ok(r)) => check_preview_vs_refined(p, r),
+                (Ok(p), Ok(r)) => check_preview_vs_refined(p, r, &expected),
                 (Err(e), _) | (_, Err(e)) => Err(e.clone()),
             },
         ),
         item(
             ITEM_OVERLAP,
-            "이웃 정밀 구역 겹침(수평 1 m 짝) 높이 차 중앙 < 0.3 m",
+            "이웃 정밀 구역 겹침(수평 1 m 짝) 높이 차 중앙 < 0.3 m (정밀 0개 FAIL, 구역 1개 해당 없음)",
             refined
                 .as_ref()
                 .map_err(Clone::clone)
-                .and_then(check_overlap),
+                .and_then(|r| check_overlap(r, &expected)),
         ),
         item(
             ITEM_SNAPSHOTS,
-            "점 수 단조 증가, 2단계부터 초벌 새 영역 > 0, NaN 없음",
-            manifest
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(|m| check_snapshots(m, &dir.join("snapshots"))),
+            "정수 단계 1..=구역 수 파일 있음, 점 수 단조 증가, 2단계부터 초벌 새 영역 > 0, final = 정밀 추출 합, NaN 없음",
+            steps.and_then(|rows| {
+                check_snapshots(
+                    &rows,
+                    &dir.join("snapshots"),
+                    &expected,
+                    refined.as_ref().ok(),
+                )
+            }),
         ),
     ];
     Report { items }
@@ -185,6 +241,14 @@ fn num(j: &Json, path: &[&str]) -> Result<f64, String> {
     }
     cur.as_f64()
         .ok_or_else(|| format!("{} 가 숫자가 아님", path.join(".")))
+}
+
+/// 음이 아닌 정수 값.
+fn as_index(j: &Json) -> Option<usize> {
+    match j {
+        Json::Num(v) if v.fract() == 0.0 && *v >= 0.0 && *v < 1e9 => Some(*v as usize),
+        _ => None,
+    }
 }
 
 fn check_registered(r: &Json) -> Result<(bool, String), String> {
@@ -234,6 +298,16 @@ fn check_reproj(r: &Json) -> Result<(bool, String), String> {
     Ok((f.is_finite() && f <= REPROJ_MAX_PX, m))
 }
 
+/// 구역 간 스케일 차 max(s)/min(s) − 1. 양수가 아닌 값이 있으면 무한대.
+pub fn scale_spread(scales: &[f64]) -> f64 {
+    let lo = scales.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = scales.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if !(lo > 0.0) || !hi.is_finite() {
+        return f64::INFINITY;
+    }
+    hi / lo - 1.0
+}
+
 fn check_align(m: &Json) -> Result<(bool, String), String> {
     let arr = m
         .get("align")
@@ -252,37 +326,39 @@ fn check_align(m: &Json) -> Result<(bool, String), String> {
     }
     let min_pairs = pairs.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_fit = fits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let med_scale = median(&mut scales.clone());
-    let max_dev = scales
-        .iter()
-        .map(|s| (s / med_scale - 1.0).abs())
-        .fold(0.0, f64::max);
+    let spread = scale_spread(&scales);
     let pass = min_pairs >= ALIGN_MIN_PAIRS
         && max_fit < ALIGN_FIT_MAX_M
-        && med_scale > 0.0
-        && max_dev <= ALIGN_SCALE_TOL + EPS;
+        && spread <= ALIGN_SCALE_TOL + EPS;
     Ok((
         pass,
         format!(
-            "점쌍 최소 {min_pairs}, 스케일 최대 편차 {:.2}%, 잔차 중앙 최대 {max_fit:.3} m",
-            max_dev * 100.0
+            "점쌍 최소 {min_pairs}, 구역 간 스케일 차 {:.2}%, 잔차 중앙 최대 {max_fit:.3} m",
+            spread * 100.0
         ),
     ))
+}
+
+fn missing_of(expected: &BTreeSet<usize>, have: &BTreeMap<usize, PointCloud>) -> Vec<usize> {
+    expected
+        .iter()
+        .filter(|k| !have.contains_key(k))
+        .copied()
+        .collect()
 }
 
 fn check_preview_vs_refined(
     p: &BTreeMap<usize, PointCloud>,
     r: &BTreeMap<usize, PointCloud>,
+    expected: &BTreeSet<usize>,
 ) -> Result<(bool, String), String> {
     if p.is_empty() || r.is_empty() {
         return Ok((false, "구역 점군 없음".into()));
     }
     let mut worst_nn = 0.0f64;
     let mut worst_dz = 0.0f64;
-    let mut missing = Vec::new();
     for (k, pc) in p {
         let Some(rc) = r.get(k) else {
-            missing.push(*k);
             continue;
         };
         let pts = xyz(pc);
@@ -292,24 +368,44 @@ fn check_preview_vs_refined(
         worst_nn = worst_nn.max(nn);
         worst_dz = worst_dz.max(dz);
     }
-    let pass = missing.is_empty() && worst_nn < NN_MEDIAN_MAX_M && worst_dz < HEIGHT_MEDIAN_MAX_M;
+    let miss_p = missing_of(expected, p);
+    let miss_r = missing_of(expected, r);
+    let pass = miss_p.is_empty()
+        && miss_r.is_empty()
+        && worst_nn < NN_MEDIAN_MAX_M
+        && worst_dz < HEIGHT_MEDIAN_MAX_M;
+    let nn_s = if worst_nn >= NN_CAP_M {
+        format!("> {NN_CAP_M:.3} m")
+    } else {
+        format!("{worst_nn:.3} m")
+    };
     let mut m = format!(
-        "{}개 구역, 최근접 중앙 최대 {worst_nn:.3} m, 높이 차 중앙 최대 {worst_dz:.3} m",
-        p.len()
+        "{}개 구역, 최근접 중앙 최대 {nn_s}, 높이 차 중앙 최대 {worst_dz:.3} m",
+        expected.len()
     );
-    if !missing.is_empty() {
-        let _ = write!(m, ", 정밀 없는 구역 {missing:?}");
+    if !miss_p.is_empty() {
+        let _ = write!(m, ", 초벌 없는 구역 {miss_p:?}");
+    }
+    if !miss_r.is_empty() {
+        let _ = write!(m, ", 정밀 없는 구역 {miss_r:?}");
     }
     Ok((pass, m))
 }
 
-fn check_overlap(r: &BTreeMap<usize, PointCloud>) -> Result<(bool, String), String> {
+fn check_overlap(
+    r: &BTreeMap<usize, PointCloud>,
+    expected: &BTreeSet<usize>,
+) -> Result<(bool, String), String> {
+    if r.is_empty() {
+        return Ok((false, "정밀 구역 0개".into()));
+    }
+    let miss = missing_of(expected, r);
+    if !miss.is_empty() {
+        return Ok((false, format!("정밀 없는 구역 {miss:?}")));
+    }
     let keys: Vec<usize> = r.keys().copied().collect();
     if keys.len() < 2 {
-        return Ok((
-            true,
-            format!("정밀 구역 {}개: 비교할 이웃 없음", keys.len()),
-        ));
+        return Ok((true, "해당 없음 (구역 1개)".into()));
     }
     let mut worst = 0.0f64;
     for w in keys.windows(2) {
@@ -324,89 +420,162 @@ fn check_overlap(r: &BTreeMap<usize, PointCloud>) -> Result<(bool, String), Stri
     ))
 }
 
-fn check_snapshots(m: &Json, snap_dir: &Path) -> Result<(bool, String), String> {
+/// manifest 의 스냅샷 한 줄. `step` 이 None 이면 최종.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepRow {
+    pub step: Option<usize>,
+    pub points: f64,
+    pub preview_new_area: Option<f64>,
+}
+
+/// `snapshots[]` 를 읽는다. step 은 1 이상 정수 또는 `"final"` 만 받는다.
+pub fn parse_steps(m: &Json) -> Result<Vec<StepRow>, String> {
     let arr = m
         .get("snapshots")
         .and_then(Json::as_array)
         .ok_or("snapshots 없음")?;
-    if arr.is_empty() {
-        return Ok((false, "스냅샷 0개".into()));
-    }
-    // (정렬 키, 단계 번호(최종은 None), 점 수, 새 영역)
     let mut rows = Vec::new();
     for s in arr {
         let step = s.get("step").ok_or("step 없음")?;
         let k = match step {
-            Json::Num(v) => Some(*v),
             Json::Str(t) if t == "final" => None,
-            _ => return Err("step 은 정수 또는 \"final\"".into()),
+            j => match as_index(j) {
+                Some(k) if k >= 1 => Some(k),
+                _ => {
+                    return Err(format!(
+                        "step 형식 오류 {step:?}: 1 이상 정수 또는 \"final\" (SPEC §2)"
+                    ))
+                }
+            },
         };
-        let pts = num(s, &["points"])?;
-        let area = s.get("preview_new_area").and_then(Json::as_f64);
-        rows.push((k.unwrap_or(f64::INFINITY), k, pts, area));
+        rows.push(StepRow {
+            step: k,
+            points: num(s, &["points"])?,
+            preview_new_area: s.get("preview_new_area").and_then(Json::as_f64),
+        });
     }
-    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(rows)
+}
+
+/// 스냅샷 파일 이름.
+pub fn snapshot_file_name(step: Option<usize>) -> String {
+    match step {
+        Some(k) => format!("step_{k:02}_{k}regions.ply"),
+        None => "step_final_all_refined.ply".to_string(),
+    }
+}
+
+fn check_snapshots(
+    rows: &[StepRow],
+    snap_dir: &Path,
+    expected: &BTreeSet<usize>,
+    refined: Option<&BTreeMap<usize, PointCloud>>,
+) -> Result<(bool, String), String> {
+    if rows.is_empty() {
+        return Ok((false, "스냅샷 0개".into()));
+    }
     let mut problems = Vec::new();
-    for w in rows.windows(2) {
-        if w[1].2 <= w[0].2 {
-            problems.push(format!("점 수 감소/정체 {}→{}", w[0].2, w[1].2));
+    let mut ints: Vec<&StepRow> = rows.iter().filter(|r| r.step.is_some()).collect();
+    ints.sort_by_key(|r| r.step);
+    let finals: Vec<&StepRow> = rows.iter().filter(|r| r.step.is_none()).collect();
+
+    // 기대 단계: 1..=구역 수 + final 하나.
+    let want: Vec<usize> = (1..=expected.len()).collect();
+    let have: Vec<usize> = ints.iter().filter_map(|r| r.step).collect();
+    let miss_steps: Vec<usize> = want.iter().filter(|k| !have.contains(k)).copied().collect();
+    if !miss_steps.is_empty() {
+        problems.push(format!("manifest 에 없는 단계 {miss_steps:?}"));
+    }
+    if have.windows(2).any(|w| w[0] == w[1]) {
+        problems.push("중복 단계".into());
+    }
+    if finals.len() != 1 {
+        problems.push(format!("final 단계 {}개", finals.len()));
+    }
+
+    // 단조 증가: 정수 단계 사이에만 (같은 수 허용).
+    for w in ints.windows(2) {
+        if w[1].points < w[0].points {
+            problems.push(format!(
+                "점 수 감소 단계 {}→{}: {}→{}",
+                w[0].step.unwrap_or(0),
+                w[1].step.unwrap_or(0),
+                w[0].points,
+                w[1].points
+            ));
         }
     }
     let mut min_area = f64::INFINITY;
-    for (_, k, _, area) in &rows {
-        if let Some(k) = k {
-            if *k >= 2.0 {
-                let a = area.unwrap_or(f64::NAN);
-                min_area = min_area.min(if a.is_nan() { f64::NEG_INFINITY } else { a });
-                if a.is_nan() || a <= 0.0 {
-                    problems.push(format!("단계 {k} 새 영역 {a}"));
-                }
+    for r in &ints {
+        let k = r.step.unwrap_or(0);
+        if k >= 2 {
+            let a = r.preview_new_area.unwrap_or(f64::NAN);
+            min_area = min_area.min(if a.is_nan() { f64::NEG_INFINITY } else { a });
+            if a.is_nan() || a <= 0.0 {
+                problems.push(format!("단계 {k} 새 영역 {a}"));
             }
         }
     }
-    // 스냅샷 PLY: NaN 없음, 파일 점 수 = manifest 점 수.
-    let mut files = 0usize;
+    // final = 정밀 구역 점 수의 e:1 간격 추출 합.
+    if let (Some(fr), Some(rc)) = (finals.first(), refined) {
+        if !rc.is_empty() {
+            let sizes: Vec<usize> = rc.values().map(PointCloud::len).collect();
+            let ok = (1..=MAX_DECIMATION)
+                .any(|e| sizes.iter().map(|n| n.div_ceil(e)).sum::<usize>() as f64 == fr.points);
+            if !ok {
+                problems.push(format!(
+                    "final {} ≠ 정밀 점 수 {:?} 의 간격 추출 합(1..={MAX_DECIMATION}:1)",
+                    fr.points, sizes
+                ));
+            }
+        }
+    }
+
+    // 스냅샷 PLY: manifest 단계마다 있어야 하고, NaN 없음, 점 수 = manifest.
+    let mut missing_files = Vec::new();
     let mut nan_files = Vec::new();
-    let entries =
-        std::fs::read_dir(snap_dir).map_err(|e| format!("{}: {e}", snap_dir.display()))?;
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("step_") && n.ends_with(".ply"))
-        .collect();
-    names.sort();
-    for n in &names {
-        let c = read_ply_file(snap_dir.join(n)).map_err(|e| format!("{n}: {e}"))?;
+    let mut files = 0usize;
+    let mut listed = BTreeSet::new();
+    for r in rows {
+        let n = snapshot_file_name(r.step);
+        listed.insert(n.clone());
+        let path = snap_dir.join(&n);
+        if !path.exists() {
+            missing_files.push(n);
+            continue;
+        }
+        let c = read_ply_file(&path).map_err(|e| format!("{n}: {e}"))?;
         files += 1;
         if c.has_nan() {
             nan_files.push(n.clone());
         }
-        let k = if n.starts_with("step_final") {
-            None
-        } else {
-            n[5..].split('_').next().and_then(|t| t.parse::<f64>().ok())
-        };
-        if let Some(row) = rows
-            .iter()
-            .find(|r| r.1 == k && (k.is_some() || n.starts_with("step_final")))
-        {
-            if row.2 != c.len() as f64 {
-                problems.push(format!("{n} 점 수 {} ≠ manifest {}", c.len(), row.2));
-            }
+        if r.points != c.len() as f64 {
+            problems.push(format!("{n} 점 수 {} ≠ manifest {}", c.len(), r.points));
         }
     }
-    if files == 0 {
-        problems.push("스냅샷 PLY 없음".into());
+    if let Ok(rd) = std::fs::read_dir(snap_dir) {
+        let mut extra: Vec<String> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("step_") && n.ends_with(".ply") && !listed.contains(n))
+            .collect();
+        extra.sort();
+        if !extra.is_empty() {
+            problems.push(format!("manifest 에 없는 파일 {}", extra.join(",")));
+        }
+    }
+    if !missing_files.is_empty() {
+        problems.push(format!("빠진 파일 {}", missing_files.join(",")));
     }
     if !nan_files.is_empty() {
         problems.push(format!("NaN: {}", nan_files.join(",")));
     }
-    let mut msg = format!(
-        "{}단계, PLY {files}개, 점 {}→{}",
-        rows.len(),
-        rows[0].2,
-        rows[rows.len() - 1].2
-    );
+    let first = ints.first().map_or(f64::NAN, |r| r.points);
+    let last = ints.last().map_or(f64::NAN, |r| r.points);
+    let mut msg = format!("{}단계, PLY {files}개, 점 {first}→{last}", rows.len());
+    if let Some(fr) = finals.first() {
+        let _ = write!(msg, ", final {}", fr.points);
+    }
     if min_area.is_finite() {
         let _ = write!(msg, ", 새 영역 최소 {min_area}");
     }
@@ -444,86 +613,136 @@ fn load_regions(dir: &Path, prefix: &str) -> Result<BTreeMap<usize, PointCloud>,
     Ok(out)
 }
 
+fn usable(p: &[f64; 3]) -> bool {
+    p.iter().all(|v| v.is_finite() && v.abs() <= COORD_LIMIT_M)
+}
+
 fn xyz(c: &PointCloud) -> Vec<[f64; 3]> {
     c.points
         .iter()
-        .filter(|p| p.xyz.iter().all(|v| v.is_finite()))
         .map(|p| [p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64])
+        .filter(usable)
         .collect()
 }
 
-// ---------------------------------------------------------------- 격자 해시
+// ---------------------------------------------------------------- 최근접 (k-d 트리)
 
-/// 2D(수평) 또는 3D 격자 해시.
-pub struct Grid {
-    cell: f64,
-    dims: usize,
-    map: HashMap<[i64; 3], Vec<u32>>,
-    pts: Vec<[f64; 3]>,
+const LEAF: usize = 16;
+
+struct Node {
+    lo: [f64; 3],
+    hi: [f64; 3],
+    start: usize,
+    end: usize,
+    kids: Option<(usize, usize)>,
 }
 
-impl Grid {
-    /// `dims` = 2 이면 z 를 무시한다.
-    pub fn new(pts: &[[f64; 3]], cell: f64, dims: usize) -> Self {
-        let mut map: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
-        let mut g = Grid {
-            cell,
+/// 2D(수평) 또는 3D 최근접 탐색용 k-d 트리. 노드마다 경계 상자를 두어,
+/// 질의 반경 밖의 상자는 통째로 건너뛴다(빈 공간에서도 질의당 노드 몇 개만 본다).
+pub struct NnIndex {
+    dims: usize,
+    pts: Vec<[f64; 3]>,
+    nodes: Vec<Node>,
+}
+
+impl NnIndex {
+    /// `dims` = 2 이면 z 를 무시한다. 유한하지 않거나 |좌표| > `COORD_LIMIT_M` 인 점은 뺀다.
+    pub fn new(pts: &[[f64; 3]], dims: usize) -> Self {
+        let mut t = NnIndex {
             dims,
-            map: HashMap::new(),
-            pts: pts.to_vec(),
+            pts: pts.iter().copied().filter(usable).collect(),
+            nodes: Vec::new(),
         };
-        for (i, p) in pts.iter().enumerate() {
-            map.entry(g.key(p)).or_default().push(i as u32);
+        if !t.pts.is_empty() {
+            t.build(0, t.pts.len());
         }
-        g.map = map;
-        g
+        t
     }
 
-    fn key(&self, p: &[f64; 3]) -> [i64; 3] {
-        let f = |v: f64| (v / self.cell).floor() as i64;
-        [f(p[0]), f(p[1]), if self.dims == 3 { f(p[2]) } else { 0 }]
+    fn build(&mut self, start: usize, end: usize) -> usize {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for p in &self.pts[start..end] {
+            for a in 0..3 {
+                lo[a] = lo[a].min(p[a]);
+                hi[a] = hi[a].max(p[a]);
+            }
+        }
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            lo,
+            hi,
+            start,
+            end,
+            kids: None,
+        });
+        if end - start > LEAF {
+            let axis = (0..self.dims)
+                .max_by(|&a, &b| (hi[a] - lo[a]).total_cmp(&(hi[b] - lo[b])))
+                .unwrap_or(0);
+            let mid = (start + end) / 2;
+            self.pts[start..end]
+                .select_nth_unstable_by(mid - start, |a, b| a[axis].total_cmp(&b[axis]));
+            let l = self.build(start, mid);
+            let r = self.build(mid, end);
+            self.nodes[id].kids = Some((l, r));
+        }
+        id
     }
 
-    fn dist2(&self, a: &[f64; 3], b: &[f64; 3]) -> f64 {
-        let dz = if self.dims == 3 { a[2] - b[2] } else { 0.0 };
-        (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + dz * dz
+    fn box_d2(&self, n: &Node, q: &[f64; 3]) -> f64 {
+        (0..self.dims)
+            .map(|a| {
+                let d = (n.lo[a] - q[a]).max(q[a] - n.hi[a]).max(0.0);
+                d * d
+            })
+            .sum()
     }
 
-    /// `max_r` 안의 최근접 점 (번호, 거리). 껍질을 하나씩 넓히며 찾는다.
-    pub fn nearest(&self, q: &[f64; 3], max_r: f64) -> Option<(usize, f64)> {
-        let c = self.key(q);
-        let max_ring = (max_r / self.cell).ceil() as i64 + 1;
-        let mut best: Option<(usize, f64)> = None;
-        let zr = |r: i64| if self.dims == 3 { r } else { 0 };
-        for ring in 0..=max_ring {
-            for dx in -ring..=ring {
-                for dy in -ring..=ring {
-                    for dz in -zr(ring)..=zr(ring) {
-                        let on_shell = dx.abs() == ring || dy.abs() == ring || dz.abs() == ring;
-                        if !on_shell {
-                            continue;
-                        }
-                        let Some(v) = self.map.get(&[c[0] + dx, c[1] + dy, c[2] + dz]) else {
-                            continue;
-                        };
-                        for &i in v {
-                            let d2 = self.dist2(q, &self.pts[i as usize]);
-                            if best.is_none_or(|(_, b)| d2 < b) {
-                                best = Some((i as usize, d2));
-                            }
+    fn d2(&self, a: &[f64; 3], b: &[f64; 3]) -> f64 {
+        (0..self.dims).map(|k| (a[k] - b[k]).powi(2)).sum()
+    }
+
+    /// `max_r` 안의 최근접 점 (점, 거리). 없으면 None.
+    pub fn nearest(&self, q: &[f64; 3], max_r: f64) -> Option<([f64; 3], f64)> {
+        if self.nodes.is_empty() || !usable(q) {
+            return None;
+        }
+        let mut best_d2 = max_r * max_r;
+        let mut best: Option<usize> = None;
+        let mut stack = vec![0usize];
+        while let Some(id) = stack.pop() {
+            let n = &self.nodes[id];
+            if self.box_d2(n, q) > best_d2 {
+                continue;
+            }
+            match n.kids {
+                None => {
+                    for i in n.start..n.end {
+                        let d = self.d2(q, &self.pts[i]);
+                        if d <= best_d2 {
+                            best_d2 = d;
+                            best = Some(i);
                         }
                     }
                 }
-            }
-            // 껍질 ring 바깥 점은 최소 ring*cell 만큼 떨어져 있다.
-            if let Some((_, b)) = best {
-                if b.sqrt() <= ring as f64 * self.cell {
-                    break;
+                Some((l, r)) => {
+                    // 가까운 쪽을 먼저 보도록 먼 쪽을 먼저 쌓는다.
+                    let (dl, dr) = (
+                        self.box_d2(&self.nodes[l], q),
+                        self.box_d2(&self.nodes[r], q),
+                    );
+                    if dl <= dr {
+                        stack.push(r);
+                        stack.push(l);
+                    } else {
+                        stack.push(l);
+                        stack.push(r);
+                    }
                 }
             }
         }
-        best.map(|(i, d2)| (i, d2.sqrt()))
-            .filter(|&(_, d)| d <= max_r)
+        best.map(|i| (self.pts[i], best_d2.sqrt()))
     }
 }
 
@@ -533,14 +752,15 @@ fn stride_of(n: usize) -> usize {
 
 /// 질의 점마다 기준 점군의 3D 최근접 거리(`NN_CAP_M` 에서 자름)의 중앙값.
 pub fn nn_median(query: &[[f64; 3]], reference: &[[f64; 3]]) -> Option<f64> {
-    if query.is_empty() || reference.is_empty() {
+    let query: Vec<[f64; 3]> = query.iter().copied().filter(usable).collect();
+    let t = NnIndex::new(reference, 3);
+    if query.is_empty() || t.pts.is_empty() {
         return None;
     }
-    let g = Grid::new(reference, 1.0, 3);
     let mut d: Vec<f64> = query
         .iter()
         .step_by(stride_of(query.len()))
-        .map(|q| g.nearest(q, NN_CAP_M).map_or(NN_CAP_M, |(_, d)| d))
+        .map(|q| t.nearest(q, NN_CAP_M).map_or(NN_CAP_M, |(_, d)| d))
         .collect();
     Some(median(&mut d))
 }
@@ -548,17 +768,15 @@ pub fn nn_median(query: &[[f64; 3]], reference: &[[f64; 3]]) -> Option<f64> {
 /// 질의 점마다 수평 `radius` 안의 수평 최근접 기준 점과 짝을 지어 |높이 차| 중앙값.
 /// 짝이 하나도 없으면 None.
 pub fn height_pair_median(query: &[[f64; 3]], reference: &[[f64; 3]], radius: f64) -> Option<f64> {
-    if query.is_empty() || reference.is_empty() {
+    let query: Vec<[f64; 3]> = query.iter().copied().filter(usable).collect();
+    let t = NnIndex::new(reference, 2);
+    if query.is_empty() || t.pts.is_empty() {
         return None;
     }
-    let g = Grid::new(reference, radius.max(0.25), 2);
     let mut d: Vec<f64> = query
         .iter()
         .step_by(stride_of(query.len()))
-        .filter_map(|q| {
-            g.nearest(q, radius)
-                .map(|(i, _)| (q[2] - reference[i][2]).abs())
-        })
+        .filter_map(|q| t.nearest(q, radius).map(|(p, _)| (q[2] - p[2]).abs()))
         .collect();
     if d.is_empty() {
         None
@@ -790,7 +1008,7 @@ mod tests {
             ((s >> 33) as f64 / (1u64 << 31) as f64) * 20.0 - 10.0
         };
         let pts: Vec<[f64; 3]> = (0..500).map(|_| [r(), r(), r()]).collect();
-        let g = Grid::new(&pts, 1.0, 3);
+        let g = NnIndex::new(&pts, 3);
         for _ in 0..200 {
             let q = [r(), r(), r()];
             let bf = pts
@@ -804,6 +1022,60 @@ mod tests {
         }
         // 반경 밖이면 None.
         assert!(g.nearest(&[100.0, 100.0, 100.0], 5.0).is_none());
+    }
+
+    /// 2만 × 2만 점 평면, 질의 점군이 25 m 위에 떠 있어 상한 안에 점이 없는 경우.
+    /// 예전 격자 껍질 탐색은 같은 크기에서 57.7 s 걸렸다. 상한·상자 건너뛰기로 1 s 안.
+    #[test]
+    fn nn_median_far_offset_is_fast_and_capped() {
+        let reference: Vec<[f64; 3]> = (0..20_000)
+            .map(|i| [(i % 200) as f64 * 0.2, (i / 200) as f64 * 0.2, 0.0])
+            .collect();
+        let query: Vec<[f64; 3]> = reference.iter().map(|p| [p[0], p[1], 25.0]).collect();
+        let t0 = std::time::Instant::now();
+        let m = nn_median(&query, &reference).unwrap();
+        let secs = t0.elapsed().as_secs_f64();
+        assert_eq!(m, NN_CAP_M);
+        assert!(secs < 1.0, "{secs:.3} s");
+    }
+
+    /// x=1e30 같은 점이 섞여도 패닉 없이 그 점만 빼고 계산한다 (디버그 빌드 넘침 확인 포함).
+    #[test]
+    fn huge_coordinates_are_ignored() {
+        let mut reference: Vec<[f64; 3]> = (0..100)
+            .map(|i| [(i % 10) as f64, (i / 10) as f64, 0.0])
+            .collect();
+        reference.push([1e30, 0.0, 0.0]);
+        reference.push([-1e19, 1e19, 5.0]);
+        let mut query: Vec<[f64; 3]> = reference[..100].iter().map(|p| [p[0], p[1], 0.5]).collect();
+        query.push([1e30, 1e30, 1e30]);
+        assert!((nn_median(&query, &reference).unwrap() - 0.5).abs() < 1e-12);
+        assert!((height_pair_median(&query, &reference, 2.0).unwrap() - 0.5).abs() < 1e-12);
+        let t = NnIndex::new(&reference, 2);
+        assert!(t.nearest(&[1e30, 0.0, 0.0], 2.0).is_none());
+    }
+
+    #[test]
+    fn scale_spread_is_between_regions() {
+        assert!(scale_spread(&[1.0, 1.0, 1.1]) <= ALIGN_SCALE_TOL + EPS);
+        assert!(scale_spread(&[0.95, 1.0, 1.06]) > ALIGN_SCALE_TOL + EPS);
+        assert!(scale_spread(&[0.9, 1.0, 1.1]) > ALIGN_SCALE_TOL + EPS);
+        assert_eq!(scale_spread(&[0.0, 1.0]), f64::INFINITY);
+    }
+
+    #[test]
+    fn step_must_be_integer_or_final() {
+        let ok = parse_json(r#"{"snapshots":[{"step":1,"points":3},{"step":"final","points":4}]}"#)
+            .unwrap();
+        let rows = parse_steps(&ok).unwrap();
+        assert_eq!(rows[0].step, Some(1));
+        assert_eq!(rows[1].step, None);
+        for bad in [r#""01""#, "1.5", "0", "-1", "null"] {
+            let j =
+                parse_json(&format!(r#"{{"snapshots":[{{"step":{bad},"points":3}}]}}"#)).unwrap();
+            let e = parse_steps(&j).unwrap_err();
+            assert!(e.contains("step 형식 오류"), "{bad}: {e}");
+        }
     }
 
     #[test]
