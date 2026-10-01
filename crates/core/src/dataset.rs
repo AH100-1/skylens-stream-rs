@@ -185,17 +185,14 @@ pub struct Position {
     pub frame: u32,
     /// `CAMERAS` 순서의 사진 경로(실제로 읽은 파일).
     pub images: [PathBuf; 3],
+    /// 위치(편대 중심) GPS: 세 카메라 GPS 의 평균.
+    pub geo: Geodetic,
+    /// 위치(편대 중심) 동-북-위 좌표(m): `image_enu` 의 평균. 원점은 gps.txt 의 첫 기록.
+    pub enu: Vector3<f64>,
     /// `CAMERAS` 순서의 카메라(드론)별 GPS.
-    pub geo: [Geodetic; 3],
-    /// `CAMERAS` 순서의 동-북-위 좌표(m), 원점은 gps.txt 의 첫 기록.
-    pub enu: [Vector3<f64>; 3],
-}
-
-impl Position {
-    /// 세 카메라 GPS 의 무게중심(동-북-위, m).
-    pub fn enu_center(&self) -> Vector3<f64> {
-        (self.enu[0] + self.enu[1] + self.enu[2]) / 3.0
-    }
+    pub image_geo: [Geodetic; 3],
+    /// `CAMERAS` 순서의 카메라(드론)별 동-북-위 좌표(m).
+    pub image_enu: [Vector3<f64>; 3],
 }
 
 /// 고른 프레임 가운데 카메라가 빠져 위치가 되지 못한 것.
@@ -455,12 +452,19 @@ pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, Datas
                 frame,
             })?;
         }
+        let image_enu = geo.map(|g| geodetic_to_enu(&g, &origin));
         positions.push(Position {
             index: positions.len(),
             frame,
             images: [0, 1, 2].map(|c| sets[c][&frame].clone()),
-            geo,
-            enu: geo.map(|g| geodetic_to_enu(&g, &origin)),
+            geo: Geodetic {
+                lat_deg: geo.iter().map(|g| g.lat_deg).sum::<f64>() / 3.0,
+                lon_deg: geo.iter().map(|g| g.lon_deg).sum::<f64>() / 3.0,
+                alt: geo.iter().map(|g| g.alt).sum::<f64>() / 3.0,
+            },
+            enu: (image_enu[0] + image_enu[1] + image_enu[2]) / 3.0,
+            image_geo: geo,
+            image_enu,
         });
     }
     if positions.is_empty() {
@@ -564,9 +568,9 @@ mod tests {
         assert_eq!(ds.skipped[0].missing, vec!["camR"]);
         assert_eq!(ds.image_count(), 9);
         assert_eq!(ds.positions[2].index, 2);
-        assert!(ds.positions[0].enu[0].norm() < 1e-6);
+        assert!(ds.positions[0].image_enu[0].norm() < 1e-6);
         // 경도 9e-5 도, 위도 37 도: 동쪽 약 6378137·cos37°·9e-5·π/180 ≈ 8.0 m.
-        let e = ds.positions[2].enu[0];
+        let e = ds.positions[2].image_enu[0];
         assert!((e.x - 8.0).abs() < 0.05, "{e}");
         assert!(e.y.abs() < 0.01 && e.z.abs() < 0.01, "{e}");
         // STRIDE 1 이면 0..10 중 6 빠져 9곳.
@@ -692,13 +696,14 @@ mod tests {
         let d = m * 1e-4_f64.to_radians();
         assert!((d - 11.09).abs() < 0.02, "{d}");
         for p in &ds.positions {
-            assert_eq!(p.geo[1].lat_deg, 37.0001);
+            assert_eq!(p.image_geo[1].lat_deg, 37.0001);
+            assert!((p.geo.lat_deg - 37.0001).abs() < 1e-12);
             for (i, j, k) in [(0, 1, 1.0), (1, 2, 1.0), (0, 2, 2.0)] {
-                let got = (p.enu[j] - p.enu[i]).norm();
+                let got = (p.image_enu[j] - p.image_enu[i]).norm();
                 assert!((got - k * d).abs() < 0.1, "위치 {} {i}-{j}: {got}", p.index);
             }
-            let c = p.enu_center();
-            assert!((c - p.enu[1]).norm() < 0.01, "{c}");
+            // 위치 좌표는 세 드론 평균 = 가운데(camR) 드론 자리.
+            assert!((p.enu - p.image_enu[1]).norm() < 0.01, "{}", p.enu);
         }
     }
 

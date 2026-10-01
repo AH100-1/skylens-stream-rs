@@ -82,12 +82,17 @@ fn loader_reads_synth_output_as_is() {
     // 따로이므로 위치 i 카메라 c 의 정답은 gps_enu[3i+c] − gps_enu[0].
     // 허용 1 cm: gps.txt 기록 정밀도(위경도 1e-9° ≈ 0.1 mm, 고도 1 mm)와 두 접평면 원점 차
     // (수 m / 지구 반지름 × 이동 거리 200 m ≈ 0.1 mm)보다 충분히 크고, 위치 간격 2.5 m 보다 훨씬 작다.
+    // 위치 좌표는 세 사진 좌표의 평균(편대 중심).
     for (i, p) in ds.positions.iter().enumerate() {
+        let mut mean = skylens_core::nalgebra::Vector3::zeros();
         for c in 0..3 {
             let want = scene.gps_enu[3 * i + c] - scene.gps_enu[0];
-            let err = (p.enu[c] - want).norm();
+            let err = (p.image_enu[c] - want).norm();
             assert!(err < 0.01, "위치 {i} 카메라 {c}: 오차 {err} m");
+            mean += want / 3.0;
         }
+        let err = (p.enu - mean).norm();
+        assert!(err < 0.01, "위치 {i} 평균: 오차 {err} m");
     }
     assert!(ds.skipped.is_empty());
 
@@ -132,6 +137,7 @@ fn synth_output_moved_into_camera_folders_reads_same() {
     for (a, b) in flat.positions.iter().zip(&sub.positions) {
         assert_eq!(a.frame, b.frame);
         assert_eq!(a.enu, b.enu);
+        assert_eq!(a.image_enu, b.image_enu);
         for (c, cam) in CAMERAS.iter().enumerate() {
             let name = a.images[c].file_name().unwrap();
             assert_eq!(b.images[c], images.join(cam).join(name));
