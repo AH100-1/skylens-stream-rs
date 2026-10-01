@@ -2,6 +2,8 @@
 //!
 //! 검출기(부화소·부스케일 정밀화) → 방향 할당 → 128차원 기술자.
 
+use rayon::prelude::*;
+
 /// 단일 채널 f32 영상(행 우선).
 #[derive(Clone, Debug)]
 pub struct GrayImage {
@@ -61,28 +63,39 @@ pub fn gaussian_blur(img: &GrayImage, sigma: f32) -> GrayImage {
     let s: f32 = k.iter().sum();
     k.iter_mut().for_each(|v| *v /= s);
     let (w, h) = (img.width as isize, img.height as isize);
+    // 행 단위 병렬. 가로는 가장자리를 복제해 덧댄 행으로, 세로는 행 전체를 한꺼번에 누산한다.
+    // 화소마다 탭을 같은 순서로 더하므로 결과는 화소별 직접 계산과 비트 단위로 같다.
+    let (wu, ru) = (img.width, r as usize);
     let mut tmp = GrayImage::new(img.width, img.height);
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0.0;
-            for (j, kv) in k.iter().enumerate() {
-                let xx = (x + j as isize - r).clamp(0, w - 1);
-                acc += kv * img.data[(y * w + xx) as usize];
+    tmp.data
+        .par_chunks_mut(wu.max(1))
+        .zip(img.data.par_chunks(wu.max(1)))
+        .for_each(|(row, src)| {
+            let padded: Vec<f32> = (-r..w + r)
+                .map(|x| src[x.clamp(0, w - 1) as usize])
+                .collect();
+            for (x, o) in row.iter_mut().enumerate() {
+                let win = &padded[x..x + 2 * ru + 1];
+                let mut acc = 0.0;
+                for (kv, v) in k.iter().zip(win) {
+                    acc += kv * v;
+                }
+                *o = acc;
             }
-            tmp.data[(y * w + x) as usize] = acc;
-        }
-    }
+        });
     let mut out = GrayImage::new(img.width, img.height);
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0.0;
+    out.data
+        .par_chunks_mut(wu.max(1))
+        .enumerate()
+        .for_each(|(y, row)| {
             for (j, kv) in k.iter().enumerate() {
-                let yy = (y + j as isize - r).clamp(0, h - 1);
-                acc += kv * tmp.data[(yy * w + x) as usize];
+                let yy = (y as isize + j as isize - r).clamp(0, h - 1) as usize;
+                let src = &tmp.data[yy * wu..(yy + 1) * wu];
+                for (o, v) in row.iter_mut().zip(src) {
+                    *o += kv * v;
+                }
             }
-            out.data[(y * w + x) as usize] = acc;
-        }
-    }
+        });
     out
 }
 
@@ -377,67 +390,74 @@ pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature
         let edge_thr = (cfg.edge_ratio + 1.0).powi(2) / cfg.edge_ratio;
         for l in 1..=s {
             let (d0, d1, d2) = (&dog[l - 1], &dog[l], &dog[l + 1]);
-            for y in 1..h - 1 {
-                for x in 1..w - 1 {
-                    let v = d1.at(x, y);
-                    if v.abs() < cfg.contrast {
-                        continue;
-                    }
-                    let mut is_max = true;
-                    let mut is_min = true;
-                    'n: for d in [d0, d1, d2] {
-                        for yy in y - 1..=y + 1 {
-                            for xx in x - 1..=x + 1 {
-                                if std::ptr::eq(d, d1) && xx == x && yy == y {
-                                    continue;
-                                }
-                                let u = d.at(xx, yy);
-                                is_max &= v > u;
-                                is_min &= v < u;
-                                if !is_max && !is_min {
-                                    break 'n;
+            // 행 단위 병렬, 행 순서대로 이어 붙여 직렬과 같은 순서를 지킨다.
+            let rows: Vec<Vec<Feature>> = (1..h - 1)
+                .into_par_iter()
+                .map(|y| {
+                    let mut out = Vec::new();
+                    for x in 1..w - 1 {
+                        let v = d1.at(x, y);
+                        if v.abs() < cfg.contrast {
+                            continue;
+                        }
+                        let mut is_max = true;
+                        let mut is_min = true;
+                        'n: for d in [d0, d1, d2] {
+                            for yy in y - 1..=y + 1 {
+                                for xx in x - 1..=x + 1 {
+                                    if std::ptr::eq(d, d1) && xx == x && yy == y {
+                                        continue;
+                                    }
+                                    let u = d.at(xx, yy);
+                                    is_max &= v > u;
+                                    is_min &= v < u;
+                                    if !is_max && !is_min {
+                                        break 'n;
+                                    }
                                 }
                             }
                         }
+                        if !(is_max || is_min) {
+                            continue;
+                        }
+                        let Some(r) = refine_extremum(&dog, x, y, l, s) else {
+                            continue;
+                        };
+                        if r.value.abs() < cfg.contrast {
+                            continue;
+                        }
+                        let d = &dog[r.layer];
+                        let (xi, yi) = (r.xi, r.yi);
+                        let c = d.at(xi, yi);
+                        let dxx = d.at(xi + 1, yi) + d.at(xi - 1, yi) - 2.0 * c;
+                        let dyy = d.at(xi, yi + 1) + d.at(xi, yi - 1) - 2.0 * c;
+                        let dxy = 0.25
+                            * (d.at(xi + 1, yi + 1) - d.at(xi - 1, yi + 1) - d.at(xi + 1, yi - 1)
+                                + d.at(xi - 1, yi - 1));
+                        let tr = dxx + dyy;
+                        let det = dxx * dyy - dxy * dxy;
+                        if det <= 0.0 || tr * tr / det >= edge_thr {
+                            continue;
+                        }
+                        let sig_oct = cfg.sigma0 * kstep.powf(r.s);
+                        let g = &gauss[r.layer];
+                        for angle in dominant_orientations(g, r.x, r.y, sig_oct) {
+                            out.push(Feature {
+                                kp: Keypoint {
+                                    x: r.x * scale,
+                                    y: r.y * scale,
+                                    sigma: sig_oct * scale,
+                                    response: r.value,
+                                    angle,
+                                },
+                                desc: describe(g, r.x, r.y, sig_oct, angle),
+                            });
+                        }
                     }
-                    if !(is_max || is_min) {
-                        continue;
-                    }
-                    let Some(r) = refine_extremum(&dog, x, y, l, s) else {
-                        continue;
-                    };
-                    if r.value.abs() < cfg.contrast {
-                        continue;
-                    }
-                    let d = &dog[r.layer];
-                    let (xi, yi) = (r.xi, r.yi);
-                    let c = d.at(xi, yi);
-                    let dxx = d.at(xi + 1, yi) + d.at(xi - 1, yi) - 2.0 * c;
-                    let dyy = d.at(xi, yi + 1) + d.at(xi, yi - 1) - 2.0 * c;
-                    let dxy = 0.25
-                        * (d.at(xi + 1, yi + 1) - d.at(xi - 1, yi + 1) - d.at(xi + 1, yi - 1)
-                            + d.at(xi - 1, yi - 1));
-                    let tr = dxx + dyy;
-                    let det = dxx * dyy - dxy * dxy;
-                    if det <= 0.0 || tr * tr / det >= edge_thr {
-                        continue;
-                    }
-                    let sig_oct = cfg.sigma0 * kstep.powf(r.s);
-                    let g = &gauss[r.layer];
-                    for angle in dominant_orientations(g, r.x, r.y, sig_oct) {
-                        out.push(Feature {
-                            kp: Keypoint {
-                                x: r.x * scale,
-                                y: r.y * scale,
-                                sigma: sig_oct * scale,
-                                response: r.value,
-                                angle,
-                            },
-                            desc: describe(g, r.x, r.y, sig_oct, angle),
-                        });
-                    }
-                }
-            }
+                    out
+                })
+                .collect();
+            out.extend(rows.into_iter().flatten());
         }
         base = gauss[s].downsample();
     }
@@ -778,6 +798,62 @@ mod tests {
             assert!(n >= 250, "매칭 수 {n}");
             assert!(acc >= 0.95, "정확도 {acc}");
         }
+    }
+
+    fn scene_image(w: usize, h: usize) -> GrayImage {
+        use crate::synth::{Scene, SceneConfig};
+        let scene = Scene::new(SceneConfig {
+            width: w as u32,
+            height: h as u32,
+            ..SceneConfig::default()
+        });
+        let (img, _) = scene.render(&scene.views[0]);
+        GrayImage::from_rgb(w, h, &img.data)
+    }
+
+    #[test]
+    fn parallel_detection_matches_single_thread() {
+        // 병렬 흐림·극값 탐색이 스레드 1개 실행과 비트 단위로 같은 특징(순서 포함)을 낸다.
+        let img = scene_image(480, 270);
+        let cfg = DetectorConfig::default();
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| detect_and_describe(&img, &cfg));
+        let many = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| detect_and_describe(&img, &cfg));
+        assert!(one.len() > 100, "특징 {}", one.len());
+        assert_eq!(one.len(), many.len());
+        for (p, q) in one.iter().zip(&many) {
+            assert_eq!(
+                (p.kp.x, p.kp.y, p.kp.sigma, p.kp.angle),
+                (q.kp.x, q.kp.y, q.kp.sigma, q.kp.angle)
+            );
+            assert_eq!(p.desc, q.desc);
+        }
+    }
+
+    #[test]
+    #[ignore = "시간 측정: cargo test --release -- --ignored --test-threads=1 detection_timing"]
+    fn detection_timing() {
+        // F-014 확인 기준: 합성 1920×1080 한 장 검출 ≤ 0.4 s.
+        let img = scene_image(1920, 1080);
+        let cfg = DetectorConfig::default();
+        let _ = detect_and_describe(&img, &cfg); // 예열
+        let t = std::time::Instant::now();
+        let f = detect_and_describe(&img, &cfg);
+        let dt = t.elapsed().as_secs_f64();
+        println!(
+            "detect_and_describe 1920x1080: {:.3} s, 특징 {}, 스레드 {}",
+            dt,
+            f.len(),
+            rayon::current_num_threads()
+        );
+        assert!(dt <= 0.4, "검출 {dt:.3} s > 0.4 s");
     }
 
     #[test]
