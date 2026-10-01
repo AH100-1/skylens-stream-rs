@@ -43,7 +43,7 @@ pub fn candidate_pairs(
 #[inline]
 fn sq_dist(p: &[f32; DESC_LEN], r: &[f32; DESC_LEN]) -> f32 {
     let mut acc = [0f32; 8];
-    for (pc, rc) in p.chunks_exact(8).zip(r.chunks_exact(8)) {
+    for (pc, rc) in p.as_chunks::<8>().0.iter().zip(r.as_chunks::<8>().0) {
         for k in 0..8 {
             let t = pc[k] - rc[k];
             acc[k] += t * t;
