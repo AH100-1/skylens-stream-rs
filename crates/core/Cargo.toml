@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 nalgebra.workspace = true
+image.workspace = true
+rayon.workspace = true

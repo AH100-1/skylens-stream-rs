@@ -9,3 +9,5 @@ license = "MIT"
 
 [workspace.dependencies]
 nalgebra = "0.33"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rayon = "1"

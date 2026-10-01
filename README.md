@@ -32,6 +32,9 @@ Rust stable(1.80 이상)이 필요하다.
 # 점군 파일 정보 보기
 skylens-stream ply-info <파일.ply>
 
+# 시험용 합성 장면 만들기 (정답 카메라·점·GPS 포함, 기본 해상도는 작게)
+skylens-stream synth <출력 폴더> [폭 높이]
+
 # 점진적 점군 생성 (개발 중)
 skylens-stream run <데이터> -o <출력> [--stride 3] [--span 12] [--overlap 2]
 
