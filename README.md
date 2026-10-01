@@ -81,19 +81,21 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 ### 라이브러리: 두 시점 상대 자세와 삼각측량
 
 ```rust
-use skylens_core::two_view::{essential_from_fundamental, recover_pose, refine_pose, triangulate};
+use skylens_core::two_view::{essential_from_fundamental, refine_relative_pose, triangulate};
 // 최소 해법이 필요하면 essential_5pt(&n1[..5], &n2[..5]) 가 본질 행렬 후보(최대 10개)를 준다.
 
 // f, inliers: 위 RANSAC 결과. k: 카메라 내부 파라미터(Intrinsics).
 let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let e = essential_from_fundamental(&f, &k, &k);
-if let Some(rp) = recover_pose(&e, &n1, &n2).filter(|rp| rp.translation_observable) {
+if let Some(rp) = refine_relative_pose(&e, &n1, &n2, 50).filter(|rp| rp.translation_observable) {
     // 카메라 1 = [I|0], 카메라 2 = [R|t] (t 는 단위 길이, 스케일 미정)
-    let (r, t) = refine_pose(&rp.rotation, &rp.translation, &n1, &n2, 50);
-    let x = triangulate(&r, &t, &n1[0], &n2[0]); // 카메라 1 좌표계의 3D 점
+    let x = triangulate(&rp.rotation, &rp.translation, &n1[0], &n2[0]); // 카메라 1 좌표계의 3D 점
 }
-// recover_pose 는 길이 불일치, NaN 입력에서 None.
+// refine_relative_pose 는 선형 E 의 분해 후보 여러 곳에서 Sampson 비용 LM 을 돌려 비용이 가장 작은 해를
+// 키랄리티로 골라 준다(선형 해 하나만 다듬으면 회전–이동 혼동 국소 최소에 갇힐 수 있음).
+// 선형 해만 필요하면 recover_pose(&e, &n1, &n2), 시작점을 직접 주려면 refine_pose 를 쓴다.
+// 둘 다 길이 불일치, NaN 입력에서 None.
 // 순수 회전·아주 짧은 기선(이동 방향을 관측할 수 없음)이면 translation_observable = false 이고
 // rotation 만 믿을 수 있다(translation 은 0). 회전 평균에는 이 회전도 쓸 수 있다.
 ```
@@ -205,19 +207,21 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 ### Library: two-view relative pose and triangulation
 
 ```rust
-use skylens_core::two_view::{essential_from_fundamental, recover_pose, refine_pose, triangulate};
+use skylens_core::two_view::{essential_from_fundamental, refine_relative_pose, triangulate};
 // For a minimal solver, essential_5pt(&n1[..5], &n2[..5]) returns essential-matrix candidates (up to 10).
 
 // f, inliers: the RANSAC result above. k: camera intrinsics (Intrinsics).
 let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let e = essential_from_fundamental(&f, &k, &k);
-if let Some(rp) = recover_pose(&e, &n1, &n2).filter(|rp| rp.translation_observable) {
+if let Some(rp) = refine_relative_pose(&e, &n1, &n2, 50).filter(|rp| rp.translation_observable) {
     // camera 1 = [I|0], camera 2 = [R|t] (t has unit length; scale is unknown)
-    let (r, t) = refine_pose(&rp.rotation, &rp.translation, &n1, &n2, 50);
-    let x = triangulate(&r, &t, &n1[0], &n2[0]); // 3D point in camera 1 coordinates
+    let x = triangulate(&rp.rotation, &rp.translation, &n1[0], &n2[0]); // 3D point in camera 1 coordinates
 }
-// recover_pose returns None on length mismatch or NaN input.
+// refine_relative_pose runs Sampson-cost LM from several decompositions of the linear E and picks the
+// lowest-cost pose by cheirality (refining only the linear pose can get stuck in a rotation–translation
+// ambiguity local minimum). Use recover_pose(&e, &n1, &n2) for the linear pose only, or refine_pose to
+// supply your own start. Both return None on length mismatch or NaN input.
 // For pure rotation or a very short baseline (translation unobservable), translation_observable = false
 // and only rotation is reliable (translation is zero). That rotation can still feed rotation averaging.
 ```

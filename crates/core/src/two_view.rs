@@ -542,6 +542,41 @@ pub fn refine_pose(
     (r, t)
 }
 
+/// 본질 행렬 E 에서 시작해 상대 자세를 Sampson 비용 최소화로 구한다.
+///
+/// 선형 E 의 분해 해 하나만 다듬으면 잡음 큰 짝에서 정답과 다른 골짜기(비용이 정답보다 10배 큰
+/// 국소 최소)에 갇힐 수 있다. 그래서 분해 네 후보와 이동 부호를 뒤집은 네 후보, 모두 여덟 곳에서
+/// `refine_pose` 를 돌려 비용이 가장 작은 해를 고른다. Sampson 비용은 t 부호와 꼬인 짝에 무관하므로
+/// 마지막에 정밀화된 E 를 `recover_pose` 로 다시 분해해 키랄리티(앞쪽 점 수)로 하나를 고르고,
+/// 이동 관측 가능 여부도 그 E 로 판정한다.
+pub fn refine_relative_pose(
+    e: &Matrix3<f64>,
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    iters: usize,
+) -> Option<RelativePose> {
+    // 입력 검사와 관측 불가 시 회전 초깃값(축 시작점)에 쓴다.
+    let linear = recover_pose(e, n1, n2)?;
+    let cost = |r: &Rotation3<f64>, t: &Vector3<f64>| -> f64 {
+        let e = essential_from_pose(r, t);
+        n1.iter()
+            .zip(n2)
+            .map(|(a, b)| sampson_residual(&e, a, b).powi(2))
+            .sum()
+    };
+    let axes = [Vector3::x(), Vector3::y(), Vector3::z()];
+    let (r, t) = decompose_essential(e)
+        .into_iter()
+        .flat_map(|(r, t)| [(r, t), (r, -t)])
+        .chain(axes.into_iter().map(|t| (linear.rotation, t)))
+        .chain(axes.into_iter().map(|t| (rotation_only_fit(n1, n2).0, t)))
+        .map(|(r, t)| refine_pose(&r, &t, n1, n2, iters))
+        .min_by(|a, b| cost(&a.0, &a.1).total_cmp(&cost(&b.0, &b.1)))?;
+    // 관측 가능 여부도 정밀화된 E 로 다시 판정한다. 선형 E 가 틀린 골짜기에 있으면 에피폴라 잔차가
+    // 부풀어 관측 가능한 짝을 순수 회전으로 오판하기 때문이다(기선/깊이 0.1, σ1 px 시드 5·6·10).
+    recover_pose(&essential_from_pose(&r, &t), n1, n2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,40 +684,58 @@ mod tests {
     }
 
     #[test]
-    fn relative_pose_under_noise() {
-        // (σ px, 회전 오차 상한 도, 이동 방향 오차 상한 도, 삼각측량 중앙값 오차 상한 m)
-        // 선형 8점만(비선형 정밀화 없음) 기준. 기선 3 m / 깊이 ~40 m 라 이동 방향이 잡음에 민감하다.
-        // 상한은 시드 7·11·23 측정 최댓값의 약 1.5 배.
-        for (sigma, max_rot, max_dir, max_pt) in [
-            (0.0, 1e-6, 1e-6, 1e-6),
-            (0.5, 0.2, 4.5, 1.7),
-            (1.0, 0.4, 12.0, 4.0),
-        ] {
-            let s = scene(200, sigma, 7);
-            let e = essential_8pt(&s.x1, &s.x2).unwrap();
-            let rp = recover_pose(&e, &s.x1, &s.x2).unwrap();
-            let (r, t) = s.rel();
-            let rot_err = rotation_angle_between(&rp.rotation, &r).to_degrees();
-            let dir_err = rp.translation.angle(&t.normalize()).to_degrees();
-            let front = rp.in_front.iter().filter(|&&b| b).count() as f64 / s.x1.len() as f64;
-            // 정답 기선 길이로 스케일을 맞춰 삼각측량 오차를 잰다.
-            let tt = rp.translation * t.norm();
-            let mut errs: Vec<f64> = (0..s.x1.len())
-                .filter_map(|i| {
-                    let x = triangulate(&rp.rotation, &tt, &s.x1[i], &s.x2[i])?;
-                    Some((x.coords - s.c1.pose.transform(&s.pts[i])).norm())
-                })
-                .collect();
-            errs.sort_by(|a, b| a.total_cmp(b));
-            let med = errs[errs.len() / 2];
-            eprintln!(
-                "sigma={sigma} rot_err={rot_err:.4} deg dir_err={dir_err:.3} deg \
-                 front={front:.3} median_pt_err={med:.3} m"
-            );
-            assert!(rot_err < max_rot, "회전 오차 {rot_err} 도");
-            assert!(dir_err < max_dir, "이동 방향 오차 {dir_err} 도");
-            assert!(front > 0.97, "앞쪽 비율 {front}");
-            assert!(med < max_pt, "삼각측량 중앙값 {med} m");
+    fn relative_pose_without_noise_is_exact() {
+        let s = scene(200, 0.0, 7);
+        let e = essential_8pt(&s.x1, &s.x2).unwrap();
+        let rp = recover_pose(&e, &s.x1, &s.x2).unwrap();
+        let (r, t) = s.rel();
+        let rot_err = rotation_angle_between(&rp.rotation, &r).to_degrees();
+        let dir_err = rp.translation.angle(&t.normalize()).to_degrees();
+        let front = rp.in_front.iter().filter(|&&b| b).count();
+        // 정답 기선 길이로 스케일을 맞춘 삼각측량 오차.
+        let tt = rp.translation * t.norm();
+        let worst = (0..s.x1.len())
+            .filter_map(|i| {
+                let x = triangulate(&rp.rotation, &tt, &s.x1[i], &s.x2[i])?;
+                Some((x.coords - s.c1.pose.transform(&s.pts[i])).norm())
+            })
+            .fold(0.0f64, f64::max);
+        assert!(rot_err < 1e-6 && dir_err < 1e-6, "{rot_err} {dir_err}");
+        assert_eq!(front, s.x1.len());
+        assert!(worst < 1e-6, "삼각측량 오차 {worst} m");
+    }
+
+    /// 선형 8점 + `recover_pose` 의 오차 분포(시드 100개). 선형 해는 정밀화 전 시작점일 뿐이라 꼬리가
+    /// 길다(시드 1..=100 σ=0.5 최악 회전 4.5°·방향 79°, 원인은 정밀화 테스트 주석). 그래서 중앙값과
+    /// 90% 분위만 단언한다. 상한은 시드 1..=100·101..=200 두 묶음 측정값 중 큰 값의 약 1.5 배.
+    #[test]
+    fn linear_pose_error_distribution() {
+        // (σ px, 회전 중앙값·90%, 방향 중앙값·90%) 도. 측정(σ0.5): 0.125·0.222, 2.98·7.66.
+        // 측정(σ1): 0.235·0.436, 5.92·11.95.
+        for (sigma, rot_med, rot_p90, dir_med, dir_p90) in
+            [(0.5, 0.2, 0.35, 4.5, 11.5), (1.0, 0.35, 0.65, 9.0, 18.0)]
+        {
+            for seeds in [1u64..=100, 101..=200] {
+                let st = pose_stats(sigma, seeds.clone());
+                let rot: Vec<f64> = st.lin.iter().map(|x| x.0).collect();
+                let dir: Vec<f64> = st.lin.iter().map(|x| x.1).collect();
+                let q = (
+                    quantile(&rot, 0.5),
+                    quantile(&rot, 0.9),
+                    quantile(&dir, 0.5),
+                    quantile(&dir, 0.9),
+                );
+                eprintln!(
+                    "linear sigma={sigma} seeds={seeds:?} n={} rot med {:.3} p90 {:.3} dir med {:.2} p90 {:.2}",
+                    rot.len(),
+                    q.0,
+                    q.1,
+                    q.2,
+                    q.3
+                );
+                assert!(q.0 < rot_med && q.1 < rot_p90, "회전 분위 {q:?}");
+                assert!(q.2 < dir_med && q.3 < dir_p90, "방향 분위 {q:?}");
+            }
         }
     }
 
@@ -697,33 +750,48 @@ mod tests {
         assert!(d < 1e-9, "E 차이 {d}");
     }
 
+    /// 원인(F-012): 꼬리 시드에서 정답 자세의 Sampson 비용은 선형 해를 다듬은 해보다 약 10 배 작다
+    /// (σ0.5 시드 92: 정답 9.4e-5, 선형 해 정밀화 1.1e-3). 즉 데이터는 모호하지 않고, 선형 해 하나에서
+    /// 시작한 LM 이 회전–이동 혼동 골짜기(회전 ~4.4°, 방향 ~75°)에 갇힌 것이다. `refine_relative_pose`
+    /// 는 시작점을 넓혀 비용 최소 해를 고르므로 다음을 시드마다 단언한다:
+    /// - 비용이 선형 해 이하(LM 단조 감소), 정답 자세 비용 이하(전역 최소라면 반드시 성립),
+    /// - 오차 최댓값·중앙값·90% 분위가 상한 아래(상한 = 두 시드 묶음 측정 최댓값의 약 1.5 배).
     #[test]
-    fn refinement_reduces_pose_error() {
-        // (σ px, 정밀화 후 회전 상한 도, 이동 방향 상한 도). 상한은 시드 세 개 측정 최댓값의 약 1.5 배.
-        for (sigma, max_rot, max_dir) in [(0.5, 0.18, 1.3), (1.0, 0.35, 2.9)] {
-            let mut worst = (0.0f64, 0.0f64);
-            for seed in [7u64, 11, 23] {
-                let s = scene(200, sigma, seed);
-                let e = essential_8pt(&s.x1, &s.x2).unwrap();
-                let rp = recover_pose(&e, &s.x1, &s.x2).unwrap();
-                let (r, t) = s.rel();
-                let (rr, tr) = refine_pose(&rp.rotation, &rp.translation, &s.x1, &s.x2, 50);
-                let errs = |rot: &Rotation3<f64>, tv: &Vector3<f64>| {
-                    (
-                        rotation_angle_between(rot, &r).to_degrees(),
-                        tv.angle(&t.normalize()).to_degrees(),
-                    )
-                };
-                let (b, a) = (errs(&rp.rotation, &rp.translation), errs(&rr, &tr));
+    fn refined_pose_error_distribution() {
+        // (σ px, 회전 중앙값·90%·최대, 방향 중앙값·90%·최대) 도.
+        // 측정(σ0.5): 회전 0.093·0.159·0.266, 방향 0.70·1.57·2.00.
+        // 측정(σ1): 회전 0.195·0.358·0.531, 방향 1.47·3.12·4.39.
+        for (sigma, rb, db) in [
+            (0.5, [0.14, 0.24, 0.4], [1.05, 2.4, 3.0]),
+            (1.0, [0.3, 0.55, 0.8], [2.2, 4.7, 6.6]),
+        ] {
+            for seeds in [1u64..=100, 101..=200] {
+                let st = pose_stats(sigma, seeds.clone());
+                for (i, &(lin, rf, truth)) in st.costs.iter().enumerate() {
+                    assert!(
+                        rf <= lin * (1.0 + 1e-9),
+                        "{i}: 정밀화가 비용을 늘림 {lin} → {rf}"
+                    );
+                    assert!(
+                        rf <= truth * (1.0 + 1e-6),
+                        "{i}: 정답보다 비싼 국소 최소 {rf} > {truth}"
+                    );
+                }
+                let rot: Vec<f64> = st.refined.iter().map(|x| x.0).collect();
+                let dir: Vec<f64> = st.refined.iter().map(|x| x.1).collect();
+                let r = [0.5, 0.9, 1.0].map(|p| quantile(&rot, p));
+                let d = [0.5, 0.9, 1.0].map(|p| quantile(&dir, p));
                 eprintln!(
-                    "refine sigma={sigma} seed={seed} rot {:.4}->{:.4} deg dir {:.3}->{:.3} deg",
-                    b.0, a.0, b.1, a.1
+                    "refined sigma={sigma} seeds={seeds:?} n={} unobservable={} rot {r:.3?} dir {d:.2?}",
+                    rot.len(),
+                    st.unobservable
                 );
-                assert!(a.0 < b.0 && a.1 < b.1, "정밀화가 오차를 줄이지 못함");
-                worst = (worst.0.max(a.0), worst.1.max(a.1));
+                // 장면은 모두 관측 가능. 선형 E 로 판정하면 σ1 에서 26·18 개가 순수 회전으로 오판되지만
+                // 정밀화된 E 로 다시 판정하면 0 개다.
+                assert_eq!(st.unobservable, 0, "관측 불가로 오판");
+                assert!((0..3).all(|k| r[k] < rb[k]), "회전 {r:?} 상한 {rb:?}");
+                assert!((0..3).all(|k| d[k] < db[k]), "방향 {d:?} 상한 {db:?}");
             }
-            assert!(worst.0 < max_rot, "정밀화 후 회전 오차 {} 도", worst.0);
-            assert!(worst.1 < max_dir, "정밀화 후 이동 방향 오차 {} 도", worst.1);
         }
     }
 
@@ -942,12 +1010,8 @@ mod tests {
                 .map(|(a, b)| sampson_error(&e, a, b).sqrt())
                 .collect(),
         );
-        // 관측 가능하면 사용 경로대로 refine_pose 를 거친 회전을 잰다.
-        let rot = if rp.translation_observable {
-            refine_pose(&rp.rotation, &rp.translation, &s.x1, &s.x2, 50).0
-        } else {
-            rp.rotation
-        };
+        // 사용 경로대로 refine_relative_pose 의 회전을 잰다(관측 불가면 recover_pose 회전 그대로).
+        let rot = refine_relative_pose(&e, &s.x1, &s.x2, 50).unwrap().rotation;
         (
             rp.translation_observable,
             rot_res / epi,
@@ -987,5 +1051,68 @@ mod tests {
             assert!((ang - std::f64::consts::FRAC_PI_2).abs() < 1e-9, "{ang}");
         }
         assert!(angle_between(&a, &a).abs() < 1e-12);
+    }
+
+    /// 백분위(가장 가까운 순위). `v` 는 비어 있지 않아야 한다.
+    fn quantile(v: &[f64], q: f64) -> f64 {
+        let mut v = v.to_vec();
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[((v.len() - 1) as f64 * q).round() as usize]
+    }
+
+    /// 시드마다 선형(8점 + `recover_pose`)·정밀화(`refine_relative_pose`) 자세의 (회전, 이동 방향) 오차(도)와
+    /// (선형, 정밀화, 정답 자세) Sampson 비용. 이동이 관측 불가로 판정된 해는 오차 목록에서 빼고,
+    /// 정밀화 해가 관측 불가인 시드 수를 센다(장면은 모두 관측 가능).
+    struct PoseStats {
+        lin: Vec<(f64, f64)>,
+        refined: Vec<(f64, f64)>,
+        costs: Vec<(f64, f64, f64)>,
+        unobservable: usize,
+    }
+
+    fn pose_stats(sigma: f64, seeds: std::ops::RangeInclusive<u64>) -> PoseStats {
+        let mut st = PoseStats {
+            lin: vec![],
+            refined: vec![],
+            costs: vec![],
+            unobservable: 0,
+        };
+        for seed in seeds {
+            let s = scene(200, sigma, seed);
+            let (r, t) = s.rel();
+            let cost = |rot: &Rotation3<f64>, tv: &Vector3<f64>| {
+                let e = essential_from_pose(rot, tv);
+                s.x1.iter()
+                    .zip(&s.x2)
+                    .map(|(a, b)| sampson_residual(&e, a, b).powi(2))
+                    .sum::<f64>()
+            };
+            let err = |p: &RelativePose| {
+                (
+                    rotation_angle_between(&p.rotation, &r).to_degrees(),
+                    p.translation.angle(&t.normalize()).to_degrees(),
+                )
+            };
+            let e = essential_8pt(&s.x1, &s.x2).unwrap();
+            let lin = recover_pose(&e, &s.x1, &s.x2).unwrap();
+            let rf = refine_relative_pose(&e, &s.x1, &s.x2, 50).unwrap();
+            if lin.translation_observable {
+                st.lin.push(err(&lin));
+            }
+            if !rf.translation_observable {
+                st.unobservable += 1;
+                continue;
+            }
+            st.refined.push(err(&rf));
+            if !lin.translation_observable {
+                continue;
+            }
+            st.costs.push((
+                cost(&lin.rotation, &lin.translation),
+                cost(&rf.rotation, &rf.translation),
+                cost(&r, &t),
+            ));
+        }
+        st
     }
 }
