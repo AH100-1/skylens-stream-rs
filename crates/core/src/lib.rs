@@ -3,6 +3,7 @@
 pub mod camera;
 pub mod distortion;
 pub mod features;
+pub mod fusion;
 pub mod geo;
 pub mod matching;
 pub mod math;
