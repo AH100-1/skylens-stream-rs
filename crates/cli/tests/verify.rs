@@ -23,6 +23,14 @@ struct Fixture {
     snap_points: [usize; 3],
     snap_area: [f64; 3],
     snap_nan: bool,
+    /// 지면 기울기 dz/dx (0 이면 평면).
+    slope: f32,
+    /// 초벌 점군만 x 방향으로 이만큼(m) 더 넓게 만든다.
+    preview_extra_x: f32,
+    /// 격자 간격·x/y 칸 수 (기본 0.5 m, 41×21).
+    cell: f32,
+    nx: usize,
+    ny: usize,
 }
 
 impl Default for Fixture {
@@ -38,9 +46,15 @@ impl Default for Fixture {
             preview_dz: 1.99,
             preview_outliers: false,
             refined1_z: 0.29,
-            snap_points: [100, 150, 200],
+            // final 288 = 정밀 구역 861 점 × 2 를 6:1 추출(144 + 144).
+            snap_points: [100, 150, 288],
             snap_area: [0.0, 12.5, 30.0],
             snap_nan: false,
+            slope: 0.0,
+            preview_extra_x: 0.0,
+            cell: 0.5,
+            nx: 41,
+            ny: 21,
         }
     }
 }
@@ -53,12 +67,13 @@ fn rec(x: f32, y: f32, z: f32) -> PointRecord {
     }
 }
 
-/// x ∈ [x0, x0+20], y ∈ [0, 10], 0.5 m 간격 격자.
-fn grid(x0: f32, z: f32) -> Vec<PointRecord> {
-    let mut v = Vec::new();
-    for i in 0..=40 {
-        for j in 0..=20 {
-            v.push(rec(x0 + i as f32 * 0.5, j as f32 * 0.5, z));
+/// x = x0 + i·cell (i < nx), y = j·cell (j < ny), z = z0 + slope·x 격자.
+fn grid(f: &Fixture, x0: f32, z0: f32, nx: usize) -> Vec<PointRecord> {
+    let mut v = Vec::with_capacity(nx * f.ny);
+    for i in 0..nx {
+        for j in 0..f.ny {
+            let x = x0 + i as f32 * f.cell;
+            v.push(rec(x, j as f32 * f.cell, z0 + f.slope * x));
         }
     }
     v
@@ -90,9 +105,10 @@ fn build(dir: &Path, f: &Fixture) {
     for (k, pos, x0, z) in names {
         write(
             &dir.join(format!("refined/refined_{k}_{pos}.ply")),
-            grid(x0, z),
+            grid(f, x0, z, f.nx),
         );
-        let mut p = grid(x0, z + f.preview_dz);
+        let extra = (f.preview_extra_x / f.cell).round() as usize;
+        let mut p = grid(f, x0, z + f.preview_dz, f.nx + extra);
         if f.preview_outliers {
             let n = p.len() + 1;
             p.extend((0..n).map(|i| rec(500.0 + i as f32, 500.0, 0.0)));
@@ -150,8 +166,14 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 fn run(tag: &str, f: &Fixture) -> (i32, String) {
+    run_with(tag, f, |_| {})
+}
+
+/// fixture 를 만든 뒤 `edit` 로 폴더를 고치고 verify 를 돌린다.
+fn run_with(tag: &str, f: &Fixture, edit: impl FnOnce(&Path)) -> (i32, String) {
     let dir = tmp(tag);
     build(&dir, f);
+    edit(&dir);
     let out = Command::new(env!("CARGO_BIN_EXE_skylens-stream"))
         .arg("verify")
         .arg(&dir)
@@ -207,13 +229,13 @@ fn passing_output_exits_zero() {
     assert!(out.contains("초벌 240/240, 정밀 240/240"), "{out}");
     assert!(out.contains("정밀 0.700 px"), "{out}");
     assert!(out.contains("점쌍 최소 1000"), "{out}");
-    assert!(out.contains("스케일 최대 편차 10.00%"), "{out}");
+    assert!(out.contains("구역 간 스케일 차 10.00%"), "{out}");
     assert!(out.contains("잔차 중앙 최대 5.990 m"), "{out}");
     // 초벌 = 정밀 + 1.99 m: 최근접·높이 차 모두 1.990 (f32 반올림).
     assert!(out.contains("최근접 중앙 최대 1.990 m"), "{out}");
     assert!(out.contains("높이 차 중앙 최대 1.990 m"), "{out}");
     assert!(out.contains("겹침 차 중앙 최대 0.290 m"), "{out}");
-    assert!(out.contains("점 100→200"), "{out}");
+    assert!(out.contains("점 100→150, final 288"), "{out}");
 }
 
 #[test]
@@ -265,14 +287,19 @@ fn align_boundaries() {
         ..Default::default()
     };
     expect_only_fail("scale_hi", &f, "preview_align");
-    // 중앙 1.0 대비 −10% 는 통과, −11% 는 실패.
+    // 구역 간 비 max/min − 1: 1/0.91 = 1.0989 통과, 1.06/0.95 = 1.116 과 1.1/0.9 = 1.222 실패.
     let f = Fixture {
-        align_scale: [1.0, 1.0, 0.9],
+        align_scale: [1.0, 1.0, 0.91],
         ..Default::default()
     };
     assert_eq!(run("scale_lo_ok", &f).0, 0);
     let f = Fixture {
-        align_scale: [1.0, 1.0, 0.89],
+        align_scale: [0.95, 1.0, 1.06],
+        ..Default::default()
+    };
+    expect_only_fail("scale_spread", &f, "preview_align");
+    let f = Fixture {
+        align_scale: [0.9, 1.0, 1.1],
         ..Default::default()
     };
     expect_only_fail("scale_lo", &f, "preview_align");
@@ -294,14 +321,14 @@ fn preview_height_difference_2m_fails() {
 
 #[test]
 fn preview_nearest_median_fails_with_far_points() {
-    // 짝 없는 먼 점이 절반을 넘으면 최근접 중앙은 상한 20 m, 높이 차(짝 있는 점만)는 1.99 m 그대로.
+    // 짝 없는 먼 점이 절반을 넘으면 최근접 중앙은 상한(> 6 m), 높이 차(짝 있는 점만)는 1.99 m 그대로.
     let f = Fixture {
         preview_outliers: true,
         ..Default::default()
     };
     expect_only_fail("nn", &f, "preview_vs_refined");
     let (_, out) = run("nn2", &f);
-    assert!(out.contains("최근접 중앙 최대 20.000 m"), "{out}");
+    assert!(out.contains("최근접 중앙 최대 > 6.000 m"), "{out}");
     assert!(out.contains("높이 차 중앙 최대 1.990 m"), "{out}");
 }
 
@@ -317,10 +344,16 @@ fn refined_overlap_0_3_fails() {
 #[test]
 fn snapshot_failures() {
     let f = Fixture {
-        snap_points: [100, 100, 200],
+        snap_points: [100, 90, 288],
         ..Default::default()
     };
     expect_only_fail("mono", &f, "snapshots");
+    // final 이 정밀 점 수의 간격 추출 합과 다르면 실패 (288 은 6:1, 289 는 어떤 e 와도 안 맞음).
+    let f = Fixture {
+        snap_points: [100, 150, 289],
+        ..Default::default()
+    };
+    expect_only_fail("final_sum", &f, "snapshots");
     let f = Fixture {
         snap_area: [0.0, 0.0, 30.0],
         ..Default::default()
@@ -345,4 +378,131 @@ fn missing_folder_fails_every_item() {
         assert_eq!(status(&s, it), "FAIL", "{it}\n{s}");
     }
     assert!(s.contains("결과: 0/7 통과"), "{s}");
+}
+
+/// F-088·F-118: final 은 정밀 전부라 마지막 step(초벌 포함)보다 작을 수 있다. 같은 수 정체도 허용.
+#[test]
+fn final_smaller_than_last_step_passes() {
+    let f = Fixture {
+        snap_points: [100, 300, 288],
+        ..Default::default()
+    };
+    let (code, out) = run("final_small", &f);
+    assert_eq!(code, 0, "{out}");
+    let f = Fixture {
+        snap_points: [150, 150, 288],
+        ..Default::default()
+    };
+    assert_eq!(run("flat", &f).0, 0);
+}
+
+/// F-087: 구역 2개 × 정밀 9만 점(0.2 m 격자), 초벌 = 정밀 + 30 m → 10 s 안에 종료 코드 1.
+#[test]
+fn far_preview_finishes_quickly_and_fails() {
+    let f = Fixture {
+        cell: 0.2,
+        nx: 300,
+        ny: 300,
+        preview_dz: 30.0,
+        ..Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    let (code, out) = run("far30", &f);
+    let secs = t0.elapsed().as_secs_f64();
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(status(&out, "preview_vs_refined"), "FAIL", "{out}");
+    assert!(out.contains("최근접 중앙 최대 > 6.000 m"), "{out}");
+    assert!(secs < 10.0, "verify {secs:.2} s");
+    eprintln!("far30 verify {secs:.2} s");
+}
+
+/// F-097: report 에 구역 2개, 디스크에 preview_00·refined_00 만, manifest 단계 1·2·final, 디스크에 step_01 만.
+#[test]
+fn missing_region_and_snapshot_files_fail() {
+    let (code, out) = run_with("missing", &Fixture::default(), |d| {
+        for n in [
+            "preview/preview_01_pos10-26.ply",
+            "refined/refined_01_pos10-26.ply",
+            "snapshots/step_02_2regions.ply",
+            "snapshots/step_final_all_refined.ply",
+        ] {
+            std::fs::remove_file(d.join(n)).unwrap();
+        }
+    });
+    assert_eq!(code, 1, "{out}");
+    for it in ["preview_vs_refined", "refined_overlap", "snapshots"] {
+        assert_eq!(status(&out, it), "FAIL", "{it}\n{out}");
+    }
+    assert!(out.contains("초벌 없는 구역 [1]"), "{out}");
+    assert!(out.contains("정밀 없는 구역 [1]"), "{out}");
+    assert!(
+        out.contains("빠진 파일 step_02_2regions.ply,step_final_all_refined.ply"),
+        "{out}"
+    );
+}
+
+/// F-097: manifest 에는 단계 1·final 만 있는데 구역은 2개 → 단계 2 누락.
+#[test]
+fn manifest_missing_step_fails() {
+    let (code, out) = run_with("missing_step", &Fixture::default(), |d| {
+        let p = d.join("snapshots/manifest.json");
+        let m = std::fs::read_to_string(&p).unwrap();
+        let m = m.replace(r#"{"step":2,"points":150,"preview_new_area":12.5},"#, "");
+        std::fs::write(&p, m).unwrap();
+        std::fs::remove_file(d.join("snapshots/step_02_2regions.ply")).unwrap();
+    });
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(status(&out, "snapshots"), "FAIL", "{out}");
+    assert!(out.contains("manifest 에 없는 단계 [2]"), "{out}");
+}
+
+/// F-066: step 이 문자열 "01" 이면 형식 오류로 FAIL.
+#[test]
+fn string_step_is_format_error() {
+    let (code, out) = run_with("str_step", &Fixture::default(), |d| {
+        let p = d.join("snapshots/manifest.json");
+        let m = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, m.replace(r#""step":1,"#, r#""step":"01","#)).unwrap();
+    });
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(status(&out, "snapshots"), "FAIL", "{out}");
+    assert!(out.contains("step 형식 오류"), "{out}");
+}
+
+/// F-118: refined 폴더가 비면 겹침 항목도 FAIL.
+#[test]
+fn empty_refined_fails_overlap() {
+    let (code, out) = run_with("no_refined", &Fixture::default(), |d| {
+        for e in std::fs::read_dir(d.join("refined")).unwrap() {
+            std::fs::remove_file(e.unwrap().path()).unwrap();
+        }
+    });
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(status(&out, "refined_overlap"), "FAIL", "{out}");
+    assert!(out.contains("정밀 구역 0개"), "{out}");
+}
+
+fn global_median_z(points: &[PointRecord]) -> f64 {
+    let mut z: Vec<f64> = points.iter().map(|p| p.xyz[2] as f64).collect();
+    z.sort_by(f64::total_cmp);
+    z[z.len() / 2]
+}
+
+/// F-117: 초벌·정밀의 xy 범위가 다르고 지면이 기울어 있어 점군 전체 중앙값끼리는 2 m 넘게
+/// 벌어지지만 같은 위치 짝 높이 차는 1.99 m → 통과해야 한다 (전체 중앙값 비교 구현은 실패).
+#[test]
+fn sloped_ground_with_different_extent_passes() {
+    let f = Fixture {
+        slope: 0.5,
+        preview_extra_x: 10.0,
+        ..Default::default()
+    };
+    let refined = grid(&f, 0.0, 0.0, f.nx);
+    let preview = grid(&f, 0.0, f.preview_dz, f.nx + 20);
+    let gap = global_median_z(&preview) - global_median_z(&refined);
+    assert!(gap > 2.0, "전체 중앙값 차 {gap}");
+    let (code, out) = run("slope", &f);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(status(&out, "preview_vs_refined"), "PASS", "{out}");
+    assert!(out.contains("높이 차 중앙 최대 1.990 m"), "{out}");
 }
