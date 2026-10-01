@@ -11,6 +11,7 @@ pub mod ply;
 pub mod rotation_averaging;
 pub mod stream;
 pub mod synth;
+pub mod tracks;
 pub mod two_view;
 pub mod undistort;
 pub mod view_selection;
