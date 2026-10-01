@@ -614,7 +614,13 @@ pub fn ransac_essential_candidates(
     cfg: &RansacConfig,
 ) -> Vec<(Matrix3<f64>, Vec<bool>)> {
     let n = n1.len();
-    if n < 5 || n != n2.len() || !all_finite(n1) || !all_finite(n2) || focal_px.is_nan() || focal_px <= 0.0 {
+    if n < 5
+        || n != n2.len()
+        || !all_finite(n1)
+        || !all_finite(n2)
+        || focal_px.is_nan()
+        || focal_px <= 0.0
+    {
         return vec![];
     }
     let th = cfg.threshold_px / focal_px;
