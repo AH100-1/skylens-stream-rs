@@ -11,9 +11,12 @@ struct Fixture {
     reg_refined: u32,
     region_images: [u32; 2],
     reproj_refined: f64,
-    align_pairs: [u32; 3],
-    align_fit: [f64; 3],
-    align_scale: [f64; 3],
+    /// 구역 0·1 의 정렬 값 (SPEC §3.7: 구역 0 도 자기 구역으로 정렬).
+    align_pairs: [u32; 2],
+    align_fit: [f64; 2],
+    align_scale: [f64; 2],
+    /// manifest `align` 에 쓸 구역 번호 (기본 [0, 1]; 2 이상은 구역 1 의 값을 쓴다).
+    align_regions: &'static [usize],
     /// 초벌 점군 = 정밀 점군 xy 그대로, z 에 이 값을 더함.
     preview_dz: f32,
     /// 초벌 점군에 짝 없는 먼 점을 (격자 점 수 + 1)개 덧붙임 → 최근접 중앙이 커짐.
@@ -40,14 +43,15 @@ impl Default for Fixture {
             reg_refined: 240,
             region_images: [42, 48],
             reproj_refined: 0.7,
-            align_pairs: [1000, 1500, 2000],
-            align_fit: [5.99, 2.0, 1.0],
-            align_scale: [1.0, 1.0, 1.1],
+            align_pairs: [1000, 2000],
+            align_fit: [5.99, 1.0],
+            align_scale: [1.0, 1.1],
+            align_regions: &[0, 1],
             preview_dz: 1.99,
             preview_outliers: false,
             refined1_z: 0.29,
-            // final 288 = 정밀 구역 861 점 × 2 를 6:1 추출(144 + 144).
-            snap_points: [100, 150, 288],
+            // final 1722 = 정밀 구역 861 점 × 2 의 합 (refined/ PLY 는 이미 추출된 점군).
+            snap_points: [100, 150, 1722],
             snap_area: [0.0, 12.5, 30.0],
             snap_nan: false,
             slope: 0.0,
@@ -139,11 +143,14 @@ fn build(dir: &Path, f: &Fixture) {
             f.snap_area[i]
         ));
     }
-    let align: Vec<String> = (0..3)
-        .map(|r| {
+    let align: Vec<String> = f
+        .align_regions
+        .iter()
+        .map(|&r| {
+            let i = r.min(1);
             format!(
                 r#"{{"region":{r},"pairs":{},"fit_median_m":{},"scale":{}}}"#,
-                f.align_pairs[r], f.align_fit[r], f.align_scale[r]
+                f.align_pairs[i], f.align_fit[i], f.align_scale[i]
             )
         })
         .collect();
@@ -235,7 +242,7 @@ fn passing_output_exits_zero() {
     assert!(out.contains("최근접 중앙 최대 1.990 m"), "{out}");
     assert!(out.contains("높이 차 중앙 최대 1.990 m"), "{out}");
     assert!(out.contains("겹침 차 중앙 최대 0.290 m"), "{out}");
-    assert!(out.contains("점 100→150, final 288"), "{out}");
+    assert!(out.contains("점 100→150, final 1722"), "{out}");
 }
 
 #[test]
@@ -273,33 +280,33 @@ fn reprojection_above_0_7_fails() {
 #[test]
 fn align_boundaries() {
     let f = Fixture {
-        align_pairs: [999, 1500, 2000],
+        align_pairs: [999, 2000],
         ..Default::default()
     };
     expect_only_fail("pairs", &f, "preview_align");
     let f = Fixture {
-        align_fit: [6.0, 2.0, 1.0],
+        align_fit: [6.0, 1.0],
         ..Default::default()
     };
     expect_only_fail("fit", &f, "preview_align");
     let f = Fixture {
-        align_scale: [1.0, 1.0, 1.11],
+        align_scale: [1.0, 1.11],
         ..Default::default()
     };
     expect_only_fail("scale_hi", &f, "preview_align");
     // 구역 간 비 max/min − 1: 1/0.91 = 1.0989 통과, 1.06/0.95 = 1.116 과 1.1/0.9 = 1.222 실패.
     let f = Fixture {
-        align_scale: [1.0, 1.0, 0.91],
+        align_scale: [1.0, 0.91],
         ..Default::default()
     };
     assert_eq!(run("scale_lo_ok", &f).0, 0);
     let f = Fixture {
-        align_scale: [0.95, 1.0, 1.06],
+        align_scale: [0.95, 1.06],
         ..Default::default()
     };
     expect_only_fail("scale_spread", &f, "preview_align");
     let f = Fixture {
-        align_scale: [0.9, 1.0, 1.1],
+        align_scale: [0.9, 1.1],
         ..Default::default()
     };
     expect_only_fail("scale_lo", &f, "preview_align");
@@ -344,16 +351,27 @@ fn refined_overlap_0_3_fails() {
 #[test]
 fn snapshot_failures() {
     let f = Fixture {
-        snap_points: [100, 90, 288],
+        snap_points: [100, 90, 1722],
         ..Default::default()
     };
     expect_only_fail("mono", &f, "snapshots");
-    // final 이 정밀 점 수의 간격 추출 합과 다르면 실패 (288 은 6:1, 289 는 어떤 e 와도 안 맞음).
-    let f = Fixture {
-        snap_points: [100, 150, 289],
-        ..Default::default()
-    };
-    expect_only_fail("final_sum", &f, "snapshots");
+    // F-157: final 은 정밀 점 수 합(861 + 861 = 1722)과 같아야 한다. 1 점 차이도, 다시 6:1
+    // 추출한 값(144 + 144 = 288)도 실패.
+    for (tag, n) in [("final_sum", 1723), ("final_redecimated", 288)] {
+        let f = Fixture {
+            snap_points: [100, 150, n],
+            ..Default::default()
+        };
+        expect_only_fail(tag, &f, "snapshots");
+    }
+    let (_, out) = run(
+        "final_288_msg",
+        &Fixture {
+            snap_points: [100, 150, 288],
+            ..Default::default()
+        },
+    );
+    assert!(out.contains("final 288 ≠ 정밀 점 수 합 1722"), "{out}");
     let f = Fixture {
         snap_area: [0.0, 0.0, 30.0],
         ..Default::default()
@@ -384,13 +402,13 @@ fn missing_folder_fails_every_item() {
 #[test]
 fn final_smaller_than_last_step_passes() {
     let f = Fixture {
-        snap_points: [100, 300, 288],
+        snap_points: [100, 1800, 1722],
         ..Default::default()
     };
     let (code, out) = run("final_small", &f);
     assert_eq!(code, 0, "{out}");
     let f = Fixture {
-        snap_points: [150, 150, 288],
+        snap_points: [150, 150, 1722],
         ..Default::default()
     };
     assert_eq!(run("flat", &f).0, 0);
@@ -527,6 +545,8 @@ fn spec_outputs_only_marks_report_items_undecided() {
     assert!(out.contains("결과: 4/7 통과"), "{out}");
     assert!(out.contains("판정 불가: 3개"), "{out}");
     assert!(out.contains("최근접 중앙 최대 1.990 m"), "{out}");
+    // 사진 수는 출력에 없지만 위치 수는 파일 이름 pos0-14·pos10-26 (hi 미포함)에서 읽어 보여 준다.
+    assert!(out.contains("파일 이름의 위치 수 [0:14 1:16]"), "{out}");
 }
 
 /// F-089: report.json 없이 판정 가능한 항목이 FAIL 이면 종료 코드 1.
@@ -553,4 +573,36 @@ fn broken_report_json_fails() {
     for it in &ITEMS[..3] {
         assert_eq!(status(&out, it), "FAIL", "{it}\n{out}");
     }
+}
+
+/// F-156: manifest `align` 의 구역 집합이 출력 구역 집합과 같아야 한다.
+#[test]
+fn align_records_must_cover_every_region() {
+    // 구역 2개에 정렬 기록 1개(구역 0) → 구역 1 누락 FAIL, 종료 1.
+    let f = Fixture {
+        align_regions: &[0],
+        ..Default::default()
+    };
+    expect_only_fail("align_missing", &f, "preview_align");
+    let (code, out) = run("align_missing_msg", &f);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("정렬 기록 없는 구역 [1]"), "{out}");
+    // 출력에 없는 구역 2 의 기록이 남아도 FAIL.
+    let f = Fixture {
+        align_regions: &[0, 1, 2],
+        ..Default::default()
+    };
+    expect_only_fail("align_extra", &f, "preview_align");
+    let (_, out) = run("align_extra_msg", &f);
+    assert!(out.contains("출력에 없는 구역의 정렬 기록 [2]"), "{out}");
+    // 같은 구역 기록이 두 번이면 FAIL (구역 1 누락도 함께).
+    let f = Fixture {
+        align_regions: &[0, 0],
+        ..Default::default()
+    };
+    expect_only_fail("align_dup", &f, "preview_align");
+    // 기본(구역 0·1 각 1개) 은 PASS.
+    let (code, out) = run("align_ok", &Fixture::default());
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("정렬 기록 2개"), "{out}");
 }

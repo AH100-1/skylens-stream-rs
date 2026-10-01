@@ -32,8 +32,8 @@
 //!
 //! 스냅샷 해석(SPEC §3.8): step_k = 정밀 0..k-2 + 초벌 k-1, final = 정밀 전부(간격 추출 뒤).
 //! 점 수 단조 증가는 정수 step 사이에만 적용한다(같은 수는 허용, 감소만 FAIL).
-//! final 은 마지막 step 보다 작을 수 있으므로 "정밀 구역 점 수를 e:1 간격 추출한 합과 같은
-//! e(1..=64)가 있음" 으로 대조한다.
+//! final 은 마지막 step 보다 작을 수 있으므로 정밀 구역 PLY 점 수 합과 같은지로 대조한다
+//! (refined/ PLY 가 이미 6:1 추출된 점군이므로 다시 추출하지 않는다).
 //!
 //! 최근접 탐색은 상자 경계가 붙은 k-d 트리로 하고, `NN_CAP_M`(판정 기준 3 m 의 2배)
 //! 너머는 찾지 않고 상한값으로 둔다(표기 "> 상한").
@@ -64,8 +64,6 @@ pub const NN_CAP_M: f64 = 2.0 * NN_MEDIAN_MAX_M;
 pub const MAX_QUERIES: usize = 200_000;
 /// 이 값보다 큰 |좌표|(m)의 점은 계산에서 뺀다 (지역 직교 좌표에서 나올 수 없는 값).
 pub const COORD_LIMIT_M: f64 = 1e7;
-/// final 대조에 쓰는 간격 추출 비율 상한.
-pub const MAX_DECIMATION: usize = 64;
 const EPS: f64 = 1e-9;
 
 // ---------------------------------------------------------------- 결과
@@ -182,18 +180,20 @@ fn item(name: &'static str, criterion: &'static str, r: Result<(bool, String), S
 }
 
 /// `report.json` 에서만 얻는 항목(1~3). 파일이 없고 출력 폴더는 있으면 판정 불가.
+/// `absent_note` 는 report.json 이 없을 때 SPEC §2 출력에서 읽은 참고 값(판정에는 쓰지 않음).
 fn report_item(
     name: &'static str,
     criterion: &'static str,
     report: &ReportJson,
     check: fn(&Json) -> Result<(bool, String), String>,
+    absent_note: &str,
 ) -> Item {
     match report {
         ReportJson::Absent => Item {
             name,
             pass: false,
             decided: false,
-            measured: "report.json 없음 (SPEC §2 출력에 없는 값)".into(),
+            measured: format!("report.json 없음 (SPEC §2 출력에 없는 값){absent_note}"),
             criterion,
         },
         ReportJson::Read(r) => item(
@@ -253,16 +253,28 @@ pub fn verify_dir(dir: &Path) -> Report {
     }
 
     let items = vec![
-        report_item(ITEM_REGISTERED, "초벌·정밀 모두 전체 등록 (240/240)", &report_src, check_registered),
-        report_item(ITEM_REGION_IMAGES, "구역 사진 수 = 3 × 위치 수", &report_src, check_region_images),
-        report_item(ITEM_REPROJ, "정밀 재투영 ≤ 0.7 px", &report_src, check_reproj),
+        report_item(
+            ITEM_REGISTERED,
+            "초벌·정밀 모두 전체 등록 (240/240)",
+            &report_src,
+            check_registered,
+            "",
+        ),
+        report_item(
+            ITEM_REGION_IMAGES,
+            "구역 사진 수 = 3 × 위치 수",
+            &report_src,
+            check_region_images,
+            &positions_note(dir),
+        ),
+        report_item(ITEM_REPROJ, "정밀 재투영 ≤ 0.7 px", &report_src, check_reproj, ""),
         item(
             ITEM_ALIGN,
             "점쌍 ≥ 1000, 구역 간 스케일 차(최대/최소 − 1) ≤ 10%, 잔차 중앙 < 6 m",
             manifest
                 .as_ref()
                 .map_err(Clone::clone)
-                .and_then(check_align),
+                .and_then(|m| check_align(m, &expected)),
         ),
         item(
             ITEM_PREVIEW_REFINED,
@@ -282,7 +294,7 @@ pub fn verify_dir(dir: &Path) -> Report {
         ),
         item(
             ITEM_SNAPSHOTS,
-            "정수 단계 1..=구역 수 파일 있음, 점 수 단조 증가, 2단계부터 초벌 새 영역 > 0, final = 정밀 추출 합, NaN 없음",
+            "정수 단계 1..=구역 수 파일 있음, 점 수 단조 증가, 2단계부터 초벌 새 영역 > 0, final = 정밀 점 수 합, NaN 없음",
             steps.and_then(|rows| {
                 check_snapshots(
                     &rows,
@@ -374,7 +386,9 @@ pub fn scale_spread(scales: &[f64]) -> f64 {
     hi / lo - 1.0
 }
 
-fn check_align(m: &Json) -> Result<(bool, String), String> {
+/// 초벌 정렬. SPEC §3.7 은 구역 0 도 자기 구역 사진으로 정렬하므로 `align[].region` 집합은
+/// 기대 구역 집합과 같아야 한다. 빠진 구역·남는 구역·중복 기록은 FAIL.
+fn check_align(m: &Json, expected: &BTreeSet<usize>) -> Result<(bool, String), String> {
     let arr = m
         .get("align")
         .and_then(Json::as_array)
@@ -385,7 +399,16 @@ fn check_align(m: &Json) -> Result<(bool, String), String> {
     let mut pairs = Vec::new();
     let mut fits = Vec::new();
     let mut scales = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut dup = Vec::new();
     for a in arr {
+        let k = a
+            .get("region")
+            .and_then(as_index)
+            .ok_or("align[].region 이 음이 아닌 정수가 아님")?;
+        if !seen.insert(k) {
+            dup.push(k);
+        }
         pairs.push(num(a, &["pairs"])?);
         fits.push(num(a, &["fit_median_m"])?);
         scales.push(num(a, &["scale"])?);
@@ -393,16 +416,29 @@ fn check_align(m: &Json) -> Result<(bool, String), String> {
     let min_pairs = pairs.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_fit = fits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let spread = scale_spread(&scales);
+    let missing: Vec<usize> = expected.difference(&seen).copied().collect();
+    let extra: Vec<usize> = seen.difference(expected).copied().collect();
     let pass = min_pairs >= ALIGN_MIN_PAIRS
         && max_fit < ALIGN_FIT_MAX_M
-        && spread <= ALIGN_SCALE_TOL + EPS;
-    Ok((
-        pass,
-        format!(
-            "점쌍 최소 {min_pairs}, 구역 간 스케일 차 {:.2}%, 잔차 중앙 최대 {max_fit:.3} m",
-            spread * 100.0
-        ),
-    ))
+        && spread <= ALIGN_SCALE_TOL + EPS
+        && missing.is_empty()
+        && extra.is_empty()
+        && dup.is_empty();
+    let mut msg = format!(
+        "정렬 기록 {}개, 점쌍 최소 {min_pairs}, 구역 간 스케일 차 {:.2}%, 잔차 중앙 최대 {max_fit:.3} m",
+        arr.len(),
+        spread * 100.0
+    );
+    if !missing.is_empty() {
+        let _ = write!(msg, "; 정렬 기록 없는 구역 {missing:?}");
+    }
+    if !extra.is_empty() {
+        let _ = write!(msg, "; 출력에 없는 구역의 정렬 기록 {extra:?}");
+    }
+    if !dup.is_empty() {
+        let _ = write!(msg, "; 중복 정렬 기록 {dup:?}");
+    }
+    Ok((pass, msg))
 }
 
 fn missing_of(expected: &BTreeSet<usize>, have: &BTreeMap<usize, PointCloud>) -> Vec<usize> {
@@ -582,16 +618,16 @@ fn check_snapshots(
             }
         }
     }
-    // final = 정밀 구역 점 수의 e:1 간격 추출 합.
+    // final = 정밀 구역 점 수 합. refined/ PLY 는 이미 6:1 추출된 점군이므로(SPEC §3.8
+    // "모든 점군은 6:1 간격 추출") final 은 다시 추출하지 않은 그 합과 같아야 한다.
     if let (Some(fr), Some(rc)) = (finals.first(), refined) {
         if !rc.is_empty() {
             let sizes: Vec<usize> = rc.values().map(PointCloud::len).collect();
-            let ok = (1..=MAX_DECIMATION)
-                .any(|e| sizes.iter().map(|n| n.div_ceil(e)).sum::<usize>() as f64 == fr.points);
-            if !ok {
+            let sum: usize = sizes.iter().sum();
+            if sum as f64 != fr.points {
                 problems.push(format!(
-                    "final {} ≠ 정밀 점 수 {:?} 의 간격 추출 합(1..={MAX_DECIMATION}:1)",
-                    fr.points, sizes
+                    "final {} ≠ 정밀 점 수 합 {sum} ({sizes:?})",
+                    fr.points
                 ));
             }
         }
@@ -656,6 +692,60 @@ fn check_snapshots(
 fn read_json(path: &Path) -> Result<Json, String> {
     let s = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     parse_json(&s).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `{prefix}{k:02}_pos{lo}-{hi}.ply` 이름에서 구역별 위치 범위 [lo, hi) 를 읽는다
+/// (SPEC §3.5 구역 [start-OVL, start+SPAN+OVL), hi 는 포함 안 함).
+pub fn region_positions(dir: &Path, prefix: &str) -> BTreeMap<usize, (usize, usize)> {
+    let mut out = BTreeMap::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = n.strip_prefix(prefix).and_then(|r| r.strip_suffix(".ply")) else {
+            continue;
+        };
+        let Some((k, pos)) = rest.split_once("_pos") else {
+            continue;
+        };
+        let Some((lo, hi)) = pos.split_once('-') else {
+            continue;
+        };
+        if let (Ok(k), Ok(lo), Ok(hi)) = (k.parse(), lo.parse(), hi.parse()) {
+            out.insert(k, (lo, hi));
+        }
+    }
+    out
+}
+
+/// report.json 이 없을 때 구역 사진 수 항목에 붙이는 참고 값: 파일 이름의 구역별 위치 수
+/// (hi − lo). 사진 수는 SPEC §2 출력에 없어 판정은 하지 않는다. 초벌·정밀 이름의 위치
+/// 범위가 다르면 그 구역도 적는다.
+fn positions_note(dir: &Path) -> String {
+    let p = region_positions(&dir.join("preview"), "preview_");
+    let r = region_positions(&dir.join("refined"), "refined_");
+    let src = if r.is_empty() { &p } else { &r };
+    if src.is_empty() {
+        return String::new();
+    }
+    let counts: Vec<String> = src
+        .iter()
+        .map(|(k, (lo, hi))| format!("{k}:{}", hi.saturating_sub(*lo)))
+        .collect();
+    let mut s = format!(
+        "; 파일 이름의 위치 수 [{}], 사진 수는 출력에 없음",
+        counts.join(" ")
+    );
+    let differ: Vec<usize> = p
+        .iter()
+        .filter(|(k, v)| r.get(k).is_some_and(|w| w != *v))
+        .map(|(k, _)| *k)
+        .collect();
+    if !differ.is_empty() {
+        let _ = write!(s, "; 초벌·정밀 위치 범위가 다른 구역 {differ:?}");
+    }
+    s
 }
 
 /// `{prefix}{k:02}_*.ply` 를 구역 번호 k 로 묶어 읽는다.
