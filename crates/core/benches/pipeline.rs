@@ -11,6 +11,20 @@
 //! | `--max-pairs P` | 0 | 매칭·검증·자세 구간에서 잴 영상 짝 수 상한(0 = 전부). 앞에서부터 고르게 뽑는다 |
 //! | `--ba-points M` | 20000 | 번들 조정 문제의 점 수 |
 //! | `--quick` | | `--positions 8 --width 480 --height 270 --repeat 3 --ba-points 3000` 과 같다 |
+//! | `--json PATH` | | 표를 JSON 으로도 쓴다(`{cores, threads, mode, rows[{name, items, unit, median_s, min_s, note}]}`) |
+//! | `--mode M` | `pipeline` | `pipeline`(구간 전체), `ba-scale`(번들 조정 실제 규모), `detect`(1920×1080 한 장 검출) |
+//! | `--ba-tracks N` | 100000 | `ba-scale` 의 트랙(점) 수 |
+//! | `--ba-iters K` | 3 | `ba-scale` 의 LM 반복 수(조기 종료 없이 K 회) |
+//!
+//! `ba-scale`: 위치 `--positions`(기본 80 → 카메라 240)의 정답 포즈에서 영상마다 고르게 화소를 골라 깊이
+//! 10~60 m 로 역투영한 점을 모든 카메라에 투영(깊이 1~80 m·영상 안, 가림 무시)한다. 렌더는 하지 않는다.
+//! `bundle_adjust` 를 반복 0(평가만)·1·K 회로 따로 돌려 (K회 − 0회)/K 를 반복당 시간으로 적는다.
+//!
+//! `detect`: 합성 장면 첫 영상 1920×1080 한 장을 `detect_and_describe` 로 R 회 검출해 F-014 기준(0.4 s)과 함께
+//! 중앙·최소를 적는다. 회귀 판정은 `tests/perf_structure.rs` 의 검출 해시 시험이 맡고 여기서는 기록만 한다.
+//!
+//! 회전 평균은 두 가지를 잰다: 정답 그래프(전체 짝, 정답 + 0.2° 잡음)와, 이 실행의 두 시점 자세 결과
+//! (정상 대응 수 가중)를 입력으로 한 것. 뒤의 것은 정답 대비 정렬 오차 중앙값을 함께 적는다.
 //!
 //! 회전 평균과 번들 조정 입력은 매칭 결과가 아니라 정답 장면에서 만든다(정답 상대 회전 + 0.2° 잡음,
 //! 정답 점 투영 + 0.5 px 잡음, 자세 흔들기). 짝 수 상한과 무관하게 전체 그래프 크기로 재기 위해서다.
@@ -29,7 +43,9 @@ use skylens_core::matching::{
     PAIR_TEMPORAL,
 };
 use skylens_core::math::{Point3, Rotation3, Vector2, Vector3};
-use skylens_core::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
+use skylens_core::rotation_averaging::{
+    aligned_errors, average_rotations, AveragingConfig, RelativeRotation,
+};
 use skylens_core::synth::{CamId, Scene, SceneConfig};
 use skylens_core::two_view::{ransac_essential, recover_pose};
 
@@ -52,6 +68,10 @@ struct Args {
     threads: usize,
     max_pairs: usize,
     ba_points: usize,
+    json: Option<String>,
+    mode: String,
+    ba_tracks: usize,
+    ba_iters: usize,
 }
 
 fn parse_args() -> Args {
@@ -63,6 +83,10 @@ fn parse_args() -> Args {
         threads: 0,
         max_pairs: 0,
         ba_points: 20_000,
+        json: None,
+        mode: "pipeline".to_string(),
+        ba_tracks: 100_000,
+        ba_iters: 3,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -80,6 +104,19 @@ fn parse_args() -> Args {
             "--threads" => a.threads = num(next, "--threads"),
             "--max-pairs" => a.max_pairs = num(next, "--max-pairs"),
             "--ba-points" => a.ba_points = num(next, "--ba-points"),
+            "--ba-tracks" => a.ba_tracks = num(next, "--ba-tracks"),
+            "--ba-iters" => a.ba_iters = num(next, "--ba-iters").max(1),
+            "--json" => {
+                a.json = Some(
+                    next.cloned()
+                        .unwrap_or_else(|| panic!("--json 뒤에 경로가 필요하다")),
+                )
+            }
+            "--mode" => {
+                a.mode = next
+                    .cloned()
+                    .unwrap_or_else(|| panic!("--mode 뒤에 값이 필요하다"))
+            }
             "--quick" => {
                 a.positions = 8;
                 a.width = 480;
@@ -185,6 +222,16 @@ fn main() {
         args.height,
         args.repeat
     );
+    let rows = match args.mode.as_str() {
+        "pipeline" => pipeline(&args),
+        "ba-scale" => ba_scale(&args),
+        "detect" => detect(&args),
+        other => panic!("알 수 없는 --mode: {other} (pipeline | ba-scale | detect)"),
+    };
+    report(&rows, &args, cores);
+}
+
+fn pipeline(args: &Args) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
 
     // 1. 장면 생성 + 렌더.
@@ -386,11 +433,53 @@ fn main() {
     let acfg = AveragingConfig::default();
     let (t, avg) = measure(args.repeat, || average_rotations(nv, &edges, &acfg));
     rows.push(Row {
-        name: "회전 평균",
+        name: "회전 평균(정답 그래프)",
         items: edges.len(),
         unit: "간선",
         times: t,
         note: format!("반복 {}", avg.as_ref().map_or(0, |r| r.iterations)),
+    });
+
+    // 7b. 회전 평균: 이 실행의 두 시점 자세 결과(정상 대응 수 가중)를 입력으로.
+    let measured: Vec<RelativeRotation> = chosen
+        .iter()
+        .zip(&poses)
+        .zip(&eres)
+        .filter_map(|((&(i, j), p), e)| {
+            let p = p.as_ref()?;
+            let w = e.as_ref()?.1.iter().filter(|&&ok| ok).count();
+            Some(RelativeRotation {
+                i,
+                j,
+                rotation: p.rotation,
+                weight: w as f64,
+            })
+        })
+        .collect();
+    let (t, avg_m) = measure(args.repeat, || average_rotations(nv, &measured, &acfg));
+    let truth: Vec<Rotation3<f64>> = scene.views.iter().map(|v| v.camera.pose.rotation).collect();
+    let note = match &avg_m {
+        Some(r) => {
+            let mut err: Vec<f64> = aligned_errors(&r.rotations, &truth)
+                .into_iter()
+                .filter(|x| x.is_finite())
+                .collect();
+            err.sort_by(f64::total_cmp);
+            let m = err.get(err.len() / 2).copied().unwrap_or(f64::NAN);
+            format!(
+                "반복 {}, 정답 대비 정렬 오차 중앙 {:.3}° {pair_note}",
+                r.iterations,
+                m.to_degrees()
+            )
+        }
+        None => format!("실패 {pair_note}"),
+    };
+    rows.push(Row {
+        name: "회전 평균(검증 결과)",
+        items: measured.len(),
+        unit: "간선",
+        times: t,
+        note,
     });
 
     // 8. 번들 조정: 깊이 지도에서 정답 점을 뽑아 모든 카메라에 투영(가림 무시), 자세를 흔든다.
@@ -418,12 +507,17 @@ fn main() {
         ),
     });
 
+    rows
+}
+
+/// 표(마크다운)와 JSON 을 쓴다.
+fn report(rows: &[Row], args: &Args, cores: usize) {
     // 표.
     println!();
     println!("| 구간 | 단위 수 | 중앙 (ms) | 최소 (ms) | 단위당 중앙 (ms) | 비고 |");
     println!("|---|---:|---:|---:|---:|---|");
     let mut total = Duration::ZERO;
-    for r in &rows {
+    for r in rows {
         let m = median(&r.times);
         let lo = r.times.iter().min().copied().unwrap_or_default();
         total += m;
@@ -438,7 +532,34 @@ fn main() {
             r.note.trim()
         );
     }
-    println!("| 합계(중앙) | | {:.1} | | | |", ms(total));
+    if args.mode == "pipeline" {
+        println!("| 합계(중앙) | | {:.1} | | | |", ms(total));
+    }
+    if let Some(path) = &args.json {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut j = format!(
+            "{{\"cores\":{cores},\"threads\":{},\"mode\":\"{}\",\"rows\":[",
+            rayon::current_num_threads(),
+            esc(&args.mode)
+        );
+        for (k, r) in rows.iter().enumerate() {
+            if k > 0 {
+                j.push(',');
+            }
+            let lo = r.times.iter().min().copied().unwrap_or_default();
+            j.push_str(&format!(
+                "{{\"name\":\"{}\",\"items\":{},\"unit\":\"{}\",\"median_s\":{:.6},\"min_s\":{:.6},\"note\":\"{}\"}}",
+                esc(r.name),
+                r.items,
+                esc(r.unit),
+                median(&r.times).as_secs_f64(),
+                lo.as_secs_f64(),
+                esc(r.note.trim())
+            ));
+        }
+        j.push_str("]}\n");
+        std::fs::write(path, j).expect("JSON 쓰기");
+    }
 }
 
 /// 정답 장면에서 번들 조정 문제를 만든다.
@@ -493,6 +614,142 @@ fn ba_problem(
             }
         }
     }
+    perturbed_problem(scene, points, observations, rng)
+}
+
+/// F-040: 번들 조정 실제 규모(카메라 3·위치, 기본 240 대·트랙 10만). 렌더 없이 정답 포즈만 쓴다.
+fn ba_scale(args: &Args) -> Vec<Row> {
+    let scene = Scene::new(SceneConfig {
+        positions: args.positions,
+        width: args.width,
+        height: args.height,
+        ..SceneConfig::default()
+    });
+    let nv = scene.views.len();
+    let mut rng = Rng(40);
+    let t_build = Instant::now();
+    // 점: 영상을 돌아가며 화소를 고르게 뽑아 깊이 10~60 m 로 역투영.
+    let mut points = Vec::with_capacity(args.ba_tracks);
+    for k in 0..args.ba_tracks {
+        let v = &scene.views[k % nv];
+        let kk = &v.camera.intrinsics;
+        let p = Vector2::new(rng.unit() * kk.width as f64, rng.unit() * kk.height as f64);
+        let d = 10.0 + 50.0 * rng.unit();
+        points.push(v.camera.unproject(&p, d));
+    }
+    let mut observations = Vec::new();
+    for (pi, x) in points.iter().enumerate() {
+        for (ci, v) in scene.views.iter().enumerate() {
+            let z = v.camera.pose.transform(x).z;
+            if z <= 1.0 || z > 80.0 {
+                continue;
+            }
+            if let Some(px) = v
+                .camera
+                .project(x)
+                .filter(|p| v.camera.intrinsics.contains(p))
+            {
+                observations.push(Observation {
+                    camera: ci,
+                    point: pi,
+                    pixel: px + Vector2::new(rng.gauss(), rng.gauss()) * 0.5,
+                });
+            }
+        }
+    }
+    let problem = perturbed_problem(&scene, points, observations, &mut rng);
+    let build = t_build.elapsed();
+    let nobs = problem.observations.len();
+    let mut per_track = vec![0usize; problem.points.len()];
+    for o in &problem.observations {
+        per_track[o.point] += 1;
+    }
+    let used = per_track.iter().filter(|&&n| n >= 2).count();
+    println!(
+        "번들 조정 규모: 카메라 {nv}, 트랙 {} (관측 2 이상 {used}), 관측 {nobs}, 평균 트랙 길이 {:.2}, 문제 생성 {:.1} s",
+        problem.points.len(),
+        nobs as f64 / problem.points.len().max(1) as f64,
+        build.as_secs_f64()
+    );
+    let mut rows = Vec::new();
+    let mut run = |name: &'static str, iters: usize| {
+        let opts = BaOptions {
+            max_iterations: iters,
+            fixed_cameras: vec![0, 1],
+            function_tolerance: 0.0,
+            ..BaOptions::default()
+        };
+        let reps = if iters == 0 { args.repeat } else { 1 };
+        let (t, rep) = measure(reps, || {
+            let mut p = problem.clone();
+            bundle_adjust(&mut p, &opts)
+        });
+        let note = format!(
+            "반복 {} 트랙 {} 관측 {} RMS {:.3}→{:.3} px 수렴 {}",
+            rep.iterations,
+            rep.num_tracks_used,
+            rep.num_observations_used,
+            rep.initial_rms,
+            rep.final_rms,
+            rep.converged
+        );
+        rows.push(Row {
+            name,
+            items: rep.iterations.max(1),
+            unit: "반복",
+            times: t,
+            note,
+        });
+    };
+    run("번들 조정 반복 0(준비·평가)", 0);
+    run("번들 조정 반복 1", 1);
+    run("번들 조정 반복 K", args.ba_iters);
+    let t0 = median(&rows[0].times);
+    let tk = median(&rows[2].times);
+    let k = rows[2].items.max(1);
+    println!(
+        "반복당 (K회 − 0회)/K = {:.3} s (K = {k}), 반복 1회 − 0회 = {:.3} s, 전체 K회 {:.3} s",
+        (tk.saturating_sub(t0)).as_secs_f64() / k as f64,
+        median(&rows[1].times).saturating_sub(t0).as_secs_f64(),
+        tk.as_secs_f64()
+    );
+    rows
+}
+
+/// F-031/F-014: 합성 1920×1080 한 장 검출 시간 기록(기준 0.4 s, 단언하지 않는다).
+fn detect(args: &Args) -> Vec<Row> {
+    let scene = Scene::new(SceneConfig {
+        positions: 1,
+        width: 1920,
+        height: 1080,
+        ..SceneConfig::default()
+    });
+    let (img, _) = scene.render(&scene.views[0]);
+    let gray = GrayImage::from_rgb(img.width as usize, img.height as usize, &img.data);
+    let cfg = DetectorConfig::default();
+    let _ = black_box(detect_and_describe(&gray, &cfg)); // 예열
+    let (t, f) = measure(args.repeat, || detect_and_describe(&gray, &cfg));
+    let m = median(&t).as_secs_f64();
+    vec![Row {
+        name: "검출 1920×1080",
+        items: 1,
+        unit: "장",
+        times: t,
+        note: format!(
+            "특징 {}, F-014 기준 0.4 s 대비 중앙 {:.0}%",
+            f.len(),
+            100.0 * m / 0.4
+        ),
+    }]
+}
+
+/// 정답 점·관측에 포즈·점을 흔들어 번들 조정 문제를 만든다(카메라 종류별 내부 파라미터 그룹 3개).
+fn perturbed_problem(
+    scene: &Scene,
+    points: Vec<Point3<f64>>,
+    observations: Vec<Observation>,
+    rng: &mut Rng,
+) -> BaProblem {
     let poses: Vec<Pose> = scene
         .views
         .iter()
