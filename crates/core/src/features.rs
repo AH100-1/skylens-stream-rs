@@ -149,10 +149,64 @@ const ORI_BINS: usize = 36;
 /// 가중치 창 σ_w = 1.5σ, 반지름 3σ_w. 36칸 히스토그램을 [1,1,1]/3 로 6번 평활하고,
 /// 최댓값의 80% 이상인 극대마다 포물선 보간한 방향을 낸다.
 pub fn dominant_orientations(img: &GrayImage, x: f32, y: f32, sigma: f32) -> Vec<f32> {
+    orientations_with(
+        img.width,
+        img.height,
+        |ux, uy| pixel_grad(img, ux, uy),
+        x,
+        y,
+        sigma,
+    )
+}
+
+/// 화소 (ux, uy) 의 중앙 차분 기울기 크기와 `atan2(gy, gx)`. 테두리 화소는 호출하지 않는다.
+#[inline]
+fn pixel_grad(img: &GrayImage, ux: usize, uy: usize) -> (f32, f32) {
+    let gx = img.at(ux + 1, uy) - img.at(ux - 1, uy);
+    let gy = img.at(ux, uy + 1) - img.at(ux, uy - 1);
+    ((gx * gx + gy * gy).sqrt(), gy.atan2(gx))
+}
+
+/// 한 층 영상의 화소별 기울기(크기, atan2)를 미리 계산해 둔 표. 특징점마다 창이 겹치므로
+/// 층마다 한 번만 계산한다. 값은 `pixel_grad` 와 같은 식이라 비트 단위로 같다.
+struct GradTable {
+    width: usize,
+    g: Vec<(f32, f32)>,
+}
+
+impl GradTable {
+    fn new(img: &GrayImage) -> Self {
+        let (w, h) = (img.width, img.height);
+        let mut g = vec![(0f32, 0f32); w * h];
+        g.par_chunks_mut(w.max(1)).enumerate().for_each(|(y, row)| {
+            if y == 0 || y + 1 >= h {
+                return;
+            }
+            for (x, o) in row.iter_mut().enumerate().take(w - 1).skip(1) {
+                *o = pixel_grad(img, x, y);
+            }
+        });
+        Self { width: w, g }
+    }
+
+    #[inline]
+    fn at(&self, ux: usize, uy: usize) -> (f32, f32) {
+        self.g[uy * self.width + ux]
+    }
+}
+
+fn orientations_with(
+    width: usize,
+    height: usize,
+    grad: impl Fn(usize, usize) -> (f32, f32),
+    x: f32,
+    y: f32,
+    sigma: f32,
+) -> Vec<f32> {
     let sw = 1.5 * sigma;
     let r = (3.0 * sw).round() as isize;
     let (xi, yi) = (x.round() as isize, y.round() as isize);
-    let (w, h) = (img.width as isize, img.height as isize);
+    let (w, h) = (width as isize, height as isize);
     let mut hist = [0f32; ORI_BINS];
     let two_pi = std::f32::consts::TAU;
     for dy in -r..=r {
@@ -161,14 +215,12 @@ pub fn dominant_orientations(img: &GrayImage, x: f32, y: f32, sigma: f32) -> Vec
             if px < 1 || py < 1 || px >= w - 1 || py >= h - 1 {
                 continue;
             }
-            let (ux, uy) = (px as usize, py as usize);
-            let gx = img.at(ux + 1, uy) - img.at(ux - 1, uy);
-            let gy = img.at(ux, uy + 1) - img.at(ux, uy - 1);
+            let (mag, at) = grad(px as usize, py as usize);
             let (fx, fy) = (px as f32 - x, py as f32 - y);
             let wgt = (-(fx * fx + fy * fy) / (2.0 * sw * sw)).exp();
-            let ang = gy.atan2(gx).rem_euclid(two_pi);
+            let ang = at.rem_euclid(two_pi);
             let bin = ((ang / two_pi * ORI_BINS as f32).round() as usize) % ORI_BINS;
-            hist[bin] += wgt * (gx * gx + gy * gy).sqrt();
+            hist[bin] += wgt * mag;
         }
     }
     for _ in 0..6 {
@@ -292,13 +344,33 @@ pub struct Feature {
 /// 가우시안 가중(σ = 칸 2개 = 창 너비의 절반), 위치 2축·방향 1축 삼선형 보간.
 /// 단위 길이로 정규화 → 0.2 로 자르기 → 다시 정규화.
 pub fn describe(img: &GrayImage, x: f32, y: f32, sigma: f32, angle: f32) -> [f32; DESC_LEN] {
+    describe_with(
+        img.width,
+        img.height,
+        |ux, uy| pixel_grad(img, ux, uy),
+        x,
+        y,
+        sigma,
+        angle,
+    )
+}
+
+fn describe_with(
+    width: usize,
+    height: usize,
+    grad: impl Fn(usize, usize) -> (f32, f32),
+    x: f32,
+    y: f32,
+    sigma: f32,
+    angle: f32,
+) -> [f32; DESC_LEN] {
     const NC: usize = 4;
     const NO: usize = 8;
     let cell = 3.0 * sigma;
     let r = (cell * std::f32::consts::SQRT_2 * (NC as f32 + 1.0) * 0.5).round() as isize;
     let (c, sn) = (angle.cos(), angle.sin());
     let (xi, yi) = (x.round() as isize, y.round() as isize);
-    let (w, h) = (img.width as isize, img.height as isize);
+    let (w, h) = (width as isize, height as isize);
     let two_pi = std::f32::consts::TAU;
     let mut hist = [0f32; DESC_LEN];
     for dy in -r..=r {
@@ -315,11 +387,8 @@ pub fn describe(img: &GrayImage, x: f32, y: f32, sigma: f32, angle: f32) -> [f32
             if bu <= -1.0 || bv <= -1.0 || bu >= NC as f32 || bv >= NC as f32 {
                 continue;
             }
-            let (ux, uy) = (px as usize, py as usize);
-            let gx = img.at(ux + 1, uy) - img.at(ux - 1, uy);
-            let gy = img.at(ux, uy + 1) - img.at(ux, uy - 1);
-            let mag = (gx * gx + gy * gy).sqrt();
-            let ori = (gy.atan2(gx) - angle).rem_euclid(two_pi);
+            let (mag, at) = grad(px as usize, py as usize);
+            let ori = (at - angle).rem_euclid(two_pi);
             let bo = ori / two_pi * NO as f32;
             let wgt = (-(u * u + v * v) / (2.0 * (NC as f32 / 2.0).powi(2))).exp();
             let m = mag * wgt;
@@ -385,6 +454,20 @@ pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature
                     .collect(),
             })
             .collect();
+        // 정밀화된 극값은 층 1..=s 에 있다(refine_extremum). 그 층들의 기울기 표.
+        let grads: Vec<GradTable> = (0..s + 3)
+            .into_par_iter()
+            .map(|i| {
+                if (1..=s).contains(&i) {
+                    GradTable::new(&gauss[i])
+                } else {
+                    GradTable {
+                        width: 0,
+                        g: Vec::new(),
+                    }
+                }
+            })
+            .collect();
         let (w, h) = (base.width, base.height);
         let scale = (1usize << o) as f32;
         let edge_thr = (cfg.edge_ratio + 1.0).powi(2) / cfg.edge_ratio;
@@ -440,8 +523,9 @@ pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature
                             continue;
                         }
                         let sig_oct = cfg.sigma0 * kstep.powf(r.s);
-                        let g = &gauss[r.layer];
-                        for angle in dominant_orientations(g, r.x, r.y, sig_oct) {
+                        let gt = &grads[r.layer];
+                        let grad = |ux, uy| gt.at(ux, uy);
+                        for angle in orientations_with(w, h, grad, r.x, r.y, sig_oct) {
                             out.push(Feature {
                                 kp: Keypoint {
                                     x: r.x * scale,
@@ -450,7 +534,7 @@ pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature
                                     response: r.value,
                                     angle,
                                 },
-                                desc: describe(g, r.x, r.y, sig_oct, angle),
+                                desc: describe_with(w, h, grad, r.x, r.y, sig_oct, angle),
                             });
                         }
                     }
