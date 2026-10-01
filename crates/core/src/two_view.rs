@@ -589,6 +589,8 @@ pub fn refine_relative_pose(
 /// `n1`·`n2` 는 정규화 좌표, `focal_px` 는 픽셀 문턱 `cfg.threshold_px` 를 정규화 단위로 바꾸는 초점 거리(px).
 /// 반환: [`ransac_essential_candidates`] 의 첫 후보(정상 수가 가장 많고 같으면 Sampson 비용이 가장 작은 해).
 /// 장면이 평면이면 두 번째 후보가 같은 정도로 대응을 설명할 수 있다(평면 두 겹 모호성).
+/// 정상 수가 `MIN_ESSENTIAL_INLIERS` 미만이거나 무작위 대응에서 우연히 나올 수 있는 수 이하면
+/// (겹침 없는 짝) None.
 pub fn ransac_essential(
     n1: &[Vector2<f64>],
     n2: &[Vector2<f64>],
@@ -881,6 +883,25 @@ pub fn ransac_essential_candidates(
     }
     out.sort_by(|a, b| b.2.cmp(&a.2).then(a.3.total_cmp(&b.3)));
     let top = out.first().map_or(0, |o| o.2);
+    // F-148: 겹침 없는 짝(대응이 사실상 무작위)도 RANSAC 은 우연히 문턱 띠에 든 대응으로 해를 만든다.
+    // 무작위 대응 하나가 어떤 E 의 Sampson 띠(폭 2·문턱)에 들 확률 p 는 둘째 영상 대응이 퍼진
+    // 직사각형(가로 w, 세로 h)에서 띠 넓이 / 직사각형 넓이 ≈ 2·문턱·√(w²+h²) / (w·h) 로 잡는다.
+    // 최소 표본 5개를 뺀 나머지의 우연 정상 수는 이항(n−5, p) ≈ 푸아송(λ = (n−5)p) 이고,
+    // 가설 수천 개에서 최댓값을 고르므로 λ + 6√λ + 2 를 넘어야 유의하다고 본다(λ ≈ 1.3 이면
+    // 꼬리 확률 ~1e-5). 그리고 정상 수는 `MIN_ESSENTIAL_INLIERS` 이상이어야 한다.
+    let (mut lo, mut hi) = (n2[0], n2[0]);
+    for x in n2 {
+        lo = lo.inf(x);
+        hi = hi.sup(x);
+    }
+    let (w, h) = ((hi.x - lo.x).max(th), (hi.y - lo.y).max(th));
+    let p_hit = (2.0 * th * (w * w + h * h).sqrt() / (w * h)).min(1.0);
+    let lambda = (n - 5) as f64 * p_hit;
+    let needed = (5.0 + lambda + 6.0 * lambda.sqrt() + 2.0).ceil() as usize;
+    let needed = needed.max(MIN_ESSENTIAL_INLIERS);
+    if top < needed {
+        return vec![];
+    }
     // 같은 골짜기의 두 해(평면의 얕은 골짜기에서 이동 방향만 다르게 멈춘 해)는 E 거리로는 갈리지만
     // 회전이 거의 같다. 회전이 `CANDIDATE_MIN_ROTATION_DEG` 안인 후보는 순위가 높은 하나만 남겨
     // 쌍둥이 해가 그 아래로 밀리지 않게 한다.
@@ -990,6 +1011,9 @@ pub const CANDIDATE_MIN_ROTATION_DEG: f64 = 1.0;
 
 /// [`ransac_essential_candidates`] 가 돌려주는 최대 후보 수.
 pub const ESSENTIAL_CANDIDATES: usize = 4;
+
+/// 본질 행렬 검증을 통과하는 최소 정상 수(최소 표본 5개의 세 배).
+pub const MIN_ESSENTIAL_INLIERS: usize = 15;
 
 /// 평면 판정용 호모그래피 4점 RANSAC 반복 수.
 pub const PLANAR_RANSAC_ITERS: usize = 200;
@@ -1347,9 +1371,6 @@ mod tests {
     /// 종료 보장은 구조로 한다: 30×30 동반 행렬의 Schur 분해는 반복 3000회 상한이고 실패하면
     /// 선행 계수를 바꿔 한 번 더(역시 상한) 푼 뒤 빈 결과를 돌려준다. 헤센베르크 QR 한 번은
     /// 약 6·30² 부동소수 연산이라 최악도 2 × 3000 × 5400 ≈ 3.2e7 연산(수십 ms)이다.
-    /// 벽시계 단언은 다른 테스트와 CPU 를 나눠 쓰는 전체 실행에서도 흔들리지 않도록
-    /// 병렬 없이 직렬로 재고, 최댓값은 위 구조 상한에 여유를 둔 100 ms, 중앙값은 2 ms 로 둔다
-    /// (단독 실행 실측: 중앙값 약 0.16 ms, 최댓값 약 6~8 ms).
     /// 1000 시드에서 5점 해가 끝나고(호출마다 반환), 해의 수가 10차 다항식 근 수 상한(10)을 넘지 않으며
     /// 정답 E 를 포함하는지만 본다. 벽시계 시간은 병렬 부하에서 흔들리므로 `five_point_timing`(무시,
     /// 단독 실행)에서 잰다.
@@ -1922,6 +1943,93 @@ mod tests {
         let share = tot_kept as f64 / tot as f64;
         eprintln!("85/15 합계: {tot} 중 정상 {tot_kept} ({share:.4})");
         assert!(share >= 0.95, "합계 평면 밖 정상 비율 {share}");
+    }
+
+    /// F-148: 정답 장면(비평면 h=10 m, σ0.5 px, 200점)에서 이상치 0·30% 짝과 겹침 없는 짝
+    /// (둘째 영상 대응이 모두 무작위)을 시드 1..=20 으로 섞어 검증한다. 겹침 없는 짝은 하나도
+    /// 통과하지 않고, 참 짝은 모두 통과하며, 통과 간선 중 상대 회전 오차 > 2° 비율은 5% 미만이어야 한다.
+    #[test]
+    fn verified_edges_rotation_error_share() {
+        let cfg = RansacConfig {
+            threshold_px: 1.5,
+            ..RansacConfig::default()
+        };
+        let (mut passed, mut wrong, mut true_pass, mut true_total, mut random_pass) =
+            (0, 0, 0, 0, 0);
+        for seed in 1..=20u64 {
+            for kind in 0..3 {
+                let mut s = scene_full(200, 0.5, seed, 3.0, 10.0);
+                let k = s.c1.intrinsics;
+                let mut rng = Lcg(seed ^ 0x7777 ^ kind);
+                let out = [0.0, 0.3, 1.0][kind as usize];
+                for x in s.x2.iter_mut() {
+                    if rng.next() < out {
+                        *x = k.to_normalized(&Vector2::new(rng.next() * 960.0, rng.next() * 540.0));
+                    }
+                }
+                if kind < 2 {
+                    true_total += 1;
+                }
+                let Some((e, inl)) = ransac_essential(&s.x1, &s.x2, k.fx, &cfg) else {
+                    continue;
+                };
+                if kind == 2 {
+                    random_pass += 1;
+                    passed += 1;
+                    wrong += 1;
+                    continue;
+                }
+                true_pass += 1;
+                passed += 1;
+                let s1: Vec<_> = (0..inl.len())
+                    .filter(|&i| inl[i])
+                    .map(|i| s.x1[i])
+                    .collect();
+                let s2: Vec<_> = (0..inl.len())
+                    .filter(|&i| inl[i])
+                    .map(|i| s.x2[i])
+                    .collect();
+                let rot = recover_pose(&e, &s1, &s2).map_or(180.0, |p| {
+                    rotation_angle_between(&p.rotation, &s.rel().0).to_degrees()
+                });
+                if rot > 2.0 {
+                    wrong += 1;
+                }
+            }
+        }
+        let share = wrong as f64 / passed.max(1) as f64;
+        eprintln!(
+            "검증 간선: 통과 {passed}, 2° 초과 {wrong} ({share:.3}), 참 짝 {true_pass}/{true_total}, 무작위 짝 통과 {random_pass}/20"
+        );
+        assert_eq!(random_pass, 0, "겹침 없는 짝 통과");
+        assert_eq!(true_pass, true_total, "참 짝 탈락");
+        assert!(share < 0.05, "2° 초과 비율 {share}");
+    }
+
+    /// 무작위 대응 짝은 대응 수가 많아도(1000개) 통과하지 않고, 정상 15개 미만은 거부된다.
+    #[test]
+    fn ransac_essential_rejects_unsupported_pairs() {
+        let cfg = RansacConfig {
+            threshold_px: 1.5,
+            ..RansacConfig::default()
+        };
+        for seed in 1..=5u64 {
+            let s = scene_full(1000, 0.5, seed, 3.0, 10.0);
+            let k = s.c1.intrinsics;
+            let mut rng = Lcg(seed ^ 0x1234);
+            let x2: Vec<_> = (0..s.x1.len())
+                .map(|_| k.to_normalized(&Vector2::new(rng.next() * 960.0, rng.next() * 540.0)))
+                .collect();
+            assert!(
+                ransac_essential(&s.x1, &x2, k.fx, &cfg).is_none(),
+                "시드 {seed}"
+            );
+            let t = scene_full(12, 0.0, seed, 3.0, 10.0);
+            assert!(
+                ransac_essential(&t.x1, &t.x2, k.fx, &cfg).is_none(),
+                "정상 12개 시드 {seed}"
+            );
+        }
     }
 
     /// 비평면 + 이상치 30% 측정(기준 하한 + 0.1° 미달, 남은 문제).
