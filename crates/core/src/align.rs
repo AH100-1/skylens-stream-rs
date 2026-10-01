@@ -1011,9 +1011,13 @@ mod tests {
 
     /// 편대 띠 측정: 설정별 (회전 최악, 기울기 최악, 위치 최악, 유지 최소, 기울기σ 보고 최대, None 수).
     /// 설정: 0 = 연직 고정(위 방향 0.2° 틀림), 1 = 자유(잡음 비례 임계), 2 = 자유 + 고정 3 m.
-    fn strip_stats(sigma: f64) -> [(f64, f64, f64, f64, f64, usize); 3] {
+    /// 둘째 값: 연직 고정 설정의 시드별 (방위 오차 도(부호 있음), 방위 이론 σ 도).
+    type StripWorst = [(f64, f64, f64, f64, f64, usize); 3];
+    fn strip_stats(sigma: f64) -> (StripWorst, Vec<(f64, f64)>) {
         let ez = Vector3::new(0.0, 0.0, 1.0);
+        let ex = Vector3::new(1.0, 0.0, 0.0);
         let mut w = [(0.0f64, 0.0f64, 0.0f64, 1.0f64, 0.0f64, 0usize); 3];
+        let mut yaw = Vec::new();
         for seed in 0..20u64 {
             let mut rng = Rng(1300 + seed);
             let s = strip_enu(&mut rng);
@@ -1050,6 +1054,12 @@ mod tests {
                 w[k].2 = w[k].2.max(ep);
                 w[k].3 = w[k].3.min(keep);
                 w[k].4 = w[k].4.max(al.tilt_sigma_deg);
+                if k == 0 {
+                    // 방위 = 오차 회전이 동쪽 축을 수평면에서 돌린 각.
+                    let v = al.sim.r * c.gt.r.inverse() * ex;
+                    let e_yaw = v.y.atan2(v.x).to_degrees();
+                    yaw.push((e_yaw, yaw_sigma_deg(&c, &al, sigma)));
+                }
             }
         }
         for (k, name) in ["up-fixed", "free", "free-3m"].iter().enumerate() {
@@ -1058,19 +1068,38 @@ mod tests {
                 w[k].0, w[k].1, w[k].2, w[k].3, w[k].4, w[k].5
             );
         }
-        w
+        (w, yaw)
     }
 
-    /// F-099: 실측 편대 띠(77 m × 20 m), 이상치 10%(10~50 m), 시드 20, 축당 σ 1·2 m.
-    /// 연직축 고정(위 방향 사전 정보 0.2° 오차 포함) 기준: 기울기 최악 < 0.5°,
-    /// 띠 안 최대 위치 오차 < 2 m, 참 대응 유지 ≥ 90%, 실패 0.
+    /// 연직축을 고정한 최소제곱 방위의 이론 표준편차(도): 정상 대응의 참 위치가
+    /// 수평 중심에서 떨어진 거리 r_i 로 σ_ψ = σ_축 / √Σ r_i².
+    /// (수평 회전 δψ 는 점 i 를 r_i·δψ 만큼 접선 방향으로 옮기고, 접선 방향 잡음은 축당 σ.)
+    fn yaw_sigma_deg(c: &GpsCase, al: &GpsAlignment, sigma_axis: f64) -> f64 {
+        let pts: Vec<Vector3<f64>> = c
+            .enu_true
+            .iter()
+            .zip(&al.inliers)
+            .filter(|(_, &k)| k)
+            .map(|(e, _)| *e)
+            .collect();
+        let mu = pts.iter().sum::<Vector3<f64>>() / pts.len() as f64;
+        let s2: f64 = pts
+            .iter()
+            .map(|p| (p.x - mu.x).powi(2) + (p.y - mu.y).powi(2))
+            .sum();
+        (sigma_axis / s2.sqrt()).to_degrees()
+    }
+
+    /// F-099 기울기·위치: 실측 편대 띠(77 m × 20 m), 이상치 10%(10~50 m), 시드 20, 축당 σ 1·2 m.
+    /// 연직축 고정이면 기울기는 위 방향 사전 정보 오차(여기서 0.2°)와 같아야 한다 → 기준 < 0.25°
+    /// (사전 오차 0.2° + 수치 여유 0.05°). 띠 안 최대 위치 오차 < 2 m, 참 대응 유지 ≥ 90%, 실패 0.
     #[test]
-    fn gps_alignment_formation_strip() {
+    fn gps_alignment_formation_strip_tilt() {
         for &sigma in &[1.0, 2.0] {
-            let w = strip_stats(sigma);
+            let (w, _) = strip_stats(sigma);
             let u = w[0];
             assert_eq!(u.5, 0, "sigma {sigma}: None");
-            assert!(u.1 < 0.5, "sigma {sigma}: tilt {}", u.1);
+            assert!(u.1 < 0.25, "sigma {sigma}: tilt {}", u.1);
             assert!(u.2 < 2.0, "sigma {sigma}: pos {}", u.2);
             assert!(u.3 >= 0.9, "sigma {sigma}: keep {}", u.3);
             // 자유 추정도 실패하지 않고 기울기 불확실성을 보고한다.
@@ -1079,12 +1108,32 @@ mod tests {
         }
     }
 
-    /// F-099 확인 기준 그대로: 전체 회전 오차 최악 < 0.5°(σ 2 m).
+    /// F-099 방위(연직축 둘레): 최소제곱 방위 오차는 잡음 한계 σ_ψ = σ_축 / √Σ r_i²
+    /// (띠 77 m × 20 m, 정상 216개, σ 2 m 에서 ≈ 0.33°)를 따라야 한다.
+    /// 시드별 정규화 오차 z = 오차 / σ_ψ 에 대해
+    /// - 최대 |z| < 3.5 (가우스면 시드 하나가 넘을 확률 4.7e-4, 20개 중 하나라도 ≈ 0.9%),
+    /// - 제곱평균 z ∈ [0.61, 1.41] (χ²₂₀ 의 0.5%·99.5% 분위 7.43·40.0 을 20 으로 나눈 제곱근),
+    /// - 절대 최악 < 3.5 × 이론 σ 최대.
+    ///
+    /// 고정 0.5° 는 σ 2 m 에서 1.52 σ_ψ 라 20 시드 모두 들어올 확률이 0.871²⁰ ≈ 6% 뿐이어서
+    /// 기준으로 쓰지 않는다.
     #[test]
-    #[ignore = "방위(연직축 둘레) 오차가 잡음 한계: σ/(띠 반경 23 m·√216) ≈ 0.33° 표준편차라 20 시드 최악이 0.5° 를 넘는다(측정 0.67°, 위 방향 0.2° 오차 포함). 기울기·위치 기준은 위 시험에서 통과"]
-    fn gps_alignment_formation_strip_full_rotation() {
-        let w = strip_stats(2.0);
-        assert!(w[0].0 < 0.5, "rot {}", w[0].0);
+    fn gps_alignment_formation_strip_yaw() {
+        for &sigma in &[1.0, 2.0] {
+            let (_, yaw) = strip_stats(sigma);
+            assert_eq!(yaw.len(), 20);
+            let zmax = yaw.iter().map(|(e, s)| (e / s).abs()).fold(0.0, f64::max);
+            let zrms = (yaw.iter().map(|(e, s)| (e / s).powi(2)).sum::<f64>() / 20.0).sqrt();
+            let emax = yaw.iter().map(|(e, _)| e.abs()).fold(0.0, f64::max);
+            let smax = yaw.iter().map(|(_, s)| *s).fold(0.0, f64::max);
+            let smin = yaw.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
+            eprintln!(
+                "strip sigma {sigma} yaw: max {emax:.3} deg theory sigma {smin:.3}..{smax:.3} deg z max {zmax:.2} z rms {zrms:.2}"
+            );
+            assert!(zmax < 3.5, "sigma {sigma}: z max {zmax}");
+            assert!((0.61..=1.41).contains(&zrms), "sigma {sigma}: z rms {zrms}");
+            assert!(emax < 3.5 * smax, "sigma {sigma}: yaw {emax}");
+        }
     }
 
     /// F-095: 거의 일직선(600 m, 옆·위 흔들림 σ 0.3 m)이면 연직축 없이 `None`,
