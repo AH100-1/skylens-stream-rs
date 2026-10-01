@@ -4,17 +4,23 @@
 //!
 //! | 인자 | 기본값 | 뜻 |
 //! |---|---|---|
-//! | `--positions N` | 80 | 촬영 위치 수(영상 수 = 3N) |
-//! | `--width W` `--height H` | 960 540 | 렌더 해상도 |
+//! | `--positions N` | 8 | 촬영 위치 수(영상 수 = 3N). `ba-scale` 에서는 지정하지 않으면 80 |
+//! | `--width W` `--height H` | 480 270 | 렌더 해상도 |
 //! | `--repeat R` | 3 | 같은 입력으로 구간마다 반복하는 횟수(중앙·최소 보고) |
 //! | `--threads T` | 0 | rayon 스레드 수(0 = rayon 기본 = 논리 코어 수) |
 //! | `--max-pairs P` | 0 | 매칭·검증·자세 구간에서 잴 영상 짝 수 상한(0 = 전부). 앞에서부터 고르게 뽑는다 |
-//! | `--ba-points M` | 20000 | 번들 조정 문제의 점 수 |
-//! | `--quick` | | `--positions 8 --width 480 --height 270 --repeat 3 --ba-points 3000` 과 같다 |
+//! | `--ba-points M` | 3000 | 번들 조정 문제의 점 수 |
+//! | `--full` | | SPEC 기준 규모: `--positions 80 --width 960 --height 540 --repeat 3 --ba-points 20000` 과 같다 |
+//! | `--quick` | | 기본값과 같다(예전 이름, 그대로 받는다) |
 //! | `--json PATH` | | 표를 JSON 으로도 쓴다(`{cores, threads, mode, rows[{name, items, unit, median_s, min_s, note}]}`) |
 //! | `--mode M` | `pipeline` | `pipeline`(구간 전체), `ba-scale`(번들 조정 실제 규모), `detect`(1920×1080 한 장 검출) |
 //! | `--ba-tracks N` | 100000 | `ba-scale` 의 트랙(점) 수 |
 //! | `--ba-iters K` | 3 | `ba-scale` 의 LM 반복 수(조기 종료 없이 K 회) |
+//!
+//! 예상 시간(4 코어 측정 기계, 부하 없음 기준 어림): 인자 없음(24장, 480×270) 약 1 분 안,
+//! `--full`(240장, 960×540, 짝 3663 전부, 반복 3) 수십 분 — 짝을 줄이려면 `--max-pairs` 를 함께 준다,
+//! `--full --width 320 --height 180` 약 5 분, `--mode ba-scale --ba-iters 2 --repeat 1` 약 1~2 분(최대 메모리 약 2.5 GB),
+//! `--mode detect` 수 초.
 //!
 //! `ba-scale`: 위치 `--positions`(기본 80 → 카메라 240)의 정답 포즈에서 영상마다 고르게 화소를 골라 깊이
 //! 10~60 m 로 역투영한 점을 모든 카메라에 투영(깊이 1~80 m·영상 안, 가림 무시)한다. 렌더는 하지 않는다.
@@ -76,13 +82,13 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut a = Args {
-        positions: 80,
-        width: 960,
-        height: 540,
+        positions: 8,
+        width: 480,
+        height: 270,
         repeat: 3,
         threads: 0,
         max_pairs: 0,
-        ba_points: 20_000,
+        ba_points: 3000,
         json: None,
         mode: "pipeline".to_string(),
         ba_tracks: 100_000,
@@ -90,6 +96,7 @@ fn parse_args() -> Args {
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
+    let mut positions_set = false;
     let num = |v: Option<&String>, name: &str| -> usize {
         v.and_then(|s| s.parse().ok())
             .unwrap_or_else(|| panic!("{name} 뒤에 0 이상의 정수가 필요하다"))
@@ -97,7 +104,10 @@ fn parse_args() -> Args {
     while i < argv.len() {
         let next = argv.get(i + 1);
         match argv[i].as_str() {
-            "--positions" => a.positions = num(next, "--positions"),
+            "--positions" => {
+                a.positions = num(next, "--positions");
+                positions_set = true;
+            }
             "--width" => a.width = num(next, "--width") as u32,
             "--height" => a.height = num(next, "--height") as u32,
             "--repeat" => a.repeat = num(next, "--repeat").max(1),
@@ -123,6 +133,17 @@ fn parse_args() -> Args {
                 a.height = 270;
                 a.repeat = 3;
                 a.ba_points = 3000;
+                positions_set = true;
+                i += 1;
+                continue;
+            }
+            "--full" => {
+                a.positions = 80;
+                a.width = 960;
+                a.height = 540;
+                a.repeat = 3;
+                a.ba_points = 20_000;
+                positions_set = true;
                 i += 1;
                 continue;
             }
@@ -134,6 +155,10 @@ fn parse_args() -> Args {
             other => panic!("알 수 없는 인자: {other}"),
         }
         i += 2;
+    }
+    // 번들 조정 실제 규모 측정은 카메라 240(위치 80)이 목적이므로 위치를 따로 주지 않으면 80 으로 둔다.
+    if a.mode == "ba-scale" && !positions_set {
+        a.positions = 80;
     }
     a
 }
@@ -458,8 +483,24 @@ fn pipeline(args: &Args) -> Vec<Row> {
         .collect();
     let (t, avg_m) = measure(args.repeat, || average_rotations(nv, &measured, &acfg));
     let truth: Vec<Rotation3<f64>> = scene.views.iter().map(|v| v.camera.pose.rotation).collect();
+    // 입력 간선 가운데 정답 상대 회전(R_j R_iᵀ)과 2° 넘게 다른 것의 비율. 회전 평균이 무너질 때 원인이
+    // 입력(틀린 간선)인지 평균 쪽인지 가르는 값이다.
+    let bad_edges = measured
+        .iter()
+        .filter(|e| {
+            let t = truth[e.j] * truth[e.i].inverse();
+            (e.rotation * t.inverse()).angle().to_degrees() > 2.0
+        })
+        .count();
+    let bad_note = format!(
+        "간선 오차>2° {}/{} ({:.1}%)",
+        bad_edges,
+        measured.len(),
+        100.0 * bad_edges as f64 / measured.len().max(1) as f64
+    );
     let note = match &avg_m {
         Some(r) => {
+            let returned = r.rotations.iter().filter(|x| x.is_some()).count();
             let mut err: Vec<f64> = aligned_errors(&r.rotations, &truth)
                 .into_iter()
                 .filter(|x| x.is_finite())
@@ -467,12 +508,12 @@ fn pipeline(args: &Args) -> Vec<Row> {
             err.sort_by(f64::total_cmp);
             let m = err.get(err.len() / 2).copied().unwrap_or(f64::NAN);
             format!(
-                "반복 {}, 정답 대비 정렬 오차 중앙 {:.3}° {pair_note}",
+                "반복 {}, 반환 시점 {returned}/{nv}, {bad_note}, 정답 대비 정렬 오차 중앙 {:.3}° {pair_note}",
                 r.iterations,
                 m.to_degrees()
             )
         }
-        None => format!("실패 {pair_note}"),
+        None => format!("실패, {bad_note} {pair_note}"),
     };
     rows.push(Row {
         name: "회전 평균(검증 결과)",
