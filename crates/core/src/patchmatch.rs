@@ -387,7 +387,7 @@ impl Ctx<'_> {
     /// 화소 (x, y) 에서 가설의 비용.
     fn cost(&self, x: usize, y: usize, rp: &Vector3<f32>, patch: &RefPatch, hyp: &Hyp) -> f32 {
         let ndr = hyp.n.dot(rp);
-        if ndr >= -1e-6 || !(hyp.depth > 0.0) {
+        if ndr >= -1e-6 || hyp.depth.is_nan() || hyp.depth <= 0.0 {
             return MAX_COST;
         }
         // 평면 nᵀX = c, c = d·nᵀr_p. 평면 위 X 에 대해 X_j = (R + t nᵀ / c) X.
@@ -596,6 +596,9 @@ impl Ctx<'_> {
     }
 }
 
+/// 한 층의 결과: 가설, 비용, K⁻¹, 너비.
+type LevelState = (Vec<Hyp>, Vec<f32>, Matrix3<f32>, usize);
+
 /// 피라미드 한 층: 시점별 (K, 영상).
 struct Level {
     k: Vec<Matrix3<f64>>,
@@ -649,7 +652,7 @@ pub fn estimate(ref_view: &View, neighbors: &[View], range: (f64, f64), cfg: &Co
         .collect();
     let range32 = (range.0 as f32, range.1 as f32);
 
-    let mut state: Option<(Vec<Hyp>, Vec<f32>, Matrix3<f32>, usize)> = None;
+    let mut state: Option<LevelState> = None;
     let top = levels.len() - 1;
     for li in (0..levels.len()).rev() {
         let lv = &levels[li];
@@ -765,7 +768,7 @@ fn ncc_cost(q: &Vector3<f32>, patch: &RefPatch, h: &Matrix3<f32>, img: &GrayImag
     }
     let mean = sum / sw;
     let var = sum2 / sw - mean * mean;
-    if !(var >= 1e-8) {
+    if var.is_nan() || var < 1e-8 {
         return MAX_COST;
     }
     let cov = cross / sw - mean * patch.mean;
