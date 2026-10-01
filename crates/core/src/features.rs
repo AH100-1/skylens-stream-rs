@@ -1,6 +1,6 @@
 //! 다중 스케일 가우시안 차분(DoG) 극값 검출 (Lowe 2004, SPEC §3.1).
 //!
-//! 진행 상황: 검출기만 있다. 방향 할당·128차원 기술자는 다음 단계.
+//! 진행 상황: 검출기(부화소·부스케일 정밀화 포함)만 있다. 방향 할당·128차원 기술자는 다음 단계.
 
 /// 단일 채널 f32 영상(행 우선).
 #[derive(Clone, Debug)]
@@ -112,12 +112,86 @@ impl Default for DetectorConfig {
 }
 
 /// 특징점: 원본 영상 좌표, 스케일(σ), DoG 응답.
+///
+/// σ 는 극값이 난 DoG 층 D = G(kσ) − G(σ) 의 아래쪽 가우시안 σ 다.
+/// 반지름 σ_b 인 가우시안 덩어리에서는 σ ≈ σ_b·k^(-1/2) 로 나온다.
 #[derive(Clone, Copy, Debug)]
 pub struct Keypoint {
     pub x: f32,
     pub y: f32,
     pub sigma: f32,
     pub response: f32,
+}
+
+/// 부화소·부스케일로 정밀화한 극값.
+struct Refined {
+    xi: usize,
+    yi: usize,
+    layer: usize,
+    x: f32,
+    y: f32,
+    /// 연속 층 좌표(σ = σ0 k^s).
+    s: f32,
+    value: f32,
+}
+
+/// 3차원 2차 근사로 극값 위치를 정밀화한다 (Brown & Lowe 2002; Lowe 2004 §4).
+/// D(x+δ) ≈ D + gᵀδ + ½δᵀHδ → δ = −H⁻¹g, D̂ = D + ½gᵀδ.
+/// |δ| 의 어느 성분이 0.5 를 넘으면 이웃 표본으로 옮겨 최대 5번 반복한다.
+fn refine_extremum(
+    dog: &[GrayImage],
+    mut x: usize,
+    mut y: usize,
+    mut l: usize,
+    s: usize,
+) -> Option<Refined> {
+    let (w, h) = (dog[0].width, dog[0].height);
+    for _ in 0..5 {
+        let (dm, d0, dp) = (&dog[l - 1], &dog[l], &dog[l + 1]);
+        let v = d0.at(x, y);
+        let g = nalgebra::Vector3::new(
+            0.5 * (d0.at(x + 1, y) - d0.at(x - 1, y)),
+            0.5 * (d0.at(x, y + 1) - d0.at(x, y - 1)),
+            0.5 * (dp.at(x, y) - dm.at(x, y)),
+        );
+        let hxx = d0.at(x + 1, y) + d0.at(x - 1, y) - 2.0 * v;
+        let hyy = d0.at(x, y + 1) + d0.at(x, y - 1) - 2.0 * v;
+        let hss = dp.at(x, y) + dm.at(x, y) - 2.0 * v;
+        let hxy = 0.25
+            * (d0.at(x + 1, y + 1) - d0.at(x - 1, y + 1) - d0.at(x + 1, y - 1)
+                + d0.at(x - 1, y - 1));
+        let hxs = 0.25 * (dp.at(x + 1, y) - dp.at(x - 1, y) - dm.at(x + 1, y) + dm.at(x - 1, y));
+        let hys = 0.25 * (dp.at(x, y + 1) - dp.at(x, y - 1) - dm.at(x, y + 1) + dm.at(x, y - 1));
+        let hm = nalgebra::Matrix3::new(hxx, hxy, hxs, hxy, hyy, hys, hxs, hys, hss);
+        let delta = -(hm.try_inverse()? * g);
+        if delta.iter().all(|d| d.abs() <= 0.5) {
+            return Some(Refined {
+                xi: x,
+                yi: y,
+                layer: l,
+                x: x as f32 + delta.x,
+                y: y as f32 + delta.y,
+                s: l as f32 + delta.z,
+                value: v + 0.5 * g.dot(&delta),
+            });
+        }
+        if !delta.iter().all(|d| d.is_finite()) {
+            return None;
+        }
+        let step = |p: usize, d: f32| p as isize + d.round() as isize;
+        let (nx, ny, nl) = (step(x, delta.x), step(y, delta.y), step(l, delta.z));
+        if nx < 1
+            || ny < 1
+            || nl < 1
+            || nx >= w as isize - 1
+            || ny >= h as isize - 1
+            || nl > s as isize
+        {
+            return None;
+        }
+        (x, y, l) = (nx as usize, ny as usize, nl as usize);
+    }
+    None
 }
 
 /// DoG 극값 검출. 입력은 이미 σ≈0.5 로 흐려진 영상으로 가정한다.
@@ -184,21 +258,30 @@ pub fn detect(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Keypoint> {
                     if !(is_max || is_min) {
                         continue;
                     }
-                    let dxx = d1.at(x + 1, y) + d1.at(x - 1, y) - 2.0 * v;
-                    let dyy = d1.at(x, y + 1) + d1.at(x, y - 1) - 2.0 * v;
+                    let Some(r) = refine_extremum(&dog, x, y, l, s) else {
+                        continue;
+                    };
+                    if r.value.abs() < cfg.contrast {
+                        continue;
+                    }
+                    let d = &dog[r.layer];
+                    let (xi, yi) = (r.xi, r.yi);
+                    let c = d.at(xi, yi);
+                    let dxx = d.at(xi + 1, yi) + d.at(xi - 1, yi) - 2.0 * c;
+                    let dyy = d.at(xi, yi + 1) + d.at(xi, yi - 1) - 2.0 * c;
                     let dxy = 0.25
-                        * (d1.at(x + 1, y + 1) - d1.at(x - 1, y + 1) - d1.at(x + 1, y - 1)
-                            + d1.at(x - 1, y - 1));
+                        * (d.at(xi + 1, yi + 1) - d.at(xi - 1, yi + 1) - d.at(xi + 1, yi - 1)
+                            + d.at(xi - 1, yi - 1));
                     let tr = dxx + dyy;
                     let det = dxx * dyy - dxy * dxy;
                     if det <= 0.0 || tr * tr / det >= edge_thr {
                         continue;
                     }
                     out.push(Keypoint {
-                        x: x as f32 * scale,
-                        y: y as f32 * scale,
-                        sigma: cfg.sigma0 * kstep.powi(l as i32) * scale,
-                        response: v,
+                        x: r.x * scale,
+                        y: r.y * scale,
+                        sigma: cfg.sigma0 * kstep.powf(r.s) * scale,
+                        response: r.value,
                     });
                 }
             }
@@ -251,8 +334,23 @@ mod tests {
                 pos_err <= 2.0 * (best.sigma / 1.6).max(1.0),
                 "위치 오차 {pos_err}"
             );
-            // 스케일 표본 간격 2^(1/3) 이내.
-            assert!((0.75..1.35).contains(&ratio), "스케일 비 {ratio}");
+            // 정밀화 후 σ·√k ≈ σ_b (k = 2^(1/3)), 3% 이내.
+            let corrected = ratio * 2f32.powf(1.0 / 6.0);
+            assert!((corrected - 1.0).abs() < 0.03, "보정 스케일 비 {corrected}");
+            // 부화소 정밀화: 정수 중심에서 0.1 px 이내.
+            assert!(pos_err < 0.1, "위치 오차 {pos_err}");
+        }
+    }
+
+    #[test]
+    fn refines_subpixel_center() {
+        // 정수 격자에서 벗어난 중심: 정밀화 없이는 최대 0.5 px 오차.
+        for (cx, cy) in [(61.3f32, 47.6f32), (60.75, 48.2)] {
+            let img = blob(140, 120, cx, cy, 4.0);
+            let best = detect(&img, &DetectorConfig::default())[0];
+            let err = ((best.x - cx).powi(2) + (best.y - cy).powi(2)).sqrt();
+            eprintln!("subpixel ({cx},{cy}) err={err:.3}");
+            assert!(err < 0.1, "부화소 오차 {err}");
         }
     }
 
