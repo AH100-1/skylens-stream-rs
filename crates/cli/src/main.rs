@@ -1,12 +1,13 @@
 //! skylens-stream 명령행 도구: PLY 정보 확인, 합성 장면 생성.
 
+mod run;
+
 use std::process::ExitCode;
 
 use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
 
-const USAGE: &str =
-    "사용법:\n  skylens-stream ply-info <파일.ply>\n  skylens-stream synth <출력 폴더> [폭 높이]";
+const USAGE: &str = "사용법:\n  skylens-stream ply-info <파일.ply>\n  skylens-stream synth <출력 폴더> [폭 높이]\n  skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -50,6 +51,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        ["run", input, output, rest @ ..] => run::run(input, output, rest),
         ["--version"] => {
             println!("skylens-stream {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
