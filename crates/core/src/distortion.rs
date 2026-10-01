@@ -54,18 +54,64 @@ impl Distortion {
         )
     }
 
+    /// 계수가 모두 0 인가(핀홀).
+    pub fn is_zero(&self) -> bool {
+        self.k1 == 0.0 && self.k2 == 0.0 && self.p1 == 0.0 && self.p2 == 0.0
+    }
+
     /// 왜곡 역변환(뉴턴 반복). 수렴하지 않으면 None.
     pub fn undistort(&self, nd: &Vector2<f64>) -> Option<Vector2<f64>> {
+        let (n, ok) = self.undistort_best(nd);
+        ok.then_some(n)
+    }
+
+    /// 왜곡 역변환의 마지막 반복값과 수렴 여부(잔차 < 1e-10).
+    /// 야코비안이 특이해지면 그 직전 값을 돌려준다. 계수가 0 이면 입력 그대로(수렴).
+    pub fn undistort_best(&self, nd: &Vector2<f64>) -> (Vector2<f64>, bool) {
+        if self.is_zero() {
+            return (*nd, nd.iter().all(|v| v.is_finite()));
+        }
         let mut n = *nd;
         for _ in 0..30 {
             let r = self.distort(&n) - nd;
             if r.norm() < 1e-14 {
-                return Some(n);
+                return (n, true);
             }
-            n -= self.jacobian_point(&n).try_inverse()? * r;
+            match self.jacobian_point(&n).try_inverse() {
+                Some(ji) => n -= ji * r,
+                None => break,
+            }
         }
-        ((self.distort(&n) - nd).norm() < 1e-10).then_some(n)
+        let ok = (self.distort(&n) - nd).norm() < 1e-10;
+        (n, ok)
     }
+}
+
+/// 왜곡 전 정규 좌표 → 픽셀. 핀홀·왜곡 카메라가 함께 쓰는 유일한 투영 경로.
+/// 계수가 0 이면 왜곡 계산을 건너뛰어 핀홀 식 fx·x + cx 와 비트 단위로 같다.
+pub fn normalized_to_pixel(
+    fx: f64,
+    fy: f64,
+    cx: f64,
+    cy: f64,
+    dist: &Distortion,
+    n: &Vector2<f64>,
+) -> Vector2<f64> {
+    let d = if dist.is_zero() { *n } else { dist.distort(n) };
+    Vector2::new(fx * d.x + cx, fy * d.y + cy)
+}
+
+/// 픽셀 → 왜곡 전 정규 좌표(광선 방향 (x, y, 1))의 마지막 반복값과 수렴 여부.
+/// 핀홀·왜곡 카메라가 함께 쓰는 유일한 정규화 경로. 계수가 0 이면 (p − c)/f 와 비트 단위로 같다.
+pub fn pixel_to_normalized(
+    fx: f64,
+    fy: f64,
+    cx: f64,
+    cy: f64,
+    dist: &Distortion,
+    p: &Vector2<f64>,
+) -> (Vector2<f64>, bool) {
+    dist.undistort_best(&Vector2::new((p.x - cx) / fx, (p.y - cy) / fy))
 }
 
 /// 왜곡 포함 카메라 내부 파라미터: [fx, fy, cx, cy, k1, k2, p1, p2].
@@ -92,16 +138,34 @@ pub struct ProjectionJacobian {
 
 impl DistortedIntrinsics {
     pub fn project_camera(&self, xc: &Vector3<f64>) -> Vector2<f64> {
-        let d = self.dist.distort(&Vector2::new(xc.x / xc.z, xc.y / xc.z));
-        Vector2::new(self.fx * d.x + self.cx, self.fy * d.y + self.cy)
+        normalized_to_pixel(
+            self.fx,
+            self.fy,
+            self.cx,
+            self.cy,
+            &self.dist,
+            &Vector2::new(xc.x / xc.z, xc.y / xc.z),
+        )
     }
 
-    /// 픽셀 → 왜곡 없는 정규 좌표 (광선 방향 (x, y, 1)).
+    /// 픽셀 → 왜곡 없는 정규 좌표 (광선 방향 (x, y, 1)). 역왜곡이 수렴하지 않으면 None.
+    /// [`crate::camera::Intrinsics::to_normalized`] 와 같은 경로([`pixel_to_normalized`])다.
     pub fn unproject(&self, p: &Vector2<f64>) -> Option<Vector2<f64>> {
-        self.dist.undistort(&Vector2::new(
-            (p.x - self.cx) / self.fx,
-            (p.y - self.cy) / self.fy,
-        ))
+        let (n, ok) = pixel_to_normalized(self.fx, self.fy, self.cx, self.cy, &self.dist, p);
+        ok.then_some(n)
+    }
+
+    /// 영상 크기를 붙여 [`crate::camera::Intrinsics`] 로 바꾼다(왜곡 계수 유지).
+    pub fn with_size(&self, width: u32, height: u32) -> crate::camera::Intrinsics {
+        crate::camera::Intrinsics {
+            fx: self.fx,
+            fy: self.fy,
+            cx: self.cx,
+            cy: self.cy,
+            width,
+            height,
+            dist: self.dist,
+        }
     }
 
     /// 세계 점 투영과 야코비안. 카메라 뒤면 None.
