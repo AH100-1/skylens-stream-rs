@@ -61,6 +61,8 @@ pub struct AveragingConfig {
     pub init_starts: usize,
     /// 마지막 선형 최소제곱 반복 수.
     pub global_iterations: usize,
+    /// 최소제곱·정상 집합 재선정을 되풀이하는 최대 횟수(1 이상으로 다룬다).
+    pub active_set_rounds: usize,
 }
 
 impl Default for AveragingConfig {
@@ -76,6 +78,7 @@ impl Default for AveragingConfig {
             outlier_sigma_factor: 6.0,
             init_starts: 8,
             global_iterations: 5,
+            active_set_rounds: 8,
         }
     }
 }
@@ -91,6 +94,11 @@ pub struct AveragingResult {
     pub inliers: Vec<bool>,
     /// 가우스–자이델 반복 수.
     pub iterations: usize,
+    /// 정상 집합을 다시 정해 다시 푼 횟수(첫 풀이 제외).
+    pub reselections: usize,
+    /// 참이면 정상 집합이 두 번 연속 같아 멈췄다. 거짓이면 재선정 상한 도달 또는 집합 순환
+    /// (이때도 `inliers` 는 마지막으로 푼 집합이고 해는 그 집합의 최소제곱 해다).
+    pub active_set_converged: bool,
     /// 실제로 쓴 이상치 문턱(rad).
     pub outlier_threshold_rad: f64,
     /// 거짓이면 이상치가 너무 많아 잡음 추정이 무너졌다(문턱이 상한에 걸림 또는 정상 비율 부족).
@@ -370,12 +378,89 @@ impl BlockSystem {
     }
 }
 
+#[cfg(test)]
+impl BlockSystem {
+    /// 띠 촐레스키 직접 풀이(밀집 촐레스키와 같은 분해, 띠 밖이 0 인 것만 이용).
+    /// 블록 번호 차가 `bw` 이하인 비대각 블록만 있어야 한다(아니면 None).
+    fn solve_banded(&self, bw: usize) -> Option<Vec<Vector3<f64>>> {
+        let m = self.diag.len();
+        let n = 3 * m;
+        let b = 3 * bw + 2; // 스칼라 반띠폭
+                            // 아래 삼각 띠 저장: l[i][b + j - i], j ∈ [i-b, i].
+        let mut l = vec![vec![0.0f64; b + 1]; n];
+        let mut put = |r: usize, c: usize, v: f64| {
+            if c <= r {
+                l[r][b + c - r] += v;
+            }
+        };
+        for (k, d) in self.diag.iter().enumerate() {
+            for x in 0..3 {
+                for y in 0..3 {
+                    put(3 * k + x, 3 * k + y, d[(x, y)]);
+                }
+            }
+        }
+        for (a, c, blk) in &self.off {
+            if a.abs_diff(*c) > bw {
+                return None;
+            }
+            for x in 0..3 {
+                for y in 0..3 {
+                    put(3 * a + x, 3 * c + y, blk[(x, y)]);
+                    put(3 * c + y, 3 * a + x, blk[(x, y)]);
+                }
+            }
+        }
+        for i in 0..n {
+            let lo = i.saturating_sub(b);
+            for j in lo..=i {
+                let mut sum = l[i][b + j - i];
+                for k in lo.max(j.saturating_sub(b))..j {
+                    sum -= l[i][b + k - i] * l[j][b + k - j];
+                }
+                if i == j {
+                    if sum <= 0.0 {
+                        return None;
+                    }
+                    l[i][b] = sum.sqrt();
+                } else {
+                    l[i][b + j - i] = sum / l[j][b];
+                }
+            }
+        }
+        let g: Vec<f64> = self.g.iter().flat_map(|v| v.iter().copied()).collect();
+        let mut y = vec![0.0; n];
+        for i in 0..n {
+            let mut sum = g[i];
+            for k in i.saturating_sub(b)..i {
+                sum -= l[i][b + k - i] * y[k];
+            }
+            y[i] = sum / l[i][b];
+        }
+        for i in (0..n).rev() {
+            let mut sum = y[i];
+            for k in i + 1..(i + b + 1).min(n) {
+                sum -= l[k][b + i - k] * y[k];
+            }
+            y[i] = sum / l[i][b];
+        }
+        Some(
+            (0..m)
+                .map(|k| Vector3::new(y[3 * k], y[3 * k + 1], y[3 * k + 2]))
+                .collect(),
+        )
+    }
+}
+
 /// 정규 방정식 풀이 방법.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Solver {
     Pcg,
     #[cfg(test)]
     Dense,
+    /// 블록 반띠폭을 준 띠 촐레스키.
+    #[cfg(test)]
+    Banded(usize),
 }
 
 /// 리 대수 선형화 가중 최소제곱.
@@ -435,6 +520,8 @@ fn refine_global(
             Solver::Pcg => sys.solve_pcg(),
             #[cfg(test)]
             Solver::Dense => sys.solve_dense(),
+            #[cfg(test)]
+            Solver::Banded(bw) => sys.solve_banded(bw),
         };
         let Some(delta) = delta else {
             return;
@@ -456,9 +543,6 @@ fn refine_global(
         }
     }
 }
-
-/// 최소제곱·정상 집합 재선정을 되풀이하는 최대 횟수.
-const ACTIVE_SET_ROUNDS: usize = 8;
 
 /// 정점 `n` 개와 상대 회전 간선으로 전역 회전을 구한다.
 ///
@@ -541,8 +625,13 @@ pub fn average_rotations(
         .map(|(&k, _)| k)
         .collect();
     // 최소제곱 뒤 잔차로 정상 집합을 다시 정하고, 바뀌었으면 다시 푼다(두 번 연속 같을 때까지, 최대
-    // `ACTIVE_SET_ROUNDS` 번). 돌려주는 정상 표시는 마지막으로 푼 집합 그대로다.
-    for round in 0..ACTIVE_SET_ROUNDS {
+    // `active_set_rounds` 번 풀이). 상한에 닿거나 전에 푼 집합으로 되돌아가면(순환) 다시 정한 집합을
+    // 버리고 멈춘다. 어느 경우든 돌려주는 정상 표시는 마지막으로 푼 집합 그대로다.
+    let rounds = cfg.active_set_rounds.max(1);
+    let mut seen: Vec<Vec<usize>> = Vec::new();
+    let mut reselections = 0;
+    let mut converged = false;
+    loop {
         refine_global(
             &mut rot,
             edges,
@@ -552,18 +641,20 @@ pub fn average_rotations(
             cfg.global_iterations,
             Solver::Pcg,
         );
-        if round + 1 == ACTIVE_SET_ROUNDS {
-            break;
-        }
         let next: Vec<usize> = comp_ids
             .iter()
             .copied()
             .filter(|&k| edge_residual(&edges[k], &rot) < thr)
             .collect();
         if next == active {
+            converged = true;
             break;
         }
-        active = next;
+        if reselections + 1 >= rounds || seen.contains(&next) {
+            break;
+        }
+        seen.push(std::mem::replace(&mut active, next));
+        reselections += 1;
     }
 
     let residuals_rad: Vec<f64> = (0..edges.len())
@@ -586,6 +677,8 @@ pub fn average_rotations(
         residuals_rad,
         inliers,
         iterations,
+        reselections,
+        active_set_converged: converged,
         outlier_threshold_rad: thr,
         reliable: !capped && ratio >= cfg.min_inlier_ratio,
     })
@@ -1242,14 +1335,16 @@ mod tests {
             let t1 = std::time::Instant::now();
             refine_global(&mut rot, &edges, &active, &nodes, 0, 1, Solver::Pcg);
             let step = t1.elapsed().as_secs_f64();
-            // 밀집 촐레스키는 2000 정점에서 288MB·80초 넘게 걸려 1000 정점까지만 비교한다.
+            // 밀집 촐레스키는 2000 정점에서 288MB·80초 넘게 걸려 1000 정점까지는 밀집, 2000 정점은
+            // 같은 촐레스키 분해를 띠(사슬 간선 블록 번호 차 ≤ 4) 안에서만 하는 직접 풀이와 비교한다.
             let mut dense = start;
             let t2 = std::time::Instant::now();
-            if n <= 1000 {
-                refine_global(&mut dense, &edges, &active, &nodes, 0, 1, Solver::Dense);
+            let solver = if n <= 1000 {
+                Solver::Dense
             } else {
-                dense.clone_from(&rot);
-            }
+                Solver::Banded(4)
+            };
+            refine_global(&mut dense, &edges, &active, &nodes, 0, 1, solver);
             let step_dense = t2.elapsed().as_secs_f64();
             let diff = rot
                 .iter()
@@ -1263,7 +1358,7 @@ mod tests {
             let err = aligned_errors(&res.rotations, &truth);
             let (mean, max) = stats(&err);
             println!(
-                "정점 {n} 간선 {}: 전체 {total:.3}s, 최소제곱 한 단계 희소 {step:.4}s 밀집 {step_dense:.4}s, 행렬 희소 {sparse_mb:.3}MB 밀집 {dense_mb:.1}MB, 희소-밀집 차 {diff:.1e} rad, 평균 {mean:.3}° 최대 {max:.3}° 반복 {}",
+                "정점 {n} 간선 {}: 전체 {total:.3}s, 최소제곱 한 단계 희소 {step:.4}s 직접({solver:?}) {step_dense:.4}s, 행렬 희소 {sparse_mb:.3}MB 밀집 {dense_mb:.1}MB, 희소-직접 차 {diff:.1e} rad, 평균 {mean:.3}° 최대 {max:.3}° 반복 {}",
                 edges.len(),
                 res.iterations
             );
@@ -1279,32 +1374,108 @@ mod tests {
         }
     }
 
-    /// 2000 정점에서 희소 풀이와 밀집 촐레스키의 1단계 비교.
+    /// 띠 촐레스키가 밀집 촐레스키와 같은 해를 내는지(2000 정점 비교의 근거).
     #[test]
-    #[ignore = "밀집 촐레스키가 2000 정점에서 288MB·80 s 넘게 걸린다; 수동 실행"]
-    fn large_chain_sparse_matches_dense_2000() {
-        let n = 2000;
-        let (_, edges) = chain_graph(n, 1f64.to_radians(), 31);
-        let res = average_rotations(n, &edges, &AveragingConfig::default()).unwrap();
-        let active: Vec<usize> = (0..edges.len()).filter(|&k| res.inliers[k]).collect();
+    fn banded_solver_matches_dense() {
+        let n = 240;
+        let (_, edges) = chain_graph(n, 1f64.to_radians(), 33);
+        let active: Vec<usize> = (0..edges.len()).collect();
         let nodes: Vec<usize> = (0..n).collect();
-        let mut start_rng = Rng(32);
-        let mut start: Vec<_> = res
-            .rotations
-            .iter()
-            .map(|r| start_rng.rotation(0.02) * r.unwrap())
+        let mut rng = Rng(34);
+        let start: Vec<_> = (0..n)
+            .map(|v| {
+                if v == 0 {
+                    Rotation3::identity()
+                } else {
+                    rng.rotation(0.5)
+                }
+            })
             .collect();
-        start[0] = res.rotations[0].unwrap();
         let (mut a, mut b) = (start.clone(), start);
-        refine_global(&mut a, &edges, &active, &nodes, 0, 1, Solver::Pcg);
+        refine_global(&mut a, &edges, &active, &nodes, 0, 1, Solver::Banded(4));
         refine_global(&mut b, &edges, &active, &nodes, 0, 1, Solver::Dense);
         let diff = a
             .iter()
             .zip(&b)
             .map(|(x, y)| angle(&(x * y.inverse())))
             .fold(0.0, f64::max);
-        println!("정점 2000 희소-밀집 1단계 차 {diff:.1e} rad");
+        println!("정점 {n} 띠-밀집 1단계 차 {diff:.1e} rad");
         assert!(diff < 1e-9, "차 {diff}");
+    }
+
+    /// 정상 표시 = 실제로 푼 집합(F-137): 시드 100..129 × 4경우, 재선정 상한 8(기본)·1.
+    #[test]
+    fn inliers_are_the_solved_set() {
+        use rayon::prelude::*;
+        let (truth, pairs) = scene_graph();
+        let nodes: Vec<usize> = (0..truth.len()).collect();
+        let cases: [(f64, usize); 4] = [(0.5, 0), (1.0, 0), (2.0, 0), (1.0, 10)];
+        for rounds in [8usize, 1] {
+            let cfg = AveragingConfig {
+                active_set_rounds: rounds,
+                ..AveragingConfig::default()
+            };
+            for (sigma_deg, every) in cases {
+                let rows: Vec<(u64, usize, bool, f64, f64)> = (100u64..130)
+                    .into_par_iter()
+                    .map(|seed| {
+                        let mut rng = Rng(seed);
+                        let (edges, _) =
+                            make_edges(&truth, &pairs, sigma_deg.to_radians(), every, &mut rng);
+                        let res = average_rotations(truth.len(), &edges, &cfg).unwrap();
+                        let rot: Vec<_> = res.rotations.iter().map(|r| r.unwrap()).collect();
+                        let active: Vec<usize> =
+                            (0..edges.len()).filter(|&k| res.inliers[k]).collect();
+                        // 돌려준 정상 표시로 50단계 더 풀어도 움직이지 않아야 한다.
+                        let mut more = rot.clone();
+                        refine_global(&mut more, &edges, &active, &nodes, 0, 50, Solver::Pcg);
+                        let moved = rot
+                            .iter()
+                            .zip(&more)
+                            .map(|(x, y)| angle(&(x * y.inverse())))
+                            .fold(0.0, f64::max);
+                        // 기준 해: 같은 정상 집합으로 정답에서 출발한 밀집 최소제곱.
+                        let mut oracle: Vec<_> =
+                            truth.iter().map(|t| t * truth[0].inverse()).collect();
+                        refine_global(&mut oracle, &edges, &active, &nodes, 0, 100, Solver::Dense);
+                        let diff = rot
+                            .iter()
+                            .zip(&oracle)
+                            .map(|(x, y)| angle(&(x * y.inverse())))
+                            .fold(0.0, f64::max);
+                        (
+                            seed,
+                            res.reselections,
+                            res.active_set_converged,
+                            moved,
+                            diff,
+                        )
+                    })
+                    .collect();
+                let max_resel = rows.iter().map(|r| r.1).max().unwrap();
+                let unconverged = rows.iter().filter(|r| !r.2).count();
+                let max_moved = rows.iter().map(|r| r.3).fold(0.0, f64::max);
+                let max_diff = rows.iter().map(|r| r.4).fold(0.0, f64::max);
+                println!(
+                    "상한 {rounds} σ={sigma_deg}° 이상치 {}%: 재선정 최대 {max_resel}, 미수렴 {unconverged}/30, 자기 일관성 최대 차 {max_moved:.1e} rad, 기준 해 차 최대 {max_diff:.1e} rad",
+                    100usize.checked_div(every).unwrap_or(0)
+                );
+                for (seed, resel, conv, moved, diff) in &rows {
+                    assert!(*resel < rounds, "시드 {seed}: 재선정 {resel}");
+                    if rounds == 8 {
+                        assert!(*conv, "σ={sigma_deg}° 시드 {seed}: 상한 8 에서 미수렴");
+                    }
+                    assert!(
+                        *moved < 1e-9,
+                        "σ={sigma_deg}° 시드 {seed}: 50단계 더 {moved}"
+                    );
+                    assert!(
+                        *diff < 1e-6,
+                        "σ={sigma_deg}° 시드 {seed}: 기준 해 차 {diff}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
