@@ -8,3 +8,7 @@ license.workspace = true
 nalgebra.workspace = true
 image.workspace = true
 rayon.workspace = true
+
+[[bench]]
+name = "pipeline"
+harness = false
