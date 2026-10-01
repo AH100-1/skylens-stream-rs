@@ -439,6 +439,9 @@ fn refine_global(
     }
 }
 
+/// 최소제곱·정상 집합 재선정을 되풀이하는 최대 횟수.
+const ACTIVE_SET_ROUNDS: usize = 8;
+
 /// 정점 `n` 개와 상대 회전 간선으로 전역 회전을 구한다.
 ///
 /// None: n = 0, 범위 밖 정점 번호, 쓸 수 있는 간선 없음.
@@ -521,21 +524,35 @@ pub fn average_rotations(
         .map(|&k| edge_residual(&edges[k], &rot))
         .collect();
     let thr = adaptive_threshold(&robust_res, cfg);
-    let active: Vec<usize> = comp_ids
+    let mut active: Vec<usize> = comp_ids
         .iter()
         .zip(&robust_res)
         .filter(|(_, &r)| r < thr)
         .map(|(&k, _)| k)
         .collect();
-    refine_global(
-        &mut rot,
-        edges,
-        &active,
-        &comp,
-        root,
-        cfg.global_iterations,
-        Solver::Pcg,
-    );
+    // 최소제곱 뒤 잔차로 정상 집합을 다시 정하고, 바뀌었으면 다시 푼다.
+    // 강건 단계 잔차로 고른 집합과 최종 해의 잔차로 고른 집합이 문턱 근처에서 어긋나면
+    // 돌려주는 정상 표시가 실제로 푼 집합과 달라진다(σ 2° 에서 관측).
+    for _ in 0..ACTIVE_SET_ROUNDS {
+        refine_global(
+            &mut rot,
+            edges,
+            &active,
+            &comp,
+            root,
+            cfg.global_iterations,
+            Solver::Pcg,
+        );
+        let next: Vec<usize> = comp_ids
+            .iter()
+            .copied()
+            .filter(|&k| edge_residual(&edges[k], &rot) < thr)
+            .collect();
+        if next == active {
+            break;
+        }
+        active = next;
+    }
 
     let residuals_rad: Vec<f64> = (0..edges.len())
         .map(|k| {
@@ -711,6 +728,14 @@ mod tests {
         (inv.trace() / n as f64).sqrt()
     }
 
+    /// 정상 간선 비용 Σ w·|log(R_j R_iᵀ R_ijᵀ)|².
+    fn inlier_cost(edges: &[RelativeRotation], inliers: &[bool], rot: &[Rotation3<f64>]) -> f64 {
+        (0..edges.len())
+            .filter(|&k| inliers[k])
+            .map(|k| edges[k].weight * edge_residual(&edges[k], rot).powi(2))
+            .sum()
+    }
+
     #[test]
     fn noisy_graph_matches_oracle_and_noise_model() {
         let (truth, pairs) = scene_graph();
@@ -742,11 +767,13 @@ mod tests {
                     res.iterations,
                     res.outlier_threshold_rad.to_degrees()
                 );
-                // 전역 최적 확인: 정답에서 출발한 최소제곱 해와 같다.
-                // σ=2° 에서는 다른 국소 해로 가는 시드가 있어(차 3e-2 rad) 아직 σ ≤ 1° 만 단언한다.
-                if sigma_deg <= 1.0 {
-                    assert!(diff < 1e-6, "기준 해와 차 {diff} rad");
-                }
+                let (c_est, c_orc) = (
+                    inlier_cost(&edges, &res.inliers, &est),
+                    inlier_cost(&edges, &res.inliers, &orc),
+                );
+                println!("  정상 집합 비용: 추정 {c_est:.9e} 기준 해 {c_orc:.9e}");
+                // 전역 최적 확인: 같은 정상 집합으로 정답에서 출발한 최소제곱 해와 같다(σ 0.5/1/2° 모두).
+                assert!(diff < 1e-6, "기준 해와 차 {diff} rad");
                 // 잡음 모델 근거: 정점 오차 RMS 는 선형화 공분산 예측의 1.25배 안
                 // (정점 240개 평균이라 표본 RMS 의 상대 흔들림은 수 % 수준).
                 assert!(
@@ -804,6 +831,11 @@ mod tests {
                 res.outlier_threshold_rad.to_degrees(),
                 pred,
                 res.iterations
+            );
+            println!(
+                "  정상 집합 비용: 추정 {:.9e} 기준 해 {:.9e}",
+                inlier_cost(&edges, &res.inliers, &est),
+                inlier_cost(&edges, &res.inliers, &orc)
             );
             assert!(diff < 1e-6, "기준 해와 차 {diff} rad");
             assert_eq!(missed, 0);
@@ -871,28 +903,56 @@ mod tests {
 
     #[test]
     fn large_chain_graph_is_fast() {
-        let n = 2000;
-        let (truth, edges) = chain_graph(n, 1f64.to_radians(), 31);
-        let t0 = std::time::Instant::now();
-        let res = average_rotations(n, &edges, &AveragingConfig::default()).unwrap();
-        let total = t0.elapsed().as_secs_f64();
-        let active: Vec<usize> = (0..edges.len()).filter(|&k| res.inliers[k]).collect();
-        let nodes: Vec<usize> = (0..n).collect();
-        let mut rot: Vec<_> = res.rotations.iter().map(|r| r.unwrap()).collect();
-        let t1 = std::time::Instant::now();
-        refine_global(&mut rot, &edges, &active, &nodes, 0, 1, Solver::Pcg);
-        let step = t1.elapsed().as_secs_f64();
-        let err = aligned_errors(&res.rotations, &truth);
-        let (mean, max) = stats(&err);
-        println!(
-            "정점 {n} 간선 {}: 전체 {total:.3}s, 최소제곱 한 단계 {step:.4}s, 평균 {mean:.3}° 최대 {max:.3}° 반복 {}",
-            edges.len(),
-            res.iterations
-        );
-        assert!(edges.len() > 7900);
-        // 시간은 기록만 한다(4 코어 측정 기계를 나눠 쓰면 흔들림). 1초 목표는 아직 못 맞춘다.
-        assert!(mean < 20.0, "평균 {mean}°");
-        assert!(res.inliers.iter().filter(|&&b| !b).count() <= edges.len() / 100);
+        for n in [240usize, 1000, 2000] {
+            let (truth, edges) = chain_graph(n, 1f64.to_radians(), 31);
+            let t0 = std::time::Instant::now();
+            let res = average_rotations(n, &edges, &AveragingConfig::default()).unwrap();
+            let total = t0.elapsed().as_secs_f64();
+            let active: Vec<usize> = (0..edges.len()).filter(|&k| res.inliers[k]).collect();
+            let nodes: Vec<usize> = (0..n).collect();
+            // 수렴 해에서 0.02 rad 흔든 출발점(기준 정점은 단위 회전 유지): 한 단계가 0 이 아니게.
+            let mut start_rng = Rng(32);
+            let mut start: Vec<_> = res
+                .rotations
+                .iter()
+                .map(|r| start_rng.rotation(0.02) * r.unwrap())
+                .collect();
+            start[0] = res.rotations[0].unwrap();
+            let mut rot = start.clone();
+            let t1 = std::time::Instant::now();
+            refine_global(&mut rot, &edges, &active, &nodes, 0, 1, Solver::Pcg);
+            let step = t1.elapsed().as_secs_f64();
+            // 밀집 촐레스키는 2000 정점에서 288MB·80초 넘게 걸려 1000 정점까지만 비교한다.
+            let mut dense = start;
+            let t2 = std::time::Instant::now();
+            if n <= 1000 {
+                refine_global(&mut dense, &edges, &active, &nodes, 0, 1, Solver::Dense);
+            } else {
+                dense.clone_from(&rot);
+            }
+            let step_dense = t2.elapsed().as_secs_f64();
+            let diff = rot
+                .iter()
+                .zip(&dense)
+                .map(|(x, y)| angle(&(x * y.inverse())))
+                .fold(0.0, f64::max);
+            // 행렬 저장량: 희소 = (대각 m + 비대각 간선 수) 블록 × 9 × 8 바이트, 밀집 = (3m)² × 8 바이트.
+            let m = n - 1;
+            let sparse_mb = ((m + active.len()) * 72) as f64 / 1e6;
+            let dense_mb = (9 * m * m * 8) as f64 / 1e6;
+            let err = aligned_errors(&res.rotations, &truth);
+            let (mean, max) = stats(&err);
+            println!(
+                "정점 {n} 간선 {}: 전체 {total:.3}s, 최소제곱 한 단계 희소 {step:.4}s 밀집 {step_dense:.4}s, 행렬 희소 {sparse_mb:.3}MB 밀집 {dense_mb:.1}MB, 희소-밀집 차 {diff:.1e} rad, 평균 {mean:.3}° 최대 {max:.3}° 반복 {}",
+                edges.len(),
+                res.iterations
+            );
+            assert!(edges.len() >= 4 * n - 10);
+            assert!(diff < 1e-9, "희소-밀집 차 {diff}");
+            // 시간은 기록만 한다(측정 기계를 나눠 쓰면 흔들림).
+            assert!(mean < 20.0, "평균 {mean}°");
+            assert!(res.inliers.iter().filter(|&&b| !b).count() <= edges.len() / 100);
+        }
     }
 
     #[test]
