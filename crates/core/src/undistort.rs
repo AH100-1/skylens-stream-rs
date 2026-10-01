@@ -40,6 +40,7 @@ pub fn pinhole_for_long_side(
         cy: (k.cy + 0.5) * sy - 0.5,
         width: w,
         height: h,
+        dist: crate::distortion::Distortion::default(),
     }
 }
 
