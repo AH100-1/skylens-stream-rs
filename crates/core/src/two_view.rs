@@ -349,24 +349,42 @@ pub fn essential_5pt(n1: &[Vector2<f64>], n2: &[Vector2<f64>]) -> Vec<Matrix3<f6
             }
         }
     }
-    // μ = 1/z: μ³M0 + μ²M1 + μM2 + M3 = 0 → 동반 행렬(30×30).
-    let Some(m0inv) = m[0].try_inverse() else {
-        return vec![];
-    };
-    let a: Vec<SMatrix<f64, 10, 10>> = (1..4).map(|k| m0inv * m[k]).collect();
-    let mut comp = nalgebra::DMatrix::<f64>::zeros(30, 30);
-    for k in 0..3 {
-        comp.view_mut((0, 10 * k), (10, 10)).copy_from(&(-a[k]));
-    }
-    for k in 0..20 {
-        comp[(10 + k, k)] = 1.0;
-    }
-    let mut out = vec![];
-    for mu in comp.complex_eigenvalues().iter() {
-        if mu.im.abs() > 1e-6 * mu.norm().max(1e-12) || mu.re.abs() < 1e-10 {
-            continue;
+    // M0 + zM1 + z²M2 + z³M3 = 0 의 실근 z. 먼저 μ = 1/z 형(μ³M0 + μ²M1 + μM2 + M3, 동반 행렬 30×30),
+    // M0 가 특이하거나 Schur 반복이 상한 안에 수렴하지 않으면 z 형(M3 을 선행 계수로)으로 다시 푼다.
+    // 반복 상한이 있는 Schur 분해라 수렴하지 않는 입력에서도 무한히 돌지 않는다.
+    let roots = |lead: usize, rest: [usize; 3]| -> Option<Vec<f64>> {
+        let inv = m[lead].try_inverse()?;
+        let mut comp = nalgebra::DMatrix::<f64>::zeros(30, 30);
+        for (k, &c) in rest.iter().enumerate() {
+            comp.view_mut((0, 10 * k), (10, 10))
+                .copy_from(&(-(inv * m[c])));
         }
-        let z = 1.0 / mu.re;
+        for k in 0..20 {
+            comp[(10 + k, k)] = 1.0;
+        }
+        let schur = nalgebra::Schur::try_new(comp, 1e-14, 3000)?;
+        Some(
+            schur
+                .complex_eigenvalues()
+                .iter()
+                .filter(|mu| mu.im.abs() <= 1e-6 * mu.norm().max(1e-12))
+                .map(|mu| mu.re)
+                .collect(),
+        )
+    };
+    let zs: Vec<f64> = match roots(0, [1, 2, 3]) {
+        Some(mus) => mus
+            .into_iter()
+            .filter(|mu| mu.abs() >= 1e-10)
+            .map(|mu| 1.0 / mu)
+            .collect(),
+        None => match roots(3, [2, 1, 0]) {
+            Some(zs) => zs,
+            None => return vec![],
+        },
+    };
+    let mut out = vec![];
+    for z in zs {
         let mz = m[0] + m[1] * z + m[2] * (z * z) + m[3] * (z * z * z);
         let svd = mz.svd(false, true);
         let vt = svd.v_t.unwrap();
@@ -374,7 +392,7 @@ pub fn essential_5pt(n1: &[Vector2<f64>], n2: &[Vector2<f64>]) -> Vec<Matrix3<f6
         if v[9].abs() < 1e-12 {
             continue;
         }
-        let (x, y) = (v[7] / v[9], v[8] / v[9]);
+        let (x, y, z) = polish_essential(&basis, v[7] / v[9], v[8] / v[9], z);
         let ev = basis[0] * x + basis[1] * y + basis[2] * z + basis[3];
         let em = Matrix3::new(
             ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8],
@@ -385,6 +403,51 @@ pub fn essential_5pt(n1: &[Vector2<f64>], n2: &[Vector2<f64>]) -> Vec<Matrix3<f6
         }
     }
     out
+}
+
+/// 본질 행렬 제약 잔차(det E, 2EEᵀE − tr(EEᵀ)E 의 9 성분), E = xB0 + yB1 + zB2 + B3.
+fn essential_constraints(b: &[SMatrix<f64, 9, 1>], p: &Vector3<f64>) -> SMatrix<f64, 10, 1> {
+    let v = b[0] * p.x + b[1] * p.y + b[2] * p.z + b[3];
+    let e = Matrix3::new(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
+    let eet = e * e.transpose();
+    let c = 2.0 * eet * e - eet.trace() * e;
+    let mut r = SMatrix::<f64, 10, 1>::zeros();
+    r[0] = e.determinant();
+    for k in 0..9 {
+        r[k + 1] = c[(k / 3, k % 3)];
+    }
+    r
+}
+
+/// 동반 행렬 고윳값에서 얻은 (x, y, z) 를 제약 잔차의 가우스–뉴턴으로 다듬는다(중앙 차분 야코비안).
+/// 잔차가 줄지 않으면 그 단계는 버린다. 고윳값 분해의 반올림 오차(1e-6 수준)를 없앤다.
+fn polish_essential(b: &[SMatrix<f64, 9, 1>], x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+    let mut p = Vector3::new(x, y, z);
+    let mut r = essential_constraints(b, &p);
+    for _ in 0..5 {
+        let mut j = SMatrix::<f64, 10, 3>::zeros();
+        for k in 0..3 {
+            let h = 1e-7 * p[k].abs().max(1.0);
+            let mut d = Vector3::zeros();
+            d[k] = h;
+            let col = (essential_constraints(b, &(p + d)) - essential_constraints(b, &(p - d)))
+                / (2.0 * h);
+            j.set_column(k, &col);
+        }
+        let Some(step) = (j.transpose() * j)
+            .try_inverse()
+            .map(|m| m * j.transpose() * r)
+        else {
+            break;
+        };
+        let q = p - step;
+        let rq = essential_constraints(b, &q);
+        if rq.norm().is_nan() || rq.norm() >= r.norm() {
+            break;
+        }
+        (p, r) = (q, rq);
+    }
+    (p.x, p.y, p.z)
 }
 
 /// 정규화 좌표에서 부호 있는 Sampson 잔차 e / ‖∇e‖.
@@ -745,6 +808,47 @@ mod tests {
             worst = worst.max(best);
         }
         assert!(worst < 1e-6, "정답 E 와 최소 차이 {worst}");
+    }
+
+    /// F-011: 시드 1..=1000 에서 모든 호출이 끝나고, 정답 E 포함률(차이 < 1e-6) ≥ 99%.
+    /// 반복 상한 없는 고윳값 분해로는 시드 114 에서 반환하지 않았다.
+    ///
+    /// 종료 보장은 구조로 한다: 30×30 동반 행렬의 Schur 분해는 반복 3000회 상한이고 실패하면
+    /// 선행 계수를 바꿔 한 번 더(역시 상한) 푼 뒤 빈 결과를 돌려준다. 헤센베르크 QR 한 번은
+    /// 약 6·30² 부동소수 연산이라 최악도 2 × 3000 × 5400 ≈ 3.2e7 연산(수십 ms)이다.
+    /// 벽시계 단언은 다른 테스트와 CPU 를 나눠 쓰는 전체 실행에서도 흔들리지 않도록
+    /// 병렬 없이 직렬로 재고, 최댓값은 위 구조 상한에 여유를 둔 100 ms, 중앙값은 2 ms 로 둔다
+    /// (단독 실행 실측: 중앙값 약 0.16 ms, 최댓값 약 6~8 ms).
+    #[test]
+    fn five_point_terminates_on_many_seeds() {
+        let t0 = std::time::Instant::now();
+        let mut ms = Vec::with_capacity(1000);
+        let mut hits = 0;
+        for seed in 1..=1000u64 {
+            let s = scene(5, 0.0, seed);
+            let (r, t) = s.rel();
+            let g = essential_from_pose(&r, &t);
+            let g = g / g.norm();
+            let c = std::time::Instant::now();
+            let sols = essential_5pt(&s.x1, &s.x2);
+            ms.push(c.elapsed().as_secs_f64() * 1e3);
+            if sols
+                .iter()
+                .any(|e| (e - g).norm().min((e + g).norm()) < 1e-6)
+            {
+                hits += 1;
+            }
+        }
+        let total = t0.elapsed().as_secs_f64();
+        ms.sort_by(f64::total_cmp);
+        let (median, worst) = (ms[ms.len() / 2], ms[ms.len() - 1]);
+        eprintln!(
+            "5pt 1000 seeds: hits={hits} median={median:.3}ms worst={worst:.2}ms total={total:.2}s"
+        );
+        assert!(hits >= 990, "정답 E 포함 {hits}/1000");
+        assert!(median <= 2.0, "중앙값 {median} ms");
+        assert!(worst <= 100.0, "최악 호출 {worst} ms");
+        assert!(total <= 10.0, "전체 {total} s");
     }
 
     #[test]
