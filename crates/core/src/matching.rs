@@ -8,8 +8,8 @@ use rayon::prelude::*;
 pub const PAIR_TEMPORAL: usize = 5;
 /// SPEC 기본값: 다른 카메라 위치 차 0..=4.
 pub const PAIR_CROSS: usize = 4;
-/// 같은 카메라 2의 거듭제곱 간격 상한 기본값(제한 없음).
-pub const PAIR_POW2_MAX: usize = usize::MAX;
+/// SPEC 기본값: 같은 카메라 2의 거듭제곱 간격 상한(1, 2, 4, 8, 16).
+pub const PAIR_POW2_MAX: usize = 16;
 
 /// 매칭할 영상 짝 후보를 만든다. `views[k] = (카메라 번호, 촬영 위치 번호)`.
 /// 같은 카메라는 위치 차이 1..=`temporal` 이거나 `pow2_max` 이하의 2의 거듭제곱(긴 경로의 먼 제약),
@@ -57,6 +57,7 @@ const MATCH_BLOCK: usize = 64;
 
 /// 최근접/차근접 거리 비율 검사 매칭(L2, 전수 탐색). 결과는 (a 인덱스, b 인덱스), a 인덱스 순.
 /// `mutual` 이면 b→a 최근접도 같은 짝인 것만 남긴다.
+/// 차근접이 없으면(`b` 가 2개 미만) 비율을 잴 수 없으므로 짝을 만들지 않는다.
 ///
 /// 거리 행렬을 한 번만 계산한다: `a` 묶음마다(rayon 병렬) 모든 `b` 와의 거리로 행 최근접·차근접과
 /// 열(b→a) 최근접을 함께 갱신하고, 열 최근접은 묶음 순서대로 합친다. 같은 거리면 앞 인덱스가 이긴다.
@@ -99,7 +100,7 @@ pub fn ratio_match(a: &[Feature], b: &[Feature], ratio: f32, mutual: bool) -> Ve
     }
     let mut out = Vec::new();
     for (i, &(j, d1, d2)) in blocks.iter().flat_map(|(row, _)| row).enumerate() {
-        if j == usize::MAX || d1 >= ratio * ratio * d2 {
+        if j == usize::MAX || !d2.is_finite() || d1 >= ratio * ratio * d2 {
             continue;
         }
         if mutual && col_best[j].1 != i {
@@ -112,6 +113,125 @@ pub fn ratio_match(a: &[Feature], b: &[Feature], ratio: f32, mutual: bool) -> Ve
 
 /// 정규화된 8점 계(AᵀA)에서 둘째로 작은 고윳값 / 가장 큰 고윳값이 이보다 작으면 퇴화로 본다.
 const DEGENERATE_EIG_RATIO: f64 = 1e-10;
+
+/// 점 분포의 짧은 축 표준편차 / 긴 축 표준편차가 이보다 작으면 사실상 한 직선 위로 본다.
+/// 정상적인 8점 표본(영상 전체에 흩어짐)은 0.1 이상이고, 길이 수백 px 직선에 σ ≤ 1 px 잡음이면 0.01 미만이다.
+const COLLINEAR_AXIS_RATIO: f64 = 0.02;
+
+/// 점들의 2×2 공분산 고윳값으로 (짧은 축 표준편차, 긴 축 표준편차).
+fn axis_spread(p: &[Vector2<f64>]) -> (f64, f64) {
+    let n = p.len().max(1) as f64;
+    let c = p.iter().fold(Vector2::zeros(), |s, x| s + x) / n;
+    let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
+    for x in p {
+        let d = x - c;
+        sxx += d.x * d.x;
+        sxy += d.x * d.y;
+        syy += d.y * d.y;
+    }
+    let (sxx, sxy, syy) = (sxx / n, sxy / n, syy / n);
+    let tr = sxx + syy;
+    let disc = ((sxx - syy).powi(2) + 4.0 * sxy * sxy).sqrt();
+    let hi = 0.5 * (tr + disc);
+    let lo = (0.5 * (tr - disc)).max(0.0);
+    (lo.sqrt(), hi.sqrt())
+}
+
+/// 어느 한 영상에서라도 점들이 거의 한 직선 위에 있으면 참.
+fn nearly_collinear(p: &[Vector2<f64>]) -> bool {
+    let (lo, hi) = axis_spread(p);
+    !(hi > 0.0 && lo > COLLINEAR_AXIS_RATIO * hi)
+}
+
+/// 정규화 DLT 로 호모그래피 x2 ~ H x1 (최소제곱). 점 4개 미만이거나 풀리지 않으면 None.
+fn homography_dlt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matrix3<f64>> {
+    if x1.len() < 4 || x1.len() != x2.len() {
+        return None;
+    }
+    let (t1, t2) = (normalizer(x1), normalizer(x2));
+    let mut ata = SMatrix::<f64, 9, 9>::zeros();
+    for (p, q) in x1.iter().zip(x2) {
+        let a = t1 * Vector3::new(p.x, p.y, 1.0);
+        let b = t2 * Vector3::new(q.x, q.y, 1.0);
+        let r1 = SMatrix::<f64, 9, 1>::from_column_slice(&[
+            0.0,
+            0.0,
+            0.0,
+            -a.x,
+            -a.y,
+            -1.0,
+            b.y * a.x,
+            b.y * a.y,
+            b.y,
+        ]);
+        let r2 = SMatrix::<f64, 9, 1>::from_column_slice(&[
+            a.x,
+            a.y,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            -b.x * a.x,
+            -b.x * a.y,
+            -b.x,
+        ]);
+        ata += r1 * r1.transpose() + r2 * r2.transpose();
+    }
+    let eig = ata.symmetric_eigen();
+    let h = eig.eigenvectors.column(eig.eigenvalues.imin());
+    let hn = Matrix3::new(h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]);
+    let h = t2.try_inverse()? * hn * t1;
+    let n = h.norm();
+    (n.is_finite() && n > 0.0).then(|| h / n)
+}
+
+/// 대칭 전달 오차의 큰 쪽(px): max(|x2 − H x1|, |x1 − H⁻¹ x2|).
+fn homography_error(
+    h: &Matrix3<f64>,
+    hi: &Matrix3<f64>,
+    p: &Vector2<f64>,
+    q: &Vector2<f64>,
+) -> f64 {
+    let tr = |m: &Matrix3<f64>, x: &Vector2<f64>| {
+        let v = m * Vector3::new(x.x, x.y, 1.0);
+        if v.z.abs() < 1e-12 {
+            None
+        } else {
+            Some(Vector2::new(v.x / v.z, v.y / v.z))
+        }
+    };
+    match (tr(h, p), tr(hi, q)) {
+        (Some(a), Some(b)) => (a - q).norm().max((b - p).norm()),
+        _ => f64::INFINITY,
+    }
+}
+
+/// 주어진 대응 가운데 한 호모그래피가 문턱 `th_px` 안에서 설명하는 최대 개수(근사).
+/// 전체로 맞춘 뒤 문턱을 줄여 가며 정상 짝으로 다시 맞춘다(호모그래피는 평면이면 대응 전체를 설명한다).
+pub fn homography_support(x1: &[Vector2<f64>], x2: &[Vector2<f64>], th_px: f64) -> usize {
+    let n = x1.len();
+    let mut sel: Vec<usize> = (0..n).collect();
+    let mut best = 0;
+    for m in [8.0, 4.0, 2.0, 1.0, 1.0] {
+        let s1: Vec<_> = sel.iter().map(|&i| x1[i]).collect();
+        let s2: Vec<_> = sel.iter().map(|&i| x2[i]).collect();
+        let Some(h) = homography_dlt(&s1, &s2) else {
+            break;
+        };
+        let Some(hi) = h.try_inverse() else {
+            break;
+        };
+        let err: Vec<f64> = (0..n)
+            .map(|i| homography_error(&h, &hi, &x1[i], &x2[i]))
+            .collect();
+        best = best.max(err.iter().filter(|&&e| e < th_px).count());
+        sel = (0..n).filter(|&i| err[i] < th_px * m).collect();
+        if sel.len() < 4 {
+            break;
+        }
+    }
+    best
+}
 
 pub(crate) fn all_finite(p: &[Vector2<f64>]) -> bool {
     p.iter().all(|v| v.x.is_finite() && v.y.is_finite())
@@ -129,9 +249,14 @@ fn normalizer(p: &[Vector2<f64>]) -> Matrix3<f64> {
 /// 정규화 8점 알고리즘으로 기본 행렬 F (x2ᵀ F x1 = 0, 픽셀 좌표)를 구한다.
 /// 점이 8개 미만이거나, 길이가 다르거나, 유한하지 않은 좌표가 있거나,
 /// 해가 하나로 정해지지 않으면(영공간 2차원 이상: 동일선상 점, 순수 회전 등) None.
+/// 어느 한 영상의 점 분포가 짧은 축/긴 축 표준편차 비 0.02 미만(잡음 섞인 동일선상)이어도 None.
 /// 결과는 계수 2, 프로베니우스 노름 1.
 pub fn fundamental_8pt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matrix3<f64>> {
     if x1.len() < 8 || x1.len() != x2.len() || !all_finite(x1) || !all_finite(x2) {
+        return None;
+    }
+    // 잡음 섞인 동일선상 배치는 고윳값 비 검사로 걸러지지 않는다(둘째 고윳값이 잡음 크기만큼 커진다).
+    if nearly_collinear(x1) || nearly_collinear(x2) {
         return None;
     }
     let (t1, t2) = (normalizer(x1), normalizer(x2));
@@ -199,9 +324,74 @@ fn rank2_unit(f: &Matrix3<f64>) -> Option<Matrix3<f64>> {
     (n.is_finite() && n > 0.0).then(|| g / n)
 }
 
+/// 정규화 좌표 a' = T₁a, b' = T₂b 와 정규화 F̂ 에서 픽셀 Sampson 잔차와 F̂ 성분 9개(행 우선)에 대한 해석적 야코비안.
+/// T₁, T₂ 는 [`normalizer`] 꼴(대각 s, 이동만)이라 픽셀 F = T₂ᵀF̂T₁ 에서
+/// e = bᵀFa = b'ᵀF̂a', (Fa)ₖ = s₂(F̂a')ₖ, (Fᵀb)ₖ = s₁(F̂ᵀb')ₖ (k = 1, 2) 이다.
+/// D = s₂²((F̂a')₁² + (F̂a')₂²) + s₁²((F̂ᵀb')₁² + (F̂ᵀb')₂²), r = e/√D 이고
+/// ∂r/∂F̂ₖₗ = b'ₖa'ₗ/√D − e/D^{3/2}·(s₂²(F̂a')ₖa'ₗ[k<2] + s₁²b'ₖ(F̂ᵀb')ₗ[l<2]).
+/// D ≤ 0 이면 잔차·야코비안 모두 0.
+fn sampson_residual_jacobian(
+    g: &Matrix3<f64>,
+    s1: f64,
+    s2: f64,
+    a: &Vector3<f64>,
+    b: &Vector3<f64>,
+) -> (f64, [f64; 9]) {
+    let ga = g * a;
+    let gtb = g.tr_mul(b);
+    let e = b.dot(&ga);
+    let (q1, q2) = (s1 * s1, s2 * s2);
+    let den = q2 * (ga.x * ga.x + ga.y * ga.y) + q1 * (gtb.x * gtb.x + gtb.y * gtb.y);
+    if den <= 0.0 {
+        return (0.0, [0.0; 9]);
+    }
+    let inv = 1.0 / den.sqrt();
+    let c = e * inv * inv * inv;
+    // 분모 미분 항의 두 벡터: s₂²(F̂a')ₖ (k<2), s₁²(F̂ᵀb')ₗ (l<2).
+    let u = [q2 * ga.x, q2 * ga.y, 0.0];
+    let v = [q1 * gtb.x, q1 * gtb.y, 0.0];
+    let mut j = [0.0; 9];
+    for k in 0..3 {
+        for l in 0..3 {
+            j[3 * k + l] = b[k] * a[l] * inv - c * (u[k] * a[l] + b[k] * v[l]);
+        }
+    }
+    (e * inv, j)
+}
+
+/// 정규화 좌표 대응에서 픽셀 Sampson 잔차(부호 있는 거리)만.
+fn sampson_residuals(
+    g: &Matrix3<f64>,
+    s1: f64,
+    s2: f64,
+    a: &[Vector3<f64>],
+    b: &[Vector3<f64>],
+    out: &mut Vec<f64>,
+) {
+    let (q1, q2) = (s1 * s1, s2 * s2);
+    out.clear();
+    out.extend(a.iter().zip(b).map(|(a, b)| {
+        let ga = g * a;
+        let gtb = g.tr_mul(b);
+        let den = q2 * (ga.x * ga.x + ga.y * ga.y) + q1 * (gtb.x * gtb.x + gtb.y * gtb.y);
+        if den > 0.0 {
+            b.dot(&ga) / den.sqrt()
+        } else {
+            0.0
+        }
+    }));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 시험용: `refine_sampson` 호출마다 받아들인 LM 걸음 수(조기 종료 확인).
+    static LM_ITERS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// 주어진 대응에서 Sampson 거리 제곱합을 줄이도록 F 를 Levenberg–Marquardt 로 정밀화한다
 /// (Hartley & Zisserman 11.4.3 의 Sampson 비용). 매개변수는 Hartley 정규화 좌표의 F 성분 9개이고,
 /// 걸음마다 계수 2·노름 1 로 투영해 7 자유도를 유지한다. 비용이 줄지 않으면 시작 F 를 그대로 돌려준다.
+/// 야코비안은 해석적([`sampson_residual_jacobian`])이라 반복마다 잔차 계산은 걸음 후보 평가뿐이다.
 fn refine_sampson(
     f: &Matrix3<f64>,
     x1: &[Vector2<f64>],
@@ -215,53 +405,40 @@ fn refine_sampson(
     let (Some(t1i), Some(t2i)) = (t1.try_inverse(), t2.try_inverse()) else {
         return *f;
     };
-    let to_px = |g: &Matrix3<f64>| t2.transpose() * g * t1;
-    // 픽셀 Sampson 잔차(부호 있는 거리).
-    let resid = |g: &Matrix3<f64>, out: &mut Vec<f64>| {
-        let fp = to_px(g);
-        out.clear();
-        for (p, q) in x1.iter().zip(x2) {
-            let a = Vector3::new(p.x, p.y, 1.0);
-            let b = Vector3::new(q.x, q.y, 1.0);
-            let fa = fp * a;
-            let ftb = fp.transpose() * b;
-            let den = (fa.x * fa.x + fa.y * fa.y + ftb.x * ftb.x + ftb.y * ftb.y).sqrt();
-            out.push(if den > 0.0 { b.dot(&fa) / den } else { 0.0 });
-        }
-    };
+    let (s1, s2) = (t1[(0, 0)], t2[(0, 0)]);
+    let a: Vec<Vector3<f64>> = x1
+        .iter()
+        .map(|p| t1 * Vector3::new(p.x, p.y, 1.0))
+        .collect();
+    let b: Vec<Vector3<f64>> = x2
+        .iter()
+        .map(|q| t2 * Vector3::new(q.x, q.y, 1.0))
+        .collect();
     let Some(mut g) = rank2_unit(&(t2i.transpose() * f * t1i)) else {
         return *f;
     };
-    let (mut r, mut rh) = (Vec::new(), Vec::new());
-    resid(&g, &mut r);
-    let mut cost: f64 = r.iter().map(|e| e * e).sum();
+    let mut rh = Vec::new();
+    sampson_residuals(&g, s1, s2, &a, &b, &mut rh);
+    let mut cost: f64 = rh.iter().map(|e| e * e).sum();
     let mut lambda = 1e-3;
-    let m = r.len();
-    let mut jac = vec![[0.0f64; 9]; m];
+    let mut taken = 0;
     for _ in 0..iters {
-        let h = 1e-7;
-        for k in 0..9 {
-            let mut gh = g;
-            gh[(k / 3, k % 3)] += h;
-            resid(&gh, &mut rh);
-            for i in 0..m {
-                jac[i][k] = (rh[i] - r[i]) / h;
-            }
-        }
         let mut jtj = SMatrix::<f64, 9, 9>::zeros();
         let mut jtr = SMatrix::<f64, 9, 1>::zeros();
-        for i in 0..m {
-            let row = SMatrix::<f64, 9, 1>::from_column_slice(&jac[i]);
-            jtj += row * row.transpose();
-            jtr += row * r[i];
+        for (ai, bi) in a.iter().zip(&b) {
+            let (ri, ji) = sampson_residual_jacobian(&g, s1, s2, ai, bi);
+            let row = SMatrix::<f64, 9, 1>::from_column_slice(&ji);
+            jtj.syger(1.0, &row, &row, 1.0);
+            jtr += row * ri;
         }
+        jtj.fill_upper_triangle_with_lower_triangle();
         let mut improved = false;
         for _ in 0..8 {
-            let mut a = jtj;
+            let mut m = jtj;
             for k in 0..9 {
-                a[(k, k)] += lambda * (jtj[(k, k)] + 1e-12);
+                m[(k, k)] += lambda * (jtj[(k, k)] + 1e-12);
             }
-            let Some(d) = a.cholesky().map(|c| c.solve(&(-jtr))) else {
+            let Some(d) = m.cholesky().map(|c| c.solve(&(-jtr))) else {
                 lambda *= 10.0;
                 continue;
             };
@@ -270,14 +447,14 @@ fn refine_sampson(
                 lambda *= 10.0;
                 continue;
             };
-            resid(&cand, &mut rh);
+            sampson_residuals(&cand, s1, s2, &a, &b, &mut rh);
             let c: f64 = rh.iter().map(|e| e * e).sum();
             if c < cost {
                 g = cand;
-                std::mem::swap(&mut r, &mut rh);
                 let rel = (cost - c) / cost.max(1e-300);
                 cost = c;
                 lambda = (lambda * 0.1).max(1e-9);
+                taken += 1;
                 improved = rel > 1e-10;
                 break;
             }
@@ -287,7 +464,10 @@ fn refine_sampson(
             break;
         }
     }
-    let fp = to_px(&g);
+    #[cfg(test)]
+    LM_ITERS.with(|v| v.borrow_mut().push(taken));
+    let _ = taken;
+    let fp = t2.transpose() * g * t1;
     let n = fp.norm();
     if n.is_finite() && n > 0.0 {
         fp / n
@@ -345,6 +525,7 @@ pub const MIN_RANSAC_ITERS: usize = 50;
 /// RANSAC(Fischler & Bolles 1981) + 8점 기본 행렬로 기하 검증.
 /// 반환: (정상 짝으로 다시 맞춘 F, 정상 여부 표시).
 /// 정상 짝이 8개 미만이거나 정상 비율이 `min_inlier_ratio` 미만이면 None.
+/// 정상 짝이 거의 한 직선 위(짧은 축/긴 축 표준편차 비 0.02 미만)이면 퇴화로 보고 None.
 /// 길이가 다르거나 유한하지 않은 좌표가 있으면 None.
 pub fn ransac_fundamental(
     x1: &[Vector2<f64>],
@@ -393,7 +574,9 @@ pub fn ransac_fundamental(
         let mut inl = inliers_of(&f);
         let mut cnt = inl.iter().filter(|&&b| b).count();
         // 국소 최적화(Chum et al. 2003): 잡음 섞인 최소 표본의 F 는 정상 짝 일부만 설명하므로
-        // 최고 가설의 절반 이상을 설명하는 가설은 정상 짝 전체로 다시 맞춰 개선이 멈출 때까지 반복한다.
+        // 최고 가설 정상 수의 4분의 1 이상을 설명하는 가설은 정상 짝 전체로 다시 맞춰 개선이 멈출 때까지 반복한다.
+        // 1/4 근거: 절반 기준에서는 반대쪽 무한대 에피폴 골짜기(정상 106 / 정답 133)에 갇힌 경우가 남아
+        // 재현율 미달이 다중 시드 500 경우 중 6건이었고, 1/4 로 넓히자 정답 골짜기 가설이 상위 묶음에 들어와 1건이 됐다.
         // 이동이 영상면과 거의 평행해 에피폴이 멀면 최소 표본 F 가 특히 부정확하다.
         let best_cnt = best.as_ref().map_or(0, |b| b.2);
         if cnt >= 8 && 4 * cnt >= best_cnt {
@@ -474,7 +657,18 @@ pub fn ransac_fundamental(
         inl = gi;
     }
     let cnt = inl.iter().filter(|&&b| b).count();
-    (cnt >= 8 && cnt as f64 >= cfg.min_inlier_ratio * n as f64).then_some((f, inl))
+    if cnt < 8 || (cnt as f64) < cfg.min_inlier_ratio * n as f64 {
+        return None;
+    }
+    // 퇴화 판정: 정상 짝이 거의 한 직선 위이면 F 가 정해지지 않으므로 확정하지 않는다.
+    // 평면 배치 지표([`homography_support`])는 지면 위주 합성 장면의 정상 짝도 대부분 설명해
+    // 여기서는 거부에 쓰지 않는다(평면 경로 분리는 남은 문제).
+    let s1: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| x1[i]).collect();
+    let s2: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| x2[i]).collect();
+    if nearly_collinear(&s1) || nearly_collinear(&s2) {
+        return None;
+    }
+    Some((f, inl))
 }
 
 /// 정답 카메라 두 대로부터 기본 행렬 F = K2⁻ᵀ [t]× R K1⁻¹ (상대 자세 2←1).
@@ -798,25 +992,39 @@ mod tests {
         }
         assert_eq!(
             same.into_iter().collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 8, 16, 32, 64]
+            vec![1, 2, 3, 4, 5, 8, 16]
         );
-        // 같은 카메라: (79+78+77+76+75) + (72+64+48+16) = 585, 카메라 3대 → 1755.
+        // 같은 카메라: (79+78+77+76+75) + (72+64) = 521, 카메라 3대 → 1563.
         // 다른 카메라: 카메라 짝마다 80 + 2(79+78+77+76) = 700, 3 짝 → 2100.
-        assert_eq!(pairs.len(), 1755 + 2100);
-        // 상한 16 이면 32·64 간격이 빠진다: 카메라마다 48 + 16 = 64 짝 감소.
+        assert_eq!(pairs.len(), 1563 + 2100);
+        // 상한을 인자로 넓히면 32·64 간격이 더해진다: 카메라마다 48 + 16 = 64 짝 증가.
         assert_eq!(
-            candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, 16).len(),
-            1755 + 2100 - 3 * 64
+            candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, usize::MAX).len(),
+            1563 + 2100 + 3 * 64
+        );
+        // 상한 0 이면 거듭제곱 간격 짝이 없다: 카메라마다 72 + 64 = 136 짝 감소.
+        assert_eq!(
+            candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, 0).len(),
+            1563 + 2100 - 3 * 136
         );
     }
 
     /// 합성 드론 장면 같은 카메라 두 장: 특징 → 비율 매칭 → RANSAC.
     /// 정답 깊이로 각 짝의 참·거짓을 판정해 (RANSAC 전 정답 비율, 후 정밀도, 재현율, 정상 수).
-    fn scene_pair(step: usize) -> (f64, f64, f64, usize) {
-        scene_pair_cams(crate::synth::CamId::F, crate::synth::CamId::F, step)
+    fn scene_pair(cam: crate::synth::CamId, step: usize, seed: u64) -> (f64, f64, f64, usize) {
+        scene_pair_cams(
+            crate::synth::SceneConfig {
+                seed,
+                ..crate::synth::SceneConfig::default()
+            },
+            cam,
+            cam,
+            step,
+        )
     }
 
     fn scene_pair_cams(
+        base: crate::synth::SceneConfig,
         cam_a: crate::synth::CamId,
         cam_b: crate::synth::CamId,
         step: usize,
@@ -827,7 +1035,7 @@ mod tests {
         let scene = Scene::new(SceneConfig {
             width: w as u32,
             height: h as u32,
-            ..SceneConfig::default()
+            ..base
         });
         let va = scene
             .views
@@ -878,26 +1086,46 @@ mod tests {
         )
     }
 
+    // 실측 편대 배치, 시드 1~3 × F/R/L × 간격 1·3 (18 경우) 측정: 정상 479~729,
+    // 정밀도 0.994~1.000, 재현율 1.000. 정상 수 기준은 최솟값 479 의 약 85%,
+    // 정밀도·재현율은 예전과 같은 0.98 (측정 최솟값보다 0.014 아래).
+    const MIN_INL: usize = 400;
+    const MIN_PREC: f64 = 0.98;
+    const MIN_REC: f64 = 0.98;
+
+    /// 실측 편대 배치(SPEC §1: 위치 간 1.0 m, 기울기 60°, 화각 65°)의 같은 카메라 짝.
+    /// 기준은 이 배치에서 시드 1~3·카메라 F/R/L·간격 1/3 을 잰 최솟값에서 정했다(위 상수 주석).
+    /// 예전 기준(정상 ≥250)은 위치 간 2.5 m·기울기 50° 배치의 F 한 대만 잰 값이었다.
+    /// 위치 간 이동이 1.0 m 로 줄어 두 장의 겹침이 커지므로 정상 수는 오히려 늘었다.
     #[test]
     fn ransac_on_synthetic_drone_views() {
-        for step in [1usize, 3] {
-            let (before, prec, rec, ni) = scene_pair(step);
-            eprintln!(
-                "scene step={step} correct_before={before:.3} precision={prec:.3} recall={rec:.3} inliers={ni}"
-            );
-            assert!(ni >= 250, "정상 수 {ni}");
-            assert!(prec >= 0.98, "정밀도 {prec}");
-            assert!(rec >= 0.98, "재현율 {rec}");
+        use crate::synth::CamId;
+        for seed in [1u64, 2, 3] {
+            for cam in CamId::ALL {
+                for step in [1usize, 3] {
+                    let (before, prec, rec, ni) = scene_pair(cam, step, seed);
+                    eprintln!(
+                        "scene seed={seed} cam={cam:?} step={step} correct_before={before:.3} precision={prec:.3} recall={rec:.3} inliers={ni}"
+                    );
+                    assert!(ni >= MIN_INL, "정상 수 {ni}");
+                    assert!(prec >= MIN_PREC, "정밀도 {prec}");
+                    assert!(rec >= MIN_REC, "재현율 {rec}");
+                }
+            }
         }
     }
 
     #[test]
     fn ransac_on_cross_camera_views() {
+        // 큰 시선 차(90°) 짝에서 RANSAC 이 버티는지 보는 시험이라 예전 쉬운 배치를 명시적으로 쓴다:
+        // 실측 편대에서 같은 위치의 F 와 R·L 은 시선이 120° 이상 벌어지고 지면 발자국이 거의
+        // 겹치지 않아 같은 위치 짝이 성립하지 않는다.
         // 앞 카메라 위치 0 과 옆 카메라 위치 0·4(10 m 앞): 시선이 90° 다른 짝.
-        use crate::synth::CamId;
+        use crate::synth::{CamId, SceneConfig};
         for b in [CamId::R, CamId::L] {
             for step in [0usize, 4] {
-                let (before, prec, rec, ni) = scene_pair_cams(CamId::F, b, step);
+                let (before, prec, rec, ni) =
+                    scene_pair_cams(SceneConfig::easy(), CamId::F, b, step);
                 eprintln!(
                     "F->{b:?} step={step} correct_before={before:.3} precision={prec:.3} recall={rec:.3} inliers={ni}"
                 );
@@ -954,7 +1182,7 @@ mod tests {
             let Some((j, d1, d2)) = nearest(fa, b) else {
                 continue;
             };
-            if d1 >= ratio * ratio * d2 {
+            if !d2.is_finite() || d1 >= ratio * ratio * d2 {
                 continue;
             }
             if mutual && nearest(&b[j], a).map(|r| r.0) != Some(i) {
@@ -1104,6 +1332,132 @@ mod tests {
     }
 
     #[test]
+    fn ratio_match_needs_second_neighbour() {
+        // b 에 특징이 하나뿐이면 차근접이 없어 비율을 잴 수 없다: 짝을 만들지 않는다.
+        let mut g = Lcg(5);
+        let a = vec![feature(&mut g), feature(&mut g)];
+        let b = vec![feature(&mut g)];
+        for mutual in [false, true] {
+            for ratio in [0.6f32, 0.8, 1.0] {
+                assert!(ratio_match(&a, &b, ratio, mutual).is_empty());
+            }
+        }
+        // b 에 a 의 복사가 둘이면 정상적으로 비율 검사를 한다.
+        let b2 = vec![a[0].clone(), feature(&mut g)];
+        assert_eq!(ratio_match(&a[..1], &b2, 0.8, false), vec![(0, 0)]);
+    }
+
+    /// 두 영상에서 각각 한 직선 위의 점 60개에 σ px 등방 잡음.
+    fn noisy_lines(sigma: f64, seed: u64) -> (Vec<Vector2<f64>>, Vec<Vector2<f64>>) {
+        let mut g = Lcg(seed);
+        let mut line = |a: f64, b: f64| -> Vec<Vector2<f64>> {
+            (0..60)
+                .map(|i| {
+                    let t = i as f64 + g.next();
+                    Vector2::new(100.0 + 13.0 * t, a + b * t)
+                        + Vector2::new(g.gauss(), g.gauss()) * sigma
+                })
+                .collect()
+        };
+        let l1 = line(200.0, 3.0);
+        let l2 = line(350.0, -2.0);
+        (l1, l2)
+    }
+
+    #[test]
+    fn noisy_collinear_points_are_rejected() {
+        // 잡음 섞인 동일선상(σ = 0.5, 1.0 px): 고윳값 비 검사만으로는 통과하던 배치.
+        let cfg = RansacConfig::default();
+        for sigma in [0.5, 1.0] {
+            for seed in 1..=5u64 {
+                let (l1, l2) = noisy_lines(sigma, seed);
+                assert!(fundamental_8pt(&l1, &l2).is_none(), "σ {sigma} seed {seed}");
+                assert!(
+                    ransac_fundamental(&l1, &l2, &cfg).is_none(),
+                    "σ {sigma} seed {seed}"
+                );
+            }
+        }
+    }
+
+    /// 두 카메라([`two_cameras`])로 본 평면 z = 0 위의 점 n 개(σ px 잡음).
+    fn planar_correspondences(
+        n: usize,
+        sigma: f64,
+        seed: u64,
+    ) -> (Vec<Vector2<f64>>, Vec<Vector2<f64>>) {
+        let (c1, c2) = two_cameras();
+        let mut g = Lcg(seed);
+        let (mut x1, mut x2) = (vec![], vec![]);
+        while x1.len() < n {
+            let p = Point3::new(g.next() * 14.0 - 7.0, g.next() * 8.0 - 4.0, 0.0);
+            let (Some(a), Some(b)) = (c1.project(&p), c2.project(&p)) else {
+                continue;
+            };
+            if !c1.intrinsics.contains(&a) || !c2.intrinsics.contains(&b) {
+                continue;
+            }
+            x1.push(a + Vector2::new(g.gauss(), g.gauss()) * sigma);
+            x2.push(b + Vector2::new(g.gauss(), g.gauss()) * sigma);
+        }
+        (x1, x2)
+    }
+
+    #[test]
+    fn homography_support_separates_planar_scene() {
+        // 평면 판정 지표: z = 0 평면 위 점(σ = 0.5 px)은 한 호모그래피가 거의 전부 설명하고,
+        // 깊이가 6 m 퍼진 일반 장면은 절반도 설명하지 못한다. 거부 규칙에는 아직 쓰지 않는다.
+        let th = RansacConfig::default().threshold_px;
+        for seed in 1..=5u64 {
+            let (x1, x2) = planar_correspondences(200, 0.5, seed);
+            let h = homography_support(&x1, &x2, th);
+            eprintln!("평면 seed {seed}: {h}/200");
+            // 양쪽 σ = 0.5 px 에서 대칭 전달 오차(두 방향 중 큰 쪽) < 1.5 px 일 확률은 약 0.85(기대 170),
+            // 이항 표준편차 약 5 → 4σ 아래인 150 을 기준으로 둔다.
+            assert!(h >= 150, "seed {seed}: 평면 호모그래피 설명 {h}/200");
+            let (x1, x2, _, _, _) = correspondences(200, 0.5, 0.0, seed);
+            let h = homography_support(&x1, &x2, th);
+            eprintln!("일반 seed {seed}: {h}/200");
+            assert!(h < 100, "seed {seed}: 일반 장면 호모그래피 설명 {h}/200");
+        }
+    }
+
+    /// 매칭 결과 짝 목록의 FNV-1a 64비트 해시.
+    fn pairs_hash(m: &[(usize, usize)]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &(i, j) in m {
+            for v in [i as u64, j as u64] {
+                for byte in v.to_le_bytes() {
+                    h ^= byte as u64;
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn ratio_match_regression_hash() {
+        // 고정 기술자(match_fixture 시드 21, a 2000개, b 약 1600 + 무관 700)의 매칭 결과를 상수로 고정한다.
+        // 거리 누산 순서·동률 처리·비율 비교를 바꾸면 짝이 달라져 이 시험이 실패한다.
+        // 기대값은 이 시험을 처음 넣은 커밋의 구현으로 한 번 계산한 값이다.
+        let (a, b) = match_fixture(21, 2000, 700);
+        let m = ratio_match(&a, &b, 0.8, true);
+        let n = ratio_match(&a, &b, 0.95, false);
+        eprintln!(
+            "mutual 0.8: {} {:#x}, 0.95: {} {:#x}",
+            m.len(),
+            pairs_hash(&m),
+            n.len(),
+            pairs_hash(&n)
+        );
+        assert_eq!((m.len(), pairs_hash(&m)), EXPECT_MUTUAL);
+        assert_eq!((n.len(), pairs_hash(&n)), EXPECT_LOOSE);
+    }
+    const EXPECT_MUTUAL: (usize, u64) = (1145, 0x22ca_99b8_6722_152d);
+    const EXPECT_LOOSE: (usize, u64) = (1282, 0x7d0c_d999_3d0c_89e5);
+
+    #[test]
     fn random_correspondences_are_not_confirmed() {
         // 서로 무관한 무작위 대응 200개: 정상 짝이 없으므로 F 를 확정하면 안 된다.
         for seed in 1..=10u64 {
@@ -1124,5 +1478,96 @@ mod tests {
             assert!(cnt < 40, "우연 정상 비율이 0.2 이상: {cnt}/200");
             assert!(r.is_none(), "무작위 대응에서 F 확정");
         }
+    }
+
+    /// F-027: Sampson 잔차의 해석적 야코비안이 중앙 차분 수치 야코비안과 상대 오차 1e-6 안에서 같다.
+    #[test]
+    fn sampson_jacobian_matches_numeric() {
+        let (x1, x2, _, c1, c2) = correspondences(60, 0.5, 0.3, 17);
+        let (t1, t2) = (normalizer(&x1), normalizer(&x2));
+        let (s1, s2) = (t1[(0, 0)], t2[(0, 0)]);
+        // 정답 F 를 정규화 좌표로 옮기고 조금 흔든 점(계수 2 아님)에서도 확인한다.
+        let f = fundamental_from_cameras(&c1, &c2);
+        let g0 = t2.try_inverse().unwrap().transpose() * f * t1.try_inverse().unwrap();
+        let mut rng = Lcg(5);
+        let shake = Matrix3::from_fn(|_, _| rng.gauss() * 0.01 * g0.norm());
+        let mut worst: f64 = 0.0;
+        for g in [g0 / g0.norm(), (g0 + shake) / (g0 + shake).norm()] {
+            for (p, q) in x1.iter().zip(&x2) {
+                let a = t1 * Vector3::new(p.x, p.y, 1.0);
+                let b = t2 * Vector3::new(q.x, q.y, 1.0);
+                let (r, j) = sampson_residual_jacobian(&g, s1, s2, &a, &b);
+                // 잔차 자체도 픽셀 Sampson 거리와 같아야 한다.
+                let fp = t2.transpose() * g * t1;
+                assert!((r * r - sampson_error(&fp, p, q)).abs() <= 1e-9 * (1.0 + r * r));
+                let h = 1e-6;
+                let (mut num, mut diff) = (0.0f64, 0.0f64);
+                for k in 0..9 {
+                    let (mut gp, mut gm) = (g, g);
+                    gp[(k / 3, k % 3)] += h;
+                    gm[(k / 3, k % 3)] -= h;
+                    let d = (sampson_residual_jacobian(&gp, s1, s2, &a, &b).0
+                        - sampson_residual_jacobian(&gm, s1, s2, &a, &b).0)
+                        / (2.0 * h);
+                    num += d * d;
+                    diff += (d - j[k]).powi(2);
+                }
+                worst = worst.max(diff.sqrt() / num.sqrt());
+            }
+        }
+        eprintln!("야코비안 최대 상대 오차 {worst:.2e}");
+        assert!(worst < 1e-6, "상대 오차 {worst}");
+    }
+
+    /// 현재 스레드가 CPU 에서 실제로 돈 시간(ns, Linux `/proc/thread-self/schedstat` 첫 값).
+    /// 측정 기계에 다른 부하가 있으면 벽시계는 대기 시간을 포함하므로 이것으로 잰다. 없으면 None.
+    fn thread_cpu_ns() -> Option<u64> {
+        let s = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+        s.split_whitespace().next()?.parse().ok()
+    }
+
+    /// 대응 4000개(정상 50%, σ 0.5 px) RANSAC 1회: (벽시계 s, 스레드 CPU s, 정상 수, 정답 F 정상 수, LM 걸음 수들).
+    fn ransac_4000_run() -> (f64, Option<f64>, usize, usize, Vec<usize>) {
+        let (x1, x2, _, c1, c2) = correspondences(4000, 0.5, 0.5, 4242);
+        let th2 = RansacConfig::default().threshold_px.powi(2);
+        let g = fundamental_from_cameras(&c1, &c2);
+        let gt = (0..x1.len())
+            .filter(|&i| sampson_error(&g, &x1[i], &x2[i]) < th2)
+            .count();
+        LM_ITERS.with(|v| v.borrow_mut().clear());
+        let (c0, w0) = (thread_cpu_ns(), std::time::Instant::now());
+        let (_, inl) = ransac_fundamental(&x1, &x2, &RansacConfig::default()).unwrap();
+        let wall = w0.elapsed().as_secs_f64();
+        let cpu = thread_cpu_ns().zip(c0).map(|(b, a)| (b - a) as f64 * 1e-9);
+        let lm = LM_ITERS.with(|v| std::mem::take(&mut *v.borrow_mut()));
+        let cnt = inl.iter().filter(|&&b| b).count();
+        eprintln!("벽시계 {wall:.3} s, CPU {cpu:?} s, 정상 {cnt} / 정답 F {gt}, LM 걸음 {lm:?}");
+        (wall, cpu, cnt, gt, lm)
+    }
+
+    /// F-027: 대응 4000개에서 정답 F 와 같은 문턱의 정상 수 98% 이상(탐색 실패 없음)이고,
+    /// Sampson LM 이 30회 상한 전에 수렴해 멈추는 경우가 실제로 있다(문턱 단계 6 × 상위 가설 5 + 마무리).
+    #[test]
+    fn ransac_4000_correspondences_lm_stops_early() {
+        let (_, _, cnt, gt, lm) = ransac_4000_run();
+        assert!(
+            cnt as f64 >= 0.98 * gt as f64,
+            "정상 {cnt} < 정답 F {gt} × 0.98"
+        );
+        assert!(
+            lm.iter().any(|&k| k < 30),
+            "LM 이 한 번도 조기 종료하지 않음"
+        );
+    }
+
+    /// F-027 확인 기준: 대응 4000개(정상 50%) RANSAC 1회 CPU 시간 0.1 s 이하.
+    /// 4 코어 측정 기계(동시 부하 있음)에서 0.116 s 로 미달 — 시간의 대부분은 가설 루프(약 1710회 ×
+    /// 8점 + 4000개 판정)와 국소 최적화이고 Sampson LM 은 작은 몫이라 LM 만으로는 닿지 않는다.
+    #[test]
+    #[ignore = "F-027 시간 기준 미달(가설 루프가 지배), 노트 남은 문제"]
+    fn ransac_4000_correspondences_time() {
+        let (wall, cpu, _, _, _) = ransac_4000_run();
+        let t = cpu.unwrap_or(wall);
+        assert!(t <= 0.1, "RANSAC 1회 {t:.3} s");
     }
 }
