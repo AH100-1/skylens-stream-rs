@@ -96,6 +96,10 @@ pub struct GpsRecord {
 }
 
 /// 위치 하나: 같은 프레임의 세 카메라 사진과 GPS.
+///
+/// 드론 3대가 따로 날기 때문에 GPS 는 사진(카메라)마다 다를 수 있다. gps.txt 이름이 카메라 접두어
+/// (`camF_0003.jpg`)로 시작하면 그 카메라 사진의 GPS, 접두어가 없으면(`0003`) 세 사진 공통 GPS 로 본다.
+/// 어떤 사진의 기록이 없으면 공통 기록, 그것도 없으면 같은 프레임 다른 카메라 기록의 평균을 쓴다.
 #[derive(Clone, Debug)]
 pub struct Position {
     /// 위치 번호(0부터).
@@ -104,8 +108,13 @@ pub struct Position {
     pub frame: u32,
     /// `CAMERAS` 순서의 사진 경로.
     pub images: [PathBuf; 3],
+    /// `CAMERAS` 순서의 사진별 GPS.
+    pub image_geo: [Geodetic; 3],
+    /// `CAMERAS` 순서의 사진별 동-북-위 좌표(m), 원점은 gps.txt 의 첫 기록.
+    pub image_enu: [Vector3<f64>; 3],
+    /// 세 사진 GPS 의 평균(편대 중심).
     pub geo: Geodetic,
-    /// 동-북-위 좌표(m), 원점은 gps.txt 의 첫 기록.
+    /// 세 사진 동-북-위 좌표의 평균(m).
     pub enu: Vector3<f64>,
 }
 
@@ -155,6 +164,24 @@ fn frame_of_name(name: &str) -> Option<u32> {
         .last()
         .map(|(i, _)| i)?;
     stem[start..].parse().ok()
+}
+
+/// 위경도·고도 단순 평균(수십 m 범위라 평면 근사로 충분하다).
+fn mean_geo(gs: &[Geodetic]) -> Geodetic {
+    let n = gs.len() as f64;
+    Geodetic {
+        lat_deg: gs.iter().map(|g| g.lat_deg).sum::<f64>() / n,
+        lon_deg: gs.iter().map(|g| g.lon_deg).sum::<f64>() / n,
+        alt: gs.iter().map(|g| g.alt).sum::<f64>() / n,
+    }
+}
+
+/// 이름이 카메라 접두어(`camF`·`camR`·`camL`)로 시작하면 그 카메라 번호.
+fn camera_of_name(name: &str) -> Option<usize> {
+    CAMERAS.iter().position(|c| {
+        name.strip_prefix(c)
+            .is_some_and(|rest| !rest.starts_with(|ch: char| ch.is_ascii_alphabetic()))
+    })
 }
 
 /// gps.txt 내용 해석.
@@ -288,9 +315,11 @@ pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, Datas
     let text = std::fs::read_to_string(&gps_path).map_err(|e| DatasetError::Io(gps_path, e))?;
     let gps = parse_gps(&text)?;
     let origin = gps.first().ok_or(DatasetError::Empty)?.geo;
-    let mut by_frame: BTreeMap<u32, &GpsRecord> = BTreeMap::new();
+    // 열쇠: (카메라 번호 또는 None = 공통, 프레임).
+    let mut by_frame: BTreeMap<(Option<usize>, u32), &GpsRecord> = BTreeMap::new();
     for g in &gps {
-        if let Some(prev) = by_frame.get(&g.frame) {
+        let key = (camera_of_name(&g.name), g.frame);
+        if let Some(prev) = by_frame.get(&key) {
             if prev.geo != g.geo {
                 return Err(DatasetError::GpsFormat {
                     line: g.line,
@@ -301,7 +330,7 @@ pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, Datas
                 });
             }
         } else {
-            by_frame.insert(g.frame, g);
+            by_frame.insert(key, g);
         }
     }
 
@@ -314,15 +343,31 @@ pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, Datas
         if !sets.iter().all(|s| s.contains_key(&frame)) {
             continue;
         }
-        let g = by_frame
-            .get(&frame)
-            .ok_or(DatasetError::GpsMissing { frame })?;
+        // 사진별 GPS: 그 카메라 기록 → 공통 기록 → 같은 프레임 다른 카메라 기록의 평균 순으로 찾는다.
+        let own: Vec<Option<Geodetic>> = (0..3)
+            .map(|c| by_frame.get(&(Some(c), frame)).map(|g| g.geo))
+            .collect();
+        let common = by_frame.get(&(None, frame)).map(|g| g.geo);
+        let others: Vec<Geodetic> = own.iter().flatten().copied().collect();
+        let mut image_geo = [origin; 3];
+        for (c, slot) in image_geo.iter_mut().enumerate() {
+            *slot = match (own[c], common) {
+                (Some(g), _) | (None, Some(g)) => g,
+                (None, None) if !others.is_empty() => mean_geo(&others),
+                _ => return Err(DatasetError::GpsMissing { frame }),
+            };
+        }
+        let image_enu = image_geo.map(|g| geodetic_to_enu(&g, &origin));
+        let enu = (image_enu[0] + image_enu[1] + image_enu[2]) / 3.0;
+        let geo = mean_geo(&image_geo);
         positions.push(Position {
             index: positions.len(),
             frame,
             images: [0, 1, 2].map(|c| sets[c][&frame].clone()),
-            geo: g.geo,
-            enu: geodetic_to_enu(&g.geo, &origin),
+            image_geo,
+            image_enu,
+            geo,
+            enu,
         });
     }
     if positions.is_empty() {
@@ -601,5 +646,65 @@ mod tests {
             load_dataset(&t.0, DatasetConfig::default()),
             Err(DatasetError::Missing(p)) if p.ends_with("camL")
         ));
+    }
+
+    #[test]
+    fn per_camera_gps_lines() {
+        // 드론마다 GPS: 사진 이름(카메라 접두어 포함)마다 한 줄. 같은 프레임이라도 카메라가 다르면 중복 아님.
+        // 위도 37°, 경도 +9e-5° ≈ 동쪽 8.0 m (위 시험과 같은 손 계산).
+        let t = TempDir::new("percam");
+        make(&t.0, 2, &[], &[0, 1]);
+        let mut gps = String::new();
+        for f in 0..2u32 {
+            for (c, cam) in CAMERAS.iter().enumerate() {
+                let lon = 127.0 + 9e-5 * c as f64;
+                gps.push_str(&format!(
+                    "{cam}_{f:04}.jpg 37.0 {lon:.9} {}\n",
+                    30.0 + f as f64
+                ));
+            }
+        }
+        std::fs::write(t.0.join("gps.txt"), gps).unwrap();
+        let ds = load_dataset(
+            &t.0,
+            DatasetConfig {
+                stride: 1,
+                ..DatasetConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ds.positions.len(), 2);
+        let p = &ds.positions[1];
+        // 카메라 c 는 동쪽 약 8.0·c m, 고도 +1 m.
+        for c in 0..3 {
+            assert!(
+                (p.image_enu[c].x - 8.0 * c as f64).abs() < 0.05,
+                "{c}: {}",
+                p.image_enu[c]
+            );
+            assert!((p.image_enu[c].z - 1.0).abs() < 1e-3);
+        }
+        // 평균 = 동쪽 약 8.0 m, 고도 +1 m.
+        assert!((p.enu.x - 8.0).abs() < 0.05);
+        assert!((p.enu.z - 1.0).abs() < 1e-3);
+        assert!((p.geo.lon_deg - (127.0 + 9e-5)).abs() < 1e-12);
+
+        // 같은 카메라·프레임이 다른 값으로 두 번 나오면 오류.
+        let mut dup = std::fs::read_to_string(t.0.join("gps.txt")).unwrap();
+        dup.push_str("camR_0001.jpg 37.0 127.5 30.0\n");
+        std::fs::write(t.0.join("gps.txt"), dup).unwrap();
+        match load_dataset(&t.0, DatasetConfig::default()) {
+            Err(DatasetError::GpsFormat { line: 7, .. }) => {}
+            other => panic!("7번째 줄 중복 오류가 아님: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn camera_prefix_detection() {
+        assert_eq!(camera_of_name("camF_0003.jpg"), Some(0));
+        assert_eq!(camera_of_name("camR0003"), Some(1));
+        assert_eq!(camera_of_name("camL_12"), Some(2));
+        assert_eq!(camera_of_name("0003"), None);
+        assert_eq!(camera_of_name("camera_0003"), None);
     }
 }

@@ -78,13 +78,21 @@ fn loader_reads_synth_output_as_is() {
         );
     }
 
-    // 위치 좌표: 로더 원점은 gps.txt 첫 기록(= 위치 0 의 GPS). 정답은 gps_enu[i] − gps_enu[0].
+    // 사진별 좌표: 드론마다 GPS 가 따로 기록된다(gps.txt 는 사진마다 한 줄, `views` 순서 = 위치 × 카메라).
+    // 로더 원점은 gps.txt 첫 기록(= 사진 0, camF_0000 의 GPS). 정답은 gps_enu[3i+c] − gps_enu[0].
+    // 위치 좌표는 세 사진 좌표의 평균(편대 중심).
     // 허용 1 cm: gps.txt 기록 정밀도(위경도 1e-9° ≈ 0.1 mm, 고도 1 mm)와 두 접평면 원점 차
-    // (수 m / 지구 반지름 × 이동 거리 200 m ≈ 0.1 mm)보다 충분히 크고, 위치 간격 2.5 m 보다 훨씬 작다.
+    // (수 m / 지구 반지름 × 이동 거리 80 m ≈ 0.1 mm)보다 충분히 크고, 드론 간격 약 10 m 보다 훨씬 작다.
     for (i, p) in ds.positions.iter().enumerate() {
-        let want = scene.gps_enu[i] - scene.gps_enu[0];
-        let err = (p.enu - want).norm();
-        assert!(err < 0.01, "위치 {i}: 오차 {err} m");
+        let mut mean = skylens_core::nalgebra::Vector3::zeros();
+        for c in 0..3 {
+            let want = scene.gps_enu[3 * i + c] - scene.gps_enu[0];
+            let err = (p.image_enu[c] - want).norm();
+            assert!(err < 0.01, "위치 {i} 카메라 {c}: 오차 {err} m");
+            mean += want / 3.0;
+        }
+        let err = (p.enu - mean).norm();
+        assert!(err < 0.01, "위치 {i} 평균: 오차 {err} m");
     }
 
     // 기본 설정(STRIDE 3, SPAN 12, OVL 2): 프레임 0,3,…,78 → 27 위치, 81 장.
@@ -127,6 +135,7 @@ fn synth_output_moved_into_camera_folders_reads_same() {
     for (a, b) in flat.positions.iter().zip(&sub.positions) {
         assert_eq!(a.frame, b.frame);
         assert_eq!(a.enu, b.enu);
+        assert_eq!(a.image_enu, b.image_enu);
         for (c, cam) in CAMERAS.iter().enumerate() {
             let name = a.images[c].file_name().unwrap();
             assert_eq!(b.images[c], images.join(cam).join(name));
