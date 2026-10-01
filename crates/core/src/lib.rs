@@ -3,5 +3,6 @@
 pub mod camera;
 pub mod math;
 pub mod ply;
+pub mod synth;
 
 pub use nalgebra;
