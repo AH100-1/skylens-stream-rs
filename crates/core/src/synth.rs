@@ -1,7 +1,9 @@
 //! 합성 검증 장면 (SPEC §6).
 //!
-//! 지면 = 완만한 높낮이 + 상자 건물, 표면 색은 절차적 무늬. 드론은 고도 30m 에서 +x 방향 직선 비행,
-//! 위치마다 카메라 3대(앞 F, 오른쪽 R, 왼쪽 L)가 아래로 기울어져 있다.
+//! 지면 = 완만한 높낮이 + 상자 건물, 표면 색은 절차적 무늬. 드론 3대가 고도 30m 에서 편대로
+//! +x 방향 직선 비행하고, 드론마다 카메라 1대(F, R, L)가 아래로 기울어져 있다.
+//! 기본값은 SPEC §1 실측 배치(편대 간격 약 10 m, 방향 F −3°·R +125°·L −116°, 기울기 60°,
+//! 화각 65°, 위치 간 1.0 m). 예전 쉬운 배치(한 기체, ±90°, 2.5 m)는 [`SceneConfig::easy`].
 //! 정답 카메라·표면을 알고 있으므로 이후 단계의 오차를 직접 잴 수 있다.
 
 use crate::camera::{Camera, Intrinsics, Pose};
@@ -39,30 +41,80 @@ pub struct Building {
 #[derive(Clone, Debug)]
 pub struct SceneConfig {
     pub positions: usize,
+    /// 위치 간 이동(m, +x 방향).
     pub spacing: f64,
     pub altitude: f64,
     pub width: u32,
     pub height: u32,
     pub hfov_deg: f64,
-    /// 카메라 내려다보는 각(수평 아래, 도).
-    pub tilt_deg: f64,
+    /// 카메라별 내려다보는 각(수평 아래, 도). 순서는 [`CamId::ALL`] (F, R, L).
+    pub tilt_deg: [f64; 3],
+    /// 카메라별 방위각(도): 진행 방향(+x) 기준 수평 각, 오른쪽(−y)이 +.
+    pub heading_deg: [f64; 3],
+    /// 카메라(드론)별 편대 중심 기준 위치 (x 앞, y 왼쪽, z 위; m).
+    pub offsets: [[f64; 3]; 3],
+    /// GPS 잡음 표준편차(m, 축마다).
     pub gps_sigma: f64,
     pub seed: u64,
 }
 
+/// SPEC §1 실측 편대 간격(F–R 9.8, F–L 10.6, R–L 10.5 m)을 만족하는 수평 삼각형,
+/// 무게중심을 원점으로 둔 좌표 (x 앞, y 왼쪽).
+fn formation_offsets() -> [[f64; 3]; 3] {
+    let (d_fr, d_fl, d_rl) = (9.8f64, 10.6f64, 10.5f64);
+    // R = (0, −d_rl/2), L = (0, +d_rl/2), F = (fx, fy).
+    let h = d_rl / 2.0;
+    let fy = (d_fr * d_fr - d_fl * d_fl) / (4.0 * h);
+    let fx = (d_fr * d_fr - (fy + h) * (fy + h)).sqrt();
+    let (gx, gy) = (fx / 3.0, fy / 3.0);
+    [
+        [fx - gx, fy - gy, 0.0],
+        [-gx, -h - gy, 0.0],
+        [-gx, h - gy, 0.0],
+    ]
+}
+
 impl Default for SceneConfig {
+    /// SPEC §1·§6 실측 편대 배치.
     fn default() -> Self {
         Self {
             positions: 80,
-            spacing: 2.5,
+            spacing: 1.0,
             altitude: 30.0,
             width: 960,
             height: 540,
-            hfov_deg: 70.0,
-            tilt_deg: 50.0,
+            hfov_deg: 65.0,
+            tilt_deg: [60.0; 3],
+            heading_deg: [-3.0, 125.0, -116.0],
+            offsets: formation_offsets(),
             gps_sigma: 1.5,
             seed: 1,
         }
+    }
+}
+
+impl SceneConfig {
+    /// 예전 쉬운 배치: 한 기체에 카메라 3대(0.3 m 간격), F 정면·R/L ±90°,
+    /// 위치 간 2.5 m, 기울기 50°, 화각 70°. 실측보다 시차가 커서 낙관적이다.
+    pub fn easy() -> Self {
+        Self {
+            spacing: 2.5,
+            hfov_deg: 70.0,
+            tilt_deg: [50.0; 3],
+            heading_deg: [0.0, 90.0, -90.0],
+            offsets: [[0.3, 0.0, 0.0], [0.0, -0.3, 0.0], [0.0, 0.3, 0.0]],
+            ..Self::default()
+        }
+    }
+
+    /// 카메라 `cam` 의 세계 보는 방향(단위 벡터).
+    pub fn view_dir(&self, cam: CamId) -> Vector3<f64> {
+        let i = cam as usize;
+        let (a, t) = (
+            self.heading_deg[i].to_radians(),
+            self.tilt_deg[i].to_radians(),
+        );
+        Vector3::new(t.cos() * a.cos(), -t.cos() * a.sin(), -t.sin())
     }
 }
 
@@ -81,9 +133,10 @@ pub struct Scene {
     pub config: SceneConfig,
     pub buildings: Vec<Building>,
     pub views: Vec<View>,
-    /// 위치별 GPS (동-북-위, 미터): 정답 기체 중심 + 잡음.
+    /// 장마다(`views` 와 같은 순서) GPS (동-북-위, 미터, [`GPS_ORIGIN`] 기준):
+    /// 그 카메라를 단 드론의 정답 중심 + 잡음. 드론이 3대이므로 위치가 아니라 장 단위다.
     pub gps_enu: Vec<Point3<f64>>,
-    /// 위치별 정답 기체 중심.
+    /// 위치별 정답 편대 중심(세 드론 무게중심).
     pub rig_centers: Vec<Point3<f64>>,
 }
 
@@ -186,8 +239,6 @@ impl Scene {
         }
 
         let k = Intrinsics::from_hfov(config.width, config.height, config.hfov_deg.to_radians());
-        let tilt = config.tilt_deg.to_radians();
-        let (c, s) = (tilt.cos(), tilt.sin());
         let mut views = Vec::new();
         let mut rig_centers = Vec::new();
         let mut gps_enu = Vec::new();
@@ -195,13 +246,16 @@ impl Scene {
             let rig = Point3::new(config.spacing * p as f64, 0.0, config.altitude);
             rig_centers.push(rig);
             for cam in CamId::ALL {
-                // 기체 위 카메라 간격 0.3m.
-                let (dir, off) = match cam {
-                    CamId::F => (Vector3::new(c, 0.0, -s), Vector3::new(0.3, 0.0, 0.0)),
-                    CamId::R => (Vector3::new(0.0, -c, -s), Vector3::new(0.0, -0.3, 0.0)),
-                    CamId::L => (Vector3::new(0.0, c, -s), Vector3::new(0.0, 0.3, 0.0)),
-                };
-                let center = rig + off;
+                let dir = config.view_dir(cam);
+                let o = config.offsets[cam as usize];
+                let center = rig + Vector3::new(o[0], o[1], o[2]);
+                let i = views.len() as u64;
+                let noise = Vector3::new(
+                    gauss(config.seed, 3 * i),
+                    gauss(config.seed, 3 * i + 1),
+                    gauss(config.seed, 3 * i + 2),
+                ) * config.gps_sigma;
+                gps_enu.push(center + noise);
                 views.push(View {
                     name: format!("cam{}_{:04}", cam.letter(), p),
                     cam,
@@ -212,12 +266,6 @@ impl Scene {
                     },
                 });
             }
-            let noise = Vector3::new(
-                gauss(config.seed, 3 * p as u64),
-                gauss(config.seed, 3 * p as u64 + 1),
-                gauss(config.seed, 3 * p as u64 + 2),
-            ) * config.gps_sigma;
-            gps_enu.push(rig + noise);
         }
         Self {
             config,
@@ -415,9 +463,9 @@ mod tests {
             let m = v.camera.pose.rotation.matrix();
             assert!((m * m.transpose() - Matrix3::identity()).norm() < 1e-12);
             assert!((m.determinant() - 1.0).abs() < 1e-12);
-            // 광축(세계) 의 z 성분 = -sin(50°).
+            // 광축(세계) 의 z 성분 = -sin(60°).
             let axis = v.camera.pose.rotation.inverse() * Vector3::z();
-            assert!((axis.z + 50f64.to_radians().sin()).abs() < 1e-12);
+            assert!((axis.z + 60f64.to_radians().sin()).abs() < 1e-12);
             // 카메라 y(아래) 축은 세계에서 아래쪽 성분을 가진다 (영상이 뒤집히지 않음).
             let down = v.camera.pose.rotation.inverse() * Vector3::y();
             assert!(down.z < 0.0);
@@ -431,12 +479,12 @@ mod tests {
         let var: f64 = s
             .gps_enu
             .iter()
-            .zip(&s.rig_centers)
-            .map(|(g, c)| (g - c).norm_squared())
+            .zip(&s.views)
+            .map(|(g, v)| (g - v.camera.pose.center()).norm_squared())
             .sum::<f64>()
             / (3.0 * n);
         let sigma = var.sqrt();
-        // 설정 1.5m, 표본 240개 성분: 1.0~2.0m 안.
+        // 설정 1.5m, 표본 720개 성분(장마다 드론 GPS): 1.0~2.0m 안.
         eprintln!("gps_sigma_est {sigma:.3}");
         assert!((1.0..2.0).contains(&sigma), "sigma {sigma}");
     }
@@ -547,9 +595,23 @@ pub const GPS_ORIGIN: crate::geo::Geodetic = crate::geo::Geodetic {
 };
 
 impl Scene {
+    /// SPEC §2 출력 원점: 첫 장(`views[0]`)의 GPS 위경도·고도.
+    pub fn first_gps_origin(&self) -> crate::geo::Geodetic {
+        crate::geo::enu_to_geodetic(&self.gps_enu[0].coords, &GPS_ORIGIN)
+    }
+
+    /// 정답 좌표([`GPS_ORIGIN`] 기준 동-북-위)를 첫 GPS 기준 동-북-위로 옮긴다.
+    pub fn to_first_gps_frame(&self, p: &Point3<f64>) -> Point3<f64> {
+        let g = crate::geo::enu_to_geodetic(&p.coords, &GPS_ORIGIN);
+        Point3::from(crate::geo::geodetic_to_enu(&g, &self.first_gps_origin()))
+    }
+
     /// SPEC §1 입력 형식으로 폴더에 쓴다:
     /// `images/cam{F,R,L}_{번호:04}.jpg`, `gps.txt`(이름 위도 경도 고도),
-    /// 정답 `truth/cameras.txt`(이름 fx fy cx cy w h, R 행 우선 9개, t 3개).
+    /// 정답 `truth/cameras.txt`(이름 fx fy cx cy w h, R 행 우선 9개, t 3개),
+    /// 정답 원점 `truth/origin.txt`(`위도 경도 고도` 한 줄 = [`GPS_ORIGIN`]).
+    /// 정답 좌표의 원점은 [`GPS_ORIGIN`] 이고 SPEC §2 출력 원점(첫 GPS)과 다르다;
+    /// 비교할 때는 [`Scene::to_first_gps_frame`] 로 옮긴다.
     pub fn write_dataset(&self, dir: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
         let img_dir = dir.join("images");
@@ -558,13 +620,20 @@ impl Scene {
         std::fs::create_dir_all(&truth_dir)?;
         let mut gps = std::fs::File::create(dir.join("gps.txt"))?;
         let mut cams = std::fs::File::create(truth_dir.join("cameras.txt"))?;
-        for v in &self.views {
+        writeln!(
+            std::fs::File::create(truth_dir.join("origin.txt"))?,
+            "{:.9} {:.9} {:.3}",
+            GPS_ORIGIN.lat_deg,
+            GPS_ORIGIN.lon_deg,
+            GPS_ORIGIN.alt
+        )?;
+        for (vi, v) in self.views.iter().enumerate() {
             let (img, _) = self.render(v);
             image::RgbImage::from_raw(img.width, img.height, img.data)
                 .expect("버퍼 크기")
                 .save(img_dir.join(format!("{}.jpg", v.name)))
                 .map_err(std::io::Error::other)?;
-            let g = crate::geo::enu_to_geodetic(&self.gps_enu[v.position].coords, &GPS_ORIGIN);
+            let g = crate::geo::enu_to_geodetic(&self.gps_enu[vi].coords, &GPS_ORIGIN);
             writeln!(
                 gps,
                 "{} {:.9} {:.9} {:.3}",
@@ -608,7 +677,7 @@ mod dataset_tests {
         let lines: Vec<&str> = gps.lines().collect();
         assert_eq!(lines.len(), 12);
         let mut worst: f64 = 0.0;
-        for (l, v) in lines.iter().zip(&s.views) {
+        for (vi, (l, v)) in lines.iter().zip(&s.views).enumerate() {
             let f: Vec<&str> = l.split_whitespace().collect();
             assert_eq!(f[0], v.name);
             let g = Geodetic {
@@ -617,7 +686,7 @@ mod dataset_tests {
                 alt: f[3].parse().unwrap(),
             };
             let e = geodetic_to_enu(&g, &GPS_ORIGIN);
-            worst = worst.max((e - s.gps_enu[v.position].coords).norm());
+            worst = worst.max((e - s.gps_enu[vi].coords).norm());
         }
         // 위경도 소수 9자리(≈0.1mm) + 고도 1mm 반올림.
         assert!(worst < 2e-3, "GPS 왕복 오차 {worst} m");
@@ -625,6 +694,182 @@ mod dataset_tests {
         assert_eq!((img.width(), img.height()), (64, 36));
         let cams = std::fs::read_to_string(dir.join("truth/cameras.txt")).unwrap();
         assert_eq!(cams.lines().count(), 12);
+        let origin = std::fs::read_to_string(dir.join("truth/origin.txt")).unwrap();
+        let o: Vec<f64> = origin
+            .split_whitespace()
+            .map(|x| x.parse().unwrap())
+            .collect();
+        assert_eq!(
+            o,
+            vec![GPS_ORIGIN.lat_deg, GPS_ORIGIN.lon_deg, GPS_ORIGIN.alt]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// F-024: 첫 GPS 를 원점으로 옮긴 정답 카메라 중심은 GPS 동-북-위와 잡음 수준으로 맞는다
+    /// (원점을 옮기지 않으면 고도 30 m 만큼 어긋난다).
+    #[test]
+    fn truth_in_first_gps_frame_matches_gps() {
+        for seed in [1u64, 2, 3, 4, 5] {
+            let s = Scene::new(SceneConfig {
+                seed,
+                ..SceneConfig::default()
+            });
+            let o = s.first_gps_origin();
+            let mut d: Vec<f64> = s
+                .views
+                .iter()
+                .zip(&s.gps_enu)
+                .map(|(v, g)| {
+                    let gps_local =
+                        geodetic_to_enu(&crate::geo::enu_to_geodetic(&g.coords, &GPS_ORIGIN), &o);
+                    (s.to_first_gps_frame(&v.camera.pose.center()).coords - gps_local).norm()
+                })
+                .collect();
+            d.sort_by(f64::total_cmp);
+            let med = d[d.len() / 2];
+            // 두 쪽 모두 같은 원점으로 옮겼으므로 차이 = 그 장의 GPS 잡음 하나.
+            // σ=1.5 m 3축 잡음의 크기 중앙값 ≈ 1.54σ ≈ 2.3 m → 기준 3 m.
+            eprintln!("seed {seed} median_truth_vs_gps {med:.3}");
+            assert!(med < 3.0, "seed {seed} 중앙값 {med}");
+            let raw_z = (s.views[0].camera.pose.center().z - 0.0).abs();
+            assert!(raw_z > 29.0, "원점 이동 전에는 고도만큼 어긋나야 함");
+        }
+    }
+}
+
+#[cfg(test)]
+mod formation_tests {
+    use super::*;
+
+    fn scene() -> Scene {
+        Scene::new(SceneConfig {
+            width: 160,
+            height: 90,
+            ..SceneConfig::default()
+        })
+    }
+
+    fn horiz_heading_deg(v: &View) -> f64 {
+        let a = v.camera.pose.rotation.inverse() * Vector3::z();
+        // 진행 방향 +x 기준, 오른쪽(−y) 이 +.
+        (-a.y).atan2(a.x).to_degrees()
+    }
+
+    /// F-029 확인 기준 (1): 편대 간격·위치 간 이동·방위각·기울기가 SPEC §1 실측값.
+    #[test]
+    fn default_is_measured_formation() {
+        let s = scene();
+        for p in 0..s.config.positions {
+            let c: Vec<Point3<f64>> = (0..3)
+                .map(|k| s.views[3 * p + k].camera.pose.center())
+                .collect();
+            let (fr, fl, rl) = (
+                (c[0] - c[1]).norm(),
+                (c[0] - c[2]).norm(),
+                (c[1] - c[2]).norm(),
+            );
+            for d in [fr, fl, rl] {
+                assert!((9.0..=11.0).contains(&d), "편대 간격 {d}");
+            }
+            assert!(
+                (fr - 9.8).abs() < 1e-9 && (fl - 10.6).abs() < 1e-9 && (rl - 10.5).abs() < 1e-9
+            );
+            if p > 0 {
+                for k in 0..3 {
+                    let m = (s.views[3 * p + k].camera.pose.center()
+                        - s.views[3 * (p - 1) + k].camera.pose.center())
+                    .norm();
+                    assert!((0.9..=1.1).contains(&m), "위치 간 이동 {m}");
+                }
+            }
+        }
+        for v in &s.views {
+            let want = match v.cam {
+                CamId::F => 0.0,
+                CamId::R => 125.0,
+                CamId::L => -116.0,
+            };
+            let h = horiz_heading_deg(v);
+            assert!((h - want).abs() <= 5.0, "{} 방위각 {h}", v.name);
+            let a = v.camera.pose.rotation.inverse() * Vector3::z();
+            let tilt = (-a.z).asin().to_degrees();
+            assert!((tilt - 60.0).abs() <= 3.0, "{} 기울기 {tilt}", v.name);
+        }
+    }
+
+    /// F-029 확인 기준 (2): 위치 1칸 같은 카메라 짝의 삼각측량 각.
+    /// 화면 9×5 격자 광선이 닿는 표면 점마다 각을 재고 카메라별 중앙값을 본다.
+    /// 평지 화면 중앙 해석값: 기선 1 m, 거리 30/sin60° = 34.6 m 에서
+    /// F 는 sin60°/34.6 rad = 1.43°, R·L 은 기선과 광선 사이 각이 약 107°라 1.59°.
+    /// 화면 위쪽(먼 점)은 각이 작고 건물 지붕(가까운 점)은 커서, 시드 1 측정 중앙값은
+    /// F 1.450°·R 1.454°·L 1.490°(전체 1.468°). 예전 쉬운 배치 F 중앙 광선은 3.08°.
+    #[test]
+    fn one_step_triangulation_angle_is_small() {
+        let s = scene();
+        let mut all = Vec::new();
+        for (k, cam) in CamId::ALL.into_iter().enumerate() {
+            let mut angles = Vec::new();
+            for p in (0..79).step_by(7) {
+                let (a, b) = (&s.views[3 * p + k], &s.views[3 * (p + 1) + k]);
+                let (ca, cb) = (a.camera.pose.center(), b.camera.pose.center());
+                let kk = a.camera.intrinsics;
+                for gx in 0..9 {
+                    for gy in 0..5 {
+                        let px = Vector2::new(
+                            (gx as f64 + 0.5) * kk.width as f64 / 9.0,
+                            (gy as f64 + 0.5) * kk.height as f64 / 5.0,
+                        );
+                        let n = kk.to_normalized(&px);
+                        let d = a.camera.pose.rotation.inverse() * Vector3::new(n.x, n.y, 1.0);
+                        if let Some(hit) = s.intersect(&ca, &d) {
+                            angles.push((ca - hit.point).angle(&(cb - hit.point)).to_degrees());
+                        }
+                    }
+                }
+            }
+            angles.sort_by(f64::total_cmp);
+            let med = angles[angles.len() / 2];
+            eprintln!(
+                "{cam:?} tri_angle n={} min={:.3} median={med:.3} max={:.3}",
+                angles.len(),
+                angles[0],
+                angles[angles.len() - 1]
+            );
+            assert!((0.8..=1.5).contains(&med), "{cam:?} 중앙 삼각측량 각 {med}");
+            all.extend(angles);
+        }
+        all.sort_by(f64::total_cmp);
+        let med = all[all.len() / 2];
+        eprintln!("all tri_angle median={med:.3}");
+        assert!((0.8..=1.5).contains(&med));
+        let easy = Scene::new(SceneConfig {
+            width: 160,
+            height: 90,
+            ..SceneConfig::easy()
+        });
+        let (a, b) = (&easy.views[0], &easy.views[3]);
+        let ca = a.camera.pose.center();
+        let hit = easy
+            .intersect(&ca, &(a.camera.pose.rotation.inverse() * Vector3::z()))
+            .unwrap();
+        let easy_ang = (ca - hit.point)
+            .angle(&(b.camera.pose.center() - hit.point))
+            .to_degrees();
+        eprintln!("easy_F center tri_angle {easy_ang:.3}");
+        assert!(easy_ang > 2.0);
+    }
+
+    #[test]
+    fn easy_layout_is_kept() {
+        let s = Scene::new(SceneConfig {
+            positions: 2,
+            width: 64,
+            height: 36,
+            ..SceneConfig::easy()
+        });
+        let d = (s.views[0].camera.pose.center() - s.views[1].camera.pose.center()).norm();
+        assert!((d - 0.3f64.hypot(0.3)).abs() < 1e-12);
+        assert!((horiz_heading_deg(&s.views[1]) - 90.0).abs() < 1e-9);
     }
 }
