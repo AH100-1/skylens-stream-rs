@@ -59,14 +59,21 @@ for f in &feats {
     // f.kp: x, y(화소), sigma(스케일), angle(라디안), response
     // f.desc: 단위 길이 128차원 기술자
 }
+// 흐림·극값 탐색·기술자는 rayon 으로 병렬 실행된다(스레드 수와 무관하게 결과가 같다).
+// 스레드 수는 RAYON_NUM_THREADS 환경 변수로 정한다.
 ```
 
 ### 라이브러리: 매칭과 기하 검증
 
 ```rust
-use skylens_core::matching::{ratio_match, ransac_fundamental, RansacConfig};
+use skylens_core::matching::{candidate_pairs, ratio_match, ransac_fundamental, RansacConfig};
+use skylens_core::matching::{PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL};
 
-// 비율 0.8, 양방향 확인
+// 매칭할 영상 짝: views[k] = (카메라 번호, 촬영 위치 번호).
+// 같은 카메라는 위치 차 1..=5 와 2의 거듭제곱(8, 16, 32, …), 다른 카메라는 위치 차 0..=4.
+let image_pairs = candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX);
+
+// 비율 0.8, 양방향 확인. 결과는 a 인덱스 순, 거리 계산은 한 번만 하며 병렬로 돈다.
 let pairs = ratio_match(&feats_a, &feats_b, 0.8, true);
 let x1: Vec<_> = pairs.iter().map(|&(i, _)| nalgebra::Vector2::new(feats_a[i].kp.x as f64, feats_a[i].kp.y as f64)).collect();
 let x2: Vec<_> = pairs.iter().map(|&(_, j)| nalgebra::Vector2::new(feats_b[j].kp.x as f64, feats_b[j].kp.y as f64)).collect();
@@ -77,6 +84,8 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 // 또는 정상 비율이 min_inlier_ratio(기본 0.2) 미만. 문턱 threshold_px 는 px 단위,
 // sampson_error 는 제곱 거리(px²)를 돌려준다.
 ```
+
+시간 측정(1920×1080 한 장 검출, 7300×7300 매칭): `cargo test --release -- --ignored --test-threads=1 --nocapture timing`
 
 ### 라이브러리: 두 시점 상대 자세와 삼각측량
 
@@ -196,14 +205,21 @@ for f in &feats {
     // f.kp: x, y (pixels), sigma (scale), angle (radians), response
     // f.desc: unit-length 128-dim descriptor
 }
+// Blurring, extremum search and descriptors run in parallel with rayon (results do not depend on the
+// thread count). Set the thread count with the RAYON_NUM_THREADS environment variable.
 ```
 
 ### Library: matching and geometric verification
 
 ```rust
-use skylens_core::matching::{ratio_match, ransac_fundamental, RansacConfig};
+use skylens_core::matching::{candidate_pairs, ratio_match, ransac_fundamental, RansacConfig};
+use skylens_core::matching::{PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL};
 
-// ratio 0.8, mutual check
+// Image pairs to match: views[k] = (camera index, capture position index).
+// Same camera: position gap 1..=5 plus powers of two (8, 16, 32, …); different cameras: gap 0..=4.
+let image_pairs = candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX);
+
+// ratio 0.8, mutual check. Results are in a-index order; distances are computed once, in parallel.
 let pairs = ratio_match(&feats_a, &feats_b, 0.8, true);
 let x1: Vec<_> = pairs.iter().map(|&(i, _)| nalgebra::Vector2::new(feats_a[i].kp.x as f64, feats_a[i].kp.y as f64)).collect();
 let x2: Vec<_> = pairs.iter().map(|&(_, j)| nalgebra::Vector2::new(feats_b[j].kp.x as f64, feats_b[j].kp.y as f64)).collect();
@@ -214,6 +230,8 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 // collinear points, or an inlier ratio below min_inlier_ratio (default 0.2). threshold_px is in px;
 // sampson_error returns the squared distance (px²).
 ```
+
+Timing (detection on one 1920×1080 image, 7300×7300 matching): `cargo test --release -- --ignored --test-threads=1 --nocapture timing`
 
 ### Library: two-view relative pose and triangulation
 
