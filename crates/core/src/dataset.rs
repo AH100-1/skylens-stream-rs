@@ -2,11 +2,15 @@
 //!
 //! 폴더 구조: 사진은 `images/cam{F,R,L}_{번호:04}.jpg`(평평한 구조, 합성 출력·README 형식) 또는
 //! `images/cam{F,R,L}/cam{F,R,L}_{번호:04}.jpg`(카메라별 하위 폴더) 중 어느 쪽이든, 둘을 섞어도
-//! 읽는다. 같은 카메라·같은 프레임 사진이 두 곳에 다 있으면 오류. 그리고 `gps.txt`.
-//! `gps.txt` 는 `이름 위도 경도 고도` 한 줄씩이며, 이름 끝의 숫자를 프레임 번호로 본다
-//! (`camF_0003.jpg`, `0003` 모두 프레임 3). 빈 줄과 `#` 로 시작하는 줄은 건너뛴다.
+//! 읽는다. 같은 카메라·같은 프레임 사진이 두 곳에 다 있으면 오류. 번호는 `{:04}` 표기 그대로여야
+//! 한다(`camF_3.jpg`, `camF_00003.jpg` 는 오류). 그리고 `gps.txt`.
+//!
+//! `gps.txt` 는 `이름 위도 경도 고도` 한 줄씩이며, 이름 끝의 숫자를 프레임 번호로 본다.
+//! 이름이 `cam{F,R,L}_` 로 시작하면 그 카메라(드론)의 GPS, 아니면(`0003` 등) 세 카메라 공통이다.
+//! 드론 3대 편대라 같은 프레임이라도 카메라마다 GPS 가 다르다. 카메라별 줄이 공통 줄보다 우선한다.
+//! 같은 (카메라, 프레임)·같은 공통 프레임에 다른 값이 두 번 나오면 오류. 빈 줄과 `#` 줄은 건너뛴다.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -26,6 +30,9 @@ pub struct DatasetConfig {
     pub span: usize,
     /// 구역 앞뒤로 겹치는 위치 수.
     pub ovl: usize,
+    /// 카메라가 빠져 건너뛰는 고른 프레임이 이 수보다 많이 연속되면 오류.
+    /// 기본 2: 두 곳을 건너뛰어도 앞뒤 위치 차가 3칸이라 §3.2 시간 이웃(1..5)에 남는다.
+    pub max_skip_run: usize,
 }
 
 impl Default for DatasetConfig {
@@ -34,6 +41,7 @@ impl Default for DatasetConfig {
             stride: 3,
             span: 12,
             ovl: 2,
+            max_skip_run: 2,
         }
     }
 }
@@ -49,8 +57,11 @@ pub enum DatasetError {
         line: usize,
         msg: String,
     },
-    /// 선택된 프레임의 GPS 가 없음.
+    /// gps.txt 에 기록이 하나도 없음.
+    GpsEmpty,
+    /// 선택된 프레임의 그 카메라 GPS 가 없음.
     GpsMissing {
+        camera: &'static str,
         frame: u32,
     },
     /// 설정 값 오류.
@@ -62,6 +73,15 @@ pub enum DatasetError {
         first: PathBuf,
         second: PathBuf,
     },
+    /// 번호가 `{:04}` 표기가 아닌 사진 이름(`camF_3.jpg`, `camF_00003.jpg`).
+    BadImageName(PathBuf),
+    /// 카메라가 빠져 건너뛴 프레임이 허용보다 길게 연속됨.
+    SkipRun {
+        first: u32,
+        last: u32,
+        count: usize,
+        limit: usize,
+    },
 }
 
 impl fmt::Display for DatasetError {
@@ -70,7 +90,10 @@ impl fmt::Display for DatasetError {
             Self::Io(p, e) => write!(f, "{}: {e}", p.display()),
             Self::Missing(p) => write!(f, "파일 없음: {}", p.display()),
             Self::GpsFormat { line, msg } => write!(f, "gps.txt {line}번째 줄: {msg}"),
-            Self::GpsMissing { frame } => write!(f, "GPS 누락: 프레임 {frame}"),
+            Self::GpsEmpty => write!(f, "gps.txt 기록 없음"),
+            Self::GpsMissing { camera, frame } => {
+                write!(f, "GPS 누락: {camera} 프레임 {frame}")
+            }
             Self::Config(m) => write!(f, "설정 오류: {m}"),
             Self::Empty => write!(f, "세 카메라가 모두 있는 위치가 없음"),
             Self::DuplicateImage { first, second } => write!(
@@ -78,6 +101,18 @@ impl fmt::Display for DatasetError {
                 "같은 사진이 두 곳에 있음: {} , {}",
                 first.display(),
                 second.display()
+            ),
+            Self::BadImageName(p) => {
+                write!(f, "사진 번호가 4자리 표기가 아님: {}", p.display())
+            }
+            Self::SkipRun {
+                first,
+                last,
+                count,
+                limit,
+            } => write!(
+                f,
+                "카메라가 빠진 프레임 {count}곳 연속(프레임 {first}..={last}, 허용 {limit})"
             ),
         }
     }
@@ -89,24 +124,86 @@ impl std::error::Error for DatasetError {}
 #[derive(Clone, Debug, PartialEq)]
 pub struct GpsRecord {
     pub name: String,
+    /// 이름의 카메라(`CAMERAS` 번호). `None` 이면 세 카메라 공통.
+    pub camera: Option<usize>,
     pub frame: u32,
     pub geo: Geodetic,
     /// 줄 번호(1부터).
     pub line: usize,
 }
 
-/// 위치 하나: 같은 프레임의 세 카메라 사진과 GPS.
+/// (카메라, 프레임) → GPS 찾기표.
+#[derive(Clone, Debug, Default)]
+pub struct GpsTable {
+    per_camera: [BTreeMap<u32, (Geodetic, usize)>; 3],
+    common: BTreeMap<u32, (Geodetic, usize)>,
+}
+
+impl GpsTable {
+    /// 기록을 모은다. 같은 (카메라, 프레임) 또는 같은 공통 프레임에 다른 값이 다시 나오면
+    /// 뒤 줄 번호로 `GpsFormat`. 같은 값의 반복은 허용.
+    pub fn build(records: &[GpsRecord]) -> Result<Self, DatasetError> {
+        let mut t = Self::default();
+        for r in records {
+            let map = match r.camera {
+                Some(c) => &mut t.per_camera[c],
+                None => &mut t.common,
+            };
+            if let Some(&(geo, line)) = map.get(&r.frame) {
+                if geo != r.geo {
+                    let who = r.camera.map_or("공통", |c| CAMERAS[c]);
+                    return Err(DatasetError::GpsFormat {
+                        line: r.line,
+                        msg: format!(
+                            "{who} 프레임 {} 이 {line}번째 줄과 다른 값으로 중복",
+                            r.frame
+                        ),
+                    });
+                }
+            } else {
+                map.insert(r.frame, (r.geo, r.line));
+            }
+        }
+        Ok(t)
+    }
+
+    /// 카메라 `cam`(`CAMERAS` 번호)·프레임의 GPS: 카메라별 기록, 없으면 공통 기록.
+    pub fn get(&self, cam: usize, frame: u32) -> Option<Geodetic> {
+        self.per_camera[cam]
+            .get(&frame)
+            .or_else(|| self.common.get(&frame))
+            .map(|&(g, _)| g)
+    }
+}
+
+/// 위치 하나: 같은 프레임의 세 카메라 사진과 카메라별 GPS.
 #[derive(Clone, Debug)]
 pub struct Position {
     /// 위치 번호(0부터).
     pub index: usize,
     /// 원래 프레임 번호.
     pub frame: u32,
-    /// `CAMERAS` 순서의 사진 경로.
+    /// `CAMERAS` 순서의 사진 경로(실제로 읽은 파일).
     pub images: [PathBuf; 3],
-    pub geo: Geodetic,
-    /// 동-북-위 좌표(m), 원점은 gps.txt 의 첫 기록.
-    pub enu: Vector3<f64>,
+    /// `CAMERAS` 순서의 카메라(드론)별 GPS.
+    pub geo: [Geodetic; 3],
+    /// `CAMERAS` 순서의 동-북-위 좌표(m), 원점은 gps.txt 의 첫 기록.
+    pub enu: [Vector3<f64>; 3],
+}
+
+impl Position {
+    /// 세 카메라 GPS 의 무게중심(동-북-위, m).
+    pub fn enu_center(&self) -> Vector3<f64> {
+        (self.enu[0] + self.enu[1] + self.enu[2]) / 3.0
+    }
+}
+
+/// 고른 프레임 가운데 카메라가 빠져 위치가 되지 못한 것.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedFrame {
+    pub frame: u32,
+    /// 빠진 카메라 이름.
+    pub missing: Vec<&'static str>,
 }
 
 /// 읽은 데이터셋.
@@ -116,6 +213,8 @@ pub struct Dataset {
     pub config: DatasetConfig,
     pub origin: Geodetic,
     pub positions: Vec<Position>,
+    /// 카메라가 빠져 건너뛴 프레임(프레임 순).
+    pub skipped: Vec<SkippedFrame>,
 }
 
 impl Dataset {
@@ -128,18 +227,30 @@ impl Dataset {
     pub fn chunks(&self) -> Vec<Range<usize>> {
         chunk_ranges(self.positions.len(), self.config.span, self.config.ovl)
     }
+
+    /// 건너뛴 프레임 번호.
+    pub fn skipped_frames(&self) -> Vec<u32> {
+        self.skipped.iter().map(|s| s.frame).collect()
+    }
 }
 
 /// 구역 분할: start = 0, SPAN, 2·SPAN, … 마다 위치 [start-OVL, start+SPAN+OVL) 를 한 구역으로,
-/// 범위는 0..n 으로 자른다. `span == 0` 이면 빈 목록.
+/// 범위는 0..n 으로 자른다. 앞 구역 끝 너머 새 위치가 OVL 개 이하인 구역(꼬리)은 따로 두지 않고
+/// 앞 구역 끝을 늘려 합친다. 그래서 구역 i≥1 은 앞 구역 끝 너머 위치를 OVL 개보다 많이 갖고,
+/// 합집합은 0..n. `span == 0` 이면 빈 목록.
 pub fn chunk_ranges(n: usize, span: usize, ovl: usize) -> Vec<Range<usize>> {
     if span == 0 {
         return Vec::new();
     }
-    (0..n)
-        .step_by(span)
-        .map(|s| s.saturating_sub(ovl)..(s + span + ovl).min(n))
-        .collect()
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for s in (0..n).step_by(span) {
+        let r = s.saturating_sub(ovl)..(s + span + ovl).min(n);
+        match out.last_mut() {
+            Some(prev) if r.end <= prev.end + ovl => prev.end = prev.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
 }
 
 /// 이름 끝의 숫자(확장자 제외)를 프레임 번호로.
@@ -155,6 +266,14 @@ fn frame_of_name(name: &str) -> Option<u32> {
         .last()
         .map(|(i, _)| i)?;
     stem[start..].parse().ok()
+}
+
+/// 이름(경로면 마지막 부분)의 카메라: `cam{F,R,L}_` 로 시작하면 그 번호.
+fn camera_of_name(name: &str) -> Option<usize> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    CAMERAS
+        .iter()
+        .position(|cam| base.strip_prefix(cam).is_some_and(|r| r.starts_with('_')))
 }
 
 /// gps.txt 내용 해석.
@@ -188,6 +307,7 @@ pub fn parse_gps(text: &str) -> Result<Vec<GpsRecord>, DatasetError> {
             frame_of_name(f[0]).ok_or_else(|| err(format!("이름에 번호 없음: {}", f[0])))?;
         out.push(GpsRecord {
             name: f[0].to_string(),
+            camera: camera_of_name(f[0]),
             frame,
             geo: Geodetic {
                 lat_deg: lat,
@@ -201,7 +321,7 @@ pub fn parse_gps(text: &str) -> Result<Vec<GpsRecord>, DatasetError> {
 }
 
 /// 폴더 하나에서 `{cam}_{번호}.jpg` 파일을 찾아 프레임 번호 → 경로 모음에 더한다.
-/// 이미 있는 프레임이면 `DuplicateImage`.
+/// 번호가 `{:04}` 표기가 아니면 `BadImageName`, 이미 있는 프레임이면 `DuplicateImage`.
 fn scan_into(dir: &Path, cam: &str, out: &mut BTreeMap<u32, PathBuf>) -> Result<(), DatasetError> {
     let rd = std::fs::read_dir(dir).map_err(|e| DatasetError::Io(dir.to_path_buf(), e))?;
     let prefix = format!("{cam}_");
@@ -219,11 +339,14 @@ fn scan_into(dir: &Path, cam: &str, out: &mut BTreeMap<u32, PathBuf>) -> Result<
         if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        let Ok(n) = num.parse() else { continue };
         let path = ent.path();
         if !path.is_file() {
             continue;
         }
+        let n: u32 = match num.parse() {
+            Ok(n) if format!("{n:04}") == num => n,
+            _ => return Err(DatasetError::BadImageName(path)),
+        };
         found.push((n, path));
     }
     // 디렉터리 순서에 기대지 않도록 정렬해 오류 메시지를 결정적으로 만든다.
@@ -263,9 +386,11 @@ pub fn image_path(root: &Path, cam: &str, frame: u32) -> PathBuf {
 
 /// 데이터셋 읽기.
 ///
-/// 세 카메라 중 하나라도 있는 프레임 가운데 가장 작은 번호 f0 에서 시작해 f0, f0+STRIDE, …
-/// 를 고르고, 그중 세 카메라가 모두 있는 프레임만 위치 0, 1, … 로 매긴다.
-/// 고른 위치에 GPS 가 없거나, 폴더·gps.txt 가 없거나, gps.txt 형식이 틀리면 Err.
+/// 세 카메라 중 하나라도 있는 프레임 가운데 가장 작은 번호 f0 에서 시작해, 실제로 있는 프레임 중
+/// (f − f0) 가 STRIDE 의 배수인 것을 고른다. 그중 세 카메라가 모두 있는 프레임만 위치 0, 1, … 로
+/// 매기고, 카메라가 빠진 프레임은 `Dataset::skipped` 에 남긴다. 건너뛴 프레임이
+/// `max_skip_run` 보다 많이 연속되면(앞·뒤 끝 포함) `SkipRun`.
+/// 고른 위치의 어느 카메라 GPS 가 없거나, 폴더·gps.txt 가 없거나, gps.txt 형식이 틀리면 Err.
 pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, DatasetError> {
     if config.stride == 0 {
         return Err(DatasetError::Config("STRIDE 는 1 이상".into()));
@@ -287,52 +412,67 @@ pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, Datas
     }
     let text = std::fs::read_to_string(&gps_path).map_err(|e| DatasetError::Io(gps_path, e))?;
     let gps = parse_gps(&text)?;
-    let origin = gps.first().ok_or(DatasetError::Empty)?.geo;
-    let mut by_frame: BTreeMap<u32, &GpsRecord> = BTreeMap::new();
-    for g in &gps {
-        if let Some(prev) = by_frame.get(&g.frame) {
-            if prev.geo != g.geo {
-                return Err(DatasetError::GpsFormat {
-                    line: g.line,
-                    msg: format!(
-                        "프레임 {} 이 {}번째 줄과 다른 값으로 중복",
-                        g.frame, prev.line
-                    ),
-                });
-            }
-        } else {
-            by_frame.insert(g.frame, g);
-        }
-    }
+    let origin = gps.first().ok_or(DatasetError::GpsEmpty)?.geo;
+    let table = GpsTable::build(&gps)?;
 
-    let all: BTreeSet<u32> = sets.iter().flat_map(|m| m.keys()).copied().collect();
-    let (Some(&first), Some(&last)) = (all.first(), all.last()) else {
+    let all: std::collections::BTreeSet<u32> =
+        sets.iter().flat_map(|m| m.keys()).copied().collect();
+    let Some(&f0) = all.first() else {
         return Err(DatasetError::Empty);
     };
+    let stride = config.stride as u64;
     let mut positions = Vec::new();
-    for frame in (first..=last).step_by(config.stride) {
-        if !sets.iter().all(|s| s.contains_key(&frame)) {
+    let mut skipped = Vec::new();
+    // 진행 중인 건너뜀 연속: (첫 프레임, 마지막 프레임, 개수).
+    let mut run: Option<(u32, u32, usize)> = None;
+    let check_run = |run: Option<(u32, u32, usize)>| match run {
+        Some((first, last, count)) if count > config.max_skip_run => Err(DatasetError::SkipRun {
+            first,
+            last,
+            count,
+            limit: config.max_skip_run,
+        }),
+        _ => Ok(()),
+    };
+    for &frame in all.iter().filter(|&&f| u64::from(f - f0) % stride == 0) {
+        let missing: Vec<&'static str> = (0..3)
+            .filter(|&c| !sets[c].contains_key(&frame))
+            .map(|c| CAMERAS[c])
+            .collect();
+        if !missing.is_empty() {
+            run = Some(match run {
+                Some((first, _, n)) => (first, frame, n + 1),
+                None => (frame, frame, 1),
+            });
+            skipped.push(SkippedFrame { frame, missing });
             continue;
         }
-        let g = by_frame
-            .get(&frame)
-            .ok_or(DatasetError::GpsMissing { frame })?;
+        check_run(run.take())?;
+        let mut geo = [origin; 3];
+        for (c, g) in geo.iter_mut().enumerate() {
+            *g = table.get(c, frame).ok_or(DatasetError::GpsMissing {
+                camera: CAMERAS[c],
+                frame,
+            })?;
+        }
         positions.push(Position {
             index: positions.len(),
             frame,
             images: [0, 1, 2].map(|c| sets[c][&frame].clone()),
-            geo: g.geo,
-            enu: geodetic_to_enu(&g.geo, &origin),
+            geo,
+            enu: geo.map(|g| geodetic_to_enu(&g, &origin)),
         });
     }
     if positions.is_empty() {
         return Err(DatasetError::Empty);
     }
+    check_run(run)?;
     Ok(Dataset {
         root: root.to_path_buf(),
         config,
         origin,
         positions,
+        skipped,
     })
 }
 
@@ -366,10 +506,17 @@ mod tests {
                 }
             }
         }
+        // 카메라(드론)마다 위도를 1e-4° 씩 달리 쓴다: 북쪽 약 11.1 m 간격.
         let mut s = String::new();
         for f in 0..frames {
             if !gps_skip.contains(&f) {
-                s += &format!("camF_{f:04}.jpg 37.0 {} 50.0\n", 127.0 + f as f64 * 1e-5);
+                for (ci, cam) in CAMERAS.iter().enumerate() {
+                    s += &format!(
+                        "{cam}_{f:04}.jpg {} {} 50.0\n",
+                        37.0 + ci as f64 * 1e-4,
+                        127.0 + f as f64 * 1e-5
+                    );
+                }
             }
         }
         std::fs::write(root.join("gps.txt"), s).unwrap();
@@ -389,7 +536,12 @@ mod tests {
         assert_eq!(chunk_ranges(0, 12, 2), Vec::<Range<usize>>::new());
         assert_eq!(chunk_ranges(5, 12, 2), vec![0..5]);
         assert_eq!(chunk_ranges(12, 12, 2), vec![0..12]);
-        assert_eq!(chunk_ranges(13, 12, 2), vec![0..13, 10..13]);
+        // 꼬리 10..13 은 새 위치가 1개(≤ OVL)라 앞 구역에 합친다.
+        assert_eq!(chunk_ranges(13, 12, 2), vec![0..13]);
+        assert_eq!(chunk_ranges(14, 12, 2), vec![0..14]);
+        assert_eq!(chunk_ranges(15, 12, 2), vec![0..15]);
+        assert_eq!(chunk_ranges(17, 12, 2), vec![0..14, 10..17]);
+        assert_eq!(chunk_ranges(26, 12, 2), vec![0..14, 10..26]);
         assert_eq!(chunk_ranges(10, 4, 0), vec![0..4, 4..8, 8..10]);
     }
 
@@ -408,11 +560,13 @@ mod tests {
         let ds = load_dataset(&t.0, DatasetConfig::default()).unwrap();
         let frames: Vec<u32> = ds.positions.iter().map(|p| p.frame).collect();
         assert_eq!(frames, vec![0, 3, 9]);
+        assert_eq!(ds.skipped_frames(), vec![6]);
+        assert_eq!(ds.skipped[0].missing, vec!["camR"]);
         assert_eq!(ds.image_count(), 9);
         assert_eq!(ds.positions[2].index, 2);
-        assert!(ds.positions[0].enu.norm() < 1e-6);
+        assert!(ds.positions[0].enu[0].norm() < 1e-6);
         // 경도 9e-5 도, 위도 37 도: 동쪽 약 6378137·cos37°·9e-5·π/180 ≈ 8.0 m.
-        let e = ds.positions[2].enu;
+        let e = ds.positions[2].enu[0];
         assert!((e.x - 8.0).abs() < 0.05, "{e}");
         assert!(e.y.abs() < 0.01 && e.z.abs() < 0.01, "{e}");
         // STRIDE 1 이면 0..10 중 6 빠져 9곳.
@@ -420,7 +574,9 @@ mod tests {
             stride: 1,
             ..Default::default()
         };
-        assert_eq!(load_dataset(&t.0, cfg).unwrap().positions.len(), 9);
+        let ds1 = load_dataset(&t.0, cfg).unwrap();
+        assert_eq!(ds1.positions.len(), 9);
+        assert_eq!(ds1.skipped_frames(), vec![6]);
     }
 
     #[test]
@@ -428,7 +584,10 @@ mod tests {
         let t = TempDir::new("gpsmiss");
         make(&t.0, 7, &[], &[3]);
         match load_dataset(&t.0, DatasetConfig::default()) {
-            Err(DatasetError::GpsMissing { frame: 3 }) => {}
+            Err(DatasetError::GpsMissing {
+                camera: "camF",
+                frame: 3,
+            }) => {}
             r => panic!("{r:?}"),
         }
     }
@@ -461,26 +620,85 @@ mod tests {
             ("# c\na_0 x 2 3\n", 2),
             ("a_0 1 2 3\na_1 95 2 3\n", 2),
             ("noname 1 2 3\n", 1),
-            ("a_0 1 2 3\na_0 1 2 4\n", 2),
         ];
         for (text, want) in cases {
-            match parse_gps(text).and_then(|g| {
-                // 중복 검사는 load 에서 하므로 여기서 흉내.
-                for (i, a) in g.iter().enumerate() {
-                    for b in &g[..i] {
-                        if a.frame == b.frame && a.geo != b.geo {
-                            return Err(DatasetError::GpsFormat {
-                                line: a.line,
-                                msg: String::new(),
-                            });
-                        }
-                    }
-                }
-                Ok(g)
-            }) {
+            match parse_gps(text) {
                 Err(DatasetError::GpsFormat { line, .. }) => assert_eq!(line, want, "{text}"),
                 r => panic!("{text}: {r:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn gps_camera_of_name() {
+        let g = parse_gps("camF_0001.jpg 1 2 3\ncamL_0001 1 2 3\n0001 1 2 3\ncamX_0001 1 2 3\n")
+            .unwrap();
+        let cams: Vec<Option<usize>> = g.iter().map(|r| r.camera).collect();
+        assert_eq!(cams, vec![Some(0), Some(2), None, None]);
+        assert!(g.iter().all(|r| r.frame == 1));
+    }
+
+    #[test]
+    fn gps_table_duplicates() {
+        // 카메라마다 다른 값: 허용. 같은 값 반복: 허용.
+        let ok =
+            parse_gps("camF_0000 1 2 3\ncamR_0000 1.1 2 3\ncamF_0000 1 2 3\n0000 5 5 5\n").unwrap();
+        let t = GpsTable::build(&ok).unwrap();
+        assert_eq!(t.get(0, 0).unwrap().lat_deg, 1.0);
+        assert_eq!(t.get(1, 0).unwrap().lat_deg, 1.1);
+        // camL 은 카메라별 기록이 없어 공통 줄.
+        assert_eq!(t.get(2, 0).unwrap().lat_deg, 5.0);
+        assert!(t.get(0, 1).is_none());
+        // 같은 (카메라, 프레임)에 다른 값: 뒤 줄 번호로 오류.
+        for (text, want) in [
+            ("camF_0000 1 2 3\ncamR_0000 1 2 3\ncamF_0000 1 2 4\n", 3),
+            ("0007 1 2 3\n0007 1 2 3.5\n", 2),
+        ] {
+            match GpsTable::build(&parse_gps(text).unwrap()) {
+                Err(DatasetError::GpsFormat { line, .. }) => assert_eq!(line, want, "{text}"),
+                r => panic!("{text}: {r:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_gps_in_dataset_is_error() {
+        let t = TempDir::new("dupgps");
+        make(&t.0, 4, &[], &[]);
+        let mut text = std::fs::read_to_string(t.0.join("gps.txt")).unwrap();
+        text += "camR_0003.jpg 37.5 127 50.0\n";
+        std::fs::write(t.0.join("gps.txt"), &text).unwrap();
+        let want = text.lines().count();
+        match load_dataset(&t.0, DatasetConfig::default()) {
+            Err(e @ DatasetError::GpsFormat { .. }) => {
+                assert!(matches!(e, DatasetError::GpsFormat { line, .. } if line == want));
+                assert!(e.to_string().contains("camR 프레임 3"), "{e}");
+            }
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn per_camera_gps_accepted() {
+        // 같은 프레임의 세 드론 GPS 가 위도 1e-4° 씩(북쪽 약 11.1 m) 다르다.
+        let t = TempDir::new("percam");
+        make(&t.0, 7, &[], &[]);
+        let ds = load_dataset(&t.0, DatasetConfig::default()).unwrap();
+        assert_eq!(ds.positions.len(), 3);
+        // 위도 1e-4° 의 남북 거리: 자오선 곡률 반지름 M = a(1−e²)/(1−e² sin²φ)^1.5, φ=37°.
+        let (a, e2) = (6378137.0_f64, 6.694379990141317e-3_f64);
+        let s2 = 37.0_f64.to_radians().sin().powi(2);
+        let m = a * (1.0 - e2) / (1.0 - e2 * s2).powf(1.5);
+        let d = m * 1e-4_f64.to_radians();
+        assert!((d - 11.09).abs() < 0.02, "{d}");
+        for p in &ds.positions {
+            assert_eq!(p.geo[1].lat_deg, 37.0001);
+            for (i, j, k) in [(0, 1, 1.0), (1, 2, 1.0), (0, 2, 2.0)] {
+                let got = (p.enu[j] - p.enu[i]).norm();
+                assert!((got - k * d).abs() < 0.1, "위치 {} {i}-{j}: {got}", p.index);
+            }
+            let c = p.enu_center();
+            assert!((c - p.enu[1]).norm() < 0.01, "{c}");
         }
     }
 
@@ -601,5 +819,168 @@ mod tests {
             load_dataset(&t.0, DatasetConfig::default()),
             Err(DatasetError::Missing(p)) if p.ends_with("camL")
         ));
+    }
+
+    #[test]
+    fn non_four_digit_names_rejected() {
+        // `camF_3.jpg`·`camF_00003.jpg` 만 있는 폴더: 없는 `camF_0003.jpg` 를 만들지 않고 Err.
+        for bad in ["camF_3.jpg", "camF_00003.jpg", "camF_012.jpg"] {
+            let t = TempDir::new("digits");
+            make(&t.0, 4, &[(0, 3)], &[]);
+            let p = t.0.join("images/camF").join(bad);
+            std::fs::write(&p, b"x").unwrap();
+            match load_dataset(&t.0, DatasetConfig::default()) {
+                Err(e @ DatasetError::BadImageName(_)) => {
+                    assert!(matches!(&e, DatasetError::BadImageName(q) if *q == p));
+                    assert!(e.to_string().contains(bad), "{e}");
+                }
+                r => panic!("{bad}: {r:?}"),
+            }
+        }
+        // 4자리 넘는 번호는 `{:04}` 표기 그대로(앞자리 0 없음)면 받는다. 모든 경로가 실제 파일.
+        let t = TempDir::new("digits5");
+        make(&t.0, 1, &[], &[]);
+        let mut gps = std::fs::read_to_string(t.0.join("gps.txt")).unwrap();
+        for cam in CAMERAS {
+            std::fs::write(t.0.join(format!("images/{cam}/{cam}_12345.jpg")), b"x").unwrap();
+            gps += &format!("{cam}_12345.jpg 37 127.1 50\n");
+        }
+        std::fs::write(t.0.join("gps.txt"), gps).unwrap();
+        let cfg = DatasetConfig {
+            stride: 12345,
+            ..Default::default()
+        };
+        let ds = load_dataset(&t.0, cfg).unwrap();
+        assert_eq!(
+            ds.positions.iter().map(|p| p.frame).collect::<Vec<_>>(),
+            vec![0, 12345]
+        );
+        assert!(ds
+            .positions
+            .iter()
+            .flat_map(|p| &p.images)
+            .all(|q| q.exists()));
+    }
+
+    #[test]
+    fn missing_camera_frames_reported_or_rejected() {
+        // camR 6 만 빠짐: 위치 0,3,9,…,39 (13곳), skipped == [6].
+        let t = TempDir::new("skip1");
+        make(&t.0, 40, &[(1, 6)], &[]);
+        let ds = load_dataset(&t.0, DatasetConfig::default()).unwrap();
+        assert_eq!(ds.positions.len(), 13);
+        assert_eq!(ds.skipped_frames(), vec![6]);
+        assert_eq!(
+            ds.skipped,
+            vec![SkippedFrame {
+                frame: 6,
+                missing: vec!["camR"]
+            }]
+        );
+        // camL 20..39 빠짐: 고른 프레임 21,24,…,39 의 7곳이 연속으로 빠짐 → 기본(2)에서 오류.
+        let t = TempDir::new("skiptail");
+        let skip: Vec<(usize, u32)> = (20..40).map(|f| (2, f)).collect();
+        make(&t.0, 40, &skip, &[]);
+        match load_dataset(&t.0, DatasetConfig::default()) {
+            Err(DatasetError::SkipRun {
+                first: 21,
+                last: 39,
+                count: 7,
+                limit: 2,
+            }) => {}
+            r => panic!("{r:?}"),
+        }
+        // 허용을 늘리면 읽되 빠진 7곳을 모두 보고한다.
+        let cfg = DatasetConfig {
+            max_skip_run: 7,
+            ..Default::default()
+        };
+        let ds = load_dataset(&t.0, cfg).unwrap();
+        assert_eq!(ds.positions.len(), 7);
+        assert_eq!(ds.skipped_frames(), vec![21, 24, 27, 30, 33, 36, 39]);
+        // 연속 2곳(허용 2)은 통과, 3곳은 오류. 앞 끝의 연속도 센다.
+        let t = TempDir::new("skiprun");
+        make(&t.0, 40, &[(0, 0), (1, 3), (2, 12), (2, 15)], &[]);
+        let ds = load_dataset(&t.0, DatasetConfig::default()).unwrap();
+        assert_eq!(ds.skipped_frames(), vec![0, 3, 12, 15]);
+        assert_eq!(ds.positions[0].frame, 6);
+        let t = TempDir::new("skiprun3");
+        make(&t.0, 40, &[(0, 0), (1, 3), (2, 6)], &[]);
+        assert!(matches!(
+            load_dataset(&t.0, DatasetConfig::default()),
+            Err(DatasetError::SkipRun {
+                first: 0,
+                last: 6,
+                count: 3,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn chunk_tail_always_adds_new_positions() {
+        for n in 1..=200 {
+            for span in [1, 4, 12] {
+                for ovl in [0, 2, 5] {
+                    let c = chunk_ranges(n, span, ovl);
+                    assert_eq!(c[0].start, 0, "{n} {span} {ovl}");
+                    assert_eq!(c.last().unwrap().end, n, "{n} {span} {ovl}");
+                    for w in c.windows(2) {
+                        // 빈틈 없이 이어지고, 뒤 구역은 앞 구역 끝 너머 위치를 OVL 개보다 많이 가진다.
+                        assert!(w[1].start <= w[0].end, "{n} {span} {ovl}: {c:?}");
+                        assert!(w[1].end > w[0].end + ovl, "{n} {span} {ovl}: {c:?}");
+                        assert!(w[1].start > w[0].start, "{n} {span} {ovl}: {c:?}");
+                    }
+                    // OVL < SPAN 이면 앞 구역들은 SPEC 범위 그대로, 꼬리만 늘어난다.
+                    if ovl < span {
+                        for (i, r) in c.iter().enumerate().take(c.len() - 1) {
+                            let s = i * span;
+                            assert_eq!(*r, s.saturating_sub(ovl)..(s + span + ovl).min(n));
+                        }
+                    }
+                }
+            }
+        }
+        // OVL ≥ SPAN 이라도 같은 구역이 두 번 나오지 않는다.
+        assert_eq!(chunk_ranges(2, 1, 5), vec![0..2]);
+    }
+
+    #[test]
+    fn empty_gps_message() {
+        let t = TempDir::new("emptygps");
+        make(&t.0, 4, &[], &[]);
+        std::fs::write(t.0.join("gps.txt"), "# 기록 없음\n\n").unwrap();
+        match load_dataset(&t.0, DatasetConfig::default()) {
+            Err(e @ DatasetError::GpsEmpty) => assert_eq!(e.to_string(), "gps.txt 기록 없음"),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn huge_frame_gap_is_fast() {
+        // 프레임 0 과 4000000000 만: 공백을 한 칸씩 돌지 않고 있는 프레임에서 고른다.
+        let t = TempDir::new("gap");
+        make(&t.0, 1, &[], &[]);
+        let mut gps = std::fs::read_to_string(t.0.join("gps.txt")).unwrap();
+        for cam in CAMERAS {
+            std::fs::write(t.0.join(format!("images/{cam}/{cam}_4000000000.jpg")), b"x").unwrap();
+            gps += &format!("{cam}_4000000000.jpg 37 127.1 50\n");
+        }
+        std::fs::write(t.0.join("gps.txt"), gps).unwrap();
+        let t0 = std::time::Instant::now();
+        let cfg = DatasetConfig {
+            stride: 1,
+            ..Default::default()
+        };
+        let ds = load_dataset(&t.0, cfg).unwrap();
+        let dt = t0.elapsed().as_secs_f64();
+        assert!(dt < 1.0, "{dt} s");
+        assert_eq!(
+            ds.positions.iter().map(|p| p.frame).collect::<Vec<_>>(),
+            vec![0, 4000000000]
+        );
+        // STRIDE 3: 4000000000 − 0 은 3 의 배수가 아니라 빠진다(3·1333333333 = 3999999999).
+        let ds3 = load_dataset(&t.0, DatasetConfig::default()).unwrap();
+        assert_eq!(ds3.positions.len(), 1);
     }
 }

@@ -18,9 +18,19 @@ impl Drop for TempDir {
     }
 }
 
-/// 프레임 0..frames, 8×8 jpg 와 gps.txt.
+/// 프레임 0..frames, 8×8 jpg 와 gps.txt. GPS 는 사진마다 한 줄, 드론마다 위도 1e-4°(약 11 m) 차.
 fn make_dataset(root: &Path, frames: u32) {
     let img = image::RgbImage::from_pixel(8, 8, image::Rgb([90, 120, 150]));
+    let mut gps = String::new();
+    for f in 0..frames {
+        for (c, cam) in ["camF", "camR", "camL"].iter().enumerate() {
+            gps += &format!(
+                "{cam}_{f:04}.jpg {} {} 30.0\n",
+                37.5 + c as f64 * 1e-4,
+                127.0 + f as f64 * 1e-5
+            );
+        }
+    }
     for cam in ["camF", "camR", "camL"] {
         let d = root.join("images").join(cam);
         std::fs::create_dir_all(&d).unwrap();
@@ -28,9 +38,6 @@ fn make_dataset(root: &Path, frames: u32) {
             img.save(d.join(format!("{cam}_{f:04}.jpg"))).unwrap();
         }
     }
-    let gps: String = (0..frames)
-        .map(|f| format!("camF_{f:04}.jpg 37.5 {} 30.0\n", 127.0 + f as f64 * 1e-5))
-        .collect();
     std::fs::write(root.join("gps.txt"), gps).unwrap();
 }
 
@@ -66,6 +73,7 @@ fn run_lists_positions_and_chunks() {
     );
     assert!(s.contains("positions 14\n"), "{s}");
     assert!(s.contains("images 42\n"), "{s}");
+    assert!(s.contains("skipped 0\n"), "{s}");
     assert!(
         s.contains("chunks 3\nchunk 0 0..6\nchunk 1 4..11\nchunk 2 9..14\n"),
         "{s}"
@@ -126,4 +134,59 @@ fn run_rejects_bad_options_and_missing_input() {
     let out = run(&[t.0.join("nope").to_str().unwrap(), o.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
     assert!(!o.exists());
+}
+
+#[test]
+fn run_reports_skipped_frames() {
+    let t = TempDir::new("skip");
+    let input = t.0.join("in");
+    make_dataset(&input, 40);
+    // camR 6 이 빠짐 → 위치 13곳, 건너뜀 1.
+    std::fs::remove_file(input.join("images/camR/camR_0006.jpg")).unwrap();
+    let o = t.0.join("o");
+    let out = run(&[input.to_str().unwrap(), o.to_str().unwrap()]);
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{s}");
+    assert!(s.contains("positions 13\n"), "{s}");
+    assert!(
+        s.contains("skipped 1 (frames 6)\nskip frame 6 missing camR\n"),
+        "{s}"
+    );
+    // camL 20..39 이 빠짐 → 연속 7곳 건너뜀, 기본 허용 2 를 넘어 종료 코드 1.
+    for f in 20..40 {
+        std::fs::remove_file(input.join(format!("images/camL/camL_{f:04}.jpg"))).unwrap();
+    }
+    let out = run(&[input.to_str().unwrap(), o.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    let e = String::from_utf8(out.stderr).unwrap();
+    assert!(e.contains("7곳 연속"), "{e}");
+    // 허용을 늘리면 통과하고 7곳 + camR 6 을 모두 보고한다.
+    let out = run(&[
+        input.to_str().unwrap(),
+        o.to_str().unwrap(),
+        "--max-skip-run",
+        "7",
+    ]);
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{s}");
+    assert!(
+        s.contains("positions 6\n") && s.contains("skipped 8 (frames 6,21,24,27,30,33,36,39)\n"),
+        "{s}"
+    );
+}
+
+#[test]
+fn run_accepts_per_drone_gps() {
+    // 같은 프레임 세 드론 GPS 가 서로 다름(약 11 m): 거부하지 않는다.
+    let t = TempDir::new("pergps");
+    let input = t.0.join("in");
+    make_dataset(&input, 7);
+    let out = run(&[input.to_str().unwrap(), t.0.join("o").to_str().unwrap()]);
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        out.status.success(),
+        "{s}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(s.contains("positions 3\n"), "{s}");
 }

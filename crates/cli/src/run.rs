@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use skylens_core::dataset::{load_dataset, DatasetConfig};
 
 pub const USAGE: &str =
-    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N]";
+    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N]";
 
 /// 출력 폴더 아래에 만드는 하위 폴더.
 pub const OUTPUT_DIRS: [&str; 3] = ["preview", "refined", "snapshots"];
@@ -19,6 +19,7 @@ fn parse_options(rest: &[&str]) -> Result<DatasetConfig, String> {
             "--stride" => &mut cfg.stride,
             "--span" => &mut cfg.span,
             "--ovl" => &mut cfg.ovl,
+            "--max-skip-run" => &mut cfg.max_skip_run,
             _ => return Err(format!("알 수 없는 옵션: {key}")),
         };
         let v = it.next().ok_or_else(|| format!("{key} 뒤에 값이 없음"))?;
@@ -58,6 +59,16 @@ pub fn run(input: &str, output: &str, rest: &[&str]) -> ExitCode {
     println!("stride {} span {} ovl {}", cfg.stride, cfg.span, cfg.ovl);
     println!("positions {}", ds.positions.len());
     println!("images {}", ds.image_count());
+    let skipped = ds.skipped_frames();
+    if skipped.is_empty() {
+        println!("skipped 0");
+    } else {
+        let list: Vec<String> = skipped.iter().map(u32::to_string).collect();
+        println!("skipped {} (frames {})", skipped.len(), list.join(","));
+        for s in &ds.skipped {
+            println!("skip frame {} missing {}", s.frame, s.missing.join(","));
+        }
+    }
     println!("chunks {}", chunks.len());
     for (i, c) in chunks.iter().enumerate() {
         println!("chunk {i} {}..{}", c.start, c.end);

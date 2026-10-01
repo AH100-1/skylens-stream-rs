@@ -78,22 +78,27 @@ fn loader_reads_synth_output_as_is() {
         );
     }
 
-    // 위치 좌표: 로더 원점은 gps.txt 첫 기록(= 위치 0 의 GPS). 정답은 gps_enu[i] − gps_enu[0].
+    // 위치 좌표: 로더 원점은 gps.txt 첫 기록(= 위치 0 camF 의 GPS). 합성 GPS 는 장(드론)마다
+    // 따로이므로 위치 i 카메라 c 의 정답은 gps_enu[3i+c] − gps_enu[0].
     // 허용 1 cm: gps.txt 기록 정밀도(위경도 1e-9° ≈ 0.1 mm, 고도 1 mm)와 두 접평면 원점 차
     // (수 m / 지구 반지름 × 이동 거리 200 m ≈ 0.1 mm)보다 충분히 크고, 위치 간격 2.5 m 보다 훨씬 작다.
     for (i, p) in ds.positions.iter().enumerate() {
-        let want = scene.gps_enu[i] - scene.gps_enu[0];
-        let err = (p.enu - want).norm();
-        assert!(err < 0.01, "위치 {i}: 오차 {err} m");
+        for c in 0..3 {
+            let want = scene.gps_enu[3 * i + c] - scene.gps_enu[0];
+            let err = (p.enu[c] - want).norm();
+            assert!(err < 0.01, "위치 {i} 카메라 {c}: 오차 {err} m");
+        }
     }
+    assert!(ds.skipped.is_empty());
 
     // 기본 설정(STRIDE 3, SPAN 12, OVL 2): 프레임 0,3,…,78 → 27 위치, 81 장.
-    // 구역 start 0,12,24 → [0,14) [10,26) [22,27).
+    // 구역 start 0,12,24 → [0,14) [10,26) [22,27); 꼬리 [22,27) 의 새 위치는 1개(≤ OVL)라
+    // 앞 구역에 합쳐 [0,14) [10,27).
     let ds3 = load_dataset(&t.0, DatasetConfig::default()).unwrap();
     assert_eq!(ds3.positions.len(), 27);
     assert_eq!(ds3.image_count(), 81);
     assert_eq!(ds3.positions.last().unwrap().frame, 78);
-    assert_eq!(ds3.chunks(), vec![0..14, 10..26, 22..27]);
+    assert_eq!(ds3.chunks(), vec![0..14, 10..27]);
 }
 
 #[test]
