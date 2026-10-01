@@ -22,7 +22,9 @@ impl GrayImage {
     /// RGB 8비트 → [0,1] 밝기.
     pub fn from_rgb(width: usize, height: usize, rgb: &[u8]) -> Self {
         let data = rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| (0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32) / 255.0)
             .collect();
         Self {
