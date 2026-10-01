@@ -598,6 +598,113 @@ pub fn ransac_essential(
         .next()
 }
 
+/// 정규화 좌표 대응 4개 이상에서 직접 선형 변환(DLT)으로 호모그래피 H(b ≃ H a)를 구한다.
+/// AᵀA(9×9)의 최소 고유벡터를 쓴다. 대응이 4개 미만이거나 결과가 유한하지 않으면 None.
+pub fn homography_dlt(a: &[Vector2<f64>], b: &[Vector2<f64>]) -> Option<Matrix3<f64>> {
+    if a.len() < 4 || a.len() != b.len() {
+        return None;
+    }
+    let mut ata = SMatrix::<f64, 9, 9>::zeros();
+    for (p, q) in a.iter().zip(b) {
+        let (x, y, u, v) = (p.x, p.y, q.x, q.y);
+        let r1 = SMatrix::<f64, 9, 1>::from_column_slice(&[
+            -x,
+            -y,
+            -1.0,
+            0.0,
+            0.0,
+            0.0,
+            u * x,
+            u * y,
+            u,
+        ]);
+        let r2 = SMatrix::<f64, 9, 1>::from_column_slice(&[
+            0.0,
+            0.0,
+            0.0,
+            -x,
+            -y,
+            -1.0,
+            v * x,
+            v * y,
+            v,
+        ]);
+        ata += r1 * r1.transpose() + r2 * r2.transpose();
+    }
+    let eig = ata.symmetric_eigen();
+    let h = eig.eigenvectors.column(eig.eigenvalues.imin());
+    let m = Matrix3::new(h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]);
+    m.iter().all(|v| v.is_finite()).then_some(m)
+}
+
+/// 호모그래피 전달 오차 ‖b − H a‖(정규화 단위). 무한원으로 가면 무한대.
+fn homography_transfer(h: &Matrix3<f64>, a: &Vector2<f64>, b: &Vector2<f64>) -> f64 {
+    let p = h * Vector3::new(a.x, a.y, 1.0);
+    if p.z.abs() < 1e-12 {
+        return f64::INFINITY;
+    }
+    (Vector2::new(p.x / p.z, p.y / p.z) - b).norm()
+}
+
+/// 표시된 정상 짝 가운데 한 평면(호모그래피)으로 설명되는 짝을 4점 RANSAC 으로 찾는다.
+/// 문턱 `th`(정규화 단위)는 한쪽 전달 오차 기준이다. 반환: 호모그래피 정상 표시(정상 짝이 4개 미만이면 None).
+fn planar_inliers(
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    inl: &[bool],
+    th: f64,
+    seed: u64,
+) -> Option<Vec<bool>> {
+    let idx: Vec<usize> = (0..inl.len()).filter(|&i| inl[i]).collect();
+    if idx.len() < 4 {
+        return None;
+    }
+    let mut st = seed ^ 0xD1B5_4A32_D192_ED03;
+    let mut rnd = |m: usize| {
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((st >> 33) as usize) % m
+    };
+    let mark = |h: &Matrix3<f64>| -> Vec<bool> {
+        (0..inl.len())
+            .map(|i| inl[i] && homography_transfer(h, &n1[i], &n2[i]) < th)
+            .collect()
+    };
+    let count = |v: &[bool]| v.iter().filter(|&&b| b).count();
+    let mut best: Option<Vec<bool>> = None;
+    for _ in 0..PLANAR_RANSAC_ITERS {
+        let mut pick = [0usize; 4];
+        let mut k = 0;
+        while k < 4 {
+            let c = idx[rnd(idx.len())];
+            if !pick[..k].contains(&c) {
+                pick[k] = c;
+                k += 1;
+            }
+        }
+        let a: Vec<_> = pick.iter().map(|&i| n1[i]).collect();
+        let b: Vec<_> = pick.iter().map(|&i| n2[i]).collect();
+        let Some(h) = homography_dlt(&a, &b) else {
+            continue;
+        };
+        let m = mark(&h);
+        if best.as_ref().is_none_or(|bm| count(&m) > count(bm)) {
+            best = Some(m);
+        }
+    }
+    // 최소 표본 해를 정상 짝 전체로 다시 맞추고, 다시 맞춘 H 로는 모든 대응을 판정한다
+    // (에피폴라 문턱 밖으로 밀려난 정상 짝도 평면 위에 있으면 되찾는다).
+    let m = best?;
+    let a: Vec<_> = (0..inl.len()).filter(|&i| m[i]).map(|i| n1[i]).collect();
+    let b: Vec<_> = (0..inl.len()).filter(|&i| m[i]).map(|i| n2[i]).collect();
+    Some(homography_dlt(&a, &b).map_or(m, |h| {
+        (0..inl.len())
+            .map(|i| homography_transfer(&h, &n1[i], &n2[i]) < th)
+            .collect()
+    }))
+}
+
 /// 5점 RANSAC 으로 서로 다른 본질 행렬 후보를 최대 `ESSENTIAL_CANDIDATES` 개 돌려준다.
 /// 표본 단계에서는 최고 정상 수의 0.7 배 이상인 가설을 최대 `ESSENTIAL_CANDIDATES + 6` 개 보관한다
 /// (잡음 섞인 최소 표본에서는 정답 골짜기의 가설이 정상 수로 뒤처질 수 있다).
@@ -605,7 +712,9 @@ pub fn ransac_essential(
 /// 최소 표본의 후보 E 마다 Sampson 거리로 정상 수를 세고, 정규화한 E 끼리 거리(부호 무관 프로베니우스)가
 /// 0.1 보다 먼 가설만 따로 보관한다. 평면 장면에서는 정답과 그 쌍둥이 해(이동이 평면 법선 쪽인 해)가
 /// 모든 대응을 똑같이 설명하므로 하나만 남기면 절반 확률로 쌍둥이를 고른다.
-/// 각 후보는 정상 짝으로 키랄리티 분해 → `refine_pose` 정밀화 → 정상 집합 갱신을 두 번 한 뒤,
+/// 각 후보는 정상 짝으로 키랄리티 분해 → `refine_pose` 정밀화 → 정상 집합 갱신을 두 번 한다.
+/// 정상 짝의 `PLANAR_MIN_SHARE` 이상이 한 호모그래피로 설명되면(평면 장면) 정상 집합을 그 호모그래피의
+/// 정상 짝(전달 오차 < `PLANAR_TRANSFER_FACTOR` × 문턱)으로 바꾸고 한 번 더 정밀화한다. 그 뒤
 /// 정상 수 내림차순(같으면 Sampson 비용 오름차순)으로 정렬한다. 최고 정상 수의 0.9 배 미만 후보는 버린다.
 /// 정상 짝이 5개 미만이거나 정상 비율이 `cfg.min_inlier_ratio` 미만, 길이가 다르거나
 /// 유한하지 않은 좌표가 있으면 빈 목록.
@@ -707,6 +816,20 @@ pub fn ransac_essential_candidates(
             }
             (e, inl) = (g, gi);
         }
+        // 평면 장면: 정상 짝 대부분이 한 호모그래피로 설명되면 그 호모그래피에서 벗어난 짝을 뺀다.
+        // 에피폴라 문턱(1차원 제약) 안에 우연히 든 이상치가 평면의 얕은 골짜기를 크게 기울이기 때문이다.
+        if let Some(hm) = planar_inliers(n1, n2, &inl, PLANAR_TRANSFER_FACTOR * th, cfg.seed) {
+            let (hc, ec) = (count(&hm), count(&inl));
+            if hm != inl && hc as f64 >= PLANAR_MIN_SHARE * ec as f64 {
+                let s1: Vec<_> = (0..n).filter(|&i| hm[i]).map(|i| n1[i]).collect();
+                let s2: Vec<_> = (0..n).filter(|&i| hm[i]).map(|i| n2[i]).collect();
+                if let Some(pose) = recover_pose(&e, &s1, &s2).filter(|p| p.translation_observable)
+                {
+                    let (r, t) = refine_pose(&pose.rotation, &pose.translation, &s1, &s2, 30);
+                    (e, inl) = (essential_from_pose(&r, &t), hm);
+                }
+            }
+        }
         // 정밀화 뒤 같은 골짜기로 모인 후보는 하나만 남긴다.
         if out.iter().all(|o| distinct(&o.0, &e)) {
             let (c, k) = (count(&inl), cost(&e, &inl));
@@ -726,6 +849,17 @@ pub fn ransac_essential_candidates(
 
 /// [`ransac_essential_candidates`] 가 돌려주는 최대 후보 수.
 pub const ESSENTIAL_CANDIDATES: usize = 4;
+
+/// 평면 판정용 호모그래피 4점 RANSAC 반복 수.
+pub const PLANAR_RANSAC_ITERS: usize = 200;
+
+/// 호모그래피 전달 오차 문턱 = 이 배수 × 에피폴라 문턱. 전달 오차는 두 영상 잡음이 2차원으로 더해져
+/// 에피폴라 거리보다 크다. 띠를 넓혀도 무작위 이상치가 한 점 둘레 원에 들 확률은 매우 작다(1920×1080 에서
+/// 반지름 3.75 px 원 ≈ 2e-5)이므로 정상 짝을 놓치지 않는 쪽으로 넉넉히 둔다.
+pub const PLANAR_TRANSFER_FACTOR: f64 = 2.5;
+
+/// 에피폴라 정상 짝 중 이 비율 이상이 한 호모그래피로 설명되면 평면 장면으로 보고 거른다.
+pub const PLANAR_MIN_SHARE: f64 = 0.8;
 
 /// 5점 RANSAC 의 최소 반복 수.
 pub const ESSENTIAL_MIN_ITERS: usize = 300;
@@ -1363,13 +1497,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "F-015 진행 중: 시드 18 이 하한 + 0.1° 를 0.026° 넘는다(정상 짝 2개 놓침)"]
     fn ransac_essential_planar_rotation() {
         planar_against_floor(0.0);
     }
 
     #[test]
-    #[ignore = "F-015 진행 중: 이상치 30% 에서 7/20 시드가 하한 + 0.1° 초과(문턱 안 거짓 정상 짝이 평면 골짜기를 기울인다)"]
     fn ransac_essential_planar_with_outliers() {
         planar_against_floor(0.3);
     }
@@ -1412,6 +1544,20 @@ mod tests {
                 "시드 {seed}: 잡음 없는 평면 최선 후보 회전 {best}°"
             );
         }
+    }
+
+    #[test]
+    fn homography_dlt_recovers_plane_transfer() {
+        // 평면 장면(높이 범위 0)의 잡음 없는 대응은 한 호모그래피로 정확히 옮겨진다.
+        let s = scene_full(50, 0.0, 7, 3.0, 0.0);
+        let h = homography_dlt(&s.x1, &s.x2).expect("H 없음");
+        let worst =
+            s.x1.iter()
+                .zip(&s.x2)
+                .map(|(a, b)| homography_transfer(&h, a, b))
+                .fold(0.0, f64::max);
+        assert!(worst < 1e-9, "평면 전달 오차 {worst}");
+        assert!(homography_dlt(&s.x1[..3], &s.x2[..3]).is_none());
     }
 
     #[test]

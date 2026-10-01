@@ -100,6 +100,17 @@ if let Some(rp) = refine_relative_pose(&e, &n1, &n2, 50).filter(|rp| rp.translat
 // rotation 만 믿을 수 있다(translation 은 0). 회전 평균에는 이 회전도 쓸 수 있다.
 ```
 
+내부 파라미터를 아는 짝은 5점 본질 행렬 RANSAC 으로 바로 검증할 수 있다(지면처럼 평면에 가까운 장면에서도 동작).
+
+```rust
+use skylens_core::two_view::{ransac_essential_candidates, recover_pose};
+// n1, n2: 모든 대응의 정규화 좌표(k.to_normalized). 문턱 cfg.threshold_px 는 픽셀, k.fx 로 환산한다.
+let cands = ransac_essential_candidates(&n1, &n2, k.fx, &RansacConfig::default());
+// 평면 장면은 두 시점만으로 두 겹 모호하므로 후보(E, 정상 표시)를 최대 4개 돌려준다.
+// 정상 짝 대부분이 한 평면(호모그래피)으로 설명되면 그 평면에서 벗어난 짝은 정상에서 뺀다.
+// 정답 후보 고르기는 셋째 시점 등 다른 정보로 한다. 하나만 필요하면 ransac_essential(...) 이 첫 후보를 준다.
+```
+
 ### 라이브러리: 회전 평균
 
 ```rust
@@ -224,6 +235,17 @@ if let Some(rp) = refine_relative_pose(&e, &n1, &n2, 50).filter(|rp| rp.translat
 // supply your own start. Both return None on length mismatch or NaN input.
 // For pure rotation or a very short baseline (translation unobservable), translation_observable = false
 // and only rotation is reliable (translation is zero). That rotation can still feed rotation averaging.
+```
+
+With known intrinsics, a pair can be verified directly with 5-point essential-matrix RANSAC (works for near-planar scenes such as the ground).
+
+```rust
+use skylens_core::two_view::{ransac_essential_candidates, recover_pose};
+// n1, n2: normalized coordinates of all matches (k.to_normalized). cfg.threshold_px is in pixels, converted with k.fx.
+let cands = ransac_essential_candidates(&n1, &n2, k.fx, &RansacConfig::default());
+// A planar scene is two-fold ambiguous from two views, so up to 4 candidates (E, inlier mask) are returned.
+// When most inliers are explained by one plane (homography), matches off that plane are dropped from the inliers.
+// Pick the right candidate with other information such as a third view. ransac_essential(...) returns the first candidate.
 ```
 
 ### Library: rotation averaging
