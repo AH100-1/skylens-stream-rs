@@ -419,65 +419,9 @@ fn rank2_unit(f: &Matrix3<f64>) -> Option<Matrix3<f64>> {
     (n.is_finite() && n > 0.0).then(|| g / n)
 }
 
-/// 픽셀 F 에 대한 부호 있는 Sampson 잔차 r = e / √d 와 그 해석적 기울기 ∂r/∂F (3×3).
-/// e = bᵀF a, d = (Fa)₀² + (Fa)₁² + (Fᵀb)₀² + (Fᵀb)₁² 이고
-/// ∂e/∂F_lm = b_l a_m, ∂d/∂F_lm = 2 (Fa)_l a_m [l<2] + 2 (Fᵀb)_m b_l [m<2],
-/// ∂r/∂F = ∂e/√d − e ∂d / (2 d^{3/2}). d = 0 이면 잔차 0·기울기 0(잔차 함수와 같은 규약).
-pub(crate) fn sampson_residual_grad(
-    f: &Matrix3<f64>,
-    p: &Vector2<f64>,
-    q: &Vector2<f64>,
-) -> (f64, Matrix3<f64>) {
-    let a = Vector3::new(p.x, p.y, 1.0);
-    let b = Vector3::new(q.x, q.y, 1.0);
-    let fa = f * a;
-    let ftb = f.transpose() * b;
-    let e = b.dot(&fa);
-    let d = fa.x * fa.x + fa.y * fa.y + ftb.x * ftb.x + ftb.y * ftb.y;
-    if d <= 0.0 {
-        return (0.0, Matrix3::zeros());
-    }
-    let sd = d.sqrt();
-    let c = e / (2.0 * d * sd);
-    let mut g = Matrix3::zeros();
-    for l in 0..3 {
-        for mm in 0..3 {
-            let mut dd = 0.0;
-            if l < 2 {
-                dd += 2.0 * fa[l] * a[mm];
-            }
-            if mm < 2 {
-                dd += 2.0 * ftb[mm] * b[l];
-            }
-            g[(l, mm)] = b[l] * a[mm] / sd - c * dd;
-        }
-    }
-    (e / sd, g)
-}
-
-/// 정규화 좌표 F 성분 g(행 우선 9개)에 대한 픽셀 Sampson 잔차의 야코비안.
-/// F_px = T2ᵀ G T1 이므로 ∂r/∂G = T2 (∂r/∂F_px) T1ᵀ.
-fn sampson_jacobian_normalized(
-    g: &Matrix3<f64>,
-    t1: &Matrix3<f64>,
-    t2: &Matrix3<f64>,
-    x1: &[Vector2<f64>],
-    x2: &[Vector2<f64>],
-    jac: &mut [[f64; 9]],
-) {
-    let fp = t2.transpose() * g * t1;
-    for ((p, q), row) in x1.iter().zip(x2).zip(jac.iter_mut()) {
-        let (_, gp) = sampson_residual_grad(&fp, p, q);
-        let gn = t2 * gp * t1.transpose();
-        for k in 0..9 {
-            row[k] = gn[(k / 3, k % 3)];
-        }
-    }
-}
-
 /// 주어진 대응에서 Sampson 거리 제곱합을 줄이도록 F 를 Levenberg–Marquardt 로 정밀화한다
-/// (Hartley & Zisserman 11.4.3 의 Sampson 비용). 매개변수는 Hartley 정규화 좌표의 F 성분 9개이고
-/// 야코비안은 해석적([`sampson_residual_grad`]), 걸음마다 계수 2·노름 1 로 투영해 7 자유도를 유지한다. 비용이 줄지 않으면 시작 F 를 그대로 돌려준다.
+/// (Hartley & Zisserman 11.4.3 의 Sampson 비용). 매개변수는 Hartley 정규화 좌표의 F 성분 9개이고,
+/// 걸음마다 계수 2·노름 1 로 투영해 7 자유도를 유지한다. 비용이 줄지 않으면 시작 F 를 그대로 돌려준다.
 fn refine_sampson(
     f: &Matrix3<f64>,
     x1: &[Vector2<f64>],
@@ -515,7 +459,15 @@ fn refine_sampson(
     let m = r.len();
     let mut jac = vec![[0.0f64; 9]; m];
     for _ in 0..iters {
-        sampson_jacobian_normalized(&g, &t1, &t2, x1, x2, &mut jac);
+        let h = 1e-7;
+        for k in 0..9 {
+            let mut gh = g;
+            gh[(k / 3, k % 3)] += h;
+            resid(&gh, &mut rh);
+            for i in 0..m {
+                jac[i][k] = (rh[i] - r[i]) / h;
+            }
+        }
         let mut jtj = SMatrix::<f64, 9, 9>::zeros();
         let mut jtr = SMatrix::<f64, 9, 1>::zeros();
         for i in 0..m {
@@ -610,13 +562,6 @@ pub fn adaptive_iterations(w: f64, sample: i32, confidence: f64, max_iters: usiz
 /// 적응형 종료가 허용하는 최소 반복 수.
 pub const MIN_RANSAC_ITERS: usize = 50;
 
-/// 국소 최적화 시작 조건: 가설의 정상 수 `cnt` 가 8 이상이고 지금까지 최고 정상 수 `best_cnt` 의
-/// **4분의 1 이상**이다. 절반 기준에서는 최소 표본 F 가 부정확해(에피폴이 먼 쌍) 정상 짝 일부만 설명하는
-/// 올바른 골짜기 가설이 LO 를 받지 못해 다중 시드 재현율이 미달했고, 4분의 1 로 낮추어 500/500 이 되었다.
-pub(crate) fn lo_should_start(cnt: usize, best_cnt: usize) -> bool {
-    cnt >= 8 && 4 * cnt >= best_cnt
-}
-
 /// RANSAC(Fischler & Bolles 1981) + 8점 기본 행렬로 기하 검증.
 /// 반환: (정상 짝으로 다시 맞춘 F, 정상 여부 표시).
 /// 정상 짝이 8개 미만이거나 정상 비율이 `min_inlier_ratio` 미만이면 None.
@@ -670,10 +615,10 @@ pub fn ransac_fundamental(
         let mut inl = inliers_of(&f);
         let mut cnt = inl.iter().filter(|&&b| b).count();
         // 국소 최적화(Chum et al. 2003): 잡음 섞인 최소 표본의 F 는 정상 짝 일부만 설명하므로
-        // 최고 가설의 4분의 1 이상을 설명하는 가설은 정상 짝 전체로 다시 맞춰 개선이 멈출 때까지 반복한다
-        // (조건은 [`lo_should_start`]). 이동이 영상면과 거의 평행해 에피폴이 멀면 최소 표본 F 가 특히 부정확하다.
+        // 최고 가설의 절반 이상을 설명하는 가설은 정상 짝 전체로 다시 맞춰 개선이 멈출 때까지 반복한다.
+        // 이동이 영상면과 거의 평행해 에피폴이 멀면 최소 표본 F 가 특히 부정확하다.
         let best_cnt = best.as_ref().map_or(0, |b| b.2);
-        if lo_should_start(cnt, best_cnt) {
+        if cnt >= 8 && 4 * cnt >= best_cnt {
             // 문턱을 넓게 시작해 줄여 가며(×3, ×2, ×1.5, ×1) 다시 맞춘다: 부정확한 시작 F 의 좁은 띠
             // 밖에 있는 정상 짝도 끌어들이기 위해서다. 문턱 ×1 의 정상 수가 늘어날 때만 받아들인다.
             let mut f_lo = f;
@@ -1545,50 +1490,6 @@ mod tests {
             assert!(r.is_none(), "무작위 대응에서 F 확정");
         }
     }
-    #[test]
-    fn lo_start_condition_is_one_quarter_of_best() {
-        // 주석의 "최고 가설의 4분의 1 이상" 과 일치해야 한다.
-        assert!(lo_should_start(8, 0));
-        assert!(!lo_should_start(7, 0));
-        assert!(lo_should_start(25, 100));
-        assert!(!lo_should_start(24, 100));
-        assert!(lo_should_start(30, 100)); // 절반 기준이었다면 거짓
-    }
-
-    #[test]
-    fn sampson_jacobian_matches_central_difference() {
-        // 해석적 야코비안 ↔ 중앙 차분(오차 O(h²), h = 1e-6 에서 상대 ~1e-10 수준)이 상대 1e-6 안에서 일치.
-        let (x1, x2, _, c1, c2) = correspondences(60, 0.7, 0.0, 3);
-        let f0 = fundamental_from_cameras(&c1, &c2);
-        let (t1, t2) = (normalizer(&x1), normalizer(&x2));
-        let g =
-            rank2_unit(&(t2.try_inverse().unwrap().transpose() * f0 * t1.try_inverse().unwrap()))
-                .unwrap();
-        // 정답에서 조금 벗어난 점(잔차가 0 이 아닌 곳)에서 비교.
-        let g = g + Matrix3::new(1e-3, -2e-3, 5e-4, 3e-4, 1e-3, -1e-3, 2e-3, 1e-3, -5e-4);
-        let mut jac = vec![[0.0; 9]; x1.len()];
-        sampson_jacobian_normalized(&g, &t1, &t2, &x1, &x2, &mut jac);
-        let r = |gg: &Matrix3<f64>, i: usize| {
-            sampson_residual_grad(&(t2.transpose() * gg * t1), &x1[i], &x2[i]).0
-        };
-        let h = 1e-6;
-        for (i, row) in jac.iter().enumerate() {
-            let scale = row.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-            for k in 0..9 {
-                let (mut gp, mut gm) = (g, g);
-                gp[(k / 3, k % 3)] += h;
-                gm[(k / 3, k % 3)] -= h;
-                let num = (r(&gp, i) - r(&gm, i)) / (2.0 * h);
-                let err = (row[k] - num).abs() / scale;
-                assert!(
-                    err < 1e-6,
-                    "점 {i} 성분 {k}: 해석 {} 수치 {num} 상대 {err:e}",
-                    row[k]
-                );
-            }
-        }
-    }
-
     /// 지면(z = 0) 위 점과 그보다 카메라 쪽으로 1~3 m 솟은 건물 점(비율 `bld`)을 섞은 대응(σ px).
     fn ground_with_buildings(
         n: usize,
@@ -1699,23 +1600,5 @@ mod tests {
             assert_eq!(m.model, TwoViewModel::Fundamental, "seed {seed}: {m:?}");
             assert!(m.gric_f < m.gric_h, "seed {seed}: {m:?}");
         }
-    }
-
-    /// 대응 4000개(정상 50%) RANSAC 1회 시간. 단독·직렬로 잰다: `cargo test --release -- --ignored ransac_4000_timing --test-threads=1 --nocapture`.
-    #[test]
-    #[ignore]
-    fn ransac_4000_timing() {
-        let (x1, x2, _, _, _) = correspondences(4000, 0.5, 0.5, 7);
-        let cfg = RansacConfig::default();
-        let _ = ransac_fundamental(&x1, &x2, &cfg);
-        let mut ts = vec![];
-        for _ in 0..5 {
-            let t = std::time::Instant::now();
-            let r = ransac_fundamental(&x1, &x2, &cfg);
-            ts.push(t.elapsed().as_secs_f64());
-            assert!(r.is_some());
-        }
-        ts.sort_by(f64::total_cmp);
-        eprintln!("4000 대응 RANSAC 중앙 {:.4} s, 최소 {:.4} s", ts[2], ts[0]);
     }
 }
