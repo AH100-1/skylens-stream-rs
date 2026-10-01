@@ -618,11 +618,9 @@ fn largest_component(n: usize, edges: &[RelativeRotation], ids: &[usize]) -> Opt
         let r = find(&mut parent, edges[k].i);
         weight[r] += edges[k].weight;
     }
-    for v in 0..n {
-        if touched[v] {
-            let r = find(&mut parent, v);
-            size[r] += 1;
-        }
+    for v in (0..n).filter(|&v| touched[v]) {
+        let r = find(&mut parent, v);
+        size[r] += 1;
     }
     // 뿌리는 성분 안 가장 작은 번호(합칠 때 작은 쪽을 뿌리로). 앞선 뿌리가 같은 크기에서 이긴다.
     let mut best: Option<usize> = None;
