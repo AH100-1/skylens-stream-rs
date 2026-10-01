@@ -105,7 +105,7 @@ impl GrayImage {
 
 impl From<&crate::features::GrayImage> for GrayImage {
     fn from(g: &crate::features::GrayImage) -> Self {
-        Self::new(g.width, g.height, g.data.clone())
+        Self::new(g.width(), g.height(), g.data().to_vec())
     }
 }
 
