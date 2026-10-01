@@ -302,7 +302,7 @@ fn check_reproj(r: &Json) -> Result<(bool, String), String> {
 pub fn scale_spread(scales: &[f64]) -> f64 {
     let lo = scales.iter().cloned().fold(f64::INFINITY, f64::min);
     let hi = scales.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if !(lo > 0.0) || !hi.is_finite() {
+    if lo.is_nan() || lo <= 0.0 || !hi.is_finite() {
         return f64::INFINITY;
     }
     hi / lo - 1.0
