@@ -43,6 +43,22 @@ impl RelativeTranslation {
     }
 }
 
+/// 카메라에서 장면 점으로 향하는 관측 방향 하나(특징 트랙의 한 관측).
+///
+/// 점을 미지 정점으로 두고 c_p − c_cam ∝ R_camᵀ b 를 카메라 짝 방향과 같은 방향 제약으로 쓴다.
+/// 한 줄로 나는 카메라 사슬은 짝 방향만으로는 간선 길이(사슬 방향 위치)가 정해지지 않지만, 줄 밖의 점이
+/// 카메라–카메라–점 삼각형을 만들어 길이를 정한다(카메라–점 방향 제약 평균).
+#[derive(Clone, Debug)]
+pub struct PointObservation {
+    pub camera: usize,
+    /// 점 번호(0..점 수).
+    pub point: usize,
+    /// 카메라 좌표계의 점 방향(길이 무관, 정규화 좌표 (x, y, 1) 이면 된다).
+    pub bearing: Vector3<f64>,
+    /// 신뢰도. 0 이하·NaN 이면 쓰지 않는다.
+    pub weight: f64,
+}
+
 /// 설정.
 #[derive(Clone, Debug)]
 pub struct TranslationConfig {
@@ -60,6 +76,8 @@ pub struct TranslationConfig {
     pub outlier_threshold_rad: f64,
     /// 등록 판정에서 두 간선이 평행하지 않다고 볼 최소 각(rad).
     pub rigidity_angle_rad: f64,
+    /// 정점이 이보다 많으면 정밀화 연립을 밀집 LU 대신 블록 야코비 선조건 켤레 기울기로 푼다.
+    pub dense_max_vertices: usize,
 }
 
 impl Default for TranslationConfig {
@@ -72,6 +90,7 @@ impl Default for TranslationConfig {
             irls_iterations: 60,
             outlier_threshold_rad: 6f64.to_radians(),
             rigidity_angle_rad: 3f64.to_radians(),
+            dense_max_vertices: 400,
         }
     }
 }
@@ -81,6 +100,8 @@ impl Default for TranslationConfig {
 pub struct TranslationResult {
     /// 카메라 중심(등록 안 된 정점은 None). 축척·원점은 임의.
     pub centers: Vec<Option<Point3<f64>>>,
+    /// 점 위치(점 관측을 줄 때만, 등록 안 된 점은 None). 카메라 중심과 같은 틀.
+    pub points: Vec<Option<Point3<f64>>>,
     /// 입력 간선별 최종 각 잔차(rad). 쓰지 않은 간선은 NaN.
     pub residuals_rad: Vec<f64>,
     /// 입력 간선별 정상 여부.
@@ -254,7 +275,17 @@ fn constrained_ls(m: usize, edges: &[Edge], w: &[f64]) -> Option<Vec<Vector3<f64
 
 /// 고정 가중치에서 min Σ w |c_i − c_j − s d|² 를 c 와 s 에 대해 함께 푼다(c_0 = 0).
 /// `clamped` 간선은 s = 1 로 고정(항 w|c_i − c_j − d|²), 나머지는 s 를 소거해 w|(I − d dᵀ)(c_i − c_j)|².
-fn joint_solve(m: usize, edges: &[Edge], w: &[f64], clamped: &[bool]) -> Option<Vec<Vector3<f64>>> {
+fn joint_solve(
+    m: usize,
+    edges: &[Edge],
+    w: &[f64],
+    clamped: &[bool],
+    start: &[Vector3<f64>],
+    dense_max: usize,
+) -> Option<Vec<Vector3<f64>>> {
+    if m > dense_max {
+        return joint_solve_pcg(m, edges, w, clamped, start);
+    }
     let dim = 3 * (m - 1);
     let mut a = DMatrix::<f64>::zeros(dim, dim);
     let mut b = DVector::<f64>::zeros(dim);
@@ -293,19 +324,127 @@ fn joint_solve(m: usize, edges: &[Edge], w: &[f64], clamped: &[bool]) -> Option<
     )
 }
 
+/// [`joint_solve`] 와 같은 연립을 행렬 없이 블록 야코비 선조건 켤레 기울기로 푼다(Hestenes–Stiefel 1952;
+/// 선조건은 정점별 3×3 대각 블록의 역). 행렬은 c_0 = 0 으로 줄인 그래프 라플라스형 대칭 양의 정부호이다.
+/// 시작값은 직전 IRLS 해라서 반복이 적다.
+fn joint_solve_pcg(
+    m: usize,
+    edges: &[Edge],
+    w: &[f64],
+    clamped: &[bool],
+    start: &[Vector3<f64>],
+) -> Option<Vec<Vector3<f64>>> {
+    let ps: Vec<Matrix3<f64>> = edges
+        .iter()
+        .zip(w)
+        .zip(clamped)
+        .map(|((e, &we), &cl)| {
+            if cl {
+                Matrix3::identity() * we
+            } else {
+                (Matrix3::identity() - e.d * e.d.transpose()) * we
+            }
+        })
+        .collect();
+    let apply = |x: &[Vector3<f64>], y: &mut Vec<Vector3<f64>>| {
+        y.iter_mut().for_each(|v| *v = Vector3::zeros());
+        for (e, p) in edges.iter().zip(&ps) {
+            let v = p * (x[e.i] - x[e.j]);
+            y[e.i] += v;
+            y[e.j] -= v;
+        }
+        y[0] = Vector3::zeros();
+    };
+    let mut b = vec![Vector3::zeros(); m];
+    let mut diag = vec![Matrix3::zeros(); m];
+    for (((e, &we), &cl), p) in edges.iter().zip(w).zip(clamped).zip(&ps) {
+        if cl {
+            b[e.i] += e.d * we;
+            b[e.j] -= e.d * we;
+        }
+        diag[e.i] += p;
+        diag[e.j] += p;
+    }
+    b[0] = Vector3::zeros();
+    let dinv: Vec<Matrix3<f64>> = diag
+        .iter()
+        .map(|d| {
+            let reg = Matrix3::identity() * (1e-9 * d.trace()).max(1e-300);
+            (d + reg).try_inverse().unwrap_or_else(Matrix3::identity)
+        })
+        .collect();
+    let dot = |a: &[Vector3<f64>], b: &[Vector3<f64>]| {
+        a.iter().zip(b).map(|(x, y)| x.dot(y)).sum::<f64>()
+    };
+    let mut x: Vec<Vector3<f64>> = start.iter().map(|v| v - start[0]).collect();
+    let mut ax = vec![Vector3::zeros(); m];
+    apply(&x, &mut ax);
+    let mut r: Vec<Vector3<f64>> = b.iter().zip(&ax).map(|(b, a)| b - a).collect();
+    let bnorm = dot(&b, &b).sqrt().max(1e-300);
+    let mut z: Vec<Vector3<f64>> = dinv.iter().zip(&r).map(|(d, r)| d * r).collect();
+    z[0] = Vector3::zeros();
+    let mut p = z.clone();
+    let mut rz = dot(&r, &z);
+    let mut ap = vec![Vector3::zeros(); m];
+    for _ in 0..20 * m {
+        if dot(&r, &r).sqrt() <= 1e-13 * bnorm {
+            break;
+        }
+        apply(&p, &mut ap);
+        let pap = dot(&p, &ap);
+        if pap.is_nan() || pap <= 0.0 {
+            break;
+        }
+        let alpha = rz / pap;
+        for k in 0..m {
+            x[k] += p[k] * alpha;
+            r[k] -= ap[k] * alpha;
+        }
+        for k in 0..m {
+            z[k] = dinv[k] * r[k];
+        }
+        z[0] = Vector3::zeros();
+        let rz_new = dot(&r, &z);
+        let beta = rz_new / rz;
+        rz = rz_new;
+        for k in 0..m {
+            p[k] = z[k] + p[k] * beta;
+        }
+    }
+    x.iter()
+        .all(|v| v.iter().all(|c| c.is_finite()))
+        .then_some(x)
+}
+
 /// 전역 회전(세계→카메라)과 짝별 이동 방향으로 카메라 중심을 구한다.
 pub fn average_translations(
     rotations: &[Option<Rotation3<f64>>],
     observations: &[RelativeTranslation],
     cfg: &TranslationConfig,
 ) -> TranslationResult {
-    let n = rotations.len();
+    average_translations_with_points(rotations, observations, &[], cfg)
+}
+
+/// [`average_translations`] 에 카메라→점 방향 관측을 더한다. 점은 정점 n_cam.. 으로 함께 푼다.
+pub fn average_translations_with_points(
+    rotations: &[Option<Rotation3<f64>>],
+    observations: &[RelativeTranslation],
+    point_observations: &[PointObservation],
+    cfg: &TranslationConfig,
+) -> TranslationResult {
+    let n_cam = rotations.len();
+    let n_pts = point_observations
+        .iter()
+        .map(|o| o.point + 1)
+        .max()
+        .unwrap_or(0);
+    let n = n_cam + n_pts;
     let mut rejected = [0usize; 2];
     // 1a. 무효·회전 불일치 제거, 세계 방향으로 바꾸기.
     let mut edges = Vec::new();
     for (idx, o) in observations.iter().enumerate() {
-        let valid = o.i < n
-            && o.j < n
+        let valid = o.i < n_cam
+            && o.j < n_cam
             && o.i != o.j
             && o.weight > 0.0
             && o.direction.norm() > 1e-12
@@ -333,6 +472,25 @@ pub fn average_translations(
             w: o.weight,
         });
     }
+    // 1a'. 카메라→점 방향: 간선 (i = 점, j = 카메라), 세계 방향 d = R_camᵀ b ∝ c_p − c_cam.
+    for (k, o) in point_observations.iter().enumerate() {
+        let rot = (o.camera < n_cam
+            && o.weight > 0.0
+            && o.bearing.norm() > 1e-12
+            && o.bearing.iter().all(|x| x.is_finite()))
+        .then(|| rotations[o.camera])
+        .flatten();
+        let Some(r) = rot else {
+            continue;
+        };
+        edges.push(Edge {
+            idx: observations.len() + k,
+            i: n_cam + o.point,
+            j: o.camera,
+            d: (r.inverse() * o.bearing).normalize(),
+            w: o.weight,
+        });
+    }
     // 1b. 삼각형 닫힘.
     let keep = triplet_filter(n, &edges, cfg);
     rejected[1] = keep.iter().filter(|k| !**k).count();
@@ -342,8 +500,9 @@ pub fn average_translations(
         .filter_map(|(e, k)| k.then_some(e))
         .collect();
 
-    let mut residuals_rad = vec![f64::NAN; observations.len()];
-    let mut inliers = vec![false; observations.len()];
+    let n_obs = observations.len();
+    let mut residuals_rad = vec![f64::NAN; n_obs];
+    let mut inliers = vec![false; n_obs];
     let mut centers = vec![None; n];
 
     // 가장 큰 성분으로 좁히고 지역 번호를 매긴다.
@@ -371,8 +530,10 @@ pub fn average_translations(
     };
     let (mut ledges, mut verts) = restrict(edges);
     if verts.len() < 2 {
+        centers.truncate(n_cam);
         return TranslationResult {
             centers,
+            points: vec![None; n_pts],
             residuals_rad,
             inliers,
             rejected,
@@ -407,14 +568,15 @@ pub fn average_translations(
         let Some(mut cc) = init else {
             break;
         };
-        // 축척: 가장 짧은 양의 길이를 1 로 둔다(하한 s ≥ 1 이 초기값을 찌그러뜨리지 않게).
+        // 축척: 양의 길이의 5% 분위를 1 로 둔다. 최솟값을 쓰면 이상치 간선 하나(길이 ~0)가 축척을 정해
+        // 하한 s ≥ 1 이 사실상 그 간선 하나에만 걸리고 나머지는 축척 불변 사영 항만 남아 해가 쏠린다.
         let mut lens: Vec<f64> = ledges
             .iter()
             .map(|e| e.d.dot(&(cc[e.i] - cc[e.j])))
             .filter(|l| *l > 0.0)
             .collect();
         lens.sort_by(|a, b| a.total_cmp(b));
-        if let Some(&l) = lens.first() {
+        if let Some(&l) = lens.get(lens.len() / 20) {
             for v in cc.iter_mut() {
                 *v /= l;
             }
@@ -449,7 +611,7 @@ pub fn average_translations(
                     clamped[k] = true;
                 }
             }
-            match joint_solve(m, &ledges, &w, &clamped) {
+            match joint_solve(m, &ledges, &w, &clamped, &cc, cfg.dense_max_vertices) {
                 Some(next) => cc = next,
                 None => break,
             }
@@ -475,8 +637,10 @@ pub fn average_translations(
         }
     }
     if c.is_empty() {
+        centers.truncate(n_cam);
         return TranslationResult {
             centers,
+            points: vec![None; n_pts],
             residuals_rad,
             inliers,
             rejected,
@@ -486,9 +650,13 @@ pub fn average_translations(
     let mut dirs: Vec<Vec<Vector3<f64>>> = vec![Vec::new(); verts.len()];
     for e in &ledges {
         let r = ang_res(&c, e);
-        residuals_rad[e.idx] = r;
+        if e.idx < n_obs {
+            residuals_rad[e.idx] = r;
+        }
         if r <= cfg.outlier_threshold_rad {
-            inliers[e.idx] = true;
+            if e.idx < n_obs {
+                inliers[e.idx] = true;
+            }
             dirs[e.i].push(e.d);
             dirs[e.j].push(e.d);
         }
@@ -502,8 +670,10 @@ pub fn average_translations(
             centers[v] = Some(Point3::from(c[k]));
         }
     }
+    let points = centers.split_off(n_cam);
     TranslationResult {
         centers,
+        points,
         residuals_rad,
         inliers,
         rejected,
@@ -595,33 +765,137 @@ mod tests {
         poses
     }
 
-    fn footprint(p: &Pose) -> Vector3<f64> {
+    /// 정규화 좌표 시야 반폭: 수평 화각 65°, 16:9 (tan 32.5° = 0.637, 세로 0.637·9/16).
+    const HALF_FOV: (f64, f64) = (0.637, 0.358);
+
+    /// 바닥(z = 0)에 비친 시야 사각형(볼록, 반시계 순서 xy).
+    fn footprint(p: &Pose) -> Vec<Vector2<f64>> {
         let c = p.center();
-        let f = p.rotation.inverse() * Vector3::z();
-        c.coords + f * (-c.z / f.z)
+        let (hx, hy) = HALF_FOV;
+        let mut poly: Vec<Vector2<f64>> = [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)]
+            .iter()
+            .map(|&(x, y)| {
+                let r = p.rotation.inverse() * Vector3::new(x, y, 1.0);
+                let g = c.coords + r * (-c.z / r.z);
+                Vector2::new(g.x, g.y)
+            })
+            .collect();
+        if signed_area(&poly) < 0.0 {
+            poly.reverse();
+        }
+        poly
     }
 
-    /// 다른 카메라끼리 짝을 맺는 바닥 시야 중심 거리 문턱(m).
-    /// 고도 30 m·내려다보는 각 60° 이면 시야 중심은 카메라에서 수평 30/tan60° ≈ 17.3 m 앞이다.
-    /// F(0°)·L(−116°) 시야 중심은 서로 가깝지만 R(+125°) 은 다른 드론 시야 중심과 약 20 m 떨어진다
-    /// (가로 간격 10 m 와 방위 차로 계산). 12 m 로 두면 R 80대가 통째로 끊기므로, 20 m 에 시야 폭
-    /// (약 35 m)의 겹침이 남는 2 m 여유를 더한 22 m 를 쓴다.
-    const CROSS_PAIR_RADIUS_M: f64 = 22.0;
+    fn signed_area(poly: &[Vector2<f64>]) -> f64 {
+        (0..poly.len())
+            .map(|k| {
+                let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
+                a.x * b.y - a.y * b.x
+            })
+            .sum::<f64>()
+            * 0.5
+    }
 
-    /// 짝: 같은 카메라 1~4칸 이웃 + 바닥 시야 중심이 CROSS_PAIR_RADIUS_M 안인 다른 카메라.
+    /// 두 볼록 다각형의 교차 넓이(Sutherland–Hodgman 자르기).
+    fn overlap_area(a: &[Vector2<f64>], b: &[Vector2<f64>]) -> f64 {
+        let mut out = a.to_vec();
+        for k in 0..b.len() {
+            let (p, q) = (b[k], b[(k + 1) % b.len()]);
+            let side = |v: &Vector2<f64>| (q - p).perp(&(v - p));
+            let input = std::mem::take(&mut out);
+            for m in 0..input.len() {
+                let (u, v) = (input[m], input[(m + 1) % input.len()]);
+                let (su, sv) = (side(&u), side(&v));
+                if su >= 0.0 {
+                    out.push(u);
+                }
+                if (su >= 0.0) != (sv >= 0.0) {
+                    out.push(u + (v - u) * (su / (su - sv)));
+                }
+            }
+            if out.is_empty() {
+                return 0.0;
+            }
+        }
+        signed_area(&out).abs()
+    }
+
+    /// 다른 카메라끼리 짝을 맺는 바닥 시야 겹침 비율 문턱(작은 쪽 시야 넓이 대비).
+    const CROSS_OVERLAP_FRAC: f64 = 0.1;
+
+    /// 짝: 같은 카메라 시간 이웃(1..5 칸과 8·16 칸, SPEC §3.2) + 바닥 시야가 작은 쪽 넓이의
+    /// CROSS_OVERLAP_FRAC 이상 겹치는 다른 카메라.
     fn pairs(poses: &[Pose]) -> Vec<(usize, usize)> {
+        let fp: Vec<_> = poses.iter().map(footprint).collect();
+        let area: Vec<f64> = fp.iter().map(|f| signed_area(f)).collect();
         let mut out = Vec::new();
         for a in 0..poses.len() {
             for b in a + 1..poses.len() {
-                let same = a % 3 == b % 3 && (b / 3 - a / 3) <= 4;
+                let gap = b / 3 - a / 3;
+                let same = a % 3 == b % 3 && (gap <= 5 || gap == 8 || gap == 16);
                 let cross = a % 3 != b % 3
-                    && (footprint(&poses[a]) - footprint(&poses[b])).norm() < CROSS_PAIR_RADIUS_M;
+                    && overlap_area(&fp[a], &fp[b]) >= CROSS_OVERLAP_FRAC * area[a].min(area[b]);
                 if same || cross {
                     out.push((a, b));
                 }
             }
         }
         out
+    }
+
+    /// 바닥 점 `count` 개와 그 점을 시야 안에 둔 카메라의 방향 관측(정점당 최대 `per_point` 개,
+    /// 정규화 좌표 잡음 σ 1e-3, `outlier_frac` 은 시야 안 아무 방향).
+    fn point_observations(
+        seed: u64,
+        poses: &[Pose],
+        count: usize,
+        per_point: usize,
+        outlier_frac: f64,
+    ) -> (Vec<Point3<f64>>, Vec<PointObservation>) {
+        let mut rng = Rng(seed ^ 0x5EED);
+        let mut pts = Vec::new();
+        let mut obs = Vec::new();
+        while pts.len() < count {
+            let x = Point3::new(
+                rng.unit() * 150.0 - 30.0,
+                rng.unit() * 90.0 - 45.0,
+                rng.unit() * 2.0,
+            );
+            let seen: Vec<(usize, Vector2<f64>)> = poses
+                .iter()
+                .enumerate()
+                .filter_map(|(k, p)| {
+                    let xc = p.transform(&x);
+                    let n = Vector2::new(xc.x / xc.z, xc.y / xc.z);
+                    (xc.z > 0.0 && n.x.abs() < HALF_FOV.0 && n.y.abs() < HALF_FOV.1)
+                        .then_some((k, n))
+                })
+                .collect();
+            if seen.len() < 3 {
+                continue;
+            }
+            let id = pts.len();
+            pts.push(x);
+            // 트랙 전체에서 고르게 per_point 개를 뽑는다.
+            let step = seen.len().div_ceil(per_point);
+            for &(cam, n) in seen.iter().step_by(step) {
+                let n = if rng.unit() < outlier_frac {
+                    Vector2::new(
+                        (rng.unit() * 2.0 - 1.0) * HALF_FOV.0,
+                        (rng.unit() * 2.0 - 1.0) * HALF_FOV.1,
+                    )
+                } else {
+                    n + Vector2::new(rng.gauss(), rng.gauss()) * 1e-3
+                };
+                obs.push(PointObservation {
+                    camera: cam,
+                    point: id,
+                    bearing: Vector3::new(n.x, n.y, 1.0),
+                    weight: 1.0,
+                });
+            }
+        }
+        (pts, obs)
     }
 
     struct Case {
@@ -673,9 +947,14 @@ mod tests {
         (rms, e.iter().cloned().fold(0.0, f64::max))
     }
 
+    /// 시험 점 수·점당 관측 수·점 관측 이상치 비율.
+    const POINTS: (usize, usize, f64) = (200, 16, 0.05);
+
     fn run(seed: u64, case: &Case) -> (usize, f64, f64) {
         let (poses, rots, obs) = observations(seed, case);
-        let res = average_translations(&rots, &obs, &TranslationConfig::default());
+        let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, POINTS.2);
+        let res =
+            average_translations_with_points(&rots, &obs, &pobs, &TranslationConfig::default());
         let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
         let (rms, max) = stats(&similarity_aligned_errors(&res.centers, &truth));
         (res.registered(), rms, max)
@@ -700,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "미해결: F 줄 끝(위치 74~79)이 같은 줄 간선뿐이라 위치가 정해지지 않음, 중심 RMS 1.8 m"]
+    #[ignore = "미해결: 시드 1·이상치 10% 에서 1차 해가 어긋나 6° 거르기 뒤 그래프가 쪼개짐(등록 102/240, 중심 RMS 9.3 m)"]
     fn noisy_outliers_register_all_seeds() {
         for (frac, rms_lim, max_lim) in [(0.10, 0.15, 0.5), (0.20, 0.15, 0.5)] {
             for seed in 1..=5u64 {
@@ -770,7 +1049,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "미해결: F 줄 끝(위치 74~79)이 같은 줄 간선뿐이라 위치가 정해지지 않음, 중심 RMS 1.8 m"]
     fn rough_model_from_averaged_poses() {
         let case = Case {
             noise_deg: 1.0,
@@ -778,7 +1056,9 @@ mod tests {
             unobservable_frac: 0.05,
         };
         let (poses, rots, obs) = observations(7, &case);
-        let res = average_translations(&rots, &obs, &TranslationConfig::default());
+        let (_, pobs) = point_observations(7, &poses, POINTS.0, POINTS.1, POINTS.2);
+        let res =
+            average_translations_with_points(&rots, &obs, &pobs, &TranslationConfig::default());
         assert_eq!(res.registered(), 240);
         // 추정 중심을 정답 틀로 닮음 정렬한 뒤, 추정 회전과 묶어 자세를 만든다.
         let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
