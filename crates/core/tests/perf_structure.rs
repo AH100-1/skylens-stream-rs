@@ -133,7 +133,8 @@ fn fnv(h: &mut u64, bytes: &[u8]) {
 }
 
 /// 검출 결과 회귀: 고정 합성 영상(480×270)의 특징 개수와 (x, y, σ, 응답, 방향) 비트 해시.
-/// 흐림 누산 순서·극값 판정·정렬이 바뀌면 값이 달라진다. 기대값은 main 08d5248 에서 한 번 계산했다.
+/// 흐림 누산 순서·극값 판정·정렬이 바뀌면 값이 달라진다. 입력 영상이 합성 장면 기본값(편대 배치, #12)에 따르므로
+/// 장면 기본값이 바뀌면 기대값도 다시 계산한다. 기대값은 main f87549a 에서 계산했다(검출 코드는 08d5248 과 같음).
 #[test]
 fn detection_hash_regression() {
     let img = test_image();
@@ -148,5 +149,5 @@ fn detection_hash_regression() {
     assert_eq!((kps.len(), h), (EXPECTED_COUNT, EXPECTED_HASH));
 }
 
-const EXPECTED_COUNT: usize = 753;
-const EXPECTED_HASH: u64 = 0x618d_ef58_7be0_2b14;
+const EXPECTED_COUNT: usize = 949;
+const EXPECTED_HASH: u64 = 0x19d5_5fb5_3194_f7bb;
