@@ -197,7 +197,13 @@ mod tests {
 
     fn look(center: Point3<f64>, target: Point3<f64>) -> Pose {
         let f = (target - center).normalize();
-        let right = f.cross(&Vector3::z()).normalize();
+        // 연직으로 보면 f × z = 0 이므로 다른 위쪽 벡터를 쓴다.
+        let up = if f.cross(&Vector3::z()).norm() < 1e-6 {
+            Vector3::y()
+        } else {
+            Vector3::z()
+        };
+        let right = f.cross(&up).normalize();
         let down = f.cross(&right);
         let r = Matrix3::from_rows(&[right.transpose(), down.transpose(), f.transpose()]);
         Pose::from_center(Rotation3::from_matrix_unchecked(r), &center)
@@ -235,24 +241,39 @@ mod tests {
 
     #[test]
     fn rejects_small_angle_and_behind() {
+        let cfg = TriangulationConfig::default();
+        let finite = |p: &Pose| {
+            p.rotation.matrix().iter().all(|v| v.is_finite())
+                && p.translation.iter().all(|v| v.is_finite())
+        };
         let target = Point3::origin();
+        // 기선 0.3 m, 거리 30 m: 광선 사이 각 ~0.6° 로 최소 각보다 작다.
         let a = look(Point3::new(0.0, 0.0, 30.0), target);
         let b = look(Point3::new(0.3, 0.0, 30.0), target);
+        assert!(finite(&a) && finite(&b));
         let x = Point3::new(0.5, 0.5, 0.0);
         let obs = vec![(a, project(&a, &x)), (b, project(&b, &x))];
-        assert!(triangulate_multiview(&obs, &TriangulationConfig::default()).is_err());
-        // 두 카메라가 서로 반대 방향을 볼 때 한 쪽 뒤에 놓이는 점.
+        assert_eq!(
+            triangulate_multiview(&obs, &cfg).unwrap_err(),
+            TriangulationFailure::SmallRayAngle
+        );
+        // c 는 +x 쪽 앞을 비스듬히 내려다보고 d 는 연직으로 내려다본다. 점은 d 앞, c 뒤(깊이 음수).
         let c = look(Point3::new(10.0, 0.0, 30.0), Point3::new(40.0, 0.0, 0.0));
         let d = look(Point3::new(0.0, 0.0, 30.0), target);
-        let behind = Point3::new(5.0, 0.0, 0.0);
+        assert!(finite(&c) && finite(&d));
+        let behind = Point3::new(-25.0, 3.0, 0.0);
         let xc = c.transform(&behind);
+        assert!(xc.z < 0.0 && d.transform(&behind).z > 0.0);
         let obs = vec![
             (c, Vector2::new(xc.x / xc.z, xc.y / xc.z)),
             (d, project(&d, &behind)),
         ];
-        assert!(triangulate_multiview(&obs, &TriangulationConfig::default()).is_err());
         assert_eq!(
-            triangulate_multiview(&obs[..1], &TriangulationConfig::default()).unwrap_err(),
+            triangulate_multiview(&obs, &cfg).unwrap_err(),
+            TriangulationFailure::BehindCamera
+        );
+        assert_eq!(
+            triangulate_multiview(&obs[..1], &cfg).unwrap_err(),
             TriangulationFailure::TooFewViews
         );
     }

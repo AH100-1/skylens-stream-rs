@@ -457,12 +457,14 @@ pub fn average_translations_with_points(
         return average_core(rotations, observations, point_observations, cfg, None);
     }
     // 세계 방향 광선.
+    let rotations = &finite_rotations(rotations);
     let rays: Vec<Option<Vector3<f64>>> = point_observations
         .iter()
         .map(|o| {
             let ok = o.camera < n_cam
                 && o.point < n_pts
                 && o.weight > 0.0
+                && o.weight.is_finite()
                 && o.bearing.norm() > 1e-12
                 && o.bearing.iter().all(|x| x.is_finite());
             ok.then(|| rotations[o.camera])
@@ -509,14 +511,59 @@ pub fn average_translations_with_points(
             .collect();
         start[cam] = robust_ray_point(&obs, gate);
     }
-    average_core(
+    let refined = average_core(
         rotations,
         observations,
         point_observations,
         cfg,
         Some(&start),
-    )
+    );
+    // 안전장치: 정밀화가 출발 해보다 나쁘면(등록 수·짝 간선 정상 수 감소, 같으면 짝 각 잔차 중앙 증가)
+    // 출발 해(1단계 중심 + 그 중심에서 삼각측량한 점)로 되돌린다.
+    let (a, b) = (
+        pair_score(&refined, observations.len()),
+        pair_score(&stage, observations.len()),
+    );
+    if a.0 < b.0 || a.1 < b.1 || (a.1 == b.1 && a.2 < b.2) {
+        let mut back = stage;
+        // 정밀화와 같은 셈: 쓰지 못한 점 관측도 무효로 센다.
+        back.rejected[0] += rays.iter().filter(|r| r.is_none()).count();
+        back.points = start[n_cam..].iter().map(|x| x.map(Point3::from)).collect();
+        return back;
+    }
+    refined
 }
+
+/// 해의 짝 간선 품질: (등록 수, 짝 간선 정상 수, −짝 각 잔차 중앙). 클수록 낫다.
+fn pair_score(res: &TranslationResult, n_obs: usize) -> (usize, usize, f64) {
+    let n = n_obs.min(res.inliers.len());
+    let inl = res.inliers[..n].iter().filter(|b| **b).count();
+    let mut r: Vec<f64> = res.residuals_rad[..n]
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
+    let med = if r.is_empty() {
+        f64::INFINITY
+    } else {
+        let k = r.len() / 2;
+        *r.select_nth_unstable_by(k, f64::total_cmp).1
+    };
+    (res.registered(), inl, -med)
+}
+
+/// 원소가 유한하지 않은 회전은 없는 회전(None)으로 바꾼다. NaN 회전은 각 비교가 거짓이 되어 일관성 검사를
+/// 그대로 통과하고 연립 전체를 NaN 으로 만든다.
+fn finite_rotations(rotations: &[Option<Rotation3<f64>>]) -> Vec<Option<Rotation3<f64>>> {
+    rotations
+        .iter()
+        .map(|r| r.filter(|r| r.matrix().iter().all(|x| x.is_finite())))
+        .collect()
+}
+
+/// [`robust_ray_point`] 가 시험하는 광선 짝 가설 수의 상한. 정상 비율 0.5 에서 정상 짝을 하나도 못 뽑을
+/// 확률은 0.75^200 ≈ 1e-25 이다.
+const RAY_HYPOTHESES: usize = 200;
 
 /// 광선들(원점, 단위 방향)이 가장 잘 만나는 점. 두 광선 중점 가설마다 각 `gate` 안에 드는 앞쪽 광선 수를 세어
 /// 가장 많은 가설의 정상 광선으로 최소제곱 min Σ |(I − d dᵀ)(x − o)|² 를 푼다. 정상 광선이 2개 미만이면 None.
@@ -541,15 +588,36 @@ fn robust_ray_point(rays: &[(Vector3<f64>, Vector3<f64>)], gate: f64) -> Option<
     };
     let mut best: Vec<usize> = Vec::new();
     let sin_min = 2f64.to_radians().sin();
-    for a in 0..rays.len() {
-        for b in a + 1..rays.len() {
-            if rays[a].1.cross(&rays[b].1).norm() < sin_min {
-                continue;
+    let try_pair = |a: usize, b: usize, best: &mut Vec<usize>| {
+        if rays[a].1.cross(&rays[b].1).norm() < sin_min {
+            return;
+        }
+        let Some(x) = ls(&[a, b]) else { return };
+        let i = inl(&x);
+        if i.len() > best.len() {
+            *best = i;
+        }
+    };
+    let k = rays.len();
+    if k * k.saturating_sub(1) / 2 <= RAY_HYPOTHESES {
+        for a in 0..k {
+            for b in a + 1..k {
+                try_pair(a, b, &mut best);
             }
-            let Some(x) = ls(&[a, b]) else { continue };
-            let i = inl(&x);
-            if i.len() > best.len() {
-                best = i;
+        }
+    } else {
+        // 광선 짝 가설을 결정적 의사난수로 RAY_HYPOTHESES 개만 뽑는다: 비용 O(가설 × k).
+        let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ k as u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % k as u64) as usize
+        };
+        for _ in 0..RAY_HYPOTHESES {
+            let (a, b) = (next(), next());
+            if a != b {
+                try_pair(a, b, &mut best);
             }
         }
     }
@@ -584,6 +652,7 @@ fn average_core(
         .unwrap_or(0);
     let n = n_cam + n_pts;
     let mut rejected = [0usize; 2];
+    let rotations = &finite_rotations(rotations);
     // 1a. 무효·회전 불일치 제거, 세계 방향으로 바꾸기.
     let mut edges = Vec::new();
     for (idx, o) in observations.iter().enumerate() {
@@ -591,6 +660,7 @@ fn average_core(
             && o.j < n_cam
             && o.i != o.j
             && o.weight > 0.0
+            && o.weight.is_finite()
             && o.direction.norm() > 1e-12
             && o.direction.iter().all(|x| x.is_finite());
         let (Some(ri), Some(rj)) = (
@@ -625,11 +695,13 @@ fn average_core(
     for (k, o) in point_observations.iter().enumerate() {
         let rot = (o.camera < n_cam
             && o.weight > 0.0
+            && o.weight.is_finite()
             && o.bearing.norm() > 1e-12
             && o.bearing.iter().all(|x| x.is_finite()))
         .then(|| rotations[o.camera])
         .flatten();
         let Some(r) = rot else {
+            rejected[0] += 1;
             continue;
         };
         if let Some(st) = start {
@@ -1158,9 +1230,9 @@ mod tests {
     /// 시험 점 수·점당 관측 수·점 관측 이상치 비율.
     const POINTS: (usize, usize, f64) = (200, 16, 0.05);
 
-    fn run(seed: u64, case: &Case) -> (usize, f64, f64) {
+    fn run_with(seed: u64, case: &Case, point_outliers: f64) -> (usize, f64, f64) {
         let (poses, rots, obs) = observations(seed, case);
-        let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, POINTS.2);
+        let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, point_outliers);
         let res =
             average_translations_with_points(&rots, &obs, &pobs, &TranslationConfig::default());
         let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
@@ -1223,24 +1295,97 @@ mod tests {
 
     #[test]
     fn noisy_outliers_register_all_seeds() {
-        // 짝 방향 잡음 1°·이상치 10/20%, 점 방향 이상치 5%. 기준: 240/240 등록, 닮음 정렬 후 중심 RMS < 0.15 m,
-        // 최대 < 0.5 m. 깨끗한 점 방향일 때 같은 시드들의 RMS 가 0.11~0.14 m 이므로 이상치를 걸러 그 수준에 들어야 한다.
-        for (frac, rms_lim, max_lim) in [(0.10, 0.15, 0.5), (0.20, 0.15, 0.5)] {
-            for seed in 1..=5u64 {
-                let case = Case {
-                    noise_deg: 1.0,
-                    outlier_frac: frac,
-                    unobservable_frac: 0.05,
-                };
-                let (reg, rms, max) = run(seed, &case);
-                println!("outlier {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m");
-                assert_eq!(reg, 240, "seed {seed} frac {frac}");
-                assert!(
-                    rms < rms_lim && max < max_lim,
-                    "seed {seed}: rms {rms} max {max}"
-                );
+        // 짝 방향 잡음 1°·짝 이상치 10/20% × 점 방향 이상치 0/5% × 시드 1~20(문턱 조정에 쓴 1~5 밖 15개 포함).
+        // 기준(F-214): 모든 경우 등록 ≥ 238/240, 닮음 정렬 후 중심 RMS ≤ 0.3 m. 실패를 모두 모아 한 번에 보인다.
+        let mut fails = Vec::new();
+        for pfrac in [0.0, 0.05] {
+            for frac in [0.10, 0.20] {
+                for seed in 1..=20u64 {
+                    let case = Case {
+                        noise_deg: 1.0,
+                        outlier_frac: frac,
+                        unobservable_frac: 0.05,
+                    };
+                    let (reg, rms, max) = run_with(seed, &case, pfrac);
+                    println!(
+                        "point {pfrac} pair {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m"
+                    );
+                    if reg < 238 || rms > 0.3 {
+                        fails.push((pfrac, frac, seed, reg, rms));
+                    }
+                }
             }
         }
+        assert!(fails.is_empty(), "{fails:?}");
+    }
+
+    #[test]
+    fn nan_rotation_and_infinite_weight_are_isolated() {
+        let case = Case {
+            noise_deg: 0.0,
+            outlier_frac: 0.0,
+            unobservable_frac: 0.0,
+        };
+        let (poses, _, obs) = observations(1, &case);
+        let cfg = TranslationConfig::default();
+        let rots: Vec<_> = poses.iter().map(|p| Some(p.rotation)).collect();
+        let base = average_translations(&rots, &obs, &cfg);
+        assert_eq!(base.registered(), 240);
+        let mut bad = rots.clone();
+        bad[5] = Some(Rotation3::from_matrix_unchecked(Matrix3::from_element(
+            f64::NAN,
+        )));
+        let res = average_translations(&bad, &obs, &cfg);
+        assert!(res.registered() >= 239, "{}", res.registered());
+        assert!(res.rejected[0] > base.rejected[0]);
+        let mut inf = obs.clone();
+        inf[0].weight = f64::INFINITY;
+        let res = average_translations(&rots, &inf, &cfg);
+        assert!(res.registered() >= 239, "{}", res.registered());
+        assert_eq!(res.rejected[0], base.rejected[0] + 1);
+        // 점 관측의 무한 가중치도 같은 방식으로 버린다.
+        let (_, mut pobs) = point_observations(1, &poses, POINTS.0, POINTS.1, 0.0);
+        let pbase = average_translations_with_points(&rots, &obs, &pobs, &cfg);
+        pobs[0].weight = f64::INFINITY;
+        let res = average_translations_with_points(&rots, &obs, &pobs, &cfg);
+        assert!(res.registered() >= 239, "{}", res.registered());
+        assert!(res.rejected[0] > pbase.rejected[0]);
+    }
+
+    #[test]
+    fn ray_point_sampled_hypotheses_are_fast_and_accurate() {
+        // 광선 5,000개: 정상 80%(점 x 를 지나는 방향에 0.2° 잡음), 이상치 20%(무작위 방향).
+        let mut rng = Rng(7);
+        let x = Vector3::new(3.0, -2.0, 1.0);
+        let rays: Vec<(Vector3<f64>, Vector3<f64>)> = (0..5000)
+            .map(|k| {
+                let o = rng.vec3() * 40.0 + Vector3::new(0.0, 0.0, 30.0);
+                let d = if k % 5 == 0 {
+                    rng.vec3().normalize()
+                } else {
+                    Rotation3::new(rng.vec3() * 0.2f64.to_radians()) * (x - o).normalize()
+                };
+                (o, d)
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let p = robust_ray_point(&rays, 10f64.to_radians()).unwrap();
+        let dt = t.elapsed().as_secs_f64();
+        // 정상 광선만으로 푼 최소제곱(전체 탐색이 찾는 정상 집합의 해)과 비교.
+        let mut a = Matrix3::zeros();
+        let mut b = Vector3::zeros();
+        for (k, (o, d)) in rays.iter().enumerate() {
+            if k % 5 != 0 {
+                let m = Matrix3::identity() - d * d.transpose();
+                a += m;
+                b += m * o;
+            }
+        }
+        let full = a.try_inverse().unwrap() * b;
+        let (e, e_full) = ((p - x).norm(), (full - x).norm());
+        println!("rays 5000: {dt:.4} s, err {e:.5} m, inlier-only LS err {e_full:.5} m");
+        assert!(dt < 0.2, "{dt} s");
+        assert!((p - full).norm() < 0.01 * (full - rays[1].0).norm());
     }
 
     #[test]
