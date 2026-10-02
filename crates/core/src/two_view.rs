@@ -800,7 +800,9 @@ pub fn ransac_essential_candidates(
             .map(|i| sampson_residual(e, &n1[i], &n2[i]).powi(2))
             .sum()
     };
-    let mut out: Vec<(Matrix3<f64>, Vec<bool>, usize, f64)> = Vec::new();
+    // (E, 정상 표시, 정상 수, Sampson 비용, 평면 판정)
+    type Refined = (Matrix3<f64>, Vec<bool>, usize, f64, bool);
+    let mut out: Vec<Refined> = Vec::new();
     for (start, _) in pool {
         let (mut e, mut inl) = (start, inliers_of(&start));
         for _ in 0..2 {
@@ -878,7 +880,7 @@ pub fn ransac_essential_candidates(
         // 정밀화 뒤 같은 골짜기로 모인 후보는 하나만 남긴다.
         if out.iter().all(|o| distinct(&o.0, &e)) {
             let (c, k) = (count(&inl), cost(&e, &inl));
-            out.push((e, inl, c, k));
+            out.push((e, inl, c, k, planar));
         }
     }
     out.sort_by(|a, b| b.2.cmp(&a.2).then(a.3.total_cmp(&b.3)));
@@ -910,7 +912,7 @@ pub fn ransac_essential_candidates(
             .map(|i| sampson_residual(e, &n1[i], &n2[i]).powi(2).min(th * th))
             .sum()
     };
-    type Kept = (Matrix3<f64>, Vec<bool>, Rotation3<f64>, f64);
+    type Kept = (Matrix3<f64>, Vec<bool>, Rotation3<f64>, f64, Option<f64>);
     let mut kept: Vec<Kept> = Vec::new();
     for o in out {
         if o.2 < 5 || 10 * o.2 < 9 * top || (o.2 as f64) < cfg.min_inlier_ratio * n as f64 {
@@ -922,20 +924,68 @@ pub fn ransac_essential_candidates(
             continue;
         };
         let m = msac(&o.0);
+        let facing = if o.4 {
+            plane_facing(&pose.rotation, &pose.translation, &s1, &s2)
+        } else {
+            None
+        };
         match kept.iter().position(|k| {
             (k.2.inverse() * pose.rotation).angle() < CANDIDATE_MIN_ROTATION_DEG.to_radians()
         }) {
             // 같은 해 묶음 안에서는 MSAC 비용(전 대응의 min(r², 문턱²) 합, Torr & Zisserman 2000)이
             // 작은 쪽을 순위 자리에 둔다.
-            Some(j) if m < kept[j].3 => kept[j] = (o.0, o.1, pose.rotation, m),
+            Some(j) if m < kept[j].3 => kept[j] = (o.0, o.1, pose.rotation, m, facing),
             Some(_) => {}
-            None => kept.push((o.0, o.1, pose.rotation, m)),
+            None => kept.push((o.0, o.1, pose.rotation, m, facing)),
+        }
+    }
+    // F-144: 평면 장면의 쌍둥이 해는 대응을 정답과 똑같이 설명하고(정상 수·Sampson·MSAC 동률), 호모그래피
+    // 분해의 두 해는 det H 가 같아 이동과 법선의 내적 t·n 도 같으므로 |t̂·n| 으로도 갈리지 않는다. 대신 쌍둥이의
+    // 평면 법선은 정답 이동 방향 쪽으로 돌아가 첫 카메라 광축과 거의 수직(지면을 스치듯 보는 면)이 된다.
+    // 내려다보는 카메라에는 지면이 광축에 비스듬히 마주 보이므로, 평면 후보가 둘 이상이면 삼각측량한 정상 점의
+    // 평면 법선이 광축과 이루는 |cos| 가 큰 후보를 첫 자리로 올린다. 두 값 차가 `PLANAR_FACING_MARGIN`
+    // 미만이면 구분 근거가 없으므로 순서를 바꾸지 않는다.
+    if kept.len() >= 2 {
+        if let (Some(a), Some(b)) = (kept[0].4, kept[1].4) {
+            if b > a + PLANAR_FACING_MARGIN {
+                kept.swap(0, 1);
+            }
         }
     }
     kept.into_iter()
         .take(ESSENTIAL_CANDIDATES)
         .map(|k| (k.0, k.1))
         .collect()
+}
+
+/// 자세 (r, t)로 정상 대응을 삼각측량해 최소제곱 평면을 맞추고, 그 법선과 첫 카메라 광축(0, 0, 1)
+/// 사이 |cos| 를 돌려준다(1 이면 정면, 0 이면 스치듯 보는 면). 삼각측량 점이 8개 미만이면 None.
+fn plane_facing(
+    r: &Rotation3<f64>,
+    t: &Vector3<f64>,
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+) -> Option<f64> {
+    let pts: Vec<Vector3<f64>> = n1
+        .iter()
+        .zip(n2)
+        .filter_map(|(a, b)| triangulate(r, t, a, b))
+        .map(|p| p.coords)
+        .filter(|p| p.iter().all(|v| v.is_finite()) && p.z > 0.0)
+        .collect();
+    if pts.len() < 8 {
+        return None;
+    }
+    let c = pts.iter().sum::<Vector3<f64>>() / pts.len() as f64;
+    let mut cov = Matrix3::zeros();
+    for p in &pts {
+        let d = p - c;
+        cov += d * d.transpose();
+    }
+    let eig = cov.symmetric_eigen();
+    let k = eig.eigenvalues.imin();
+    let normal = eig.eigenvectors.column(k).into_owned();
+    Some(normal.z.abs() / normal.norm())
 }
 
 /// 두 시점 짝의 자세 신뢰도.
@@ -1011,6 +1061,10 @@ pub const CANDIDATE_MIN_ROTATION_DEG: f64 = 1.0;
 
 /// [`ransac_essential_candidates`] 가 돌려주는 최대 후보 수.
 pub const ESSENTIAL_CANDIDATES: usize = 4;
+
+/// 평면 쌍둥이 해 판별에서 첫 자리를 바꾸는 데 필요한 평면 법선·광축 |cos| 차.
+/// 실측 편대 배치(내려다보는 각 60°)에서 정답 면은 |cos| ≈ cos 30° ≈ 0.87, 쌍둥이 면은 측정상 0.5 미만이다.
+pub const PLANAR_FACING_MARGIN: f64 = 0.1;
 
 /// 본질 행렬 검증을 통과하는 최소 정상 수(최소 표본 5개의 세 배).
 pub const MIN_ESSENTIAL_INLIERS: usize = 15;
@@ -2040,5 +2094,102 @@ mod tests {
         let worst = ex.iter().map(|x| x.1).fold(f64::MIN, f64::max);
         eprintln!("비평면 이상치 0.3: 하한 대비 최대 초과 {worst:.4}°");
         assert!(worst <= 0.1, "최대 초과 {worst}°");
+    }
+
+    /// SPEC §6 실측 편대 배치의 평면 지면 짝: 고도 30 m, 내려다보는 각 60°, 화각 65°, 2048×1152,
+    /// 둘째 카메라는 옆으로 b(m), 지면 점 200개, σ0.5 px, 이상치 비율 `out`.
+    fn formation_plane_scene(seed: u64, b: f64, out: f64) -> (Scene, Vec<bool>) {
+        let k = Intrinsics::from_hfov(2048, 1152, 65f64.to_radians());
+        let (sn, cs) = 60f64.to_radians().sin_cos();
+        let rot = Rotation3::from_matrix_unchecked(Matrix3::from_rows(&[
+            Vector3::new(1.0, 0.0, 0.0).transpose(),
+            Vector3::new(0.0, -sn, -cs).transpose(),
+            Vector3::new(0.0, cs, -sn).transpose(),
+        ]));
+        let mut rng = Lcg(seed);
+        let yaw = Rotation3::from_euler_angles(0.0, 0.0, (rng.next() - 0.5) * 0.02);
+        let c1 = Camera {
+            intrinsics: k,
+            pose: Pose::from_center(rot, &Point3::new(0.0, 0.0, 30.0)),
+        };
+        let c2 = Camera {
+            intrinsics: k,
+            pose: Pose::from_center(rot * yaw, &Point3::new(b, 0.0, 30.0)),
+        };
+        let inside = |u: &Vector2<f64>| u.x >= 0.0 && u.y >= 0.0 && u.x < 2048.0 && u.y < 1152.0;
+        let (mut x1, mut x2, mut pts, mut bad) = (vec![], vec![], vec![], vec![]);
+        while x1.len() < 200 {
+            let x = Point3::new((rng.next() - 0.5) * 120.0, rng.next() * 90.0, 0.0);
+            let (Some(p), Some(q)) = (c1.project(&x), c2.project(&x)) else {
+                continue;
+            };
+            if !inside(&p) || !inside(&q) {
+                continue;
+            }
+            let noise = |r: &mut Lcg| Vector2::new(r.gauss(), r.gauss()) * 0.5;
+            x1.push(k.to_normalized(&(p + noise(&mut rng))));
+            let o = rng.next() < out;
+            let q = if o {
+                Vector2::new(rng.next() * 2048.0, rng.next() * 1152.0)
+            } else {
+                q + noise(&mut rng)
+            };
+            x2.push(k.to_normalized(&q));
+            bad.push(o);
+            pts.push(x);
+        }
+        (
+            Scene {
+                c1,
+                c2,
+                x1,
+                x2,
+                pts,
+            },
+            bad,
+        )
+    }
+
+    /// F-144: 실측 배치 평면 지면에서 `ransac_essential` 첫 후보(정답 사용 없음)가 쌍둥이 해가 아니고
+    /// 시드별 하한(이상치 아닌 대응으로 정답에서 시작한 정밀화) + 0.2° 이내다. 쌍둥이 해의 회전 오차는
+    /// 위치 간 1 m 에서 약 1.9°, 8 m 에서 약 15° 이므로 0.2° 여유는 둘을 확실히 가른다.
+    #[test]
+    fn ransac_essential_formation_plane_no_twin() {
+        let mut fails = vec![];
+        for b in [1.0, 2.0, 4.0, 8.0] {
+            for out in [0.0, 0.3] {
+                let mut worst = f64::MIN;
+                for seed in 1..=20u64 {
+                    let (s, bad) = formation_plane_scene(seed, b, out);
+                    let floor = planar_floor(&s, &bad);
+                    let cfg = RansacConfig {
+                        threshold_px: 1.5,
+                        ..RansacConfig::default()
+                    };
+                    let fx = s.c1.intrinsics.fx;
+                    let Some((e, inl)) = ransac_essential(&s.x1, &s.x2, fx, &cfg) else {
+                        fails.push((b, out, seed, f64::NAN));
+                        continue;
+                    };
+                    let s1: Vec<_> = (0..inl.len())
+                        .filter(|&i| inl[i])
+                        .map(|i| s.x1[i])
+                        .collect();
+                    let s2: Vec<_> = (0..inl.len())
+                        .filter(|&i| inl[i])
+                        .map(|i| s.x2[i])
+                        .collect();
+                    let p = recover_pose(&e, &s1, &s2).expect("자세 없음");
+                    let rot = rotation_angle_between(&p.rotation, &s.rel().0).to_degrees();
+                    worst = worst.max(rot - floor);
+                    if rot > floor + 0.2 {
+                        fails.push((b, out, seed, rot));
+                    }
+                }
+                eprintln!("편대 평면 위치 간 {b} m 이상치 {out}: 하한 대비 최대 초과 {worst:.4}°");
+            }
+        }
+        eprintln!("편대 평면 실패 {} {fails:.3?}", fails.len());
+        assert!(fails.is_empty(), "하한 + 0.2° 초과(쌍둥이) {fails:.3?}");
     }
 }
