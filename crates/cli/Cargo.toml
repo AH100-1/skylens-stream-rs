@@ -11,3 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 skylens-core = { path = "../core" }
+
+[dev-dependencies]
+image.workspace = true
