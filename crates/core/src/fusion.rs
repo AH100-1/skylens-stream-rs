@@ -71,7 +71,9 @@ pub struct FusionConfig {
 }
 
 /// [`FusionConfig::same_group_views`] 기본값.
-const SAME_GROUP_VIEWS: Option<usize> = None;
+/// 실측 편대 42장(σ 0.1%·이상치 10%)에서 0.3 m 초과 0점·최대 0.057 m 를 지키면서
+/// 점 수가 무리 조건만 쓸 때의 약 20배가 되는 값.
+const SAME_GROUP_VIEWS: Option<usize> = Some(8);
 
 impl Default for FusionConfig {
     fn default() -> Self {
@@ -1342,11 +1344,10 @@ mod tests {
             all.len()
         );
         println!(
-            "formation all views, groups>=2: points {} median {med:.4} max {max:.4} >0.3m {far} normal>10° {nover} max {nmax:.1}°",
+            "formation all views, default (groups>=2 or same-group >= 8): points {} median {med:.4} max {max:.4} >0.3m {far} normal>10° {nover} max {nmax:.1}°",
             cloud.len()
         );
-        // 무리 조건을 걸면 서로 다른 드론 시선이 겹치는 지면만 남아 점 수가 크게 준다
-        // (무리 조건 없이 50만 점대). 하한은 겹침 영역이 사라지지 않았는지만 본다.
+        // 비율 검사를 끈 대조(같은 무리 우연 동의가 남는지).
         let r0 = fuse(
             &vs,
             &maps,
@@ -1357,10 +1358,27 @@ mod tests {
         );
         let (r0med, r0max, r0far) = errors(&FORM, &r0);
         println!(
-            "formation all views, groups>=2, min_ratio 0: points {} median {r0med:.4} max {r0max:.3} >0.3m {r0far}",
+            "formation all views, default, min_ratio 0: points {} median {r0med:.4} max {r0max:.3} >0.3m {r0far}",
             r0.len()
         );
-        assert!(cloud.len() > 10_000, "points {}", cloud.len());
+        // F-069 밀도: 무리 조건에 못 미치는 점에 더 많은 동의 사진을 요구하는 안.
+        for m in [None, Some(4usize), Some(5), Some(6), Some(8)] {
+            let c = fuse(
+                &vs,
+                &maps,
+                FusionConfig {
+                    same_group_views: m,
+                    ..cfg
+                },
+            );
+            let (smed, smax, sfar) = errors(&FORM, &c);
+            println!(
+                "formation all views, groups>=2 or same-group {m:?}: points {} median {smed:.4} max {smax:.3} >0.3m {sfar}",
+                c.len()
+            );
+        }
+        // 같은 무리 동의는 8장 이상이면 받는다(기본): 무리 조건만 쓸 때(1.8만 점)보다 훨씬 많다.
+        assert!(cloud.len() > 300_000, "points {}", cloud.len());
         // 깊이 ~35 m, σ 0.1% → 단일 화소 ≈ 0.035 m 의 시선 방향 잡음.
         assert!(med < 0.02, "median {med}");
         assert_eq!(far, 0, "far {far}");
@@ -1507,7 +1525,7 @@ mod tests {
 
     /// F-113: 실측 편대 48장(16곳), 960×540 융합 시간.
     #[test]
-    #[ignore = "2 s 기준 미달(4 코어 측정 기계 부하 중 20.8 s): 이웃 제한·행 병렬만으로 부족"]
+    #[ignore = "2 s 기준 미달(4 코어 측정 기계, 부하 평균 8~11 에서 7.95 s): 기준 사진 단위 병렬 필요"]
     fn formation_timing_960() {
         let cams = formation(16, 960, 540);
         let maps: Vec<DepthMap> = cams.iter().map(|c| render(&FORM, c)).collect();
