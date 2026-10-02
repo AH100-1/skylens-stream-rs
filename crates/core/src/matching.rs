@@ -326,6 +326,18 @@ pub fn select_two_view_model(
     f: &Matrix3<f64>,
     sigma_px: f64,
 ) -> Option<ModelSelection> {
+    select_two_view_model_with_margin(x1, x2, f, sigma_px, 0)
+}
+
+/// [`select_two_view_model`] 에 시차 짝 필요 수 여유 `extra` 를 더한 판정
+/// ([`ransac_fundamental`] 이 RANSAC 띠로 끌려 들어올 무관한 대응 수의 상한을 넘긴다).
+fn select_two_view_model_with_margin(
+    x1: &[Vector2<f64>],
+    x2: &[Vector2<f64>],
+    f: &Matrix3<f64>,
+    sigma_px: f64,
+    extra: usize,
+) -> Option<ModelSelection> {
     let n = x1.len();
     if n < 8
         || n != x2.len()
@@ -373,7 +385,7 @@ pub fn select_two_view_model(
     let (l1, l2) = (4f64.ln(), (4.0 * nf).ln());
     let gric_f = rho_f + l1 * 3.0 * nf + l2 * 7.0;
     let gric_h = rho_h + l1 * 2.0 * nf + l2 * 8.0;
-    let parallax_needed = parallax_needed(n);
+    let parallax_needed = parallax_needed(n) + extra;
     let model = if gric_h < gric_f && parallax < parallax_needed {
         TwoViewModel::Homography
     } else {
@@ -803,6 +815,25 @@ fn off_line_count(p: &[Vector2<f64>], th_px: f64) -> usize {
     n - best
 }
 
+/// 평면 짝에서 무관한 대응이 F 띠(문턱 `th_px`)로 끌려 들어와 시차 짝으로 세어질 수 있는 수의 상한.
+/// 무관한 대응 수 u 는 F 정상이 아닌 대응 수 `rejected` 를 띠 밖 확률 1 − p 로 나눠 추정하고
+/// (p = [`epipolar_band_probability`]), B(u, p) 꼬리가 [`PARALLAX_CHANCE_PROB`] 미만인 가장 작은 k 에
+/// 에피폴 자유도 2 를 더한다. 무관한 대응이 없으면(rejected = 0) 0.
+fn planar_chance_parallax(x2: &[Vector2<f64>], rejected: usize, th_px: f64) -> usize {
+    if rejected == 0 {
+        return 0;
+    }
+    let p = epipolar_band_probability(x2, th_px);
+    if p >= 1.0 {
+        return x2.len() + 1;
+    }
+    let u = ((rejected as f64 / (1.0 - p)).ceil() as usize).min(x2.len());
+    let k = (0..=u)
+        .find(|&k| binomial_tail(u, k, p) < PARALLAX_CHANCE_PROB)
+        .unwrap_or(u + 1);
+    k + 2
+}
+
 /// 한 직선 밖 정상 짝이 이보다 적으면 F 가 정해지지 않는다(3차원 직선은 F 에 제약 몇 개만 준다).
 const MIN_OFF_LINE: usize = 8;
 
@@ -991,7 +1022,12 @@ pub fn ransac_fundamental(
     // 시선만 도는 순수 회전 짝이 없다. 거부하지 않는 이유는 지면 위주 장면에서 평면 짝의 회전은
     // 호모그래피로도 쓸 수 있고, 정상 짝 수는 겹침 판단(간선 존재)에 쓰이기 때문이다.
     // 평면 표시가 붙은 F 에서 이동 방향을 꺼내면 안 된다(에피폴이 임의).
-    let selection = select_two_view_model(&s1, &s2, &f, cfg.threshold_px / 3.0);
+    // 평면 장면에서도 F 에는 H 외에 에피폴 2자유도가 남아, RANSAC 이 무관한 대응을 에피폴 띠로 끌어들인다.
+    // 이 짝들은 H 잔차가 크고 F 잔차가 작아 시차 짝으로 세어지므로, 필요 수에 그 수의 상한을 더한다
+    // ([`planar_chance_parallax`]: 무관한 대응 u 개가 띠 확률 p 로 들어올 때 B(u, p) ≥ k 가 1e-6 미만인
+    // 가장 작은 k + 에피폴이 정확히 맞추는 2개).
+    let extra = planar_chance_parallax(x2, n - cnt, cfg.threshold_px);
+    let selection = select_two_view_model_with_margin(&s1, &s2, &f, cfg.threshold_px / 3.0, extra);
     let model = selection.map_or(TwoViewModel::Fundamental, |m| m.model);
     Some(FundamentalFit {
         f,
@@ -2649,6 +2685,71 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// 순수 지면 200점 짝에 영상 전체에 고르게 흩어진 무관한 대응을 비율 `rate`(전체 대비)만큼 섞는다.
+    fn with_unrelated(
+        x1: &mut Vec<Vector2<f64>>,
+        x2: &mut Vec<Vector2<f64>>,
+        ca: &Camera,
+        rate: f64,
+        seed: u64,
+    ) -> usize {
+        let n = x1.len() as f64;
+        let m = (n * rate / (1.0 - rate)).round() as usize;
+        let (w, h) = (ca.intrinsics.width as f64, ca.intrinsics.height as f64);
+        let mut g = Lcg(seed * 7919 + 17);
+        for _ in 0..m {
+            x1.push(Vector2::new(g.next() * w, g.next() * h));
+            x2.push(Vector2::new(g.next() * w, g.next() * h));
+        }
+        m
+    }
+
+    #[test]
+    fn formation_planar_pair_with_unrelated_is_flagged() {
+        // F-220: 실측 편대 순수 지면 200점(F·R·L × 1·4칸 × 시드 1~10, σ 0.5 px)에 무관한 대응
+        // 0·10·30·50%(0·22·86·200개)를 섞어도 평면 표시가 60/60 이다. 시차 짝 필요 수에 RANSAC 띠로
+        // 끌려 들어올 무관한 대응 수의 상한을 더하기 전에는 30% 37/60, 50% 0/60.
+        use crate::synth::CamId;
+        let cfg = RansacConfig::default();
+        eprintln!("무관 비율 | 개수 | 평면 표시 | None | 시차 짝 최소~최대 | 필요 최소~최대");
+        for rate in [0.0, 0.1, 0.3, 0.5] {
+            let (mut flagged, mut none, mut m) = (0usize, 0usize, 0usize);
+            let (mut pmin, mut pmax, mut nmin, mut nmax) = (usize::MAX, 0, usize::MAX, 0);
+            let mut missed = vec![];
+            for cam in CamId::ALL {
+                for gap in [1usize, 4] {
+                    for seed in 1..=10u64 {
+                        let (mut x1, mut x2, ca, _, _) =
+                            formation_pair(cam, gap, 200, 0.0, 0.5, seed);
+                        m = with_unrelated(&mut x1, &mut x2, &ca, rate, seed);
+                        match ransac_fundamental(&x1, &x2, &cfg) {
+                            Some(r) => {
+                                if let Some(s) = r.selection {
+                                    pmin = pmin.min(s.parallax);
+                                    pmax = pmax.max(s.parallax);
+                                    nmin = nmin.min(s.parallax_needed);
+                                    nmax = nmax.max(s.parallax_needed);
+                                }
+                                if r.is_planar() {
+                                    flagged += 1;
+                                } else {
+                                    missed.push((cam, gap, seed, r.selection));
+                                }
+                            }
+                            None => none += 1,
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "{:.0}% | {m} | {flagged}/60 | {none} | {pmin}~{pmax} | {nmin}~{nmax}",
+                rate * 100.0
+            );
+            assert_eq!(none, 0, "무관 {:.0}%: None {none}", rate * 100.0);
+            assert_eq!(flagged, 60, "무관 {:.0}%: {missed:?}", rate * 100.0);
         }
     }
 }
