@@ -469,6 +469,48 @@ mod tests {
                 angle(1.0),
                 angle(8.0)
             );
+            // 같은 카메라 간격별 분포: 공유 점 수, 공유 점 광선 사이 각의 중앙값, 점수 합, 점수 순위.
+            let mut table = Vec::new();
+            for d in (-12i64..=12).filter(|&d| d != 0) {
+                let Some(j) = scene
+                    .views
+                    .iter()
+                    .position(|v| v.cam == cam && v.position as i64 == c as i64 + d)
+                else {
+                    continue;
+                };
+                let (mut n_sh, mut sum, mut angs) = (0usize, 0.0, Vec::new());
+                for p in pts
+                    .iter()
+                    .filter(|p| p.observers.contains(&me) && p.observers.contains(&j))
+                {
+                    n_sh += 1;
+                    sum += pair_score(&views[me], &views[j], &p.xyz);
+                    let (ra, rb) = (c0 - p.xyz, views[j].cam.pose.center() - p.xyz);
+                    angs.push((ra.dot(&rb) / (ra.norm() * rb.norm())).acos().to_degrees());
+                }
+                angs.sort_by(f64::total_cmp);
+                let med = angs.get(angs.len() / 2).copied().unwrap_or(f64::NAN);
+                table.push((d, n_sh, med, sum));
+            }
+            let mut order: Vec<usize> = (0..table.len()).collect();
+            order.sort_by(|&a, &b| table[b].3.total_cmp(&table[a].3));
+            for (r, &t) in order.iter().enumerate() {
+                let (d, n_sh, med, sum) = table[t];
+                eprintln!(
+                    "{} offset {d:+} rank {} shared {n_sh} median_angle {med:.2} score {sum:.1}",
+                    cam.letter(),
+                    r + 1
+                );
+            }
+            // 1위 간격의 공유 점 광선 각 중앙값은 목표 10° 에서 ±2.5°(약 2칸) 안, 1칸 이웃은 24개 중 하위 4.
+            let (_, _, med1, _) = table[order[0]];
+            assert!((med1 - TARGET_ANGLE_DEG).abs() <= 2.5, "1위 중앙 각 {med1}");
+            for (r, &t) in order.iter().enumerate() {
+                if table[t].0.abs() == 1 {
+                    assert!(r + 1 > order.len() - 4, "1칸 순위 {}", r + 1);
+                }
+            }
             let same: Vec<i64> = nb[me]
                 .iter()
                 .filter(|&&j| scene.views[j].cam == cam)
