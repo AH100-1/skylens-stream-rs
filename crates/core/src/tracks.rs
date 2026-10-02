@@ -237,67 +237,86 @@ pub fn build_tracks(
             order.sort_unstable_by(|a, b| b.0.cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2))));
             // 대표마다 성분이 가진 영상 번호(정렬됨). 비어 있으면 홀로인 노드.
             let mut images: Vec<Vec<usize>> = vec![Vec::new(); n];
-            let imgs_of = |images: &mut Vec<Vec<usize>>, r: usize| {
-                let v = std::mem::take(&mut images[r]);
-                if v.is_empty() {
-                    vec![node_image[r]]
-                } else {
-                    v
-                }
-            };
             // 1 단계: 지지도 > 0 간선을 지지도 내림차순으로 합친다(충돌이면 건너뜀).
             let split = order.iter().position(|e| e.0 == 0).unwrap_or(order.len());
             for &(_, u, v) in &order[..split] {
-                let (ru, rv) = (uf.find(u), uf.find(v));
-                if ru == rv {
-                    continue;
-                }
-                let iu = imgs_of(&mut images, ru);
-                let iv = imgs_of(&mut images, rv);
-                if common_count(&iu, &iv) > 0 {
+                if !try_join(&mut uf, &mut images, &node_image, u, v) {
                     stats.conflicts += 1;
-                    images[ru] = iu;
-                    images[rv] = iv;
-                    continue;
-                }
-                let r = uf.link(ru, rv);
-                images[r] = merge_sorted(&iu, &iv);
-            }
-            // 2 단계: 지지도 0 간선은 1 단계 뒤 성분 쌍마다 묶어, 두 성분을 잇는 서로 다른 간선 수가
-            // 많은 쌍부터, 영상이 겹치지 않을 때만 합친다. 대응 재현율 30~50% 에서는 참 트랙 조각 사이
-            // 간선이 1 개뿐인 경우가 많아 간선 수 문턱(2 개)을 두면 참 트랙이 쪼개진다(완전도 0.83).
-            // 오대응은 같은 쌍 안에서 간선이 많은 쪽 뒤에 처리되어 대개 충돌로 걸러진다.
-            let mut groups: Vec<(usize, usize, usize)> = order[split..]
-                .iter()
-                .filter_map(|&(_, u, v)| {
-                    let (ru, rv) = (uf.find(u), uf.find(v));
-                    (ru != rv).then(|| (ru.min(rv), ru.max(rv), 0))
-                })
-                .collect();
-            groups.sort_unstable();
-            let mut counted: Vec<(usize, usize, usize)> = Vec::with_capacity(groups.len());
-            for (a, b, _) in groups {
-                match counted.last_mut() {
-                    Some(last) if last.0 == a && last.1 == b => last.2 += 1,
-                    _ => counted.push((a, b, 1)),
                 }
             }
-            counted.sort_unstable_by(|x, y| y.2.cmp(&x.2).then((x.0, x.1).cmp(&(y.0, y.1))));
-            for (a, b, count) in counted {
-                let (ru, rv) = (uf.find(a), uf.find(b));
-                if ru == rv {
-                    continue;
+            // 2 단계: 지지도 0 간선은 1 단계 뒤 성분 쌍마다 묶는다. 대응 재현율 30~50% 에서는 참 트랙
+            // 조각 사이 간선이 1 개뿐인 경우가 많아 간선 수 문턱을 두면 참 트랙이 쪼개진다(완전도 0.83).
+            // 대신 순서로 오대응을 늦춘다: 성분 그래프에서 간선 2 개 이상이거나 공통 이웃 성분(삼각형)이
+            // 있는 쌍을 먼저 되풀이해 합쳐 참 트랙을 키운 뒤, 남은 단일 간선을 마지막에 합친다. 무작위
+            // 오대응은 삼각형을 이루기 어려워 뒤로 밀리고, 그때는 양쪽 트랙이 커져 영상이 겹쳐(충돌) 걸러진다.
+            let zero = &order[split..];
+            let mut comp_start = vec![0usize; n + 1];
+            for round in 0..=8 {
+                let mut counted = component_pairs(zero, &mut uf);
+                if counted.is_empty() {
+                    break;
                 }
-                let iu = imgs_of(&mut images, ru);
-                let iv = imgs_of(&mut images, rv);
-                if common_count(&iu, &iv) > 0 {
-                    stats.conflicts += count;
-                    images[ru] = iu;
-                    images[rv] = iv;
-                    continue;
+                // 성분 그래프 CSR(대표 번호 = 노드 번호)로 쌍마다 공통 이웃 성분 수를 센다.
+                comp_start.iter_mut().for_each(|x| *x = 0);
+                for &(a, b, _, _) in &counted {
+                    comp_start[a + 1] += 1;
+                    comp_start[b + 1] += 1;
                 }
-                let r = uf.link(ru, rv);
-                images[r] = merge_sorted(&iu, &iv);
+                for i in 0..n {
+                    comp_start[i + 1] += comp_start[i];
+                }
+                let mut fill = comp_start.clone();
+                let mut flat = vec![0usize; 2 * counted.len()];
+                for &(a, b, _, _) in &counted {
+                    flat[fill[a]] = b;
+                    fill[a] += 1;
+                    flat[fill[b]] = a;
+                    fill[b] += 1;
+                }
+                // `counted` 가 (a, b) 오름차순이라 각 목록은 이미 정렬돼 있지 않을 수 있다.
+                for i in 0..n {
+                    if comp_start[i + 1] - comp_start[i] > 1 {
+                        flat[comp_start[i]..comp_start[i + 1]].sort_unstable();
+                    }
+                }
+                for c in counted.iter_mut() {
+                    c.3 = common_count(
+                        &flat[comp_start[c.0]..comp_start[c.0 + 1]],
+                        &flat[comp_start[c.1]..comp_start[c.1 + 1]],
+                    );
+                }
+                counted.sort_unstable_by(|x, y| {
+                    (y.2, y.3)
+                        .cmp(&(x.2, x.3))
+                        .then((x.0, x.1).cmp(&(y.0, y.1)))
+                });
+                let last = round == 8;
+                let mut merged = 0;
+                for (a, b, count, sup) in counted {
+                    let strong = count >= 2 || sup > 0;
+                    if !strong && !last {
+                        continue;
+                    }
+                    if try_join(&mut uf, &mut images, &node_image, a, b) {
+                        merged += 1;
+                    } else {
+                        stats.conflicts += count;
+                    }
+                }
+                if last {
+                    break;
+                }
+                if merged == 0 {
+                    // 강한 쌍이 더 없으면 마지막 단계(단일 간선 포함)로 넘어간다.
+                    let mut rest = component_pairs(zero, &mut uf);
+                    rest.sort_unstable_by(|x, y| y.2.cmp(&x.2).then((x.0, x.1).cmp(&(y.0, y.1))));
+                    for (a, b, count, _) in rest {
+                        if !try_join(&mut uf, &mut images, &node_image, a, b) {
+                            stats.conflicts += count;
+                        }
+                    }
+                    break;
+                }
             }
         }
     }
@@ -350,6 +369,64 @@ pub fn build_tracks(
     stats.truncated = before - tracks.len();
     stats.tracks = tracks.len();
     (tracks, stats)
+}
+
+/// 두 노드의 성분을 영상이 겹치지 않을 때만 합친다. 이미 같은 성분이면 참(할 일 없음).
+fn try_join(
+    uf: &mut UnionFind,
+    images: &mut [Vec<usize>],
+    node_image: &[usize],
+    u: usize,
+    v: usize,
+) -> bool {
+    let (ru, rv) = (uf.find(u), uf.find(v));
+    if ru == rv {
+        return true;
+    }
+    let single_u = [node_image[ru]];
+    let single_v = [node_image[rv]];
+    let iu: &[usize] = if images[ru].is_empty() {
+        &single_u
+    } else {
+        &images[ru]
+    };
+    let iv: &[usize] = if images[rv].is_empty() {
+        &single_v
+    } else {
+        &images[rv]
+    };
+    if common_count(iu, iv) > 0 {
+        return false;
+    }
+    let m = merge_sorted(iu, iv);
+    images[ru] = Vec::new();
+    images[rv] = Vec::new();
+    let r = uf.link(ru, rv);
+    images[r] = m;
+    true
+}
+
+/// 지지도 0 간선을 현재 성분 쌍 (작은 대표, 큰 대표, 간선 수, 0) 으로 묶는다(대표 쌍 오름차순).
+fn component_pairs(
+    zero: &[(usize, usize, usize)],
+    uf: &mut UnionFind,
+) -> Vec<(usize, usize, usize, usize)> {
+    let mut groups: Vec<(usize, usize)> = zero
+        .iter()
+        .filter_map(|&(_, u, v)| {
+            let (ru, rv) = (uf.find(u), uf.find(v));
+            (ru != rv).then(|| (ru.min(rv), ru.max(rv)))
+        })
+        .collect();
+    groups.sort_unstable();
+    let mut counted: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(groups.len());
+    for (a, b) in groups {
+        match counted.last_mut() {
+            Some(last) if last.0 == a && last.1 == b => last.2 += 1,
+            _ => counted.push((a, b, 1, 0)),
+        }
+    }
+    counted
 }
 
 /// 정렬된 두 목록의 공통 원소 수.
