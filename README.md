@@ -61,6 +61,11 @@ skylens-stream synth <출력 폴더> [폭 높이]
 # 등록 사진 수·구역 사진 수·재투영 오차는 출력 폴더의 report.json 이 있을 때만 판정한다
 skylens-stream verify <출력 폴더>
 
+# 합성 장면으로 끝까지 돌려 보기(synth → run → verify). 느리면 --stride 8 --max-features 800 --dense-width 96 을 더한다
+skylens-stream synth scene 480 270
+skylens-stream run scene out --stride 8 --span 6 --ovl 1 --max-features 800 --dense-width 96
+skylens-stream verify out
+
 # 판 번호 출력 ("skylens-stream 0.1.0")
 skylens-stream --version
 
@@ -290,6 +295,11 @@ skylens-stream synth <output dir> [width height]
 # Exit code: 1 if any FAIL, 2 if no FAIL but some undecided, 0 if all PASS
 # Registered images, region images and reprojection error are decided only when report.json is in the output folder
 skylens-stream verify <output dir>
+
+# Run a synthetic scene end to end (synth -> run -> verify); add --stride 8 --max-features 800 --dense-width 96 if slow
+skylens-stream synth scene 480 270
+skylens-stream run scene out --stride 8 --span 6 --ovl 1 --max-features 800 --dense-width 96
+skylens-stream verify out
 
 # Print the version ("skylens-stream 0.1.0")
 skylens-stream --version

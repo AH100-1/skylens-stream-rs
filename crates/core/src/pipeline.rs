@@ -17,8 +17,8 @@ use crate::camera::{Camera, Intrinsics, Pose};
 use crate::dataset::Dataset;
 use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use crate::fusion::{fuse, FusionConfig, FusionView};
-use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::matching::{candidate_pairs, ratio_match, RansacConfig, PAIR_CROSS, PAIR_TEMPORAL};
+use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::ply::{PointCloud, PointRecord};
 use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
 use crate::stream::{
@@ -117,7 +117,10 @@ pub mod stand_in {
         }
         for (i, j, m) in matches {
             for &(a, b) in m {
-                let (ra, rb) = (find(&mut parent, off[*i] + a), find(&mut parent, off[*j] + b));
+                let (ra, rb) = (
+                    find(&mut parent, off[*i] + a),
+                    find(&mut parent, off[*j] + b),
+                );
                 if ra != rb {
                     parent[ra] = rb;
                 }
@@ -188,10 +191,7 @@ pub mod stand_in {
     }
 
     /// 점-광선 최소제곱 삼각측량. 반환: 점(깊이가 모두 양수, 재투영 `max_px` 이하일 때만).
-    pub fn triangulate_track(
-        cams: &[(Camera, Vector2<f64>)],
-        max_px: f64,
-    ) -> Option<Vector3<f64>> {
+    pub fn triangulate_track(cams: &[(Camera, Vector2<f64>)], max_px: f64) -> Option<Vector3<f64>> {
         let mut a = Matrix3::zeros();
         let mut b = Vector3::zeros();
         for (cam, px) in cams {
@@ -213,13 +213,17 @@ pub mod stand_in {
 
     /// 희소 점 보간 깊이 맵(역거리 가중, 반경 밖은 빈 화소). `cam` 은 깊이 맵 해상도의 카메라.
     pub fn depth_from_sparse(cam: &Camera, points: &[Vector3<f64>]) -> crate::fusion::DepthMap {
-        let (w, h) = (cam.intrinsics.width as usize, cam.intrinsics.height as usize);
+        let (w, h) = (
+            cam.intrinsics.width as usize,
+            cam.intrinsics.height as usize,
+        );
         let proj: Vec<(f64, f64, f64)> = points
             .iter()
             .filter_map(|p| {
                 let z = cam.pose.transform(&Point3::from(*p)).z;
                 let q = cam.project(&Point3::from(*p))?;
-                (q.x >= 0.0 && q.y >= 0.0 && q.x < w as f64 && q.y < h as f64).then_some((q.x, q.y, z))
+                (q.x >= 0.0 && q.y >= 0.0 && q.x < w as f64 && q.y < h as f64)
+                    .then_some((q.x, q.y, z))
             })
             .collect();
         let radius = (w as f64 * 0.1).max(3.0);
@@ -361,7 +365,37 @@ fn sparse_init(
     let svd = h.svd(true, true);
     let (u, vt) = (svd.u.ok_or("SVD")?, svd.v_t.ok_or("SVD")?);
     let d = (vt.transpose() * u.transpose()).determinant().signum();
-    let g = vt.transpose() * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, d)) * u.transpose();
+    let mut g = vt.transpose() * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, d)) * u.transpose();
+    // 편대가 거의 한 직선으로 날면 Kabsch 는 직선 둘레 회전을 못 정한다: 비행 축 둘레 회전을
+    // 카메라가 아래를 보는 쪽(보는 방향의 평균 z 가 가장 작은 쪽)으로 고른다.
+    let valid: Vec<Rotation3<f64>> = rots.iter().flatten().copied().collect();
+    let mut axis = Vector3::zeros();
+    let mut first: Option<Vector3<f64>> = None;
+    for p in pm {
+        let dg = gps[p.j] - gps[p.i];
+        if dg.norm() > 3.0 {
+            let dn = dg.normalize();
+            let r = *first.get_or_insert(dn);
+            axis += if dn.dot(&r) >= 0.0 { dn } else { -dn };
+        }
+    }
+    if axis.norm() > 1e-9 && !valid.is_empty() {
+        let axis = nalgebra::Unit::new_normalize(axis);
+        let mut best = (f64::INFINITY, g);
+        for step in 0..180 {
+            let gm =
+                *Rotation3::from_axis_angle(&axis, step as f64 * 2f64.to_radians()).matrix() * g;
+            let down: f64 = valid
+                .iter()
+                .map(|r| (gm * (r.inverse() * Vector3::z())).z)
+                .sum::<f64>()
+                / valid.len() as f64;
+            if down < best.0 {
+                best = (down, gm);
+            }
+        }
+        g = best.1;
+    }
     let ids: Vec<usize> = (0..n).filter(|&i| rots[i].is_some()).collect();
     let loc: HashMap<usize, usize> = ids.iter().enumerate().map(|(a, &i)| (i, a)).collect();
     let dirs: Vec<(usize, usize, Vector3<f64>)> = dirs_model
@@ -375,6 +409,30 @@ fn sparse_init(
     for (a, &i) in ids.iter().enumerate() {
         let r = Rotation3::from_matrix_unchecked(rots[i].unwrap().matrix() * g.transpose());
         poses[i] = Some(Pose::from_center(r, &Point3::from(centers[a])));
+    }
+    if std::env::var("PIPE_DEBUG").is_ok() {
+        let mut ang: Vec<f64> = pm
+            .iter()
+            .filter_map(|p| {
+                let (ri, t) = (rots[p.i]?, p.t?);
+                let b = g * (ri.inverse() * (-(p.rot.inverse() * t)));
+                let dg = gps[p.j] - gps[p.i];
+                (dg.norm() > 3.0).then(|| b.angle(&dg).to_degrees())
+            })
+            .collect();
+        ang.sort_by(f64::total_cmp);
+        let down: f64 = poses
+            .iter()
+            .flatten()
+            .map(|p| (p.rotation.inverse() * Vector3::z()).z)
+            .sum::<f64>()
+            / poses.iter().flatten().count().max(1) as f64;
+        eprintln!(
+            "debug gauge pairs {} angle median {:?} view-dir z mean {down:.2} det {}",
+            ang.len(),
+            ang.get(ang.len() / 2),
+            g.determinant()
+        );
     }
     let counts: Vec<usize> = imgs.iter().map(|d| d.feats.len()).collect();
     let ms: Vec<_> = pm
@@ -426,7 +484,9 @@ fn sparse_init(
 
 /// 번들 조정(`iters == 0` 이면 재투영 오차만 잰다). 반환: 재투영 RMS(px).
 fn run_ba(s: &mut Sparse, k: &Intrinsics, iters: usize) -> f64 {
-    let ids: Vec<usize> = (0..s.poses.len()).filter(|&i| s.poses[i].is_some()).collect();
+    let ids: Vec<usize> = (0..s.poses.len())
+        .filter(|&i| s.poses[i].is_some())
+        .collect();
     let loc: HashMap<usize, usize> = ids.iter().enumerate().map(|(a, &i)| (i, a)).collect();
     let mut observations = Vec::new();
     for (p, o) in s.obs.iter().enumerate() {
@@ -554,10 +614,16 @@ pub fn run_pipeline(
     let mut cache: HashMap<usize, ImgData> = HashMap::new();
     let mut k_opt: Option<Intrinsics> = None;
     let mut res = PipelineResult::default();
-    let (mut prelim, mut refined, mut tr_pairs): (Vec<PointCloud>, Vec<PointCloud>, Vec<(Region, Vec<Track>, Vec<Track>)>) =
-        (Vec::new(), Vec::new(), Vec::new());
+    let (mut prelim, mut refined, mut tr_pairs): (
+        Vec<PointCloud>,
+        Vec<PointCloud>,
+        Vec<(Region, Vec<Track>, Vec<Track>)>,
+    ) = (Vec::new(), Vec::new(), Vec::new());
     let mut centers: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
-    let (mut reg_prev, mut reg_ref) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    let (mut reg_prev, mut reg_ref) = (
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    );
     for r in &regions {
         let mut st = RegionStats {
             region: r.index,
@@ -565,12 +631,23 @@ pub fn run_pipeline(
             images: 3 * (r.hi - r.lo),
             ..Default::default()
         };
-        let gids: Vec<usize> = (r.lo..r.hi).flat_map(|p| (0..3).map(move |c| 3 * p + c)).collect();
+        let gids: Vec<usize> = (r.lo..r.hi)
+            .flat_map(|p| (0..3).map(move |c| 3 * p + c))
+            .collect();
         let t0 = Instant::now();
-        let need: Vec<usize> = gids.iter().copied().filter(|g| !cache.contains_key(g)).collect();
+        let need: Vec<usize> = gids
+            .iter()
+            .copied()
+            .filter(|g| !cache.contains_key(g))
+            .collect();
         let loaded: Vec<Result<(usize, ImgData), String>> = need
             .par_iter()
-            .map(|&g| Ok((g, load(&ds.positions[g / 3].images[g % 3], cfg.max_features)?)))
+            .map(|&g| {
+                Ok((
+                    g,
+                    load(&ds.positions[g / 3].images[g % 3], cfg.max_features)?,
+                ))
+            })
             .collect();
         for l in loaded {
             let (g, d) = l?;
@@ -591,8 +668,8 @@ pub fn run_pipeline(
         let pm = match_pairs(&imgs, &views, &k);
         st.secs_matching = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
-        let init = sparse_init(&imgs, &pm, &gps, &k)
-            .map_err(|e| format!("구역 {}: {e}", r.index))?;
+        let init =
+            sparse_init(&imgs, &pm, &gps, &k).map_err(|e| format!("구역 {}: {e}", r.index))?;
         st.secs_sparse = t2.elapsed().as_secs_f64();
         let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
         let t3 = Instant::now();
@@ -600,7 +677,10 @@ pub fn run_pipeline(
             let ((pc, dt), (rs, rc)) = rayon::join(
                 || {
                     let t = Instant::now();
-                    (dense_cloud(&init, &imgs, &k, &in_region, cfg.dense_width), t.elapsed().as_secs_f64())
+                    (
+                        dense_cloud(&init, &imgs, &k, &in_region, cfg.dense_width),
+                        t.elapsed().as_secs_f64(),
+                    )
                 },
                 || {
                     let mut rs = init.clone();
