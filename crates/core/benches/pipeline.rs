@@ -12,6 +12,10 @@
 //! | `--ba-points M` | 3000 | 번들 조정 문제의 점 수 |
 //! | `--full` | | SPEC 기준 규모: `--positions 80 --width 960 --height 540 --repeat 3 --ba-points 20000` 과 같다 |
 //! | `--quick` | | 기본값과 같다(예전 이름, 그대로 받는다) |
+//!
+//! 순서 규칙: `--full`·`--quick` 은 어디에 두든 먼저 적용하고, 개별 인자(`--positions` 등)가 그 위에 덮어쓴다.
+//! `--positions 20 --full` 과 `--full --positions 20` 은 모두 위치 20·960×540 이다. 둘 다 주면 뒤에 준 묶음이 이긴다.
+//! 해석은 `benches/support/args.rs`, 순서 시험은 `tests/perf_structure.rs`.
 //! | `--json PATH` | | 표를 JSON 으로도 쓴다(`{cores, threads, mode, rows[{name, items, unit, median_s, min_s, note}]}`) |
 //! | `--mode M` | `pipeline` | `pipeline`(구간 전체), `ba-scale`(번들 조정 실제 규모), `detect`(1920×1080 한 장 검출) |
 //! | `--ba-tracks N` | 100000 | `ba-scale` 의 트랙(점) 수 |
@@ -55,6 +59,10 @@ use skylens_core::rotation_averaging::{
 use skylens_core::synth::{CamId, Scene, SceneConfig};
 use skylens_core::two_view::{ransac_essential, recover_pose};
 
+#[path = "support/args.rs"]
+mod args;
+use args::Args;
+
 /// 짝 하나의 대응 좌표: (픽셀 a, 픽셀 b, 정규 a, 정규 b).
 type PairCoords = (
     Vec<Vector2<f64>>,
@@ -65,103 +73,6 @@ type PairCoords = (
 
 /// 비율 검사 문턱(SPEC 기본 0.8)과 상호 최근접.
 const RATIO: f32 = 0.8;
-
-struct Args {
-    positions: usize,
-    width: u32,
-    height: u32,
-    repeat: usize,
-    threads: usize,
-    max_pairs: usize,
-    ba_points: usize,
-    json: Option<String>,
-    mode: String,
-    ba_tracks: usize,
-    ba_iters: usize,
-}
-
-fn parse_args() -> Args {
-    let mut a = Args {
-        positions: 8,
-        width: 480,
-        height: 270,
-        repeat: 3,
-        threads: 0,
-        max_pairs: 0,
-        ba_points: 3000,
-        json: None,
-        mode: "pipeline".to_string(),
-        ba_tracks: 100_000,
-        ba_iters: 3,
-    };
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
-    let mut positions_set = false;
-    let num = |v: Option<&String>, name: &str| -> usize {
-        v.and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| panic!("{name} 뒤에 0 이상의 정수가 필요하다"))
-    };
-    while i < argv.len() {
-        let next = argv.get(i + 1);
-        match argv[i].as_str() {
-            "--positions" => {
-                a.positions = num(next, "--positions");
-                positions_set = true;
-            }
-            "--width" => a.width = num(next, "--width") as u32,
-            "--height" => a.height = num(next, "--height") as u32,
-            "--repeat" => a.repeat = num(next, "--repeat").max(1),
-            "--threads" => a.threads = num(next, "--threads"),
-            "--max-pairs" => a.max_pairs = num(next, "--max-pairs"),
-            "--ba-points" => a.ba_points = num(next, "--ba-points"),
-            "--ba-tracks" => a.ba_tracks = num(next, "--ba-tracks"),
-            "--ba-iters" => a.ba_iters = num(next, "--ba-iters").max(1),
-            "--json" => {
-                a.json = Some(
-                    next.cloned()
-                        .unwrap_or_else(|| panic!("--json 뒤에 경로가 필요하다")),
-                )
-            }
-            "--mode" => {
-                a.mode = next
-                    .cloned()
-                    .unwrap_or_else(|| panic!("--mode 뒤에 값이 필요하다"))
-            }
-            "--quick" => {
-                a.positions = 8;
-                a.width = 480;
-                a.height = 270;
-                a.repeat = 3;
-                a.ba_points = 3000;
-                positions_set = true;
-                i += 1;
-                continue;
-            }
-            "--full" => {
-                a.positions = 80;
-                a.width = 960;
-                a.height = 540;
-                a.repeat = 3;
-                a.ba_points = 20_000;
-                positions_set = true;
-                i += 1;
-                continue;
-            }
-            // cargo bench 가 붙이는 인자는 무시한다.
-            "--bench" => {
-                i += 1;
-                continue;
-            }
-            other => panic!("알 수 없는 인자: {other}"),
-        }
-        i += 2;
-    }
-    // 번들 조정 실제 규모 측정은 카메라 240(위치 80)이 목적이므로 위치를 따로 주지 않으면 80 으로 둔다.
-    if a.mode == "ba-scale" && !positions_set {
-        a.positions = 80;
-    }
-    a
-}
 
 /// 한 구간의 측정 결과.
 struct Row {
@@ -228,7 +139,8 @@ fn spread(n: usize, k: usize) -> Vec<usize> {
 }
 
 fn main() {
-    let args = parse_args();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let args = args::parse(&argv);
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(args.threads)
