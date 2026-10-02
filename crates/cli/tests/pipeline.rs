@@ -1,7 +1,5 @@
 //! 합성 장면 → run → verify, 정답 카메라 중심·표면 대비 오차.
 
-use std::path::PathBuf;
-
 use skylens_core::dataset::{load_dataset, DatasetConfig};
 use skylens_core::math::Point3;
 use skylens_core::pipeline::{run_pipeline, PipelineConfig};
@@ -16,8 +14,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 #[test]
 fn synthetic_scene_runs_end_to_end() {
-    let root =
-        PathBuf::from(std::env::temp_dir()).join(format!("skylens_pipe_{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("skylens_pipe_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let (input, output) = (root.join("in"), root.join("out"));
     let scene = Scene::new(SceneConfig {

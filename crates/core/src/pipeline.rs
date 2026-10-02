@@ -93,16 +93,17 @@ struct Sparse {
     rms: f64,
 }
 
+/// (사진 i, 사진 j, 특징 짝 목록).
+type PairList = (usize, usize, Vec<(usize, usize)>);
+type RegionTracks = (Region, Vec<Track>, Vec<Track>);
+
 pub mod stand_in {
     //! 병합 전 부품의 단순 대체. 모양은 TASKS 인터페이스를 따른다.
     use super::*;
 
     /// 트랙: 합집합-찾기, 같은 사진이 두 번 든 성분은 버린다. 반환은 성분별 (사진, 특징) 목록.
     /// `feat_counts[i]` = 사진 i 의 특징 수, `matches` = (i, j, [(특징 i, 특징 j)]).
-    pub fn build_tracks(
-        feat_counts: &[usize],
-        matches: &[(usize, usize, Vec<(usize, usize)>)],
-    ) -> Vec<Vec<(usize, usize)>> {
+    pub fn build_tracks(feat_counts: &[usize], matches: &[PairList]) -> Vec<Vec<(usize, usize)>> {
         let mut off = vec![0usize; feat_counts.len() + 1];
         for (i, c) in feat_counts.iter().enumerate() {
             off[i + 1] = off[i] + c;
@@ -204,7 +205,7 @@ pub mod stand_in {
         let x = a.lu().solve(&b)?;
         for (cam, px) in cams {
             let q = cam.project(&Point3::from(x))?;
-            if !((q - px).norm() < max_px) {
+            if (q - px).norm().partial_cmp(&max_px) != Some(std::cmp::Ordering::Less) {
                 return None;
             }
         }
@@ -617,7 +618,7 @@ pub fn run_pipeline(
     let (mut prelim, mut refined, mut tr_pairs): (
         Vec<PointCloud>,
         Vec<PointCloud>,
-        Vec<(Region, Vec<Track>, Vec<Track>)>,
+        Vec<RegionTracks>,
     ) = (Vec::new(), Vec::new(), Vec::new());
     let mut centers: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
     let (mut reg_prev, mut reg_ref) = (
