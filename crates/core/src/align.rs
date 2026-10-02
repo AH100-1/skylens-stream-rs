@@ -511,6 +511,68 @@ pub fn align_to_enu_with(
     })
 }
 
+/// 정밀 포즈(세계→카메라 회전)에서 복원 좌표의 위 방향을 구한다.
+///
+/// 짐벌 카메라는 옆으로 구르지 않으므로 카메라 x 축(세계 좌표 Rᵀe_x)은 수평이다.
+/// 위 방향 = Σ x_i x_iᵀ 의 최소 고유벡터, 부호는 평균 광축(Rᵀe_z)이 아래를 보게 정한다.
+/// 보는 방위가 한 방향뿐이면(둘째 고유값 < 최대의 [`UP_MIN_HEADING_SPREAD`]) 위 방향이
+/// x 축 둘레로 정해지지 않으므로 `None`. 기울기 잡음 σ_p(카메라별)에서 오차 ≈ σ_p / √N.
+pub fn up_from_rotations(rotations: &[Rotation3<f64>]) -> Option<Vector3<f64>> {
+    let mut m = Matrix3::zeros();
+    let mut zsum = Vector3::zeros();
+    let mut n = 0usize;
+    for r in rotations {
+        let mt = r.matrix().transpose();
+        let x: Vector3<f64> = mt.column(0).into();
+        let z: Vector3<f64> = mt.column(2).into();
+        if !(finite(&x) && finite(&z)) {
+            continue;
+        }
+        m += x * x.transpose();
+        zsum += z;
+        n += 1;
+    }
+    if n < 2 {
+        return None;
+    }
+    let eig = m.symmetric_eigen();
+    let mut idx = [0usize, 1, 2];
+    idx.sort_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]));
+    let (l_mid, l_max) = (eig.eigenvalues[idx[1]], eig.eigenvalues[idx[2]]);
+    if !(l_max > 0.0 && l_mid >= UP_MIN_HEADING_SPREAD * l_max) {
+        return None;
+    }
+    let mut up: Vector3<f64> = eig.eigenvectors.column(idx[0]).into();
+    let d = up.dot(&zsum);
+    if !d.is_finite() || d.abs() < 1e-9 * n as f64 {
+        return None;
+    }
+    if d > 0.0 {
+        up = -up;
+    }
+    Some(up.normalize())
+}
+
+/// [`up_from_rotations`] 의 방위 퍼짐 문턱(둘째/최대 고유값). 0.05 는 방위가 약 ±13° 이상
+/// 퍼진 것에 해당한다.
+pub const UP_MIN_HEADING_SPREAD: f64 = 0.05;
+
+/// 정밀 포즈(세계→카메라 회전·카메라 중심)를 GPS 에 정렬하는 기본 진입점.
+/// 위 방향을 [`up_from_rotations`] 로 데이터에서 구해 연직축 고정 추정을 쓰고,
+/// 위 방향이 정해지지 않을 때만 자유 추정으로 돌아간다(이때 `tilt_sigma_deg` > 0).
+pub fn gps_align_poses(
+    rotations: &[Rotation3<f64>],
+    centers: &[Vector3<f64>],
+    gps: &[Geodetic],
+    origin: &Geodetic,
+) -> Option<GpsAlignment> {
+    let cfg = GpsAlignConfig {
+        up: up_from_rotations(rotations),
+        ..Default::default()
+    };
+    gps_align_with(centers, gps, origin, &cfg)
+}
+
 /// 위경도 GPS 를 `origin` 기준 동-북-위로 바꾼 뒤 [`align_to_enu`] (상한 3 m).
 pub fn gps_align(
     centers: &[Vector3<f64>],
@@ -1010,7 +1072,7 @@ mod tests {
     }
 
     /// 편대 띠 측정: 설정별 (회전 최악, 기울기 최악, 위치 최악, 유지 최소, 기울기σ 보고 최대, None 수).
-    /// 설정: 0 = 연직 고정(위 방향 0.2° 틀림), 1 = 자유(잡음 비례 임계), 2 = 자유 + 고정 3 m.
+    /// 설정: 0 = 연직 고정(위 방향은 정밀 포즈에서 추정), 1 = 자유(잡음 비례 임계), 2 = 자유 + 고정 3 m.
     /// 둘째 값: 연직 고정 설정의 시드별 (방위 오차 도(부호 있음), 방위 이론 σ 도).
     type StripWorst = [(f64, f64, f64, f64, f64, usize); 3];
     fn strip_stats(sigma: f64) -> (StripWorst, Vec<(f64, f64)>) {
@@ -1018,17 +1080,16 @@ mod tests {
         let ex = Vector3::new(1.0, 0.0, 0.0);
         let mut w = [(0.0f64, 0.0f64, 0.0f64, 1.0f64, 0.0f64, 0usize); 3];
         let mut yaw = Vec::new();
+        let mut up_err = Vec::new();
         for seed in 0..20u64 {
             let mut rng = Rng(1300 + seed);
             let s = strip_enu(&mut rng);
             let c = gps_case(&mut rng, s, sigma, 0.1, 10.0, 50.0);
-            // 위 방향 사전 정보에 0.2° 오차(임의 수평축 둘레)를 넣는다.
-            let tilt_axis = Vector3::new(rng.gauss(), rng.gauss(), 0.0).normalize();
-            let up_err = Rotation3::from_axis_angle(
-                &nalgebra::Unit::new_normalize(tilt_axis),
-                0.2f64.to_radians(),
-            );
-            let up = c.gt.r.inverse() * (up_err * ez);
+            // 위 방향은 정밀 포즈(카메라당 0.1° 잡음)에서 데이터로 구한다.
+            let rots = strip_rotations(&mut rng, &c, 0.1);
+            let up = up_from_rotations(&rots).expect("up");
+            let up_true = c.gt.r.inverse() * ez;
+            up_err.push(up.angle(&up_true).to_degrees());
             let cfgs = [
                 GpsAlignConfig {
                     up: Some(up),
@@ -1062,13 +1123,45 @@ mod tests {
                 }
             }
         }
+        eprintln!(
+            "strip sigma {sigma} up from poses: err max {:.4} deg",
+            up_err.iter().fold(0.0f64, |a, &b| a.max(b))
+        );
         for (k, name) in ["up-fixed", "free", "free-3m"].iter().enumerate() {
+            if w[k].5 == 20 {
+                eprintln!("strip sigma {sigma} {name}: no result 20/20");
+                continue;
+            }
             eprintln!(
                 "strip sigma {sigma} {name}: rot max {:.3} deg tilt max {:.3} deg pos max {:.3} m keep min {:.3} tilt-sigma {:.3} deg none {}/20",
                 w[k].0, w[k].1, w[k].2, w[k].3, w[k].4, w[k].5
             );
         }
         (w, yaw)
+    }
+
+    /// 편대 카메라 회전(세계→카메라, 복원 좌표): 중심마다 방위 −60°·0°·+60° 를 돌려 쓰고
+    /// 아래로 60° 기울인다(SPEC §1 의 비스듬한 3방향 카메라). 카메라마다 σ `noise_deg` 의
+    /// 임의 축 회전 잡음(구름 포함)을 넣는다.
+    fn strip_rotations(rng: &mut Rng, c: &GpsCase, noise_deg: f64) -> Vec<Rotation3<f64>> {
+        (0..c.centers.len())
+            .map(|k| {
+                let a = [-60.0f64, 0.0, 60.0][k % 3].to_radians();
+                let t = 60f64.to_radians();
+                let d = Vector3::new(t.cos() * a.cos(), t.cos() * a.sin(), -t.sin());
+                let z = d;
+                let x = z.cross(&Vector3::z()).normalize();
+                let y = z.cross(&x);
+                let r_enu = Rotation3::from_matrix_unchecked(Matrix3::from_rows(&[
+                    x.transpose(),
+                    y.transpose(),
+                    z.transpose(),
+                ]));
+                let e = rng.gvec(noise_deg.to_radians());
+                let noise = Rotation3::from_scaled_axis(e);
+                noise * r_enu * c.gt.r
+            })
+            .collect()
     }
 
     /// 연직축을 고정한 최소제곱 방위의 이론 표준편차(도): 정상 대응의 참 위치가
@@ -1090,22 +1183,76 @@ mod tests {
         (sigma_axis / s2.sqrt()).to_degrees()
     }
 
-    /// F-099 기울기·위치: 실측 편대 띠(77 m × 20 m), 이상치 10%(10~50 m), 시드 20, 축당 σ 1·2 m.
-    /// 연직축 고정이면 기울기는 위 방향 사전 정보 오차(여기서 0.2°)와 같아야 한다 → 기준 < 0.25°
-    /// (사전 오차 0.2° + 수치 여유 0.05°). 띠 안 최대 위치 오차 < 2 m, 참 대응 유지 ≥ 90%, 실패 0.
+    /// F-099·F-152 기울기·위치: 실측 편대 띠(77 m × 20 m), 이상치 10%(10~50 m), 시드 20, 축당 σ 1·2 m.
+    /// 위 방향은 주입하지 않고 정밀 포즈(카메라당 축별 0.1° 잡음)에서 [`up_from_rotations`] 로 구한다.
+    /// 연직 고정이면 기울기 = 위 방향 추정 오차 ≈ 0.1°·√2/√240 ≈ 0.01° 수준이라
+    /// 기준 < 0.1°(F-152 의 0.5° 보다 엄격, 이론의 약 10배 여유). 위치 < 2 m, 유지 ≥ 90%, 실패 0.
     #[test]
     fn gps_alignment_formation_strip_tilt() {
         for &sigma in &[1.0, 2.0] {
             let (w, _) = strip_stats(sigma);
             let u = w[0];
             assert_eq!(u.5, 0, "sigma {sigma}: None");
-            assert!(u.1 < 0.25, "sigma {sigma}: tilt {}", u.1);
+            assert!(u.1 < 0.1, "sigma {sigma}: tilt {}", u.1);
             assert!(u.2 < 2.0, "sigma {sigma}: pos {}", u.2);
             assert!(u.3 >= 0.9, "sigma {sigma}: keep {}", u.3);
             // 자유 추정도 실패하지 않고 기울기 불확실성을 보고한다.
             assert_eq!(w[1].5, 0);
             assert!(w[1].4 > 0.1, "sigma {sigma}: tilt sigma {}", w[1].4);
+            // F-153: SPEC §3.4 문자 그대로(고정 3 m)는 σ 1 m 에서 정렬되고, σ 2 m 에서는
+            // 3차원 잔차 중앙 ≈ 1.54σ ≈ 3.1 m 라 정상이 절반 아래 → 20/20 `None` 이 기대 동작.
+            let want_none = if sigma > 1.5 { 20 } else { 0 };
+            assert_eq!(w[2].5, want_none, "sigma {sigma}: fixed 3 m None");
         }
+    }
+
+    /// F-154: 위 방향 추정 단계를 임의 방향으로 바꾸면 같은 기준이 깨져야 한다
+    /// (기울기 시험이 구성 성질만 보는 것이 아님을 확인). 또 방위가 한 방향뿐인 카메라는 `None`.
+    #[test]
+    fn up_from_rotations_is_load_bearing() {
+        let ez = Vector3::new(0.0, 0.0, 1.0);
+        let mut worst_rand = 0.0f64;
+        for seed in 0..20u64 {
+            let mut rng = Rng(1300 + seed);
+            let s = strip_enu(&mut rng);
+            let c = gps_case(&mut rng, s, 2.0, 0.1, 10.0, 50.0);
+            let up_true = c.gt.r.inverse() * ez;
+            let rots = strip_rotations(&mut rng, &c, 0.1);
+            let up = up_from_rotations(&rots).unwrap();
+            assert!(up.angle(&up_true).to_degrees() < 0.1, "seed {seed}");
+            let rand_up = rng.gvec(1.0).normalize();
+            let cfg = GpsAlignConfig {
+                up: Some(rand_up),
+                ..Default::default()
+            };
+            if let Some(al) = align_to_enu_with(&c.centers, &c.enu, &cfg) {
+                worst_rand = worst_rand.max((al.sim.r * up_true).angle(&ez).to_degrees());
+            } else {
+                worst_rand = f64::INFINITY;
+            }
+        }
+        assert!(worst_rand > 0.5, "random up tilt {worst_rand}");
+        // 한 방위만 보는 카메라: 위 방향이 정해지지 않는다.
+        let mut rng = Rng(5);
+        let s = strip_enu(&mut rng);
+        let c = gps_case(&mut rng, s, 1.0, 0.0, 0.0, 0.0);
+        let one: Vec<_> = strip_rotations(&mut rng, &c, 0.0)
+            .into_iter()
+            .step_by(3)
+            .collect();
+        assert!(up_from_rotations(&one).is_none());
+        // 기본 진입점이 포즈에서 위 방향을 써서 연직 고정 추정을 한다.
+        let origin = Geodetic {
+            lat_deg: 37.5,
+            lon_deg: 127.0,
+            alt: 50.0,
+        };
+        let gps: Vec<_> = c.enu.iter().map(|e| enu_to_geodetic(e, &origin)).collect();
+        let rots = strip_rotations(&mut rng, &c, 0.1);
+        let al = gps_align_poses(&rots, &c.centers, &gps, &origin).unwrap();
+        assert_eq!(al.tilt_sigma_deg, 0.0);
+        let up_true = c.gt.r.inverse() * ez;
+        assert!((al.sim.r * up_true).angle(&ez).to_degrees() < 0.1);
     }
 
     /// F-099 방위(연직축 둘레): 최소제곱 방위 오차는 잡음 한계 σ_ψ = σ_축 / √Σ r_i²
