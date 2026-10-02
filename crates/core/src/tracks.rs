@@ -13,6 +13,10 @@
 //!   영상이 겹치지 않을 때 잇는다(대응이 성긴 참 트랙 조각은 간선 한 개로만 이어지는 경우가 많다).
 //!   충돌이 없는 성분은 어느 정책이든 같은 결과다.
 //!
+//! 오대응 선거름(Split): 짝마다 대응의 변위(b 화소 − a 화소)를 같은 짝에서 영상 a 의 가까운 대응들
+//! 변위의 중앙값과 비교해 크게 어긋난 대응은 간선으로 쓰지 않는다. 그래프 구조만으로는 대응이 성긴
+//! (재현율 30%) 참 트랙의 잎과 오대응 잎이 구별되지 않아 순도가 0.97 에 머물렀다(노트 참고).
+//!
 //! 결정성: 간선을 (작은 노드, 큰 노드) 로 정규화·정렬·중복 제거한 뒤 처리하므로 짝 순서, 짝 안 대응 순서,
 //! 짝의 앞뒤(a, b) 방향을 바꿔도 결과가 같다. 출력 트랙은 관측을 (영상, 특징) 순으로, 트랙 목록은
 //! 첫 관측 순으로 정렬한다.
@@ -20,6 +24,11 @@
 use crate::ba::Observation;
 use crate::math::Vector2;
 use std::collections::HashMap;
+
+/// 국소 변위 일관성 문턱(화소): 이웃 대응 변위 중앙값과의 차이.
+const DISPLACEMENT_TOLERANCE: f64 = 40.0;
+/// 이웃 탐색 격자 칸 크기(화소). 3x3 칸을 본다.
+const DISPLACEMENT_CELL: f64 = 96.0;
 
 /// SPEC 번들 조정 트랙 상한과 같은 값.
 pub const MAX_TRACKS: usize = 100_000;
@@ -121,6 +130,8 @@ pub struct TrackStats {
     pub conflicts: usize,
     /// 길이 미달로 버린 성분 수.
     pub too_short: usize,
+    /// Split: 같은 짝 이웃 대응의 변위와 어긋나 버린 대응 수.
+    pub inconsistent: usize,
     /// 상한 때문에 버린 트랙 수.
     pub truncated: usize,
     pub tracks: usize,
@@ -179,7 +190,9 @@ pub fn build_tracks(
     }
 
     let mut edges: Vec<(usize, usize)> = Vec::new();
+    let mut valid: Vec<(usize, usize)> = Vec::new();
     for p in pairs {
+        valid.clear();
         for &(fa, fb) in &p.matches {
             let ok = p.image_a != p.image_b
                 && p.image_a < keypoints.len()
@@ -190,7 +203,27 @@ pub fn build_tracks(
                 stats.invalid_matches += 1;
                 continue;
             }
-            let (u, v) = (offset[p.image_a] + fa, offset[p.image_b] + fb);
+            valid.push((fa, fb));
+        }
+        // 방향·순서·중복과 무관하게: 작은 영상 번호를 기준 영상으로, 대응은 정렬·중복 제거.
+        let flip = p.image_a > p.image_b;
+        if flip {
+            valid.iter_mut().for_each(|m| *m = (m.1, m.0));
+        }
+        valid.sort_unstable();
+        valid.dedup();
+        let (lo, hi) = (p.image_a.min(p.image_b), p.image_a.max(p.image_b));
+        let outlier = if cfg.policy == ConflictPolicy::Split && !valid.is_empty() {
+            displacement_outliers(&valid, &keypoints[lo], &keypoints[hi])
+        } else {
+            vec![false; valid.len()]
+        };
+        for (&(fa, fb), &bad) in valid.iter().zip(&outlier) {
+            if bad {
+                stats.inconsistent += 1;
+                continue;
+            }
+            let (u, v) = (offset[lo] + fa, offset[hi] + fb);
             edges.push((u.min(v), u.max(v)));
         }
     }
@@ -369,6 +402,60 @@ pub fn build_tracks(
     stats.truncated = before - tracks.len();
     stats.tracks = tracks.len();
     (tracks, stats)
+}
+
+/// 짝 안 국소 변위 일관성: 대응마다 같은 짝에서 영상 a 의 가까운 대응들(격자 3x3 칸) 변위의 중앙값과
+/// 비교해 어긋난 정도가 문턱을 넘으면 오대응으로 본다. 이웃이 적으면(증거 부족) 그대로 둔다.
+/// 가까운 점끼리는 같은 표면이라 변위가 부드럽게 변하지만, 우연한 오대응은 변위가 이웃과 무관하다.
+fn displacement_outliers(
+    matches: &[(usize, usize)],
+    kp_a: &[Vector2<f64>],
+    kp_b: &[Vector2<f64>],
+) -> Vec<bool> {
+    let (tol, cell) = (DISPLACEMENT_TOLERANCE, DISPLACEMENT_CELL);
+    let mut out = vec![false; matches.len()];
+    if matches.len() < 8 {
+        return out;
+    }
+    let pos: Vec<(Vector2<f64>, Vector2<f64>)> = matches
+        .iter()
+        .map(|&(fa, fb)| (kp_a[fa], kp_b[fb] - kp_a[fa]))
+        .collect();
+    let key = |p: &Vector2<f64>| ((p.x / cell).floor() as i64, (p.y / cell).floor() as i64);
+    let mut idx: Vec<((i64, i64), usize)> = pos
+        .iter()
+        .enumerate()
+        .map(|(i, q)| (key(&q.0), i))
+        .collect();
+    idx.sort_unstable();
+    let (mut dx, mut dy) = (Vec::new(), Vec::new());
+    for (i, q) in pos.iter().enumerate() {
+        let (cx, cy) = key(&q.0);
+        dx.clear();
+        dy.clear();
+        for gx in cx - 1..=cx + 1 {
+            for gy in cy - 1..=cy + 1 {
+                let lo = idx.partition_point(|e| e.0 < (gx, gy));
+                for e in idx[lo..].iter().take_while(|e| e.0 == (gx, gy)) {
+                    if e.1 != i {
+                        dx.push(pos[e.1].1.x);
+                        dy.push(pos[e.1].1.y);
+                    }
+                }
+            }
+        }
+        if dx.len() < 4 {
+            continue;
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_unstable_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        let (mx, my) = (med(&mut dx), med(&mut dy));
+        let r = ((q.1.x - mx).powi(2) + (q.1.y - my).powi(2)).sqrt();
+        out[i] = r > tol;
+    }
+    out
 }
 
 /// 두 노드의 성분을 영상이 겹치지 않을 때만 합친다. 이미 같은 성분이면 참(할 일 없음).
@@ -792,17 +879,17 @@ mod tests {
 
     #[test]
     fn sparse_recall_keeps_tracks_whole() {
-        // 짝마다 참 대응의 50%·30% 만 남기고(대응 재현율) 오대응 0·1% 를 섞는다.
+        // 짝마다 참 대응의 100%·50%·30% 만 남기고(대응 재현율) 오대응 0·1% 를 섞는다.
         // 네 경우를 모두 잰 뒤 한꺼번에 판정한다.
         let mut failures = Vec::new();
-        for keep in [50, 30] {
+        for keep in [100, 50, 30] {
             for opm in [0, 10] {
                 let s = synthetic(opm, keep, 0);
                 let (pd, cd, sd, md) = run_policy(&s, ConflictPolicy::Drop);
                 let (ps, cs, ss, ms) = run_policy(&s, ConflictPolicy::Split);
                 eprintln!(
-                    "keep {keep}% outlier {opm}permil edges {}: Drop tracks {} purity {pd:.4} completeness {cd:.4} mean {md:.2} | Split tracks {} purity {ps:.4} completeness {cs:.4} mean {ms:.2} conflicts {}",
-                    ss.edges, sd.tracks, ss.tracks, ss.conflicts
+                    "keep {keep}% outlier {opm}permil edges {}: Drop tracks {} purity {pd:.4} completeness {cd:.4} mean {md:.2} | Split tracks {} purity {ps:.4} completeness {cs:.4} mean {ms:.2} conflicts {} inconsistent {}",
+                    ss.edges, sd.tracks, ss.tracks, ss.conflicts, ss.inconsistent
                 );
                 if ps < 0.99 {
                     failures.push(format!("keep {keep} opm {opm}: Split 순도 {ps}"));
@@ -816,6 +903,64 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// 기준 규모(240 장 × 8192 특징, 대응 약 527만) 시간 측정. `cargo test --release -p skylens-core
+    /// --lib tracks::tests::reference_scale_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "기준 규모 시간 측정(수 초~수십 초, 메모리 큼)"]
+    fn reference_scale_time() {
+        let (images, feats, block, per_pair) = (240usize, 8192usize, 12usize, 4_000usize);
+        // 12 장씩 한 블록: 블록 안에서 특징 번호 f 는 같은 3D 점(위치는 블록·f 의 해시 + 영상별 작은 변위).
+        let keypoints: Vec<Vec<Vector2<f64>>> = (0..images)
+            .map(|i| {
+                (0..feats)
+                    .map(|f| {
+                        let h = hash(((i / block) * feats + f) as u64);
+                        let j = (i % block) as f64 * 0.5;
+                        Vector2::new(
+                            (h & 0xFFFF) as f64 / 65.536 * 1.92 + j,
+                            (h >> 16 & 0xFFFF) as f64 / 65.536 * 1.08,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut pairs = Vec::new();
+        for a in 0..images {
+            for b in a + 1..(a / block + 1) * block {
+                let matches = (0..per_pair)
+                    .map(|k| {
+                        let f =
+                            (hash((a * 1009 + b) as u64 * 7919 + k as u64) % feats as u64) as usize;
+                        (f, f)
+                    })
+                    .collect();
+                pairs.push(PairMatches {
+                    image_a: a,
+                    image_b: b,
+                    matches,
+                });
+            }
+        }
+        let total: usize = pairs.iter().map(|p| p.matches.len()).sum();
+        for policy in [ConflictPolicy::Drop, ConflictPolicy::Split] {
+            let t0 = std::time::Instant::now();
+            let (t, st) = build_tracks(
+                &pairs,
+                &keypoints,
+                &TrackConfig {
+                    policy,
+                    ..TrackConfig::default()
+                },
+            );
+            eprintln!(
+                "{policy:?}: matches {total} edges {} tracks {} time {:.2} s",
+                st.edges,
+                t.len(),
+                t0.elapsed().as_secs_f64()
+            );
+        }
     }
 
     #[test]
