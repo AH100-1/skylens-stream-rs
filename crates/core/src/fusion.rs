@@ -1183,10 +1183,14 @@ mod tests {
         println!("neighbors F7 {:?} R7 {:?} L7 {:?}", nb[21], nb[22], nb[23]);
         assert!(nb.iter().all(|v| v.len() == 8), "{nb:?}");
         let mut vs = views(&cams);
-        // 사진 순서는 위치마다 F·R·L.
-        for (i, (v, n)) in vs.iter_mut().zip(&nb).enumerate() {
-            v.neighbors = n.clone();
+        // 사진 순서는 위치마다 F·R·L. 이웃 8장은 모두 같은 드론 사진이라(위 출력)
+        // 무리 조건과 함께 쓸 수 없으므로 동의 검사는 전체 사진과 한다.
+        let mut nbv = vs.clone();
+        for (i, v) in vs.iter_mut().enumerate() {
             v.group = Some((i % 3) as u32);
+        }
+        for (v, n) in nbv.iter_mut().zip(&nb) {
+            v.neighbors = n.clone();
         }
         let cfg = FusionConfig::default();
         super::TRACE.with(|t| t.borrow_mut().clear());
@@ -1222,20 +1226,45 @@ mod tests {
                 );
             }
         }
-        let all = fuse(&views(&cams), &maps, cfg);
+        let one = FusionConfig {
+            min_groups: 1,
+            ..cfg
+        };
+        let all = fuse(&views(&cams), &maps, one);
         let (amed, amax, afar) = errors(&FORM, &all);
+        let nbc = fuse(&nbv, &maps, one);
+        let (nmed, nmax8, nfar) = errors(&FORM, &nbc);
+        println!(
+            "formation neighbors-8 no groups: points {} median {nmed:.4} max {nmax8:.3} >0.3m {nfar}",
+            nbc.len()
+        );
         let cloud = fuse(&vs, &maps, cfg);
         let (med, max, far) = errors(&FORM, &cloud);
         let (nover, nmax) = normal_stats(&FORM, &cloud);
         println!(
-            "formation all-views: points {} median {amed:.4} max {amax:.3} >0.3m {afar}",
+            "formation all views no groups: points {} median {amed:.4} max {amax:.3} >0.3m {afar}",
             all.len()
         );
         println!(
-            "formation neighbors: points {} median {med:.4} max {max:.4} >0.3m {far} normal>10° {nover} max {nmax:.1}°",
+            "formation all views, groups>=2: points {} median {med:.4} max {max:.4} >0.3m {far} normal>10° {nover} max {nmax:.1}°",
             cloud.len()
         );
-        assert!(cloud.len() > 300_000, "points {}", cloud.len());
+        // 무리 조건을 걸면 서로 다른 드론 시선이 겹치는 지면만 남아 점 수가 크게 준다
+        // (무리 조건 없이 50만 점대). 하한은 겹침 영역이 사라지지 않았는지만 본다.
+        let r0 = fuse(
+            &vs,
+            &maps,
+            FusionConfig {
+                min_ratio: 0.0,
+                ..cfg
+            },
+        );
+        let (r0med, r0max, r0far) = errors(&FORM, &r0);
+        println!(
+            "formation all views, groups>=2, min_ratio 0: points {} median {r0med:.4} max {r0max:.3} >0.3m {r0far}",
+            r0.len()
+        );
+        assert!(cloud.len() > 10_000, "points {}", cloud.len());
         // 깊이 ~35 m, σ 0.1% → 단일 화소 ≈ 0.035 m 의 시선 방향 잡음.
         assert!(med < 0.02, "median {med}");
         assert_eq!(far, 0, "far {far}");
