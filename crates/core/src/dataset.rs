@@ -232,22 +232,20 @@ impl Dataset {
 }
 
 /// 구역 분할: start = 0, SPAN, 2·SPAN, … 마다 위치 [start-OVL, start+SPAN+OVL) 를 한 구역으로,
-/// 범위는 0..n 으로 자른다. 앞 구역 끝 너머 새 위치가 OVL 개 이하인 구역(꼬리)은 따로 두지 않고
-/// 앞 구역 끝을 늘려 합친다. 그래서 구역 i≥1 은 앞 구역 끝 너머 위치를 OVL 개보다 많이 갖고,
-/// 합집합은 0..n. `span == 0` 이면 빈 목록.
+/// 범위는 0..n 으로 자른다. start ≥ 1 인 구역은 start + OVL < n 일 때만 만든다. 그렇지 않은
+/// 꼬리(start 부터 남은 위치 수 ≤ OVL)는 앞 구역 끝이 이미 n 이라 앞 구역 안에 통째로 들어가므로
+/// 따로 두지 않는다. 남는 구역은 모두 SPEC 범위 그대로이고, 구역 i≥1 은 앞 구역 끝 너머 위치를
+/// 1개 이상 가지며, 합집합은 0..n. 80/12/2 → 7구역, 26/12/2 → [0..14, 10..26].
+/// `span == 0` 이면 빈 목록.
 pub fn chunk_ranges(n: usize, span: usize, ovl: usize) -> Vec<Range<usize>> {
     if span == 0 {
         return Vec::new();
     }
-    let mut out: Vec<Range<usize>> = Vec::new();
-    for s in (0..n).step_by(span) {
-        let r = s.saturating_sub(ovl)..(s + span + ovl).min(n);
-        match out.last_mut() {
-            Some(prev) if r.end <= prev.end + ovl => prev.end = prev.end.max(r.end),
-            _ => out.push(r),
-        }
-    }
-    out
+    (0..n)
+        .step_by(span)
+        .filter(|&s| s == 0 || s + ovl < n)
+        .map(|s| s.saturating_sub(ovl)..(s + span + ovl).min(n))
+        .collect()
 }
 
 /// 이름 끝의 숫자(확장자 제외)를 프레임 번호로.
@@ -538,15 +536,34 @@ mod tests {
     #[test]
     fn chunks_edges() {
         assert_eq!(chunk_ranges(0, 12, 2), Vec::<Range<usize>>::new());
+        assert_eq!(chunk_ranges(1, 12, 2), vec![0..1]);
         assert_eq!(chunk_ranges(5, 12, 2), vec![0..5]);
         assert_eq!(chunk_ranges(12, 12, 2), vec![0..12]);
-        // 꼬리 10..13 은 새 위치가 1개(≤ OVL)라 앞 구역에 합친다.
+        // start 12 의 꼬리 10..13·10..14 는 앞 구역 0..13·0..14 안에 들어가므로 만들지 않는다.
         assert_eq!(chunk_ranges(13, 12, 2), vec![0..13]);
         assert_eq!(chunk_ranges(14, 12, 2), vec![0..14]);
-        assert_eq!(chunk_ranges(15, 12, 2), vec![0..15]);
+        // 12 + 2 < 15 부터 꼬리 구역이 앞 구역 끝 너머 새 위치를 가진다.
+        assert_eq!(chunk_ranges(15, 12, 2), vec![0..14, 10..15]);
         assert_eq!(chunk_ranges(17, 12, 2), vec![0..14, 10..17]);
         assert_eq!(chunk_ranges(26, 12, 2), vec![0..14, 10..26]);
+        assert_eq!(chunk_ranges(27, 12, 2), vec![0..14, 10..26, 22..27]);
+        // 80 곳 전후: 81·82·86 곳은 7구역(마지막 구역만 늘어남), 87 곳부터 8구역.
+        let head = vec![0..14, 10..26, 22..38, 34..50, 46..62, 58..74];
+        for (n, tail) in [(81, vec![70..81]), (82, vec![70..82]), (86, vec![70..86])] {
+            let mut want = head.clone();
+            want.extend(tail);
+            assert_eq!(chunk_ranges(n, 12, 2), want, "n={n}");
+        }
+        let mut want = head.clone();
+        want.extend([70..86, 82..87]);
+        assert_eq!(chunk_ranges(87, 12, 2), want);
+        // OVL 0: 꼬리가 1곳이어도 새 위치라 남긴다.
         assert_eq!(chunk_ranges(10, 4, 0), vec![0..4, 4..8, 8..10]);
+        assert_eq!(chunk_ranges(9, 4, 0), vec![0..4, 4..8, 8..9]);
+        // SPAN 4, OVL 2: 10 곳이면 start 8 꼬리(8+2=10)는 앞 구역 2..10 안이라 버린다.
+        assert_eq!(chunk_ranges(10, 4, 2), vec![0..6, 2..10]);
+        assert_eq!(chunk_ranges(11, 4, 2), vec![0..6, 2..10, 6..11]);
+        assert_eq!(chunk_ranges(10, 0, 2), Vec::<Range<usize>>::new());
     }
 
     #[test]
@@ -928,20 +945,30 @@ mod tests {
             for span in [1, 4, 12] {
                 for ovl in [0, 2, 5] {
                     let c = chunk_ranges(n, span, ovl);
-                    assert_eq!(c[0].start, 0, "{n} {span} {ovl}");
-                    assert_eq!(c.last().unwrap().end, n, "{n} {span} {ovl}");
+                    let ctx = format!("{n} {span} {ovl}: {c:?}");
+                    assert_eq!(c[0].start, 0, "{ctx}");
+                    assert_eq!(c.last().unwrap().end, n, "{ctx}");
                     for w in c.windows(2) {
-                        // 빈틈 없이 이어지고, 뒤 구역은 앞 구역 끝 너머 위치를 OVL 개보다 많이 가진다.
-                        assert!(w[1].start <= w[0].end, "{n} {span} {ovl}: {c:?}");
-                        assert!(w[1].end > w[0].end + ovl, "{n} {span} {ovl}: {c:?}");
-                        assert!(w[1].start > w[0].start, "{n} {span} {ovl}: {c:?}");
+                        // 빈틈 없이 이어지고, 뒤 구역은 앞 구역 끝 너머 위치를 1개 이상 가진다.
+                        assert!(w[1].start <= w[0].end, "{ctx}");
+                        assert!(w[1].end > w[0].end, "{ctx}");
+                        // OVL ≥ SPAN 이면 앞쪽 여러 구역이 0 에서 시작할 수 있다(SPEC 범위 그대로).
+                        assert!(w[1].start >= w[0].start, "{ctx}");
                     }
-                    // OVL < SPAN 이면 앞 구역들은 SPEC 범위 그대로, 꼬리만 늘어난다.
-                    if ovl < span {
-                        for (i, r) in c.iter().enumerate().take(c.len() - 1) {
-                            let s = i * span;
-                            assert_eq!(*r, s.saturating_sub(ovl)..(s + span + ovl).min(n));
-                        }
+                    // 남은 구역은 모두 SPEC §3.5 범위 그대로(i 번째 구역의 start = i·SPAN).
+                    for (i, r) in c.iter().enumerate() {
+                        let s = i * span;
+                        assert_eq!(*r, s.saturating_sub(ovl)..(s + span + ovl).min(n), "{ctx}");
+                    }
+                    // 버려진 start 는 앞 구역 안에 통째로 들어가는 것뿐이다.
+                    let dropped = n.div_ceil(span) - c.len();
+                    for k in c.len()..c.len() + dropped {
+                        let s = k * span;
+                        let prev = c.last().unwrap();
+                        assert!(
+                            s.saturating_sub(ovl) >= prev.start && n <= prev.end,
+                            "{ctx}"
+                        );
                     }
                 }
             }

@@ -60,6 +60,12 @@ pub struct SceneConfig {
 
 /// SPEC §1 실측 편대 간격(F–R 9.8, F–L 10.6, R–L 10.5 m)을 만족하는 수평 삼각형,
 /// 무게중심을 원점으로 둔 좌표 (x 앞, y 왼쪽).
+///
+/// 가정: 거리 세 개는 삼각형의 모양만 정하고 진행 방향에 대한 놓임은 정하지 않는다.
+/// 여기서는 (1) 세 드론이 같은 고도, (2) R–L 변이 진행 방향에 수직, (3) F 가 그 변의 앞쪽에
+/// 있다고 둔다. 그러면 R = (0, −h), L = (0, +h), h = R–L/2 = 5.25 m 이고
+/// F 의 y = (FR² − FL²)/(4h) = −0.777 m, x = √(FR² − (y + h)²) = 8.720 m 이다(R–L 변 기준).
+/// 실측 상대 위치가 생기면 이 가정을 그것으로 바꾼다.
 fn formation_offsets() -> [[f64; 3]; 3] {
     let (d_fr, d_fl, d_rl) = (9.8f64, 10.6f64, 10.5f64);
     // R = (0, −d_rl/2), L = (0, +d_rl/2), F = (fx, fy).
@@ -105,6 +111,26 @@ impl SceneConfig {
             offsets: [[0.3, 0.0, 0.0], [0.0, -0.3, 0.0], [0.0, 0.3, 0.0]],
             ..Self::default()
         }
+    }
+
+    /// 설정 검사. 기울기는 (0°, 90°) 열린 구간만 받는다: 90° 에서는 보는 방향이 연직이라
+    /// 카메라 x 축(보는 방향 × 위)이 정해지지 않고(NaN), 0° 이하는 지면을 보지 않는다.
+    pub fn validate(&self) -> Result<(), String> {
+        for (cam, t) in CamId::ALL.iter().zip(self.tilt_deg) {
+            if !(t > 0.0 && t < 90.0) {
+                return Err(format!("{cam:?} 기울기 {t}° 는 (0, 90) 밖"));
+            }
+        }
+        if !(self.hfov_deg > 0.0 && self.hfov_deg < 180.0) {
+            return Err(format!("수평 화각 {}° 는 (0, 180) 밖", self.hfov_deg));
+        }
+        if !(self.spacing.is_finite() && self.altitude.is_finite() && self.altitude > 0.0) {
+            return Err("위치 간 이동·고도가 유한하지 않거나 고도 ≤ 0".into());
+        }
+        if self.width == 0 || self.height == 0 {
+            return Err("영상 크기 0".into());
+        }
+        Ok(())
     }
 
     /// 카메라 `cam` 의 세계 보는 방향(단위 벡터).
@@ -218,7 +244,17 @@ pub struct Hit {
 }
 
 impl Scene {
+    /// 장면 생성. 설정이 잘못되면([`SceneConfig::validate`]) 멈춘다; 오류로 받으려면 [`Scene::try_new`].
     pub fn new(config: SceneConfig) -> Self {
+        match Self::try_new(config) {
+            Ok(s) => s,
+            Err(e) => panic!("잘못된 장면 설정: {e}"),
+        }
+    }
+
+    /// 설정을 검사한 뒤 장면 생성.
+    pub fn try_new(config: SceneConfig) -> Result<Self, String> {
+        config.validate()?;
         let length = config.spacing * (config.positions.max(1) - 1) as f64;
         // 경로 양옆과 위에 상자 건물을 흩어 놓는다.
         let mut buildings = Vec::new();
@@ -267,13 +303,13 @@ impl Scene {
                 });
             }
         }
-        Self {
+        Ok(Self {
             config,
             buildings,
             views,
             gps_enu,
             rig_centers,
-        }
+        })
     }
 
     /// 건물 포함 표면 높이.
@@ -798,51 +834,116 @@ mod formation_tests {
         }
     }
 
-    /// F-029 확인 기준 (2): 위치 1칸 같은 카메라 짝의 삼각측량 각.
-    /// 화면 9×5 격자 광선이 닿는 표면 점마다 각을 재고 카메라별 중앙값을 본다.
-    /// 평지 화면 중앙 해석값: 기선 1 m, 거리 30/sin60° = 34.6 m 에서
-    /// F 는 sin60°/34.6 rad = 1.43°, R·L 은 기선과 광선 사이 각이 약 107°라 1.59°.
-    /// 화면 위쪽(먼 점)은 각이 작고 건물 지붕(가까운 점)은 커서, 시드 1 측정 중앙값은
-    /// F 1.450°·R 1.454°·L 1.490°(전체 1.468°). 예전 쉬운 배치 F 중앙 광선은 3.08°.
-    #[test]
-    fn one_step_triangulation_angle_is_small() {
-        let s = scene();
-        let mut all = Vec::new();
-        for (k, cam) in CamId::ALL.into_iter().enumerate() {
-            let mut angles = Vec::new();
-            for p in (0..79).step_by(7) {
-                let (a, b) = (&s.views[3 * p + k], &s.views[3 * (p + 1) + k]);
-                let (ca, cb) = (a.camera.pose.center(), b.camera.pose.center());
-                let kk = a.camera.intrinsics;
-                for gx in 0..9 {
-                    for gy in 0..5 {
-                        let px = Vector2::new(
-                            (gx as f64 + 0.5) * kk.width as f64 / 9.0,
-                            (gy as f64 + 0.5) * kk.height as f64 / 5.0,
-                        );
-                        let n = kk.to_normalized(&px);
-                        let d = a.camera.pose.rotation.inverse() * Vector3::new(n.x, n.y, 1.0);
-                        if let Some(hit) = s.intersect(&ca, &d) {
-                            angles.push((ca - hit.point).angle(&(cb - hit.point)).to_degrees());
-                        }
+    /// 평지(z = 0) 화면 중앙 광선의 위치 1칸 삼각측량 각(도), 해석값.
+    ///
+    /// 카메라 높이 H(고도), 기울기 t, 방위각 a, 기선 b(위치 간 이동, 진행 방향 +x).
+    /// 화면 중앙 광선 방향 d = (cos t cos a, −cos t sin a, −sin t) 이 평지에 닿는 거리는
+    /// D = H / sin t, 기선과 광선(카메라→점) 사이 각 φ 는 cos φ = cos t cos a.
+    /// 점 P 에서 두 카메라 중심을 보는 각은 삼각형 (C, C + b x̂, P) 에서
+    ///   θ = atan2(b sin φ, D − b cos φ)  ≈  (b / H) · sin t · √(1 − cos² t cos² a).
+    /// H = 30, t = 60°, b = 1.0 에서 정확한 식은 F(a = −3°) 1.454°, R(+125°) 1.571°,
+    /// L(−116°) 1.603°. 근사식(b ≪ D)은 1.433°·1.585°·1.614° 로, 차이 b cos φ / D(최대 1.4%)는
+    /// 둘째 카메라가 광선 방향으로 앞(F)·뒤(R·L)에 있어 거리가 줄거나 느는 몫이다.
+    fn center_angle_flat_deg(cfg: &SceneConfig, cam: CamId) -> f64 {
+        let d = cfg.view_dir(cam);
+        let big_d = cfg.altitude / (-d.z);
+        let cos_phi = d.x;
+        let sin_phi = (1.0 - cos_phi * cos_phi).sqrt();
+        (cfg.spacing * sin_phi)
+            .atan2(big_d - cfg.spacing * cos_phi)
+            .to_degrees()
+    }
+
+    /// 화면 9×5 격자 광선이 표면에 닿는 점마다 위치 p, p+1 같은 카메라 짝의 삼각측량 각(도).
+    /// `flat` 이면 표면 대신 평지 z = 0 에 닿는 점을 쓴다(해석 기준 분포).
+    fn grid_angles(s: &Scene, k: usize, flat: bool) -> Vec<f64> {
+        let mut angles = Vec::new();
+        for p in (0..s.config.positions - 1).step_by(7) {
+            let (a, b) = (&s.views[3 * p + k], &s.views[3 * (p + 1) + k]);
+            let (ca, cb) = (a.camera.pose.center(), b.camera.pose.center());
+            let kk = a.camera.intrinsics;
+            for gx in 0..9 {
+                for gy in 0..5 {
+                    let px = Vector2::new(
+                        (gx as f64 + 0.5) * kk.width as f64 / 9.0,
+                        (gy as f64 + 0.5) * kk.height as f64 / 5.0,
+                    );
+                    let n = kk.to_normalized(&px);
+                    let d = a.camera.pose.rotation.inverse() * Vector3::new(n.x, n.y, 1.0);
+                    let hit = if flat {
+                        (d.z < 0.0).then(|| ca + d * (-ca.z / d.z))
+                    } else {
+                        s.intersect(&ca, &d).map(|h| h.point)
+                    };
+                    if let Some(q) = hit {
+                        angles.push((ca - q).angle(&(cb - q)).to_degrees());
                     }
                 }
             }
-            angles.sort_by(f64::total_cmp);
-            let med = angles[angles.len() / 2];
-            eprintln!(
-                "{cam:?} tri_angle n={} min={:.3} median={med:.3} max={:.3}",
-                angles.len(),
-                angles[0],
-                angles[angles.len() - 1]
-            );
-            assert!((0.8..=1.5).contains(&med), "{cam:?} 중앙 삼각측량 각 {med}");
-            all.extend(angles);
         }
-        all.sort_by(f64::total_cmp);
-        let med = all[all.len() / 2];
-        eprintln!("all tri_angle median={med:.3}");
-        assert!((0.8..=1.5).contains(&med));
+        angles.sort_by(f64::total_cmp);
+        angles
+    }
+
+    /// 표면 격자 중앙값과 평지 격자 중앙값(같은 광선을 z = 0 평지에 쏜 해석 분포)의 허용 폭(도).
+    /// θ ∝ 1/D 이므로 표면 높이가 Δz 바뀌면 θ 는 약 θ·Δz/(H − Δz) 바뀐다. 지형 높낮이
+    /// ±1.9 m([`TERRAIN_MIN`]·[`TERRAIN_MAX`])에서 θ ≈ 1.5° 면 1.5·1.9/28.1 = 0.10°.
+    /// 건물 지붕은 격자 점의 일부라 중앙값을 조금만 민다.
+    const TRI_TOL_FLAT_DEG: f64 = 0.1;
+
+    /// 화면 중앙 해석값과 측정 중앙값의 허용 폭(도). 격자 광선은 화면 위(먼 점)·아래(가까운 점)로
+    /// 거리가 달라 평지 격자 중앙값이 중앙 광선 값보다 F 0.05°·R 0.14°·L 0.17° 작다(시험 출력
+    /// `flat_grid_median`). 여기에 지형 몫 ±0.10° 가 붙는데 실제로는 지붕·높은 지형이 각을 키우는
+    /// 쪽이라 중앙 광선 쪽으로 돌아온다. 0.2° 는 두 몫 중 큰 쪽(0.17°)에 여유를 둔 값이다.
+    /// 장면이 잘못 만들어지면(기선 2.5 m 면 θ 가 2.5 배, 고도가 10 m 틀리면 약 30%) 이 폭을 넘는다.
+    const TRI_TOL_DEG: f64 = 0.2;
+
+    /// F-029 확인 기준 (2)·F-115: 위치 1칸 같은 카메라 짝의 삼각측량 각 중앙값이
+    /// 화면 중앙 해석값([`center_angle_flat_deg`]) ± [`TRI_TOL_DEG`] 안. 시드 1~5 모두.
+    /// 해석 범위: F 1.25~1.65°, R 1.37~1.77°, L 1.40~1.80°. 함께 평지 격자 중앙값 ± [`TRI_TOL_FLAT_DEG`].
+    #[test]
+    fn one_step_triangulation_angle_is_small() {
+        for seed in 1u64..=5 {
+            let s = Scene::new(SceneConfig {
+                width: 160,
+                height: 90,
+                seed,
+                ..SceneConfig::default()
+            });
+            for (k, cam) in CamId::ALL.into_iter().enumerate() {
+                let want = center_angle_flat_deg(&s.config, cam);
+                let angles = grid_angles(&s, k, false);
+                let flat = grid_angles(&s, k, true);
+                let med = angles[angles.len() / 2];
+                eprintln!(
+                    "seed={seed} {cam:?} tri_angle n={} min={:.3} median={med:.3} max={:.3} center_analytic={want:.3} flat_grid_median={:.3}",
+                    angles.len(),
+                    angles[0],
+                    angles[angles.len() - 1],
+                    flat[flat.len() / 2]
+                );
+                assert!(
+                    (med - want).abs() <= TRI_TOL_DEG,
+                    "시드 {seed} {cam:?} 중앙 삼각측량 각 {med} (해석 {want})"
+                );
+                let flat_med = flat[flat.len() / 2];
+                assert!(
+                    (med - flat_med).abs() <= TRI_TOL_FLAT_DEG,
+                    "시드 {seed} {cam:?} 중앙 삼각측량 각 {med} (평지 격자 {flat_med})"
+                );
+            }
+        }
+        // 해석값 자체를 숫자로 고정한다(식이 바뀌면 드러나게).
+        let cfg = SceneConfig::default();
+        for (cam, want) in [(CamId::F, 1.454), (CamId::R, 1.571), (CamId::L, 1.603)] {
+            let got = center_angle_flat_deg(&cfg, cam);
+            assert!((got - want).abs() < 1e-3, "{cam:?} 해석 {got}");
+            // 근사식과는 1.5% 안.
+            let d = cfg.view_dir(cam);
+            let approx =
+                (cfg.spacing / cfg.altitude * (-d.z) * (1.0 - d.x * d.x).sqrt()).to_degrees();
+            assert!((got - approx).abs() / got < 0.015, "{cam:?} 근사 {approx}");
+        }
         let easy = Scene::new(SceneConfig {
             width: 160,
             height: 90,
@@ -856,8 +957,112 @@ mod formation_tests {
         let easy_ang = (ca - hit.point)
             .angle(&(b.camera.pose.center() - hit.point))
             .to_degrees();
-        eprintln!("easy_F center tri_angle {easy_ang:.3}");
+        eprintln!(
+            "easy_F center tri_angle {easy_ang:.3} analytic {:.3}",
+            center_angle_flat_deg(&easy.config, CamId::F)
+        );
         assert!(easy_ang > 2.0);
+    }
+
+    /// F-116: 기울기 (0°, 90°) 밖은 오류.
+    #[test]
+    fn invalid_tilt_is_rejected() {
+        for t in [90.0, 0.0, -10.0, 120.0, f64::NAN] {
+            let cfg = SceneConfig {
+                positions: 2,
+                width: 32,
+                height: 18,
+                tilt_deg: [t; 3],
+                ..SceneConfig::default()
+            };
+            assert!(cfg.validate().is_err(), "기울기 {t}");
+            assert!(Scene::try_new(cfg).is_err(), "기울기 {t}");
+        }
+        let one = SceneConfig {
+            positions: 2,
+            width: 32,
+            height: 18,
+            tilt_deg: [60.0, 90.0, 60.0],
+            ..SceneConfig::default()
+        };
+        assert!(Scene::try_new(one).is_err());
+        let ok = SceneConfig {
+            positions: 2,
+            width: 32,
+            height: 18,
+            tilt_deg: [89.0; 3],
+            ..SceneConfig::default()
+        };
+        let s = Scene::try_new(ok).unwrap();
+        assert!(s.views.iter().all(|v| v
+            .camera
+            .pose
+            .rotation
+            .matrix()
+            .iter()
+            .all(|x| x.is_finite())));
+        assert!(std::panic::catch_unwind(|| Scene::new(SceneConfig {
+            positions: 2,
+            width: 32,
+            height: 18,
+            tilt_deg: [90.0; 3],
+            ..SceneConfig::default()
+        }))
+        .is_err());
+    }
+
+    /// F-029·F-116: 편대 배치 수치를 정확히 단언한다. 거리 F–R 9.8·F–L 10.6·R–L 10.5 m,
+    /// 위치 간 1.0 m, 방위각 −3°/125°/−116°, 기울기 60°, 같은 고도, 편대 놓임 가정
+    /// (R–L 변이 진행 방향에 수직, F 가 그 변에서 8.720 m 앞).
+    #[test]
+    fn formation_exact_values() {
+        let s = Scene::new(SceneConfig {
+            positions: 5,
+            width: 64,
+            height: 36,
+            ..SceneConfig::default()
+        });
+        for p in 0..s.config.positions {
+            let c: Vec<Point3<f64>> = (0..3)
+                .map(|k| s.views[3 * p + k].camera.pose.center())
+                .collect();
+            assert!(((c[0] - c[1]).norm() - 9.8).abs() < 1e-9);
+            assert!(((c[0] - c[2]).norm() - 10.6).abs() < 1e-9);
+            assert!(((c[1] - c[2]).norm() - 10.5).abs() < 1e-9);
+            assert!(c.iter().all(|q| (q.z - 30.0).abs() < 1e-12), "같은 고도");
+            assert!((c[1].x - c[2].x).abs() < 1e-12, "R–L 변이 진행 방향에 수직");
+            assert!(
+                ((c[0].x - c[1].x) - 8.720).abs() < 1e-3,
+                "F 앞 {}",
+                c[0].x - c[1].x
+            );
+            let g = (c[0].coords + c[1].coords + c[2].coords) / 3.0;
+            assert!((g - s.rig_centers[p].coords).norm() < 1e-12);
+            if p > 0 {
+                for k in 0..3 {
+                    let m = s.views[3 * p + k].camera.pose.center()
+                        - s.views[3 * (p - 1) + k].camera.pose.center();
+                    assert!(
+                        (m - Vector3::new(1.0, 0.0, 0.0)).norm() < 1e-12,
+                        "위치 간 {m:?}"
+                    );
+                }
+            }
+        }
+        for v in &s.views {
+            let want = match v.cam {
+                CamId::F => -3.0,
+                CamId::R => 125.0,
+                CamId::L => -116.0,
+            };
+            assert!(
+                (horiz_heading_deg(v) - want).abs() < 1e-9,
+                "{} 방위각",
+                v.name
+            );
+            let a = v.camera.pose.rotation.inverse() * Vector3::z();
+            assert!(((-a.z).asin().to_degrees() - 60.0).abs() < 1e-9);
+        }
     }
 
     #[test]

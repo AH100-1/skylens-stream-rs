@@ -60,7 +60,8 @@ const MATCH_BLOCK: usize = 64;
 /// 차근접이 없으면(`b` 가 2개 미만) 비율을 잴 수 없으므로 짝을 만들지 않는다.
 ///
 /// 거리 행렬을 한 번만 계산한다: `a` 묶음마다(rayon 병렬) 모든 `b` 와의 거리로 행 최근접·차근접과
-/// 열(b→a) 최근접을 함께 갱신하고, 열 최근접은 묶음 순서대로 합친다. 같은 거리면 앞 인덱스가 이긴다.
+/// 열(b→a) 최근접을 함께 갱신하고, 열 최근접은 묶음 순서대로 합친다. 열 최근접은 같은 거리면 앞 인덱스가 이긴다
+/// (행 최근접 동률은 최근접 = 차근접이라 비율 검사에서 떨어진다).
 pub fn ratio_match(a: &[Feature], b: &[Feature], ratio: f32, mutual: bool) -> Vec<(usize, usize)> {
     type Blk = (Vec<(usize, f32, f32)>, Vec<(f32, usize)>);
     let blocks: Vec<Blk> = a
@@ -144,42 +145,19 @@ fn nearly_collinear(p: &[Vector2<f64>]) -> bool {
 }
 
 /// 정규화 DLT 로 호모그래피 x2 ~ H x1 (최소제곱). 점 4개 미만이거나 풀리지 않으면 None.
+/// 계수 계산은 [`crate::two_view::homography_dlt`] 하나를 쓰고, 여기서는 픽셀 좌표의 Hartley 정규화만 한다.
 fn homography_dlt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matrix3<f64>> {
     if x1.len() < 4 || x1.len() != x2.len() {
         return None;
     }
     let (t1, t2) = (normalizer(x1), normalizer(x2));
-    let mut ata = SMatrix::<f64, 9, 9>::zeros();
-    for (p, q) in x1.iter().zip(x2) {
-        let a = t1 * Vector3::new(p.x, p.y, 1.0);
-        let b = t2 * Vector3::new(q.x, q.y, 1.0);
-        let r1 = SMatrix::<f64, 9, 1>::from_column_slice(&[
-            0.0,
-            0.0,
-            0.0,
-            -a.x,
-            -a.y,
-            -1.0,
-            b.y * a.x,
-            b.y * a.y,
-            b.y,
-        ]);
-        let r2 = SMatrix::<f64, 9, 1>::from_column_slice(&[
-            a.x,
-            a.y,
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            -b.x * a.x,
-            -b.x * a.y,
-            -b.x,
-        ]);
-        ata += r1 * r1.transpose() + r2 * r2.transpose();
-    }
-    let eig = ata.symmetric_eigen();
-    let h = eig.eigenvectors.column(eig.eigenvalues.imin());
-    let hn = Matrix3::new(h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]);
+    let tf = |t: &Matrix3<f64>, p: &Vector2<f64>| {
+        let v = t * Vector3::new(p.x, p.y, 1.0);
+        Vector2::new(v.x / v.z, v.y / v.z)
+    };
+    let a: Vec<_> = x1.iter().map(|p| tf(&t1, p)).collect();
+    let b: Vec<_> = x2.iter().map(|p| tf(&t2, p)).collect();
+    let hn = crate::two_view::homography_dlt(&a, &b)?;
     let h = t2.try_inverse()? * hn * t1;
     let n = h.norm();
     (n.is_finite() && n > 0.0).then(|| h / n)
@@ -206,31 +184,186 @@ fn homography_error(
     }
 }
 
-/// 주어진 대응 가운데 한 호모그래피가 문턱 `th_px` 안에서 설명하는 최대 개수(근사).
-/// 전체로 맞춘 뒤 문턱을 줄여 가며 정상 짝으로 다시 맞춘다(호모그래피는 평면이면 대응 전체를 설명한다).
+/// 주어진 대응 가운데 한 호모그래피가 문턱 `th_px`(대칭 전달 오차의 큰 쪽) 안에서 설명하는 개수.
+/// 4점 RANSAC + 정상 짝 재적합이라 이상치가 많아도 평면을 찾는다.
 pub fn homography_support(x1: &[Vector2<f64>], x2: &[Vector2<f64>], th_px: f64) -> usize {
+    fit_homography(x1, x2, th_px).map_or(0, |(_, _, c)| c)
+}
+
+/// 호모그래피 4점 RANSAC 의 최대 반복 수.
+const HOMOGRAPHY_MAX_ITERS: usize = 500;
+
+/// [`homography_support`] 의 적합: 4점 RANSAC(고정 시드, 적응형 종료) 뒤 정상 짝 전체로
+/// 문턱을 ×4 → ×1 로 줄여 가며 다시 맞추고 정상 수가 늘 때만 받아들인다. (H, H⁻¹, 문턱 안 개수).
+fn fit_homography(
+    x1: &[Vector2<f64>],
+    x2: &[Vector2<f64>],
+    th_px: f64,
+) -> Option<(Matrix3<f64>, Matrix3<f64>, usize)> {
     let n = x1.len();
-    let mut sel: Vec<usize> = (0..n).collect();
-    let mut best = 0;
-    for m in [8.0, 4.0, 2.0, 1.0, 1.0] {
-        let s1: Vec<_> = sel.iter().map(|&i| x1[i]).collect();
-        let s2: Vec<_> = sel.iter().map(|&i| x2[i]).collect();
+    if n < 4 || n != x2.len() {
+        return None;
+    }
+    let errors = |h: &Matrix3<f64>, hi: &Matrix3<f64>| -> Vec<f64> {
+        (0..n)
+            .map(|i| homography_error(h, hi, &x1[i], &x2[i]))
+            .collect()
+    };
+    let mut st = 0x2545_F491_4F6C_DD1Du64;
+    let mut rnd = |m: usize| {
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((st >> 33) as usize) % m
+    };
+    let mut best: Option<(Matrix3<f64>, Matrix3<f64>, usize)> = None;
+    let mut iters = HOMOGRAPHY_MAX_ITERS;
+    let mut it = 0;
+    while it < iters {
+        it += 1;
+        let mut idx = [0usize; 4];
+        let mut k = 0;
+        while k < 4 {
+            let c = rnd(n);
+            if !idx[..k].contains(&c) {
+                idx[k] = c;
+                k += 1;
+            }
+        }
+        let s1: Vec<_> = idx.iter().map(|&i| x1[i]).collect();
+        let s2: Vec<_> = idx.iter().map(|&i| x2[i]).collect();
         let Some(h) = homography_dlt(&s1, &s2) else {
-            break;
+            continue;
         };
         let Some(hi) = h.try_inverse() else {
-            break;
+            continue;
         };
-        let err: Vec<f64> = (0..n)
-            .map(|i| homography_error(&h, &hi, &x1[i], &x2[i]))
-            .collect();
-        best = best.max(err.iter().filter(|&&e| e < th_px).count());
-        sel = (0..n).filter(|&i| err[i] < th_px * m).collect();
-        if sel.len() < 4 {
-            break;
+        let c = errors(&h, &hi).iter().filter(|&&e| e < th_px).count();
+        if best.as_ref().is_none_or(|b| c > b.2) {
+            best = Some((h, hi, c));
+            iters = adaptive_iterations(c as f64 / n as f64, 4, 0.999, HOMOGRAPHY_MAX_ITERS);
         }
     }
-    best
+    let (mut h, mut hi, mut cnt) = best?;
+    let mut cur = (h, hi);
+    for m in [4.0, 2.0, 1.0, 1.0] {
+        let err = errors(&cur.0, &cur.1);
+        let sel: Vec<usize> = (0..n).filter(|&i| err[i] < th_px * m).collect();
+        let s1: Vec<_> = sel.iter().map(|&i| x1[i]).collect();
+        let s2: Vec<_> = sel.iter().map(|&i| x2[i]).collect();
+        let Some(g) = homography_dlt(&s1, &s2) else {
+            break;
+        };
+        let Some(gi) = g.try_inverse() else {
+            break;
+        };
+        cur = (g, gi);
+        let c = errors(&g, &gi).iter().filter(|&&e| e < th_px).count();
+        if c > cnt {
+            (h, hi, cnt) = (g, gi, c);
+        }
+    }
+    Some((h, hi, cnt))
+}
+
+/// 두 시점 기하 모델.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwoViewModel {
+    /// 일반 장면: 기본 행렬이 정해진다.
+    Fundamental,
+    /// 평면(또는 시차 없는) 장면: 호모그래피로 충분하고 F 는 정해지지 않는다.
+    Homography,
+}
+
+/// [`select_two_view_model`] 의 결과.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelSelection {
+    pub model: TwoViewModel,
+    /// Torr GRIC 점수(작을수록 좋음).
+    pub gric_f: f64,
+    pub gric_h: f64,
+    /// 호모그래피 잔차가 χ²₂ 99.9% 분위(13.8σ²)를 넘고 F 잔차는 χ²₁ 99.9% 분위(10.8σ²) 안인 짝 수
+    /// (평면 밖 시차가 있는 정상 짝).
+    pub parallax: usize,
+    /// 평면으로 판정하지 않는 데 필요한 최소 시차 짝 수.
+    pub parallax_needed: usize,
+    /// 실제로 쓴 잡음 σ(px): 호출자 σ 와 강건 추정 중 큰 쪽.
+    pub sigma_px: f64,
+}
+
+/// 정상 짝(x1, x2)과 그 F 에 대해 F/H 모델을 고른다. `sigma_px` 는 좌표 잡음 표준편차.
+///
+/// GRIC(Torr 1998): Σ min(e²/σ², λ₃(r−d)) + λ₁ d n + λ₂ k, r = 4, λ₁ = ln r, λ₂ = ln(r n), λ₃ = 2,
+/// F: d = 3, k = 7(e² = 제곱 Sampson 거리), H: d = 2, k = 8(e² = 두 방향 전달 오차 제곱 평균의 절반,
+/// 양쪽 잡음 σ 에서 기댓값 2σ² 로 4차원 기하 오차와 맞춘다).
+/// 순수 GRIC 는 평면 밖 짝 비율이 약 19% 미만이면(평면 위 짝마다 F 가 ln 4 를 더 내고 평면 밖 짝마다 H 가
+/// 약 3 을 더 내므로 ln4 − 1 ≈ 0.39 ≈ 2·비율) H 를 고른다. 그러나 F 는 호모그래피 + 평면 밖 두 점으로 정해지므로
+/// 지면 위주 장면에서 건물 몇 %만 있어도 F 가 정해진다. 그래서 GRIC 가 H 를 고르더라도 시차 짝 수가
+/// 순수 평면에서 우연히 나올 수 있는 수(기대 0.001n + 3√(0.001n), 여기에 고정 8)를 넘으면 F 를 고른다.
+/// 잡음 크기는 호출자 σ 와 정상 짝의 제곱 Sampson 거리 중앙값에서 구한 강건 추정
+/// σ̂ = √(중앙값 / 0.455)(χ²₁ 중앙값) 가운데 큰 쪽을 쓴다(σ 를 실제보다 작게 넘겨도 평면 밖 시차로 잘못 세지 않게).
+/// 정상 짝이 8개 미만이거나, σ 가 유한한 양수가 아니거나, 호모그래피를 맞출 수 없으면 None.
+pub fn select_two_view_model(
+    x1: &[Vector2<f64>],
+    x2: &[Vector2<f64>],
+    f: &Matrix3<f64>,
+    sigma_px: f64,
+) -> Option<ModelSelection> {
+    let n = x1.len();
+    if n < 8 || n != x2.len() || !sigma_px.is_finite() || sigma_px <= 0.0 {
+        return None;
+    }
+    let mut es: Vec<f64> = x1
+        .iter()
+        .zip(x2)
+        .map(|(p, q)| sampson_error(f, p, q))
+        .filter(|e| e.is_finite())
+        .collect();
+    if es.len() < 8 {
+        return None;
+    }
+    es.sort_by(f64::total_cmp);
+    let sigma_hat = (es[es.len() / 2] / 0.455).sqrt();
+    let sigma_px = sigma_px.max(sigma_hat);
+    let s2 = sigma_px * sigma_px;
+    let (h, hi, _) = fit_homography(x1, x2, 3.0 * sigma_px)?;
+    let tr = |m: &Matrix3<f64>, x: &Vector2<f64>, y: &Vector2<f64>| -> f64 {
+        let v = m * Vector3::new(x.x, x.y, 1.0);
+        if v.z.abs() < 1e-12 {
+            f64::INFINITY
+        } else {
+            (Vector2::new(v.x / v.z, v.y / v.z) - y).norm_squared()
+        }
+    };
+    let (mut rho_f, mut rho_h, mut parallax) = (0.0, 0.0, 0usize);
+    for (p, q) in x1.iter().zip(x2) {
+        let ef = sampson_error(f, p, q) / s2;
+        let eh = 0.25 * (tr(&h, p, q) + tr(&hi, q, p)) / s2;
+        rho_f += ef.min(2.0 * (4.0 - 3.0));
+        rho_h += eh.min(2.0 * (4.0 - 2.0));
+        if eh > 13.8 && ef < 10.8 {
+            parallax += 1;
+        }
+    }
+    let nf = n as f64;
+    let (l1, l2) = (4f64.ln(), (4.0 * nf).ln());
+    let gric_f = rho_f + l1 * 3.0 * nf + l2 * 7.0;
+    let gric_h = rho_h + l1 * 2.0 * nf + l2 * 8.0;
+    let mu = 0.001 * nf;
+    let parallax_needed = 8 + (mu + 3.0 * mu.sqrt()).ceil() as usize;
+    let model = if gric_h < gric_f && parallax < parallax_needed {
+        TwoViewModel::Homography
+    } else {
+        TwoViewModel::Fundamental
+    };
+    Some(ModelSelection {
+        model,
+        gric_f,
+        gric_h,
+        parallax,
+        parallax_needed,
+        sigma_px,
+    })
 }
 
 pub(crate) fn all_finite(p: &[Vector2<f64>]) -> bool {
@@ -487,6 +620,12 @@ pub struct RansacConfig {
     /// 적응형 종료 신뢰도.
     pub confidence: f64,
     pub seed: u64,
+    /// 받아들일 최소 정상 짝 수. 겹침 없는 짝에서도 비율 검사를 지난 우연 짝 20개 안팎 중
+    /// 9~11개가 한 F 에 맞으므로 8 로는 거를 수 없다.
+    pub min_inliers: usize,
+    /// 정상 수가 우연(무관한 대응이 에피폴라 띠에 들어갈 확률의 이항 꼬리)으로 나올 확률의 상한.
+    /// 이보다 크면 None. 0 이하이면 검사하지 않는다.
+    pub max_chance_prob: f64,
 }
 
 impl Default for RansacConfig {
@@ -497,6 +636,8 @@ impl Default for RansacConfig {
             max_iters: 2000,
             confidence: 0.999,
             seed: 1,
+            min_inliers: MIN_VERIFIED_INLIERS,
+            max_chance_prob: 1e-6,
         }
     }
 }
@@ -522,10 +663,109 @@ pub fn adaptive_iterations(w: f64, sample: i32, confidence: f64, max_iters: usiz
 /// 적응형 종료가 허용하는 최소 반복 수.
 pub const MIN_RANSAC_ITERS: usize = 50;
 
+/// [`RansacConfig::min_inliers`] 기본값.
+pub const MIN_VERIFIED_INLIERS: usize = 15;
+
+/// F 가 정확히 맞출 수 있는 대응 수(자유도 7)에 국소 최적화가 흡수하는 1개를 더한 값.
+/// 이만큼은 무관한 대응이라도 정상이 되므로 유의성 검사에서 뺀다.
+const FREE_FIT: usize = 8;
+
+/// 무관한 대응 한 개가 문턱 `th_px` 의 에피폴라 띠에 우연히 들어갈 확률의 상한:
+/// 둘째 영상 점들의 경계 상자(가로 w, 세로 h)에서 띠 넓이 2·th·대각선 / (w·h).
+pub fn epipolar_band_probability(x2: &[Vector2<f64>], th_px: f64) -> f64 {
+    let (mut lo, mut hi) = (
+        Vector2::repeat(f64::INFINITY),
+        Vector2::repeat(f64::NEG_INFINITY),
+    );
+    for p in x2 {
+        lo = lo.inf(p);
+        hi = hi.sup(p);
+    }
+    let d = hi - lo;
+    let area = d.x * d.y;
+    if !(area.is_finite() && area > 0.0) {
+        return 1.0;
+    }
+    (2.0 * th_px * d.norm() / area).clamp(0.0, 1.0)
+}
+
+/// 이항 꼬리 P(X ≥ k), X ~ B(n, p). 로그 공간에서 합한다.
+pub fn binomial_tail(n: usize, k: usize, p: f64) -> f64 {
+    if k == 0 {
+        return 1.0;
+    }
+    if k > n || p <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return 1.0;
+    }
+    let (lp, lq) = (p.ln(), (-p).ln_1p());
+    let mut log_c = 0.0; // ln C(n, i)
+    let mut sum = 0.0;
+    for i in 0..=n {
+        if i > 0 {
+            log_c += ((n - i + 1) as f64).ln() - (i as f64).ln();
+        }
+        if i >= k {
+            sum += (log_c + i as f64 * lp + (n - i) as f64 * lq).exp();
+        }
+    }
+    sum.min(1.0)
+}
+
+/// 대응 n 개 중 `cnt` 개가 정상인 것이 우연(무관한 대응)으로 나올 확률:
+/// F 가 흡수하는 [`FREE_FIT`] 개를 빼고 나머지가 띠 확률 p 로 들어갈 이항 꼬리.
+pub fn chance_inlier_probability(n: usize, cnt: usize, p: f64) -> f64 {
+    if cnt <= FREE_FIT {
+        return 1.0;
+    }
+    binomial_tail(n.saturating_sub(FREE_FIT), cnt - FREE_FIT, p)
+}
+
+/// 정상 짝 가운데 한 직선(문턱 `th_px`)으로 설명되지 않는 점 수의 하한 추정.
+/// 두 점 직선 RANSAC(고정 시드, 최대 300회)으로 가장 많은 점을 지나는 직선을 찾아 그 밖의 수를 센다.
+fn off_line_count(p: &[Vector2<f64>], th_px: f64) -> usize {
+    let n = p.len();
+    if n < 3 {
+        return 0;
+    }
+    let mut st = 0x6A09_E667_F3BC_C909u64;
+    let mut rnd = |m: usize| {
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((st >> 33) as usize) % m
+    };
+    let mut best = 0usize;
+    for _ in 0..300 {
+        let (i, j) = (rnd(n), rnd(n));
+        let d = p[j] - p[i];
+        let len = d.norm();
+        if i == j || len.is_nan() || len <= 0.0 {
+            continue;
+        }
+        let nrm = Vector2::new(-d.y, d.x) / len;
+        let c = p
+            .iter()
+            .filter(|q| (*q - p[i]).dot(&nrm).abs() < th_px)
+            .count();
+        best = best.max(c);
+    }
+    n - best
+}
+
+/// 한 직선 밖 정상 짝이 이보다 적으면 F 가 정해지지 않는다(3차원 직선은 F 에 제약 몇 개만 준다).
+const MIN_OFF_LINE: usize = 8;
+
 /// RANSAC(Fischler & Bolles 1981) + 8점 기본 행렬로 기하 검증.
 /// 반환: (정상 짝으로 다시 맞춘 F, 정상 여부 표시).
-/// 정상 짝이 8개 미만이거나 정상 비율이 `min_inlier_ratio` 미만이면 None.
-/// 정상 짝이 거의 한 직선 위(짧은 축/긴 축 표준편차 비 0.02 미만)이면 퇴화로 보고 None.
+/// 정상 짝이 `max(8, min_inliers)` 개 미만이거나 정상 비율이 `min_inlier_ratio` 미만이면 None.
+/// 정상 수가 무관한 대응에서 우연히 나올 확률([`chance_inlier_probability`])이 `max_chance_prob` 를 넘으면 None
+/// (시야가 겹치지 않는 짝에서 비율 검사를 지난 우연 짝을 거른다).
+/// 정상 짝이 거의 한 직선 위(짧은 축/긴 축 표준편차 비 0.02 미만)이거나, 한 직선(문턱 threshold_px)
+/// 밖 정상 짝이 어느 영상에서든 8개 미만이면 퇴화로 보고 None.
+/// 평면·순수 회전 판정은 하지 않는다 — 정상 짝에 [`select_two_view_model`] 을 따로 적용한다.
 /// 길이가 다르거나 유한하지 않은 좌표가 있으면 None.
 pub fn ransac_fundamental(
     x1: &[Vector2<f64>],
@@ -657,17 +897,30 @@ pub fn ransac_fundamental(
         inl = gi;
     }
     let cnt = inl.iter().filter(|&&b| b).count();
-    if cnt < 8 || (cnt as f64) < cfg.min_inlier_ratio * n as f64 {
+    if cnt < 8.max(cfg.min_inliers) || (cnt as f64) < cfg.min_inlier_ratio * n as f64 {
         return None;
     }
-    // 퇴화 판정: 정상 짝이 거의 한 직선 위이면 F 가 정해지지 않으므로 확정하지 않는다.
-    // 평면 배치 지표([`homography_support`])는 지면 위주 합성 장면의 정상 짝도 대부분 설명해
-    // 여기서는 거부에 쓰지 않는다(평면 경로 분리는 남은 문제).
+    // 유의성: 무관한 대응만 있어도 F 는 8개 안팎을 맞추고 나머지는 띠 확률로 들어온다.
+    if cfg.max_chance_prob > 0.0 {
+        let p = epipolar_band_probability(x2, cfg.threshold_px);
+        if chance_inlier_probability(n, cnt, p) > cfg.max_chance_prob {
+            return None;
+        }
+    }
+    // 퇴화 판정: 정상 짝이 거의 한 직선 위이거나, 한 직선 밖 정상 짝이 8개 미만이면
+    // F 가 정해지지 않으므로 확정하지 않는다(직선 + 일반 점 몇 개).
     let s1: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| x1[i]).collect();
     let s2: Vec<_> = (0..n).filter(|&i| inl[i]).map(|i| x2[i]).collect();
     if nearly_collinear(&s1) || nearly_collinear(&s2) {
         return None;
     }
+    let line_th = cfg.threshold_px;
+    if off_line_count(&s1, line_th) < MIN_OFF_LINE || off_line_count(&s2, line_th) < MIN_OFF_LINE {
+        return None;
+    }
+    // 평면 판정은 여기서 하지 않는다: 같은 위치에서 회전만 한 짝(시선 90° 차이 등)도 호모그래피로
+    // 설명되며 그 짝의 회전은 쓸모가 있다. 호출자가 정상 짝으로 [`select_two_view_model`] 을 불러
+    // 호모그래피가 선택되면 F 에서 이동을 꺼내지 않는다.
     Some((f, inl))
 }
 
@@ -1439,7 +1692,8 @@ mod tests {
     #[test]
     fn ratio_match_regression_hash() {
         // 고정 기술자(match_fixture 시드 21, a 2000개, b 약 1600 + 무관 700)의 매칭 결과를 상수로 고정한다.
-        // 거리 누산 순서·동률 처리·비율 비교를 바꾸면 짝이 달라져 이 시험이 실패한다.
+        // 픽스처에는 비율 경계·동률 근처 행이 거의 없어 누산 순서·동률 규칙 변경은 이 해시로 잡히지 않는다
+        // (그 변경은 `ratio_match_rounding_boundary`·`ratio_match_ties_take_lower_index` 가 잡는다).
         // 기대값은 이 시험을 처음 넣은 커밋의 구현으로 한 번 계산한 값이다.
         let (a, b) = match_fixture(21, 2000, 700);
         let m = ratio_match(&a, &b, 0.8, true);
@@ -1477,6 +1731,167 @@ mod tests {
             eprintln!("seed={seed} 우연 정상 수={cnt}/200");
             assert!(cnt < 40, "우연 정상 비율이 0.2 이상: {cnt}/200");
             assert!(r.is_none(), "무작위 대응에서 F 확정");
+        }
+    }
+    /// 지면(z = 0) 위 점과 그보다 카메라 쪽으로 1~3 m 솟은 건물 점(비율 `bld`)을 섞은 대응(σ px).
+    fn ground_with_buildings(
+        n: usize,
+        bld: f64,
+        sigma: f64,
+        seed: u64,
+    ) -> (Vec<Vector2<f64>>, Vec<Vector2<f64>>) {
+        let (c1, c2) = two_cameras();
+        let mut g = Lcg(seed);
+        let (mut x1, mut x2) = (vec![], vec![]);
+        let nb = (n as f64 * bld).round() as usize;
+        while x1.len() < n {
+            let z = if x1.len() < nb {
+                -1.0 - 2.0 * g.next()
+            } else {
+                0.0
+            };
+            let p = Point3::new(g.next() * 14.0 - 7.0, g.next() * 8.0 - 4.0, z);
+            let (Some(a), Some(b)) = (c1.project(&p), c2.project(&p)) else {
+                continue;
+            };
+            if !c1.intrinsics.contains(&a) || !c2.intrinsics.contains(&b) {
+                continue;
+            }
+            x1.push(a + Vector2::new(g.gauss(), g.gauss()) * sigma);
+            x2.push(b + Vector2::new(g.gauss(), g.gauss()) * sigma);
+        }
+        (x1, x2)
+    }
+
+    #[test]
+    fn planar_scene_selects_homography() {
+        let cfg = RansacConfig::default();
+        for seed in 1..=5u64 {
+            // 모든 점 z = 0, σ = 0.5 px: RANSAC 이 낸 F 와 정상 짝으로 모델을 고르면 호모그래피.
+            let (x1, x2) = planar_correspondences(200, 0.5, seed);
+            let (f, inl) = ransac_fundamental(&x1, &x2, &cfg).expect("평면 장면에서 RANSAC None");
+            let s1: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x1[i]).collect();
+            let s2: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x2[i]).collect();
+            let m = select_two_view_model(&s1, &s2, &f, cfg.threshold_px / 3.0).unwrap();
+            assert_eq!(
+                m.model,
+                TwoViewModel::Homography,
+                "seed {seed}: RANSAC F {m:?}"
+            );
+            // 정답 F 를 주어도 모델 선택은 호모그래피.
+            let (c1, c2) = two_cameras();
+            let m =
+                select_two_view_model(&x1, &x2, &fundamental_from_cameras(&c1, &c2), 0.5).unwrap();
+            eprintln!("평면 seed {seed}: {m:?}");
+            assert_eq!(m.model, TwoViewModel::Homography, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn model_selection_robust_to_underestimated_sigma() {
+        // 실제 잡음 σ 0.5·1.0·1.5 px 에 호출자는 0.5 만 넘긴다: 순수 평면 200점은 모두 H.
+        let (c1, c2) = two_cameras();
+        let f0 = fundamental_from_cameras(&c1, &c2);
+        for actual in [0.5, 1.0, 1.5] {
+            for seed in 1..=5u64 {
+                let (x1, x2) = planar_correspondences(200, actual, seed);
+                let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+                eprintln!("평면 실제 σ {actual} seed {seed}: {m:?}");
+                assert_eq!(
+                    m.model,
+                    TwoViewModel::Homography,
+                    "σ {actual} seed {seed}: {m:?}"
+                );
+                // 강건 추정 σ 는 실제의 0.7~1.4 배 안(작게 넘긴 σ 를 바로잡는다).
+                assert!(
+                    m.sigma_px > 0.7 * actual && m.sigma_px < 1.4 * actual.max(0.5),
+                    "σ {actual} seed {seed}: 추정 {}",
+                    m.sigma_px
+                );
+            }
+        }
+        // 지면 + 건물 5%, 실제 σ 0.5 에 0.5 를 넘기면 계속 F.
+        for seed in 1..=5u64 {
+            let (x1, x2) = ground_with_buildings(300, 0.05, 0.5, seed);
+            let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+            assert_eq!(
+                m.model,
+                TwoViewModel::Fundamental,
+                "건물 5% seed {seed}: {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_selection_rejects_non_finite_sigma() {
+        let (c1, c2) = two_cameras();
+        let f0 = fundamental_from_cameras(&c1, &c2);
+        let (x1, x2) = planar_correspondences(50, 0.5, 1);
+        for s in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 0.0, -1.0] {
+            assert!(select_two_view_model(&x1, &x2, &f0, s).is_none(), "σ {s}");
+        }
+        // 동일선상 20점에 σ = ∞ 도 None.
+        let l1: Vec<_> = (0..20)
+            .map(|i| Vector2::new(10.0 * i as f64, 5.0 * i as f64))
+            .collect();
+        let l2: Vec<_> = l1.iter().map(|p| p + Vector2::new(3.0, 1.0)).collect();
+        assert!(select_two_view_model(&l1, &l2, &f0, f64::INFINITY).is_none());
+    }
+
+    #[test]
+    fn ground_scene_with_few_buildings_keeps_fundamental() {
+        // 건물 5%·10%(순수 GRIC 는 약 19% 미만에서 H 를 고른다): 시차 짝이 있으므로 F 를 유지한다.
+        let cfg = RansacConfig::default();
+        let (c1, c2) = two_cameras();
+        let f0 = fundamental_from_cameras(&c1, &c2);
+        for bld in [0.05, 0.1] {
+            for seed in 1..=5u64 {
+                let (x1, x2) = ground_with_buildings(300, bld, 0.5, seed);
+                let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+                eprintln!("건물 {bld} seed {seed}: {m:?}");
+                assert_eq!(m.model, TwoViewModel::Fundamental, "건물 {bld} seed {seed}");
+                let (f, inl) = ransac_fundamental(&x1, &x2, &cfg).expect("지면+건물 장면에서 None");
+                let s1: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x1[i]).collect();
+                let s2: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x2[i]).collect();
+                let me = select_two_view_model(&s1, &s2, &f, cfg.threshold_px / 3.0).unwrap();
+                assert_eq!(
+                    me.model,
+                    TwoViewModel::Fundamental,
+                    "건물 {bld} seed {seed}: RANSAC F {me:?}"
+                );
+                // 정답 F 기준 정상 짝(Sampson < 문턱)을 추정 F 도 95% 이상 정상으로 본다.
+                let th2 = cfg.threshold_px * cfg.threshold_px;
+                let truth: Vec<bool> = (0..x1.len())
+                    .map(|i| sampson_error(&f0, &x1[i], &x2[i]) < th2)
+                    .collect();
+                let tp = (0..x1.len()).filter(|&i| truth[i] && inl[i]).count();
+                let nt = truth.iter().filter(|&&b| b).count();
+                assert!(
+                    tp as f64 >= 0.95 * nt as f64,
+                    "건물 {bld} seed {seed}: {tp}/{nt}"
+                );
+                // 건물 점(앞쪽 nb 개)에서 추정 F 의 Sampson 오차가 문턱 안: 평면 밖 기하도 맞는다.
+                let nb = (300.0 * bld).round() as usize;
+                let ok = (0..nb)
+                    .filter(|&i| sampson_error(&f, &x1[i], &x2[i]) < th2)
+                    .count();
+                assert!(
+                    ok as f64 >= 0.9 * nb as f64,
+                    "건물 {bld} seed {seed}: 건물 {ok}/{nb}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn general_scene_selects_fundamental() {
+        let (c1, c2) = two_cameras();
+        let f0 = fundamental_from_cameras(&c1, &c2);
+        for seed in 1..=5u64 {
+            let (x1, x2, _, _, _) = correspondences(200, 0.5, 0.0, seed);
+            let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+            assert_eq!(m.model, TwoViewModel::Fundamental, "seed {seed}: {m:?}");
+            assert!(m.gric_f < m.gric_h, "seed {seed}: {m:?}");
         }
     }
 
@@ -1569,5 +1984,231 @@ mod tests {
         let (wall, cpu, _, _, _) = ransac_4000_run();
         let t = cpu.unwrap_or(wall);
         assert!(t <= 0.1, "RANSAC 1회 {t:.3} s");
+    }
+
+    /// 3차원 직선 (t, 0.3t + 0.5, 0.1t) 위 점 60개 + 일반 대응 k 개(σ px), 떼어 둔 일반 대응 100개.
+    #[allow(clippy::type_complexity)]
+    fn line_plus_general(
+        k: usize,
+        sigma: f64,
+        seed: u64,
+    ) -> (
+        Vec<Vector2<f64>>,
+        Vec<Vector2<f64>>,
+        Vec<Vector2<f64>>,
+        Vec<Vector2<f64>>,
+    ) {
+        let (c1, c2) = two_cameras();
+        let mut g = Lcg(seed);
+        let (mut x1, mut x2) = (vec![], vec![]);
+        while x1.len() < 60 {
+            let t = g.next() * 12.0 - 6.0;
+            let p = Point3::new(t, 0.3 * t + 0.5, 0.1 * t);
+            let (Some(a), Some(b)) = (c1.project(&p), c2.project(&p)) else {
+                continue;
+            };
+            if !c1.intrinsics.contains(&a) || !c2.intrinsics.contains(&b) {
+                continue;
+            }
+            x1.push(a + Vector2::new(g.gauss(), g.gauss()) * sigma);
+            x2.push(b + Vector2::new(g.gauss(), g.gauss()) * sigma);
+        }
+        let (g1, g2, _, _, _) = correspondences(k + 100, sigma, 0.0, seed + 1000);
+        x1.extend_from_slice(&g1[..k]);
+        x2.extend_from_slice(&g2[..k]);
+        (x1, x2, g1[k..].to_vec(), g2[k..].to_vec())
+    }
+
+    #[test]
+    fn line_plus_few_general_points_is_not_confirmed() {
+        // F-091: 직선 위 60점 + 일반 대응 2·4·6개는 F 가 정해지지 않는다.
+        // None 이거나, 떼어 둔 일반 대응 100개의 Sampson 거리 중앙값이 3 px 이하인 F 만 허용한다.
+        let cfg = RansacConfig::default();
+        for k in [2usize, 4, 6, 10] {
+            let mut confirmed = 0;
+            for seed in 1..=10u64 {
+                let (x1, x2, h1, h2) = line_plus_general(k, 0.5, seed);
+                let Some((f, _)) = ransac_fundamental(&x1, &x2, &cfg) else {
+                    continue;
+                };
+                confirmed += 1;
+                let mut e: Vec<f64> = h1
+                    .iter()
+                    .zip(&h2)
+                    .map(|(p, q)| sampson_error(&f, p, q).sqrt())
+                    .collect();
+                e.sort_by(f64::total_cmp);
+                let med = e[e.len() / 2];
+                eprintln!("k={k} seed={seed} 떼어 둔 대응 Sampson 중앙값 {med:.2} px");
+                assert!(
+                    med <= 3.0,
+                    "k={k} seed={seed}: 틀린 F 확정(중앙값 {med:.1} px)"
+                );
+            }
+            eprintln!("k={k}: 확정 {confirmed}/10");
+            if k == 10 {
+                assert_eq!(confirmed, 10, "일반 대응 10개면 F 가 정해진다");
+            }
+        }
+    }
+
+    #[test]
+    fn binomial_tail_matches_direct_sum() {
+        // n = 5, p = 0.3: P(X ≥ 2) = 1 − 0.7⁵ − 5·0.3·0.7⁴ = 0.47178.
+        assert!((binomial_tail(5, 2, 0.3) - 0.47178).abs() < 1e-12);
+        assert_eq!(binomial_tail(5, 0, 0.3), 1.0);
+        assert_eq!(binomial_tail(5, 6, 0.3), 0.0);
+        assert!((binomial_tail(10, 10, 0.5) - 0.5f64.powi(10)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn non_overlapping_pairs_are_rejected() {
+        // N04: 시야가 겹치지 않는 짝은 비율 검사를 지난 짝 18~27개가 모두 우연 짝이고(정답 0),
+        // 그 가운데 9~11개가 한 F 에 맞아 이전 기준(최소 8개·비율 0.2)을 넘었다.
+        // 영상 전체에 고르게 흩어진 무관한 대응 n ∈ [15, 40] 개, 시드 200개에서 거부율 1.0 을 단언한다.
+        let cfg = RansacConfig::default();
+        let legacy = RansacConfig {
+            min_inliers: 8,
+            max_chance_prob: 0.0,
+            ..cfg
+        };
+        let (mut rejected, mut legacy_pass, mut total) = (0usize, 0usize, 0usize);
+        for seed in 1..=200u64 {
+            let mut g = Lcg(seed * 7919);
+            let n = 15 + (g.next() * 26.0) as usize;
+            let mut pt = || Vector2::new(g.next() * 960.0, g.next() * 540.0);
+            let x1: Vec<_> = (0..n).map(|_| pt()).collect();
+            let x2: Vec<_> = (0..n).map(|_| pt()).collect();
+            total += 1;
+            if ransac_fundamental(&x1, &x2, &cfg).is_none() {
+                rejected += 1;
+            }
+            if ransac_fundamental(&x1, &x2, &legacy).is_some() {
+                legacy_pass += 1;
+            }
+        }
+        eprintln!("거부 {rejected}/{total}, 이전 기준 통과 {legacy_pass}/{total}");
+        assert_eq!(rejected, total, "정답 짝 0 인 쌍 거부율 {rejected}/{total}");
+    }
+
+    #[test]
+    fn small_true_overlap_is_still_confirmed() {
+        // 겹침이 작은 카메라 간 짝: 정답 20개 + 우연 짝 10개(σ 0.5 px). 시드 1..=20 모두 확정하고
+        // 정답 짝 재현율 ≥ 0.9 를 단언한다(유의성 검사가 진짜 짝을 버리지 않는지).
+        let cfg = RansacConfig::default();
+        for seed in 1..=20u64 {
+            let (x1, x2, truth, _, _) = correspondences(30, 0.5, 1.0 / 3.0, seed);
+            let nt = truth.iter().filter(|&&t| t).count();
+            if nt < 16 {
+                continue;
+            }
+            let (_, inl) = ransac_fundamental(&x1, &x2, &cfg)
+                .unwrap_or_else(|| panic!("seed {seed}: 정답 {nt}/30 인데 거부"));
+            let hit = (0..30).filter(|&i| inl[i] && truth[i]).count();
+            assert!(
+                hit as f64 >= 0.9 * nt as f64,
+                "seed {seed}: 재현 {hit}/{nt}"
+            );
+        }
+    }
+
+    #[test]
+    fn homography_support_finds_plane_among_outliers() {
+        // F-120: 평면(z = 0, σ 0.5 px) 140점 + 무작위 이상치 60점(30%). 4점 RANSAC 지표는 평면을 찾는다.
+        let th = RansacConfig::default().threshold_px;
+        for seed in 1..=5u64 {
+            let (mut x1, mut x2) = planar_correspondences(140, 0.5, seed);
+            let mut g = Lcg(seed + 77);
+            for _ in 0..60 {
+                x1.push(Vector2::new(g.next() * 960.0, g.next() * 540.0));
+                x2.push(Vector2::new(g.next() * 960.0, g.next() * 540.0));
+            }
+            let h = homography_support(&x1, &x2, th);
+            eprintln!("평면 + 이상치 30% seed {seed}: {h}/200");
+            // 평면 점 140개 중 기대 0.85 → 119, 4σ 아래 100.
+            assert!(h >= 100, "seed {seed}: 평면 설명 {h}/200");
+        }
+    }
+
+    /// `sq_dist` 의 명세: 8칸 누산기(칸 k 는 성분 8i + k), 칸을 0..8 순서로 합한다.
+    fn sq_dist_spec(p: &[f32; DESC_LEN], r: &[f32; DESC_LEN]) -> f32 {
+        let mut acc = [0f32; 8];
+        for i in 0..DESC_LEN {
+            let t = p[i] - r[i];
+            acc[i % 8] += t * t;
+        }
+        let mut s = 0f32;
+        for a in acc {
+            s += a;
+        }
+        s
+    }
+
+    #[test]
+    fn ratio_match_rounding_boundary() {
+        // F-093 (1): 비율이 경계에서 f32 한 칸 안쪽인 행. 누산 순서를 순차 합으로 바꾸면 거리가
+        // 반올림으로 달라져 판정이 뒤집힌다. 고정 시드에서 순차 합과 명세 값이 다른 기술자를 고르고,
+        // 비율을 두 값 사이에 두어 명세대로면 짝이 생기고 순차 합이면 생기지 않게(또는 반대) 만든다.
+        let mut g = Lcg(93);
+        let mut found = 0;
+        for _ in 0..200 {
+            let a = feature(&mut g);
+            let b1 = feature(&mut g);
+            let b2 = feature(&mut g);
+            let d1 = sq_dist_spec(&a.desc, &b1.desc);
+            let d2 = sq_dist_spec(&a.desc, &b2.desc);
+            let seq = |x: &[f32; DESC_LEN], y: &[f32; DESC_LEN]| {
+                x.iter()
+                    .zip(y)
+                    .fold(0f32, |s, (u, v)| s + (u - v) * (u - v))
+            };
+            let s1 = seq(&a.desc, &b1.desc);
+            assert_eq!(sq_dist(&a.desc, &b1.desc).to_bits(), d1.to_bits());
+            if s1 == d1 || d1 >= d2 {
+                continue;
+            }
+            // 비율² · d2 가 d1 과 s1 사이에 오도록 r 을 찾는다(f32 비교 그대로).
+            let target = 0.5 * (d1 as f64 + s1 as f64) / d2 as f64;
+            let mut r = target.sqrt() as f32;
+            let between = |r: f32| {
+                let lim = r * r * d2;
+                (d1 < lim) != (s1 < lim)
+            };
+            for _ in 0..64 {
+                if between(r) {
+                    break;
+                }
+                r = f32::from_bits(r.to_bits() + 1);
+            }
+            if !between(r) {
+                continue;
+            }
+            found += 1;
+            let m = ratio_match(std::slice::from_ref(&a), &[b1, b2], r, false);
+            let expect = d1 < r * r * d2;
+            assert_eq!(!m.is_empty(), expect, "경계 행 판정이 명세와 다름");
+        }
+        eprintln!("경계 행 {found}개");
+        assert!(found >= 5, "경계 행이 너무 적다: {found}");
+    }
+
+    #[test]
+    fn ratio_match_ties_take_lower_index() {
+        // F-093 (2): 같은 기술자 둘이 같은 b 를 가리키면(열 최근접 동률) 상호 검사에서 앞 번호가 이긴다.
+        // 같은 묶음 안(0, 1)과 다른 묶음(0, MATCH_BLOCK + 6) 두 경우. `<` 를 `<=` 로 바꾸면 뒤 번호가 된다.
+        // 행 최근접 동률(같은 기술자 둘이 b 에 있음)은 최근접 = 차근접이라 비율 검사에서 항상 떨어지므로
+        // 행 갱신의 `<`/`<=` 는 결과에 나타나지 않는다(동치 변이).
+        let mut g = Lcg(11);
+        let b: Vec<Feature> = (0..20).map(|_| feature(&mut g)).collect();
+        for dup in [1usize, MATCH_BLOCK + 6] {
+            let mut a: Vec<Feature> = (0..dup + 4).map(|_| feature(&mut g)).collect();
+            let mut x = b[3].clone();
+            x.desc[0] += 1e-3;
+            a[0] = x.clone();
+            a[dup] = x;
+            let m = ratio_match(&a, &b, 0.8, true);
+            assert!(m.contains(&(0, 3)), "dup {dup}: {m:?}");
+            assert!(!m.iter().any(|&(i, _)| i == dup), "dup {dup}: {m:?}");
+        }
     }
 }

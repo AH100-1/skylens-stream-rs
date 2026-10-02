@@ -97,13 +97,13 @@ fn loader_reads_synth_output_as_is() {
     assert!(ds.skipped.is_empty());
 
     // 기본 설정(STRIDE 3, SPAN 12, OVL 2): 프레임 0,3,…,78 → 27 위치, 81 장.
-    // 구역 start 0,12,24 → [0,14) [10,26) [22,27); 꼬리 [22,27) 의 새 위치는 1개(≤ OVL)라
-    // 앞 구역에 합쳐 [0,14) [10,27).
+    // 구역 start 0,12,24 → [0,14) [10,26) [22,27). 24 + OVL < 27 이라 꼬리 구역은 앞 구역 끝 26
+    // 너머 위치 26 을 가지므로 남는다(SPEC §3.5 범위 그대로).
     let ds3 = load_dataset(&t.0, DatasetConfig::default()).unwrap();
     assert_eq!(ds3.positions.len(), 27);
     assert_eq!(ds3.image_count(), 81);
     assert_eq!(ds3.positions.last().unwrap().frame, 78);
-    assert_eq!(ds3.chunks(), vec![0..14, 10..27]);
+    assert_eq!(ds3.chunks(), vec![0..14, 10..26, 22..27]);
 }
 
 #[test]
