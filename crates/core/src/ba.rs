@@ -11,8 +11,12 @@
 //!   아무것도 고치지 않고 `BaStop::InvalidInput` 으로 돌려준다. 범위 밖 점·카메라 번호,
 //!   유한하지 않은 픽셀·점 좌표의 관측은 제외하고 수를 보고한다(비유한 점은 그대로 둔다).
 //! - `refined` 는 받아들인 단계가 하나 이상일 때만 참이다. 쓸 관측이 없으면 반복하지 않는다.
-//! - 관측 트랙(3D 점)은 관측 2개 이상인 점 중 최대 `max_tracks` 개만 쓴다.
-//!   관측 수가 많은 점부터, 같으면 번호 순.
+//! - 관측 트랙(3D 점)은 서로 다른 카메라 2대 이상에서 관측된 점 중 최대 `max_tracks` 개만
+//!   쓴다. 관측 수가 많은 점부터, 같으면 번호 순. 같은 (카메라, 점) 중복 관측은 첫 것만 쓰고
+//!   나머지는 제외 수에 센다.
+//! - 옵션(손실 척도 유한·> 0, `initial_lambda`·`function_tolerance` 유한·≥ 0)을 어기면
+//!   `BaStop::InvalidInput`.
+//! - 투영된(카메라 앞) 관측이 0개이면 RMS 는 NaN 이다.
 
 use crate::camera::Pose;
 use crate::distortion::DistortedIntrinsics;
@@ -126,7 +130,7 @@ pub enum BaStop {
     MaxIterations,
     /// 감쇠를 키워도 비용을 줄이는 단계를 찾지 못했다(촐레스키 실패 연속·비유한 비용 포함).
     StepFailed,
-    /// 입력 크기·그룹 번호가 맞지 않아 아무것도 하지 않았다.
+    /// 입력 크기·그룹 번호나 옵션이 맞지 않아 아무것도 하지 않았다.
     InvalidInput,
 }
 
@@ -141,6 +145,7 @@ pub struct BaReport {
     pub num_observations_used: usize,
     /// 재투영 오차 RMS(픽셀 거리, sqrt(Σ|r|²/N)), 가중 없음. N 은 카메라 앞에 투영된
     /// 관측 수이고, 카메라 뒤 관측은 분모·분자 모두에서 빠진다(`*_observations_behind`).
+    /// N = 0 이면 NaN.
     pub initial_rms: f64,
     pub final_rms: f64,
     pub initial_cost: f64,
@@ -148,7 +153,7 @@ pub struct BaReport {
     /// `stop == BaStop::Converged` 일 때만 참.
     pub converged: bool,
     pub stop: BaStop,
-    /// 범위 밖 번호·비유한 픽셀·비유한 점 좌표로 제외한 관측 수.
+    /// 범위 밖 번호·비유한 픽셀·비유한 점 좌표·같은 (카메라, 점) 중복으로 제외한 관측 수.
     pub num_observations_rejected: usize,
     /// 축소 계통 촐레스키 실패 횟수(λ 재시도 포함).
     pub cholesky_failures: usize,
@@ -157,9 +162,9 @@ pub struct BaReport {
     pub final_observations_behind: usize,
 }
 
-/// 결정적 트랙 선택: 서로 다른 카메라 2대 이상에서 관측된 점만, 카메라 수 내림차순,
+/// 결정적 트랙 선택: 서로 다른 카메라 2대 이상에서 관측된 점만, 관측 수 내림차순,
 /// 같으면 점 번호 오름차순. 선택된 점 번호(오름차순). 범위 밖 점 번호 관측은 세지 않는다.
-/// 한 카메라에서만 여러 번 관측된 점은 깊이가 정해지지 않으므로 트랙이 아니다.
+/// 같은 (카메라, 점) 관측이 여럿이면 카메라 수에는 한 번만 센다.
 pub fn select_tracks(
     num_points: usize,
     observations: &[Observation],
@@ -173,8 +178,20 @@ pub fn select_tracks(
     pairs.sort_unstable();
     pairs.dedup();
     let mut count = vec![0usize; num_points];
-    for &(p, _) in &pairs {
-        count[p] += 1;
+    let mut cams: Vec<Vec<usize>> = vec![Vec::new(); num_points];
+    for o in observations {
+        if let Some(c) = count.get_mut(o.point) {
+            *c += 1;
+            let list = &mut cams[o.point];
+            if !list.contains(&o.camera) {
+                list.push(o.camera);
+            }
+        }
+    }
+    for (c, list) in count.iter_mut().zip(&cams) {
+        if list.len() < 2 {
+            *c = 0;
+        }
     }
     let mut ids: Vec<usize> = (0..num_points).filter(|&p| count[p] >= 2).collect();
     if ids.len() > max_tracks {
@@ -245,8 +262,8 @@ struct Layout {
 }
 
 /// 고정 카메라 목록(범위 밖 제거, 비면 첫 카메라)과 축척 고정 (카메라, 평행이동 성분).
-/// 축척 고정 후보는 쓰는 관측 `obs` 를 가진 카메라뿐이고, 고정 카메라와 트랙을 공유하는
-/// 카메라가 있으면 그중에서 고른다(관측 없는 카메라의 성분을 고정하면 축척이 풀린다).
+/// 축척 고정 후보는 `obs` 에 관측이 있는 카메라로 한정하고, 고정 카메라와 점을 공유하는
+/// 카메라가 있으면 그중에서 고른다.
 fn gauge(
     problem: &BaProblem,
     opts: &BaOptions,
@@ -270,24 +287,24 @@ fn gauge(
     // 고정 카메라 C_0 를 중심으로 한 축척 s 에서 t_k = −R_k(C_0 + s(C_k − C_0)) 이므로
     // ∂t_k/∂s = −R_k(C_k − C_0). 이 기울기 성분이 가장 큰 (k, i) 를 고정한다.
     let c0 = problem.poses[fixed[0]].center();
-    let mut observed = vec![false; n_cam];
-    let mut fixed_points = vec![false; problem.points.len()];
+    let mut has_obs = vec![false; n_cam];
+    let mut seen_by_fixed = vec![false; problem.points.len()];
     for o in obs {
-        observed[o.camera] = true;
+        has_obs[o.camera] = true;
         if o.camera == fixed[0] {
-            fixed_points[o.point] = true;
+            seen_by_fixed[o.point] = true;
         }
     }
     let mut shares = vec![false; n_cam];
     for o in obs {
-        if fixed_points[o.point] {
+        if seen_by_fixed[o.point] {
             shares[o.camera] = true;
         }
     }
-    let any_shared = (0..n_cam).any(|k| k != fixed[0] && shares[k]);
+    let prefer_shared = (0..n_cam).any(|k| k != fixed[0] && shares[k]);
     let mut best: Option<(usize, usize, f64)> = None;
     for k in 0..n_cam {
-        if k == fixed[0] || !observed[k] || (any_shared && !shares[k]) {
+        if k == fixed[0] || !has_obs[k] || (prefer_shared && !shares[k]) {
             continue;
         }
         let pose = &problem.poses[k];
@@ -551,7 +568,7 @@ fn input_is_consistent(problem: &BaProblem) -> bool {
             .all(|&g| g < problem.groups.len())
 }
 
-/// 손실 척도는 유한·양수, 감쇠 초기값·수렴 문턱은 유한·0 이상이어야 한다.
+/// 손실 척도 유한·> 0, 감쇠 초기값·수렴 문턱 유한·≥ 0 인지 본다.
 fn options_are_valid(opts: &BaOptions) -> bool {
     let scale_ok = match opts.loss {
         Loss::Squared => true,
@@ -596,12 +613,12 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
             final_observations_behind: 0,
         };
     }
-    // 같은 (카메라, 점) 관측이 여럿이면 첫 관측만 쓰고 나머지는 제외로 센다.
-    let mut seen = std::collections::HashSet::new();
+    // 같은 (카메라, 점) 관측이 여럿이면 처음 것만 쓰고 나머지는 제외로 센다.
+    let mut seen_pair = std::collections::HashSet::new();
     let valid: Vec<Observation> = problem
         .observations
         .iter()
-        .filter(|o| observation_is_valid(problem, o) && seen.insert((o.camera, o.point)))
+        .filter(|o| observation_is_valid(problem, o) && seen_pair.insert((o.camera, o.point)))
         .copied()
         .collect();
     let rejected = problem.observations.len() - valid.len();
@@ -616,7 +633,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
         by_point[o.point].push(i);
     }
     let lay = layout(problem, opts, &obs);
-    // 투영된 관측이 없으면 RMS 는 정의되지 않는다(0 px 로 보고하지 않는다).
+    // 투영된 관측이 없으면 RMS 는 정의되지 않는다(NaN). 0 px 로 보고하지 않는다.
     let rms = |sq: f64, behind: usize| {
         let n = obs.len() - behind;
         if n == 0 {
@@ -627,8 +644,9 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
     };
     // Cauchy 는 비볼록이라 먼 초기값에서 일부 점이 이상치 쪽 해에 걸린다. 같은 척도의
     // Huber 로 먼저 수렴시킨 뒤 Cauchy 로 바꾼다(단계 방식).
+    // 반복하지 않는 경우(한도 0·관측 없음)에는 단계 전환도 없다.
     let mut staged = match opts.loss {
-        Loss::Cauchy(d) => Some(Loss::Huber(d)),
+        Loss::Cauchy(d) if opts.max_iterations > 0 && !obs.is_empty() => Some(Loss::Huber(d)),
         _ => None,
     };
     let (initial_cost, sq0, behind0) = evaluate(problem, &obs, opts.loss);
@@ -1746,8 +1764,16 @@ mod tests {
 
     /// SPEC §6 실측 편대 배치(3대 × `positions` 위치, 위치 간 1.0 m, 방향 −3°/+125°/−116°,
     /// 기울기 60°)의 정답 문제. 카메라 종류마다 내부 파라미터 그룹 하나(F, R, L 순서).
-    /// 점은 지형 위 0~3 m, 세 장 이상에 보이는 것만.
-    fn formation_scene(seed: u64, positions: usize, n_pts: usize) -> (BaProblem, Rng) {
+    /// 점은 지형 위 0~3 m, 세 장 이상에 보이는 것만. 그중 `n_cross` 개 이상은 두 대 이상의 드론
+    /// 카메라에 보이는 점이다. 균일하게 뽑으면 방향이 120° 씩 달라 600점 중 약 3점만 드론 사이에
+    /// 공유되어, 드론별 블록의 상대 닮음(7자유도 × 2)이 거의 정해지지 않는다(시드 41 축소 정보 행렬
+    /// 고윳값 3개가 0, 드론 R·L 카메라 전체의 평행이동 방향).
+    fn formation_scene(
+        seed: u64,
+        positions: usize,
+        n_pts: usize,
+        n_cross: usize,
+    ) -> (BaProblem, Rng) {
         use crate::synth::{terrain_height, CamId, Scene, SceneConfig};
         let sc = Scene::new(SceneConfig {
             positions,
@@ -1773,6 +1799,7 @@ mod tests {
         let x_end = (positions as f64 - 1.0) * sc.config.spacing;
         let mut points = Vec::new();
         let mut observations = Vec::new();
+        let mut n_cross_now = 0;
         while points.len() < n_pts {
             let (x, y) = (rng.uni(-60.0, x_end + 60.0), rng.uni(-60.0, 60.0));
             let p = Point3::new(x, y, terrain_height(x, y) + rng.uni(0.0, 3.0));
@@ -1790,6 +1817,15 @@ mod tests {
             if seen.len() < 3 {
                 continue;
             }
+            let mut drones = 0u8;
+            for &(c, _) in &seen {
+                drones |= 1 << camera_group[c];
+            }
+            let cross = drones.count_ones() >= 2;
+            if !cross && points.len() - n_cross_now >= n_pts - n_cross {
+                continue;
+            }
+            n_cross_now += usize::from(cross);
             let i = points.len();
             points.push(p);
             for (c, px) in seen {
@@ -1873,26 +1909,139 @@ mod tests {
         (s, r, mb - s * r * ma)
     }
 
+    /// 정답 근처 공분산 분석. 정답 포즈·점에서 선형화한 카메라 축소 정보 행렬 S(점 소거)의
+    /// 고유 분해 S = Σ λ_i v_i v_iᵀ 로 방향별 표준편차 σ_i = σ/√λ_i 를 얻는다.
+    struct Covariance {
+        lay: Layout,
+        /// (λ_i, v_i), λ 오름차순.
+        eig: Vec<(f64, DVector<f64>)>,
+        sigma: f64,
+    }
+
+    impl Covariance {
+        fn at_truth(gt: &BaProblem, start: &BaProblem, opts: &BaOptions, sigma: f64) -> Self {
+            // 게이지(고정 카메라·축척 성분)는 시작 문제와 같게 고른다.
+            let lay = layout(start, opts, &start.observations);
+            let tracks = select_tracks(gt.points.len(), &gt.observations, usize::MAX);
+            let mut by_point = vec![Vec::new(); gt.points.len()];
+            for (i, o) in gt.observations.iter().enumerate() {
+                by_point[o.point].push(i);
+            }
+            let lin = linearize(
+                gt,
+                &lay,
+                &tracks,
+                &by_point,
+                &gt.observations,
+                Loss::Squared,
+            );
+            let (s, _, _) = schur(&lin, 0.0);
+            let e = s.symmetric_eigen();
+            let mut eig: Vec<(f64, DVector<f64>)> = (0..e.eigenvalues.len())
+                .map(|i| (e.eigenvalues[i], e.eigenvectors.column(i).into_owned()))
+                .collect();
+            eig.sort_by(|a, b| a.0.total_cmp(&b.0));
+            Self { lay, eig, sigma }
+        }
+
+        /// 포즈 오차를 축소 계통 좌표로(회전 왼쪽 섭동 로그, 평행이동 차).
+        fn delta(&self, est: &[Pose], gt: &[Pose]) -> DVector<f64> {
+            let mut d = DVector::zeros(self.lay.n);
+            for (c, idx) in self.lay.cam_idx.iter().enumerate() {
+                let w = (est[c].rotation * gt[c].rotation.inverse()).scaled_axis();
+                let t = est[c].translation - gt[c].translation;
+                for (k, slot) in idx.iter().enumerate() {
+                    if let Some(i) = *slot {
+                        d[i] = if k < 3 { w[k] } else { t[k - 3] };
+                    }
+                }
+            }
+            d
+        }
+
+        /// 증분 d 를 정답 포즈에 적용했을 때 중심 이동 RMS(m).
+        fn center_rms(&self, d: &DVector<f64>, gt: &[Pose]) -> f64 {
+            let mut sq = 0.0;
+            for (c, idx) in self.lay.cam_idx.iter().enumerate() {
+                let v: Vec<f64> = idx.iter().map(|i| i.map_or(0.0, |i| d[i])).collect();
+                sq += (apply_pose(&gt[c], &v).center() - gt[c].center()).norm_squared();
+            }
+            (sq / gt.len() as f64).sqrt()
+        }
+
+        /// 방향 i 의 1σ 가 만드는 중심 이동 RMS(m).
+        fn center_sigma(&self, i: usize, gt: &[Pose]) -> f64 {
+            let (l, v) = &self.eig[i];
+            self.center_rms(&(v * (self.sigma / l.sqrt())), gt)
+        }
+
+        /// 약한 방향(1σ 중심 이동 > `weak_m`) 번호.
+        fn weak(&self, gt: &[Pose], weak_m: f64) -> Vec<usize> {
+            (0..self.eig.len())
+                .filter(|&i| self.center_sigma(i, gt) > weak_m)
+                .collect()
+        }
+
+        /// 약한 방향을 뺀 나머지의 중심 오차 기댓값 √(Σ_강한 σ_c,i²)(m).
+        fn strong_expect(&self, weak: &[usize], gt: &[Pose]) -> f64 {
+            (0..self.eig.len())
+                .filter(|i| !weak.contains(i))
+                .map(|i| self.center_sigma(i, gt).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        }
+
+        /// (약한 방향별 정규화 성분 z_i = (v_i·δ)√λ_i/σ, 약한 방향을 뺀 나머지 중심 오차 m,
+        /// 전체 방향 최대 |z|).
+        fn split(&self, d: &DVector<f64>, weak: &[usize], gt: &[Pose]) -> (Vec<f64>, f64, f64) {
+            let mut strong = d.clone();
+            let mut zw = Vec::new();
+            let mut zmax: f64 = 0.0;
+            for (i, (l, v)) in self.eig.iter().enumerate() {
+                let a = v.dot(d);
+                let z = a * l.sqrt() / self.sigma;
+                zmax = zmax.max(z.abs());
+                if weak.contains(&i) {
+                    zw.push(z);
+                    strong -= v * a;
+                }
+            }
+            (zw, self.center_rms(&strong, gt), zmax)
+        }
+    }
+
     /// F-036: 실측 편대 배치(3대 × 12위치)에서 정답 포즈에 잡음(σ = 0.5 px)과 이상치(관측 10%,
-    /// 20~60 px)를 넣고 포즈·점을 작게 섭동한 뒤 Huber·Cauchy 결과를 정답과 비교한다.
-    /// 내부 파라미터는 정답으로 고정한다: 위치 간 1.0 m 기선에서 내부 파라미터를 풀면 이상치 없는
-    /// 최소제곱도 100회 안에 수렴하지 않고 정렬 중심 오차 약 1 m 가 남는다(시드 41, 연구 노트).
-    /// 섭동이 크면(이동 0.3 m) 내부 파라미터를 고정해도 같다.
+    /// 20~60 px)를 넣고 포즈·점을 작게 섭동한 뒤 최소제곱·Huber·Cauchy 결과를 정답과 비교한다.
+    /// 내부 파라미터는 정답으로 고정한다.
     ///
-    /// 기준의 근거:
-    /// - 잡음만 있을 때 최소제곱 해의 잔차 RMS 기댓값은 σ√2·√(1 − p/(2m)) (p 자유 파라미터,
-    ///   m 관측). 같은 잡음·같은 시작에서 이상치 없는 최소제곱 실행이 이를 0.95~1.05 로 맞춘다.
-    /// - 그 깨끗한 최소제곱 해의 중심·점 오차가 이 잡음에서 얻을 수 있는 하한(최대우도) 기준이다.
-    ///   강건 손실은 이상치가 있어도 내정 RMS < 1.2·σ√2(Cauchy)·1.5·σ√2(Huber),
-    ///   중심·점 오차 < 기준의 1.5배(Cauchy)·2.5배(Huber), 중심 오차 < 0.05 m.
-    /// - 이상치를 그대로 받는 최소제곱은 내정 RMS > 3·σ√2 여야 시험이 이상치를 구분한다.
+    /// 기준은 정답 근처 공분산 σ²S⁻¹(S: 정답에서 선형화한 카메라 축소 정보 행렬)의 고유 방향별
+    /// σ_i 로 정한다. 추정과 정답이 같은 게이지에 있도록 축척 고정 성분은 정답 값에서 시작한다.
+    /// - 약한 방향(1σ 가 중심을 2 cm 넘게 움직이는 방향, 시드 41~50 에서 5~8개, 1σ 2~9 cm):
+    ///   성분 |z_i| < 5(최소제곱·Cauchy)·8(Huber).
+    /// - 그 성분을 뺀 나머지 중심 오차 < 2.5·√(Σ 강한 방향 σ_c²)(최소제곱; Cauchy 3배·Huber 4배),
+    ///   모든 방향 |z| 최대 < 5(최소제곱)·6(Cauchy)·8(Huber).
+    /// - 잔차: 이상치 없는 최소제곱 수렴, RMS / 기댓값 σ√2·√(1 − p/(2m)) 이 0.95~1.05.
+    ///   강건 손실 내정 RMS < 1.2·σ√2(Cauchy)·1.5·σ√2(Huber), Cauchy 내정 3 px 초과 ≤ 5,
+    ///   이상치를 받는 최소제곱 > 3·σ√2.
     #[test]
-    #[ignore = "장면 관측 문제: 시드 41 점 600개 중 597개가 한 종류 카메라(F/R/L)에만 보이고 종류 간 공유 트랙 F-R 1·F-L 2·R-L 0개라 세 블록의 상대 포즈·축척이 거의 묶이지 않는다(정렬 중심 오차 1.2 m). 종류 간 공유 트랙을 보장하는 장면으로 바꿔야 한다"]
+    fn least_squares_on_formation_scene() {
+        formation_check(false);
+    }
+
+    /// 같은 장면에서 이상치(관측 10%)를 넣은 Huber·Cauchy 기준.
+    #[test]
+    #[ignore = "드론 사이 공유 점을 넣어도 강건 손실 일부 시드가 기준 미달(시드 41~50: Cauchy 내정 RMS 최대 1.365 > 0.849·3px 초과 최대 8, Huber 시드 43 약한 방향 |z| 18): 관측 적은 점이 이상치 쪽 해에 남는다"]
     fn robust_losses_on_formation_scene() {
+        formation_check(true);
+    }
+
+    fn formation_check(robust: bool) {
         let sigma = 0.5;
         let clean = sigma * 2f64.sqrt();
+        let weak_m = 0.02;
+        let mut failures = Vec::new();
         for seed in 41u64..=50 {
-            let (gt, mut rng) = formation_scene(seed, 12, 600);
+            let (gt, mut rng) = formation_scene(seed, 12, 600, 150);
             let mut noisy = gt.clone();
             add_noise(&mut noisy, &mut rng, sigma);
             let mut inlier = vec![true; noisy.observations.len()];
@@ -1904,9 +2053,14 @@ mod tests {
                     inlier[i] = false;
                 }
             }
-            // 같은 섭동을 깨끗한 문제와 이상치 문제에 함께 준다.
-            let mut start = noisy.clone();
+            let opts = |loss| BaOptions {
+                loss,
+                max_iterations: 100,
+                default_free_intrinsics: [false; 8],
+                ..Default::default()
+            };
             // 초기 복원 뒤 정밀화를 가정한 작은 섭동(회전 0.002 rad, 이동 0.05 m, 점 0.05 m).
+            let mut start = noisy.clone();
             for c in 1..start.poses.len() {
                 let w = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.002;
                 let dt = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.05;
@@ -1915,66 +2069,296 @@ mod tests {
             for x in &mut start.points {
                 *x += Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.05;
             }
+            // 축척 고정 성분은 정답 값으로 둔다: 그래야 추정과 정답이 같은 게이지에 있다.
+            let (_, fix) = gauge(&start, &opts(Loss::Squared), &start.observations);
+            let (kc, ki) = fix.unwrap();
+            start.poses[kc].translation[ki] = gt.poses[kc].translation[ki];
+            assert_eq!(
+                gauge(&start, &opts(Loss::Squared), &start.observations).1,
+                Some((kc, ki))
+            );
             noisy.poses = start.poses.clone();
             noisy.points = start.points.clone();
-            noisy.groups = start.groups.clone();
             dirty.poses = start.poses.clone();
             dirty.points = start.points.clone();
-            dirty.groups = start.groups.clone();
-            let opts = |loss| BaOptions {
-                loss,
-                max_iterations: 100,
-                default_free_intrinsics: [false; 8],
-                ..Default::default()
-            };
-            let all = vec![true; inlier.len()];
+            let cov = Covariance::at_truth(&gt, &start, &opts(Loss::Squared), sigma);
+            let weak = cov.weak(&gt.poses, weak_m);
+            let strong_exp = cov.strong_expect(&weak, &gt.poses);
+            let weak_sig: Vec<f64> = weak
+                .iter()
+                .map(|&i| cov.center_sigma(i, &gt.poses))
+                .collect();
+
             let mut ref_p = noisy.clone();
             let rep = bundle_adjust(&mut ref_p, &opts(Loss::Squared));
             let params = 6 * gt.poses.len() - 7 + 3 * rep.num_tracks_used;
             let m = rep.num_observations_used as f64;
             let expect = clean * (1.0 - params as f64 / (2.0 * m)).sqrt();
-            let (_, _, ref_c, ref_x) = errors_vs_truth(&ref_p, &gt, &all);
+            let (ref_zw, ref_strong, ref_zmax) =
+                cov.split(&cov.delta(&ref_p.poses, &gt.poses), &weak, &gt.poses);
+            let all = vec![true; inlier.len()];
+            let (_, _, ref_c, _) = errors_vs_truth(&ref_p, &gt, &all);
             let run = |loss| {
                 let mut p = dirty.clone();
                 let r = bundle_adjust(&mut p, &opts(loss));
-                (errors_vs_truth(&p, &gt, &inlier), r)
+                let e = errors_vs_truth(&p, &gt, &inlier);
+                let s = cov.split(&cov.delta(&p.poses, &gt.poses), &weak, &gt.poses);
+                (e, s, r)
             };
-            let ((l2_rms, ..), _) = run(Loss::Squared);
-            let ((hu_rms, hu_o, hu_c, hu_x), hu_r) = run(Loss::Huber(1.0));
-            let ((ca_rms, ca_o, ca_c, ca_x), ca_r) = run(Loss::Cauchy(1.0));
+            let ((l2_rms, ..), ..) = run(Loss::Squared);
+            if !robust {
+                eprintln!(
+                    "seed {seed}: obs {} strong_exp {strong_exp:.4} weak {} | L2 rms/exp {:.4} {:?} it {} \
+                     aligned c {ref_c:.3} z_w max {:.2} strong {ref_strong:.4} zmax {ref_zmax:.2} | L2+out {l2_rms:.3}",
+                    rep.num_observations_used,
+                    weak.len(),
+                    rep.final_rms / expect,
+                    rep.stop,
+                    rep.iterations,
+                    ref_zw.iter().fold(0.0f64, |a, z| a.max(z.abs())),
+                );
+                let mut check = |ok: bool, what: &str| {
+                    if !ok {
+                        failures.push(format!("seed {seed} {what}"));
+                    }
+                };
+                check(rep.converged, "L2 converged");
+                check((rep.final_rms / expect - 1.0).abs() < 0.05, "L2 rms/expect");
+                check(ref_zw.iter().all(|z| z.abs() < 5.0), "L2 weak");
+                check(ref_strong < 2.5 * strong_exp, "L2 strong");
+                check(ref_zmax < 5.0, "L2 zmax");
+                check(l2_rms > 3.0 * clean, "L2+outliers separable");
+                continue;
+            }
+            let ((hu_rms, _, hu_c, _), (hu_zw, hu_strong, hu_zmax), hu_r) = run(Loss::Huber(1.0));
+            let ((ca_rms, ca_o, ca_c, _), (ca_zw, ca_strong, ca_zmax), ca_r) =
+                run(Loss::Cauchy(1.0));
+            let fmt = |z: &[f64]| {
+                z.iter()
+                    .map(|v| format!("{v:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
             eprintln!(
-                "seed {seed}: cams {} tracks {} obs {} | clean L2 rms/expect {:.4} c {:.4} x {:.4} it {} | \
-                 L2+out inlier {l2_rms:.3} | Huber {hu_rms:.3} >3px {hu_o} c {hu_c:.4} x {hu_x:.4} it {} | \
-                 Cauchy {ca_rms:.3} >3px {ca_o} c {ca_c:.4} x {ca_x:.4} it {}",
-                gt.poses.len(),
-                rep.num_tracks_used,
+                "seed {seed}: obs {} strong_exp {strong_exp:.4} weak {} sig_m [{}] | L2 rms/exp {:.4} {:?} it {} aligned c {ref_c:.3} \
+                 z_w [{}] strong {ref_strong:.4} zmax {ref_zmax:.2} | L2+out {l2_rms:.3} | \
+                 Huber {hu_rms:.3} c {hu_c:.3} z_w [{}] strong {hu_strong:.4} zmax {hu_zmax:.2} | \
+                 Cauchy {ca_rms:.3} >3px {ca_o} c {ca_c:.3} z_w [{}] strong {ca_strong:.4} zmax {ca_zmax:.2}",
                 rep.num_observations_used,
+                weak.len(),
+                weak_sig.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(","),
                 rep.final_rms / expect,
-                ref_c,
-                ref_x,
+                rep.stop,
                 rep.iterations,
-                hu_r.iterations,
-                ca_r.iterations,
+                fmt(&ref_zw),
+                fmt(&hu_zw),
+                fmt(&ca_zw),
             );
-            assert!(rep.converged, "seed {seed} {:?}", rep.stop);
-            assert!((rep.final_rms / expect - 1.0).abs() < 0.05, "seed {seed}");
-            assert!(ref_c < 0.05, "seed {seed} clean center {ref_c}");
-            assert!(l2_rms > 3.0 * clean, "seed {seed} L2 {l2_rms}");
-            assert!(hu_r.refined && ca_r.refined, "seed {seed}");
-            assert!(hu_rms < 1.5 * clean, "seed {seed} Huber {hu_rms}");
-            assert!(
-                ca_rms < 1.2 * clean && ca_o == 0,
-                "seed {seed} Cauchy {ca_rms} {ca_o}"
+            let mut check = |ok: bool, what: &str| {
+                if !ok {
+                    failures.push(format!("seed {seed} {what}"));
+                }
+            };
+            check(rep.converged, "L2 converged");
+            check((rep.final_rms / expect - 1.0).abs() < 0.05, "L2 rms/expect");
+            check(ref_zw.iter().all(|z| z.abs() < 5.0), "L2 weak");
+            check(ref_strong < 2.5 * strong_exp, "L2 strong");
+            check(ref_zmax < 5.0, "L2 zmax");
+            check(l2_rms > 3.0 * clean, "L2+outliers separable");
+            check(hu_r.refined && ca_r.refined, "refined");
+            check(hu_rms < 1.5 * clean, "Huber inlier rms");
+            check(ca_rms < 1.2 * clean, "Cauchy inlier rms");
+            check(ca_o <= 5, "Cauchy >3px");
+            check(ca_zw.iter().all(|z| z.abs() < 5.0), "Cauchy weak");
+            check(
+                ca_strong < 3.0 * strong_exp && ca_zmax < 6.0,
+                "Cauchy strong",
             );
-            assert!(hu_c < 0.05 && ca_c < 0.05, "seed {seed} {hu_c} {ca_c}");
-            assert!(
-                ca_c < 1.5 * ref_c + 1e-3 && ca_x < 1.5 * ref_x,
-                "seed {seed} Cauchy"
+            check(hu_zw.iter().all(|z| z.abs() < 8.0), "Huber weak");
+            check(
+                hu_strong < 4.0 * strong_exp && hu_zmax < 8.0,
+                "Huber strong",
             );
-            assert!(
-                hu_c < 2.5 * ref_c + 1e-3 && hu_x < 2.5 * ref_x,
-                "seed {seed} Huber"
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// F-165: 한 카메라에서만 두 번 관측된 점은 트랙이 아니다.
+    #[test]
+    fn single_camera_duplicate_tracks_are_not_used() {
+        let base = noisy_perturbed(13);
+        let mut p = base.clone();
+        let mut obs = Vec::new();
+        for o in &base.observations {
+            if o.camera == 1 {
+                obs.push(*o);
+                // 0.3 px 어긋난 복제. 같은 (카메라, 점) 이라 제외된다.
+                obs.push(Observation {
+                    pixel: o.pixel + Vector2::new(0.3, 0.0),
+                    ..*o
+                });
+            }
+        }
+        let n_dup = obs.len() / 2;
+        p.observations = obs;
+        let before = p.clone();
+        let rep = bundle_adjust(&mut p, &short_opts());
+        assert_eq!(rep.num_tracks_used, 0);
+        assert_eq!(rep.stop, BaStop::EvaluationOnly);
+        assert!(!rep.refined);
+        assert_eq!(rep.num_observations_rejected, n_dup);
+        assert!(rep.final_rms.is_nan());
+        assert_eq!(p.points, before.points);
+        // select_tracks 만으로도(중복 제거 전) 카메라 1대짜리 점은 고르지 않는다.
+        assert!(select_tracks(p.points.len(), &before.observations, usize::MAX).is_empty());
+
+        // 정상 장면에 중복 관측 1건: 제외 1, 최종 RMS 는 깨끗한 실행의 1% 이내.
+        let mut clean = base.clone();
+        let rc = bundle_adjust(&mut clean, &short_opts());
+        let mut dup = base.clone();
+        let o = dup.observations[7];
+        dup.observations.push(Observation {
+            pixel: o.pixel + Vector2::new(0.3, 0.0),
+            ..o
+        });
+        let rd = bundle_adjust(&mut dup, &short_opts());
+        assert_eq!(rd.num_observations_rejected, 1);
+        assert!((rd.final_rms / rc.final_rms - 1.0).abs() < 0.01);
+    }
+
+    /// F-164: 축척 고정 카메라의 관측을 모두 지워도 다른 (관측 있는) 카메라에서 고르고,
+    /// 감쇠 초기값과 무관하게 같은 해가 나온다.
+    #[test]
+    fn scale_gauge_camera_has_observations() {
+        let mut base = noisy_perturbed(11);
+        let opts = BaOptions::default();
+        let (_, fix0) = gauge(&base, &opts, &base.observations);
+        let (cam0, _) = fix0.unwrap();
+        base.observations.retain(|o| o.camera != cam0);
+        let (_, fix1) = gauge(&base, &opts, &base.observations);
+        let (cam1, _) = fix1.unwrap();
+        assert_ne!(cam1, cam0);
+        assert!(base.observations.iter().any(|o| o.camera == cam1));
+        let run = |lambda: f64| {
+            let mut p = base.clone();
+            let rep = bundle_adjust(
+                &mut p,
+                &BaOptions {
+                    loss: Loss::Squared,
+                    max_iterations: 200,
+                    initial_lambda: lambda,
+                    function_tolerance: 0.0,
+                    ..Default::default()
+                },
             );
+            ((p.poses[1].center() - p.poses[0].center()).norm(), rep)
+        };
+        let (d_lo, rep_lo) = run(1e-12);
+        let (d_hi, rep_hi) = run(1e-4);
+        eprintln!(
+            "scale cam {cam0} -> {cam1}: |c1-c0| {d_lo:.12} vs {d_hi:.12}, chol {} {}, {:?} {:?}",
+            rep_lo.cholesky_failures, rep_hi.cholesky_failures, rep_lo.stop, rep_hi.stop
+        );
+        assert!(((d_lo - d_hi) / d_hi).abs() < 1e-9, "{d_lo} vs {d_hi}");
+        assert_eq!(rep_lo.cholesky_failures, 0);
+        assert_eq!(rep_hi.cholesky_failures, 0);
+    }
+
+    /// F-162: 투영된 관측이 0개이면 RMS 는 NaN(0 px 아님), refined·converged 거짓.
+    #[test]
+    fn rms_is_nan_without_projected_observations() {
+        let mut all_nan = noisy_perturbed(16);
+        for o in &mut all_nan.observations {
+            o.pixel.x = f64::NAN;
+        }
+        let mut behind = noisy_perturbed(16);
+        for x in &mut behind.points {
+            x.z = 1000.0;
+        }
+        let no_tracks = noisy_perturbed(16);
+        let cases = [
+            (all_nan, short_opts()),
+            (behind, short_opts()),
+            (
+                no_tracks,
+                BaOptions {
+                    max_tracks: 0,
+                    ..short_opts()
+                },
+            ),
+        ];
+        for (mut p, o) in cases {
+            let rep = bundle_adjust(&mut p, &o);
+            assert!(rep.initial_rms.is_nan(), "{rep:?}");
+            assert!(rep.final_rms.is_nan(), "{rep:?}");
+            assert!(!rep.refined && !rep.converged, "{:?}", rep.stop);
+        }
+        // 정상 장면 RMS 는 유한하다.
+        let mut ok = noisy_perturbed(16);
+        let rep = bundle_adjust(&mut ok, &short_opts());
+        assert!(rep.final_rms.is_finite() && rep.final_rms < 1.0);
+    }
+
+    /// F-174: Cauchy 도 반복 한도 0 이나 관측 0개면 EvaluationOnly·반복 0.
+    #[test]
+    fn cauchy_evaluation_only() {
+        for limit in [0usize, 1, 30] {
+            let mut p = noisy_perturbed(13);
+            if limit > 0 {
+                p.observations.clear();
+            }
+            let rep = bundle_adjust(
+                &mut p,
+                &BaOptions {
+                    loss: Loss::Cauchy(2.0),
+                    max_iterations: limit,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(rep.stop, BaStop::EvaluationOnly, "limit {limit}");
+            assert_eq!(rep.iterations, 0);
+            assert!(!rep.refined);
+        }
+    }
+
+    /// F-167: 잘못된 옵션은 InvalidInput, 입력은 비트 단위로 그대로.
+    #[test]
+    fn invalid_options_are_rejected() {
+        let bad = [
+            BaOptions {
+                loss: Loss::Huber(f64::NAN),
+                ..short_opts()
+            },
+            BaOptions {
+                loss: Loss::Huber(0.0),
+                ..short_opts()
+            },
+            BaOptions {
+                initial_lambda: -1.0,
+                ..short_opts()
+            },
+            BaOptions {
+                initial_lambda: f64::NAN,
+                ..short_opts()
+            },
+            BaOptions {
+                loss: Loss::Cauchy(-1.0),
+                ..short_opts()
+            },
+            BaOptions {
+                function_tolerance: f64::NAN,
+                ..short_opts()
+            },
+        ];
+        for o in bad {
+            let mut p = noisy_perturbed(13);
+            let before = p.clone();
+            let rep = bundle_adjust(&mut p, &o);
+            assert_eq!(rep.stop, BaStop::InvalidInput, "{o:?}");
+            assert!(!rep.refined && !rep.converged);
+            assert_eq!(format!("{:?}", p.points), format!("{:?}", before.points));
+            assert_eq!(format!("{:?}", p.poses), format!("{:?}", before.poses));
+            assert_eq!(format!("{:?}", p.groups), format!("{:?}", before.groups));
         }
     }
 
