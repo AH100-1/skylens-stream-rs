@@ -1383,6 +1383,29 @@ mod tests {
         out
     }
 
+    /// F-197 실측 겹침 일정: 같은 카메라 시간 이웃(SPEC §3.2) + F(p)–R(p+12..=p+40) + F(p)–L(p+16..=p+40).
+    /// 번호 = 위치·3 + 카메라(F 0, R 1, L 2).
+    fn schedule_pairs(n: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for a in 0..n {
+            for b in a + 1..n {
+                let gap = b / 3 - a / 3;
+                if a % 3 == b % 3 && (gap <= 5 || gap == 8 || gap == 16) {
+                    out.push((a, b));
+                }
+            }
+        }
+        for p in 0..n / 3 {
+            for q in p + 12..=(p + 40).min(n / 3 - 1) {
+                out.push((3 * p, 3 * q + 1));
+            }
+            for q in p + 16..=(p + 40).min(n / 3 - 1) {
+                out.push((3 * p, 3 * q + 2));
+            }
+        }
+        out
+    }
+
     /// 바닥 점 `count` 개와 그 점을 시야 안에 둔 카메라의 방향 관측(정점당 최대 `per_point` 개,
     /// 정규화 좌표 잡음 σ 1e-3, `outlier_frac` 은 시야 안 아무 방향).
     fn point_observations(
@@ -1520,7 +1543,12 @@ mod tests {
             .map(|p| Some(Rotation3::new(rng.vec3() * 0.1f64.to_radians()) * p.rotation))
             .collect();
         let mut obs = Vec::new();
-        for (i, j) in pairs(&poses) {
+        let sched = if std::env::var("DIAG_OLDPAIRS").is_ok() {
+            pairs(&poses)
+        } else {
+            schedule_pairs(poses.len())
+        };
+        for (i, j) in sched {
             if rng.unit() < case.unobservable_frac {
                 continue;
             }
@@ -1554,7 +1582,11 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1.5);
-        for frac in [-1.0f64, 0.0, 0.10, 0.20] {
+        let fracs: Vec<f64> = std::env::var("DIAG_FRACS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_else(|| vec![-1.0, 0.0, 0.10, 0.20]);
+        for frac in fracs {
             for &seed in &seeds {
                 let case = Case {
                     noise_deg: if frac < 0.0 { 0.0 } else { 1.0 },
@@ -1704,6 +1736,27 @@ mod tests {
             assert_eq!(res.registered(), 240);
             assert!(rms < 1.0 && max < 5.0, "rms {rms} max {max}");
         }
+    }
+
+    #[test]
+    fn real_schedule_cross_pairs_improve_pairs_only() {
+        // F-197 일정(F(p)–R(p+12..+40), F(p)–L(p+16..+40))의 짝만 쓴 평균: 옛 일정의 RMS 9~11 m 에서
+        // 실측 3.2~3.9 m(최대 19~24 m)로 줄지만 목표(0.3 m)에는 못 미친다(노트 참조).
+        let sp = schedule_pairs(240);
+        assert!(sp.iter().all(|&(a, b)| a < b));
+        assert!(sp.contains(&(0, 3 * 12 + 1)) && sp.contains(&(0, 3 * 16 + 2)));
+        assert!(!sp.contains(&(0, 3 * 11 + 1)) && !sp.contains(&(0, 3 * 15 + 2)));
+        let case = Case {
+            noise_deg: 1.0,
+            outlier_frac: 0.10,
+            unobservable_frac: 0.05,
+        };
+        let (poses, _, rots, obs) = real_observations(1, &case, 1.5);
+        let res = average_translations(&rots, &obs, &TranslationConfig::default());
+        let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+        let (rms, _) = stats(&similarity_aligned_errors(&res.centers, &truth));
+        assert!(res.registered() >= 225, "registered {}", res.registered());
+        assert!(rms < 6.0, "rms {rms}");
     }
 
     #[test]
