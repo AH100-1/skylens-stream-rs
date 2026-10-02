@@ -157,6 +157,10 @@ pub struct Config {
     /// 가장 거친 층이 아닌 층에서 화소마다 비용 계산에 쓰는 이웃 수. 층 시작 때 현재 가설로
     /// 이웃마다 비용을 재서 낮은 순서로 이만큼 고른다. 0 이면 전부.
     pub fine_neighbors: usize,
+    /// 원 해상도 층(피라미드가 둘 이상일 때)의 창 표본 간격. 0 이면 `step` 과 같다.
+    pub fine_step: usize,
+    /// 가장 거친 층이 아닌 층에서 쓰는 전파 이웃 수(8 이면 전부, 4 는 거리 1 의 네 곳).
+    pub fine_propagation: usize,
     /// 난수 씨앗.
     pub seed: u64,
 }
@@ -166,7 +170,7 @@ impl Default for Config {
         Self {
             radius: 4,
             step: 2,
-            iterations: 6,
+            iterations: 5,
             refine_iterations: 1,
             coarse_width: 240,
             sigma_color: 0.1,
@@ -175,8 +179,10 @@ impl Default for Config {
             perturbations: 3,
             refine_perturbations: 1,
             max_neighbors: 8,
-            fine_neighbors: 4,
-            normal_steps: 3,
+            fine_neighbors: 3,
+            normal_steps: 0,
+            fine_step: 4,
+            fine_propagation: 4,
             seed: 0x5eed,
         }
     }
@@ -340,6 +346,7 @@ struct Ctx<'a> {
     range: (f32, f32),
     cfg: &'a Config,
     tab: &'a Tables,
+    nprop: usize,
 }
 
 impl Ctx<'_> {
@@ -527,6 +534,7 @@ impl Ctx<'_> {
         let (w, h) = (self.w, self.h);
         let cfg = self.cfg;
         let log_span = (self.range.1 / self.range.0).ln();
+        let offs = &OFFS[..self.nprop.min(OFFS.len())];
         for it in 0..iterations {
             for color in 0..2usize {
                 let updates: Vec<(usize, Hyp, f32)> = (0..h)
@@ -560,7 +568,7 @@ impl Ctx<'_> {
                             let mut tried = [(Vector3::zeros(), 0.0f32); OFFS.len() + 1];
                             tried[0] = (best.n, best.depth);
                             let mut nt = 1;
-                            for &(dx, dy) in &OFFS {
+                            for &(dx, dy) in offs {
                                 let nx = x as isize + dx;
                                 let ny = y as isize + dy;
                                 if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
@@ -717,6 +725,14 @@ pub fn estimate_profiled(
         return DepthMap::invalid(w, h);
     }
     let tab = Tables::new(cfg);
+    let tab_fine = Tables::new(&Config {
+        step: if cfg.fine_step == 0 {
+            cfg.step
+        } else {
+            cfg.fine_step
+        },
+        ..cfg.clone()
+    });
 
     // 피라미드(층 0 = 원 해상도). 시점마다 0~1 정규화.
     let mut levels = vec![Level {
@@ -778,7 +794,12 @@ pub fn estimate_profiled(
             neighbors,
             range: range32,
             cfg,
-            tab: &tab,
+            tab: if li == 0 && top > 0 { &tab_fine } else { &tab },
+            nprop: if li == top {
+                8
+            } else {
+                cfg.fine_propagation.clamp(1, 8)
+            },
         };
         let n = ctx.w * ctx.h;
         let mut hyps: Vec<Hyp> = match state.take() {
@@ -1402,7 +1423,7 @@ mod tests {
         assert!(el <= 0.7, "{el:.2} s > 0.7 s");
     }
 
-    /// 같은 장면에서 이전 설정(이웃 전부·법선 단계 없음)과 기본 설정을 번갈아 잰다.
+    /// 같은 장면에서 설정 여러 개를 번갈아 잰다(시간·정확도·부하).
     /// cargo test --release -- --ignored ab_960 --nocapture
     #[test]
     #[ignore = "시간 비교용(측정 기계 부하에 따라 값이 달라짐)"]
@@ -1415,14 +1436,39 @@ mod tests {
         let cams = rig8(960, 540, 1.0, 10.0);
         let (refv, ns, gt) = views(&cams, &scene);
         let n_gt = Vector3::new(0.3, -0.15, -1.0).normalize();
+        let d = Config::default();
         let old = Config {
-            fine_neighbors: 0,
+            fine_step: 2,
+            fine_propagation: 8,
+            coarse_width: 240,
+            iterations: 5,
             normal_steps: 0,
-            ..Config::default()
+            ..d.clone()
         };
-        let new = Config::default();
+        let b = Config {
+            coarse_width: 240,
+            iterations: 5,
+            normal_steps: 0,
+            ..d.clone()
+        };
+        let c = Config {
+            iterations: 5,
+            normal_steps: 0,
+            ..d.clone()
+        };
+        let e = Config {
+            normal_steps: 0,
+            ..d.clone()
+        };
+        let f = Config {
+            normal_steps: 0,
+            iterations: 5,
+            fine_neighbors: 3,
+            ..d.clone()
+        };
+        let cfgs = [("이전", old), ("B", b), ("C", c), ("기본", e), ("F", f)];
         for round in 0..2 {
-            for (name, cfg) in [("이전", &old), ("기본", &new)] {
+            for (name, cfg) in &cfgs {
                 let t = std::time::Instant::now();
                 let dm = estimate(&refv, &ns, (5.0, 20.0), cfg);
                 let el = t.elapsed().as_secs_f64();
