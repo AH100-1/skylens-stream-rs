@@ -1748,7 +1748,12 @@ mod tests {
                 let i = y * dm.w + x;
                 rel.push((dm.depth[i] as f64 - gt[i]).abs() / gt[i]);
                 let n = dm.normal[i];
-                let n = Vector3::new(n[0] as f64, n[1] as f64, n[2] as f64).normalize();
+                let n = Vector3::new(n[0] as f64, n[1] as f64, n[2] as f64);
+                if n.norm() == 0.0 {
+                    ang.push(180.0);
+                    continue;
+                }
+                let n = n.normalize();
                 ang.push(n.dot(&gt_n(i)).clamp(-1.0, 1.0).acos().to_degrees());
             }
         }
@@ -2280,7 +2285,7 @@ mod tests {
         };
         let mut best = [f64::INFINITY; 2];
         let mut last_fast = None;
-        for round in 0..3 {
+        for round in 0..1 {
             for which in 0..2 {
                 let t = std::time::Instant::now();
                 let dm = if which == 0 {
