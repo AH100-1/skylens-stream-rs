@@ -30,9 +30,19 @@ impl std::error::Error for ImageSizeError {}
 /// 필드는 비공개이며 모든 생성자가 `data.len() == width * height` 를 보장한다.
 /// 길이가 틀린 영상은 만들 수 없다:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use skylens_core::features::GrayImage;
 /// let img = GrayImage { width: 64, height: 64, data: vec![0.5; 100] };
+/// ```
+///
+/// 오류 코드(E0451, 비공개 필드)는 안정판 rustdoc 이 확인하지 않으므로, 같은 경로·같은 값이
+/// 생성자로는 컴파일되고 길이 검사에 걸리는 것을 아래 시험이 함께 고정한다(경로가 깨지면 이 시험이 실패한다):
+///
+/// ```
+/// use skylens_core::features::GrayImage;
+/// assert!(GrayImage::try_from_vec(64, 64, vec![0.5; 100]).is_err());
+/// let img = GrayImage::try_from_vec(64, 64, vec![0.5; 64 * 64]).unwrap();
+/// assert_eq!((img.width(), img.height(), img.data().len()), (64, 64, 4096));
 /// ```
 #[derive(Clone, Debug)]
 pub struct GrayImage {
