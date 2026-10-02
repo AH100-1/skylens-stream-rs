@@ -119,33 +119,75 @@ impl Scalar {
     }
 }
 
+/// 헤더 한 줄의 최대 길이(줄바꿈 포함, 바이트).
+pub const MAX_HEADER_LINE: usize = 4096;
+/// 헤더 전체(`ply` 부터 `end_header` 줄까지)의 최대 크기(바이트).
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// 헤더 한 줄을 읽는다. 줄 길이·헤더 누적 크기 상한을 넘으면 그 이상 읽지 않고 `InvalidData`.
+fn read_header_line<R: BufRead>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    used: &mut usize,
+) -> io::Result<String> {
+    buf.clear();
+    let n = r
+        .by_ref()
+        .take(MAX_HEADER_LINE as u64 + 1)
+        .read_until(b'\n', buf)?;
+    if n == 0 {
+        return Err(invalid("헤더가 끝나기 전에 파일이 끝남"));
+    }
+    if n > MAX_HEADER_LINE {
+        return Err(invalid(format!(
+            "헤더 줄이 너무 김: {MAX_HEADER_LINE} 바이트 초과"
+        )));
+    }
+    if buf.last() != Some(&b'\n') {
+        return Err(invalid("헤더가 끝나기 전에 파일이 끝남"));
+    }
+    *used += n;
+    if *used > MAX_HEADER_BYTES {
+        return Err(invalid(format!(
+            "헤더가 너무 큼: {MAX_HEADER_BYTES} 바이트 초과"
+        )));
+    }
+    let l = std::str::from_utf8(buf).map_err(|_| invalid("헤더가 UTF-8 이 아님"))?;
+    Ok(l.trim().to_string())
+}
+
 /// 이진 리틀엔디언 PLY 의 vertex 원소를 읽는다. vertex 가 첫 원소여야 한다.
+///
+/// 헤더에는 `format binary_little_endian 1.0` 줄이 정확히 한 번 있어야 하고,
+/// 헤더 줄은 [`MAX_HEADER_LINE`], 헤더 전체는 [`MAX_HEADER_BYTES`] 바이트를 넘을 수 없다.
 pub fn read_ply<R: Read>(r: R) -> io::Result<PointCloud> {
     let mut r = BufReader::new(r);
-    let mut line = String::new();
-    let mut next_line = |r: &mut BufReader<R>| -> io::Result<String> {
-        line.clear();
-        if r.read_line(&mut line)? == 0 {
-            return Err(invalid("헤더가 끝나기 전에 파일이 끝남"));
-        }
-        Ok(line.trim().to_string())
-    };
+    let mut buf = Vec::new();
+    let mut used = 0usize;
 
-    if next_line(&mut r)? != "ply" {
+    if read_header_line(&mut r, &mut buf, &mut used)? != "ply" {
         return Err(invalid("PLY 매직 없음"));
     }
     let mut count: Option<usize> = None;
     let mut in_vertex = false;
+    let mut format_seen = false;
     let mut props: Vec<(String, Scalar)> = Vec::new();
     loop {
-        let l = next_line(&mut r)?;
+        let l = read_header_line(&mut r, &mut buf, &mut used)?;
         let tok: Vec<&str> = l.split_whitespace().collect();
         match tok.as_slice() {
             ["end_header"] => break,
-            ["format", fmt, _] => {
+            ["format", fmt, ver] => {
+                if format_seen {
+                    return Err(invalid("format 줄이 둘 이상"));
+                }
                 if *fmt != "binary_little_endian" {
                     return Err(invalid(format!("지원하지 않는 형식: {fmt}")));
                 }
+                if *ver != "1.0" {
+                    return Err(invalid(format!("지원하지 않는 형식 버전: {ver}")));
+                }
+                format_seen = true;
             }
             ["comment", ..] | ["obj_info", ..] => {}
             ["element", name, n] => {
@@ -172,6 +214,9 @@ pub fn read_ply<R: Read>(r: R) -> io::Result<PointCloud> {
             ["property", ..] => {}
             _ => return Err(invalid(format!("해석할 수 없는 헤더 줄: {l}"))),
         }
+    }
+    if !format_seen {
+        return Err(invalid("format 줄 없음"));
     }
     let count = count.ok_or_else(|| invalid("vertex 원소 없음"))?;
 
@@ -346,9 +391,11 @@ property double z\nproperty double x\nproperty double y\nend_header\n"
         let e = read_ply(&header_only("10000000000", xyz)[..]).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert!(e.to_string().contains("잘림"), "{e}");
-        // count * 12 가 usize 를 넘는 헤더.
+        // 개수가 u64 로도 표현되지 않는 헤더 → 개수 해석 실패.
         let e = read_ply(&header_only("683212743470724134000", xyz)[..]).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("해석 실패"), "{e}");
+        // 개수는 해석되지만 count * 12 가 usize 를 넘는 헤더.
         let e = read_ply(&header_only("1537228672809129302", xyz)[..]).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert!(e.to_string().contains("너무 큼"), "{e}");
@@ -371,5 +418,90 @@ property double z\nproperty double x\nproperty double y\nend_header\n"
         assert!(!cloud.has_nan());
         cloud.points[1].xyz[2] = f32::NAN;
         assert!(cloud.has_nan());
+    }
+
+    const XYZ: &str = "property float x\nproperty float y\nproperty float z\n";
+
+    #[test]
+    fn rejects_header_line_over_limit() {
+        // 상한과 같은 길이(줄바꿈 포함)는 통과, 1 바이트 더 길면 거부.
+        let pad = |n: usize| format!("comment {}\n", "a".repeat(n - "comment \n".len()));
+        let ok = format!(
+            "ply\nformat binary_little_endian 1.0\n{}element vertex 0\n{XYZ}end_header\n",
+            pad(MAX_HEADER_LINE)
+        );
+        assert_eq!(read_ply(ok.as_bytes()).unwrap().len(), 0);
+        let bad = format!(
+            "ply\nformat binary_little_endian 1.0\n{}element vertex 0\n{XYZ}end_header\n",
+            pad(MAX_HEADER_LINE + 1)
+        );
+        let e = read_ply(bad.as_bytes()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("헤더 줄이 너무 김"), "{e}");
+    }
+
+    #[test]
+    fn long_line_without_newline_is_not_read_to_end() {
+        // 줄바꿈 없는 큰 줄: 상한+1 바이트만 읽고 멈춰야 한다.
+        struct Counting<'a>(&'a [u8], usize);
+        impl Read for Counting<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let n = self.0.read(out)?;
+                self.1 += n;
+                Ok(n)
+            }
+        }
+        let mut data = b"ply\ncomment ".to_vec();
+        data.resize(4 << 20, b'a');
+        let mut src = Counting(&data, 0);
+        let e = read_ply(&mut src).unwrap_err();
+        assert!(e.to_string().contains("헤더 줄이 너무 김"), "{e}");
+        // BufReader 내부 버퍼(8 KiB) 이상은 읽지 않는다.
+        assert!(
+            src.1 <= MAX_HEADER_LINE + 16 * 1024,
+            "읽은 바이트 {}",
+            src.1
+        );
+    }
+
+    #[test]
+    fn rejects_header_over_total_limit() {
+        // 각 줄은 짧지만 헤더 전체가 64 KiB 를 넘는다.
+        let comments = "comment 0123456789012345678901234567890123456789\n".repeat(1400);
+        let h = format!(
+            "ply\nformat binary_little_endian 1.0\n{comments}element vertex 0\n{XYZ}end_header\n"
+        );
+        assert!(h.len() > MAX_HEADER_BYTES);
+        let e = read_ply(h.as_bytes()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("헤더가 너무 큼"), "{e}");
+    }
+
+    #[test]
+    fn rejects_missing_or_wrong_format_line() {
+        let mut no_fmt = format!("ply\nelement vertex 1\n{XYZ}end_header\n").into_bytes();
+        no_fmt.extend_from_slice(&[0u8; 12]);
+        let e = read_ply(&no_fmt[..]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("format 줄 없음"), "{e}");
+
+        let mut v2 =
+            format!("ply\nformat binary_little_endian 2.0\nelement vertex 1\n{XYZ}end_header\n")
+                .into_bytes();
+        v2.extend_from_slice(&[0u8; 12]);
+        let e = read_ply(&v2[..]).unwrap_err();
+        assert!(e.to_string().contains("버전"), "{e}");
+
+        let mut twice = format!(
+            "ply\nformat binary_little_endian 1.0\nformat binary_little_endian 1.0\nelement vertex 1\n{XYZ}end_header\n"
+        )
+        .into_bytes();
+        twice.extend_from_slice(&[0u8; 12]);
+        let e = read_ply(&twice[..]).unwrap_err();
+        assert!(e.to_string().contains("둘 이상"), "{e}");
+
+        let mut ok = header_only("1", XYZ);
+        ok.extend_from_slice(&[0u8; 12]);
+        assert_eq!(read_ply(&ok[..]).unwrap().len(), 1);
     }
 }
