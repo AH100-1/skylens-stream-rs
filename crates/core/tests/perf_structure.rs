@@ -8,6 +8,10 @@ use skylens_core::matching::{candidate_pairs, PAIR_CROSS, PAIR_POW2_MAX, PAIR_TE
 use skylens_core::synth::{CamId, Scene, SceneConfig};
 use skylens_core::two_view::ESSENTIAL_MIN_ITERS;
 
+#[path = "../benches/support/args.rs"]
+#[allow(dead_code)]
+mod bench_args;
+
 /// 3 카메라 × `positions` 위치의 (카메라, 위치) 목록.
 fn rig_views(positions: usize) -> Vec<(usize, usize)> {
     (0..positions)
@@ -127,4 +131,59 @@ fn detected_scales_follow_octave_count() {
 #[test]
 fn essential_ransac_min_iterations_fixed() {
     assert_eq!(ESSENTIAL_MIN_ITERS, 300);
+}
+
+fn argv(s: &str) -> Vec<String> {
+    s.split_whitespace().map(str::to_string).collect()
+}
+
+/// bench 묶음 인자(`--full`·`--quick`)는 놓인 자리와 상관없이 먼저 적용되고 개별 인자가 이긴다.
+/// 예전에는 `--positions 20 --full` 이 위치 80 으로 바뀌어 줄인 측정이 전체 규모로 돌았다.
+#[test]
+fn bench_args_preset_order_does_not_matter() {
+    let a = bench_args::parse(&argv("--positions 20 --full"));
+    let b = bench_args::parse(&argv("--full --positions 20"));
+    assert_eq!(a, b);
+    assert_eq!(a.positions, 20);
+    // 나머지는 `--full` 값.
+    assert_eq!(
+        (a.width, a.height, a.repeat, a.ba_points),
+        (960, 540, 3, 20_000)
+    );
+
+    // 해상도·반복도 같은 규칙.
+    let c = bench_args::parse(&argv("--width 320 --height 180 --repeat 1 --full --bench"));
+    let d = bench_args::parse(&argv("--bench --full --width 320 --height 180 --repeat 1"));
+    assert_eq!(c, d);
+    assert_eq!(
+        (c.positions, c.width, c.height, c.repeat),
+        (80, 320, 180, 1)
+    );
+
+    let e = bench_args::parse(&argv("--ba-points 500 --quick"));
+    assert_eq!(e.ba_points, 500);
+    assert_eq!(e.positions, 8);
+
+    // 묶음끼리는 뒤의 것이 이긴다.
+    assert_eq!(bench_args::parse(&argv("--quick --full")).positions, 80);
+    assert_eq!(bench_args::parse(&argv("--full --quick")).positions, 8);
+}
+
+/// 인자 없는 실행은 빠른 규모(24장·480×270)이고, 240장은 `--full` 을 줄 때만이다.
+#[test]
+fn bench_args_default_is_quick_scale() {
+    let a = bench_args::parse(&[]);
+    assert_eq!(a, bench_args::parse(&argv("--quick")));
+    assert_eq!((a.positions, a.width, a.height), (8, 480, 270));
+    assert_eq!(bench_args::parse(&argv("--full")).positions, 80);
+    // ba-scale 은 위치를 따로 주지 않으면 80, 주면 그 값(묶음 인자도 위치를 준 것으로 본다).
+    assert_eq!(bench_args::parse(&argv("--mode ba-scale")).positions, 80);
+    assert_eq!(
+        bench_args::parse(&argv("--positions 4 --mode ba-scale")).positions,
+        4
+    );
+    assert_eq!(
+        bench_args::parse(&argv("--mode ba-scale --quick")).positions,
+        8
+    );
 }
