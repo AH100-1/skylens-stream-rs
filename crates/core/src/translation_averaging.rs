@@ -78,6 +78,10 @@ pub struct TranslationConfig {
     pub rigidity_angle_rad: f64,
     /// 정점이 이보다 많으면 정밀화 연립을 밀집 LU 대신 블록 야코비 선조건 켤레 기울기로 푼다.
     pub dense_max_vertices: usize,
+    /// 점 단계: 1단계 중심에서 점을 삼각측량할 때 정상 광선으로 볼 각(rad).
+    pub point_gate_rad: f64,
+    /// 점 단계 IRLS 의 코시 가중 각 척도(rad): 가중 × 1 / (1 + (각 잔차 / 척도)²).
+    pub robust_sigma_rad: f64,
 }
 
 impl Default for TranslationConfig {
@@ -91,6 +95,8 @@ impl Default for TranslationConfig {
             outlier_threshold_rad: 6f64.to_radians(),
             rigidity_angle_rad: 3f64.to_radians(),
             dense_max_vertices: 400,
+            point_gate_rad: 10f64.to_radians(),
+            robust_sigma_rad: 2f64.to_radians(),
         }
     }
 }
@@ -422,15 +428,153 @@ pub fn average_translations(
     observations: &[RelativeTranslation],
     cfg: &TranslationConfig,
 ) -> TranslationResult {
-    average_translations_with_points(rotations, observations, &[], cfg)
+    average_core(rotations, observations, &[], cfg, None)
 }
 
 /// [`average_translations`] 에 카메라→점 방향 관측을 더한다. 점은 정점 n_cam.. 으로 함께 푼다.
+///
+/// 두 단계로 푼다. 점 방향 이상치가 1차 최소제곱 해를 끌면 6° 거르기 뒤 그래프가 쪼개지므로,
+/// (1) 카메라 짝 방향만으로 중심을 구하고, (2) 그 중심에서 점을 강건하게 삼각측량하고(두 광선 중점 가설 +
+/// 정상 광선 수 최대), 등록되지 않은 카메라는 점 방향으로 선형 위치 추정(회전 고정)한 뒤, (3) 이 값에서
+/// 시작해 짝·점 간선을 함께 각 잔차 기반 강건 재가중(IRLS)으로 정밀화한다. 1차 최소제곱을 다시 풀지 않는다.
 pub fn average_translations_with_points(
     rotations: &[Option<Rotation3<f64>>],
     observations: &[RelativeTranslation],
     point_observations: &[PointObservation],
     cfg: &TranslationConfig,
+) -> TranslationResult {
+    if point_observations.is_empty() {
+        return average_core(rotations, observations, &[], cfg, None);
+    }
+    let n_cam = rotations.len();
+    let n_pts = point_observations
+        .iter()
+        .map(|o| o.point + 1)
+        .max()
+        .unwrap_or(0);
+    let stage = average_core(rotations, observations, &[], cfg, None);
+    if stage.registered() < 2 {
+        return average_core(rotations, observations, point_observations, cfg, None);
+    }
+    // 세계 방향 광선.
+    let rays: Vec<Option<Vector3<f64>>> = point_observations
+        .iter()
+        .map(|o| {
+            let ok = o.camera < n_cam
+                && o.point < n_pts
+                && o.weight > 0.0
+                && o.bearing.norm() > 1e-12
+                && o.bearing.iter().all(|x| x.is_finite());
+            ok.then(|| rotations[o.camera])
+                .flatten()
+                .map(|r| (r.inverse() * o.bearing).normalize())
+        })
+        .collect();
+    let mut by_point = vec![Vec::new(); n_pts];
+    for (k, o) in point_observations.iter().enumerate() {
+        if rays[k].is_some() {
+            by_point[o.point].push(k);
+        }
+    }
+    let gate = cfg.point_gate_rad;
+    let mut start: Vec<Option<Vector3<f64>>> = vec![None; n_cam + n_pts];
+    for (v, c) in stage.centers.iter().enumerate() {
+        start[v] = c.map(|c| c.coords);
+    }
+    // 점 삼각측량(등록된 카메라의 광선만).
+    for (p, ks) in by_point.iter().enumerate() {
+        let obs: Vec<(Vector3<f64>, Vector3<f64>)> = ks
+            .iter()
+            .filter_map(|&k| {
+                let c = start[point_observations[k].camera]?;
+                Some((c, rays[k]?))
+            })
+            .collect();
+        start[n_cam + p] = robust_ray_point(&obs, gate);
+    }
+    // 등록되지 않은 카메라: 회전 고정, 삼각측량된 점으로 선형 위치 추정(c 에 대해 같은 식).
+    let mut by_cam = vec![Vec::new(); n_cam];
+    for (k, o) in point_observations.iter().enumerate() {
+        if rays[k].is_some() {
+            by_cam[o.camera].push(k);
+        }
+    }
+    for cam in 0..n_cam {
+        if start[cam].is_some() {
+            continue;
+        }
+        let obs: Vec<(Vector3<f64>, Vector3<f64>)> = by_cam[cam]
+            .iter()
+            .filter_map(|&k| Some((start[n_cam + point_observations[k].point]?, -rays[k]?)))
+            .collect();
+        start[cam] = robust_ray_point(&obs, gate);
+    }
+    average_core(
+        rotations,
+        observations,
+        point_observations,
+        cfg,
+        Some(&start),
+    )
+}
+
+/// 광선들(원점, 단위 방향)이 가장 잘 만나는 점. 두 광선 중점 가설마다 각 `gate` 안에 드는 앞쪽 광선 수를 세어
+/// 가장 많은 가설의 정상 광선으로 최소제곱 min Σ |(I − d dᵀ)(x − o)|² 를 푼다. 정상 광선이 2개 미만이면 None.
+fn robust_ray_point(rays: &[(Vector3<f64>, Vector3<f64>)], gate: f64) -> Option<Vector3<f64>> {
+    let inl = |x: &Vector3<f64>| -> Vec<usize> {
+        (0..rays.len())
+            .filter(|&k| {
+                let v = x - rays[k].0;
+                v.dot(&rays[k].1) > 0.0 && angle_between(&v, &rays[k].1) < gate
+            })
+            .collect()
+    };
+    let ls = |idx: &[usize]| -> Option<Vector3<f64>> {
+        let mut a = Matrix3::zeros();
+        let mut b = Vector3::zeros();
+        for &k in idx {
+            let p = Matrix3::identity() - rays[k].1 * rays[k].1.transpose();
+            a += p;
+            b += p * rays[k].0;
+        }
+        a.try_inverse().map(|ai| ai * b)
+    };
+    let mut best: Vec<usize> = Vec::new();
+    let sin_min = 2f64.to_radians().sin();
+    for a in 0..rays.len() {
+        for b in a + 1..rays.len() {
+            if rays[a].1.cross(&rays[b].1).norm() < sin_min {
+                continue;
+            }
+            let Some(x) = ls(&[a, b]) else { continue };
+            let i = inl(&x);
+            if i.len() > best.len() {
+                best = i;
+            }
+        }
+    }
+    if best.len() < 2 {
+        return None;
+    }
+    let mut x = ls(&best)?;
+    for _ in 0..3 {
+        let i = inl(&x);
+        if i.len() < 2 {
+            break;
+        }
+        x = ls(&i)?;
+    }
+    x.iter().all(|v| v.is_finite()).then_some(x)
+}
+
+/// 본 풀이. `start` 가 있으면(전역 번호, 카메라 다음 점) 1차 최소제곱 대신 그 값에서 시작하고,
+/// IRLS 가중치에 각 잔차 기반 코시 가중을 곱하며, 시작값이 없는 정점에 닿는 간선은 쓰지 않는다.
+fn average_core(
+    rotations: &[Option<Rotation3<f64>>],
+    observations: &[RelativeTranslation],
+    point_observations: &[PointObservation],
+    cfg: &TranslationConfig,
+    start: Option<&[Option<Vector3<f64>>]>,
 ) -> TranslationResult {
     let n_cam = rotations.len();
     let n_pts = point_observations
@@ -464,6 +608,11 @@ pub fn average_translations_with_points(
                 continue;
             }
         }
+        if let Some(st) = start {
+            if st[o.i].is_none() || st[o.j].is_none() {
+                continue;
+            }
+        }
         edges.push(Edge {
             idx,
             i: o.i,
@@ -483,6 +632,16 @@ pub fn average_translations_with_points(
         let Some(r) = rot else {
             continue;
         };
+        if let Some(st) = start {
+            let (Some(xp), Some(xc)) = (st.get(n_cam + o.point).copied().flatten(), st[o.camera])
+            else {
+                continue;
+            };
+            // 시작값에서 이미 크게 어긋난 점 방향은 쓰지 않는다.
+            if angle_between(&(xp - xc), &(r.inverse() * o.bearing)) > cfg.point_gate_rad {
+                continue;
+            }
+        }
         edges.push(Edge {
             idx: observations.len() + k,
             i: n_cam + o.point,
@@ -555,7 +714,22 @@ pub fn average_translations_with_points(
         // 2. 초기값.
         let mut w: Vec<f64> = ledges.iter().map(|e| e.w).collect();
         let mut init = None;
-        for _ in 0..cfg.init_iterations.max(1) {
+        if let Some(st) = start {
+            let base = if pass == 0 {
+                verts
+                    .iter()
+                    .map(|&v| st[v].unwrap_or_default())
+                    .collect::<Vec<_>>()
+            } else {
+                c.clone()
+            };
+            init = Some(base.iter().map(|x| x - base[0]).collect());
+        }
+        for _ in 0..if start.is_some() {
+            0
+        } else {
+            cfg.init_iterations.max(1)
+        } {
             let Some(sol) = constrained_ls(m, &ledges, &w) else {
                 break;
             };
@@ -592,7 +766,13 @@ pub fn average_translations_with_points(
                 .zip(&s)
                 .map(|(e, &se)| {
                     let r = (cc[e.i] - cc[e.j] - e.d * se).norm();
-                    e.w / r.max(1e-3 * se)
+                    let robust = if start.is_some() {
+                        let a = ang_res(&cc, e) / cfg.robust_sigma_rad;
+                        1.0 / (1.0 + a * a)
+                    } else {
+                        1.0
+                    };
+                    e.w * robust / r.max(1e-3 * se)
                 })
                 .collect();
             // s 와 c 를 함께 푼다(교대 갱신은 80칸 사슬에서 수렴이 매우 느리다).
@@ -621,6 +801,34 @@ pub fn average_translations_with_points(
             break;
         }
         // 4. 정상 간선만 남기고 한 번 더.
+        // 시작값을 쓴 풀이는 2차에서 1차 해에서 이어 가므로 지역 번호가 그대로여야 한다.
+        if start.is_some() {
+            let keep: Vec<bool> = ledges
+                .iter()
+                .map(|e| ang_res(&c, e) <= cfg.outlier_threshold_rad)
+                .collect();
+            let full: Vec<Edge> = ledges
+                .into_iter()
+                .zip(&keep)
+                .filter_map(|(e, &k)| k.then_some(e))
+                .map(|e| Edge {
+                    i: verts[e.i],
+                    j: verts[e.j],
+                    ..e
+                })
+                .collect();
+            let mut glob = vec![None; n];
+            for (k, &v) in verts.iter().enumerate() {
+                glob[v] = Some(c[k]);
+            }
+            (ledges, verts) = restrict(full);
+            if verts.len() < 2 {
+                c.clear();
+                break;
+            }
+            c = verts.iter().map(|&v| glob[v].unwrap_or_default()).collect();
+            continue;
+        }
         let kept: Vec<Edge> = ledges
             .into_iter()
             .filter(|e| ang_res(&c, e) <= cfg.outlier_threshold_rad)
@@ -964,8 +1172,12 @@ mod tests {
     #[test]
     #[ignore = "진단 출력용"]
     fn diag_point_constraints() {
+        let seeds: Vec<u64> = std::env::var("DIAG_SEEDS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_else(|| (1..=5).collect());
         for frac in [0.10, 0.20] {
-            for seed in 1..=5u64 {
+            for &seed in &seeds {
                 let case = Case {
                     noise_deg: 1.0,
                     outlier_frac: frac,
@@ -1010,8 +1222,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "미해결: 시드 1·이상치 10% 에서 1차 해가 어긋나 6° 거르기 뒤 그래프가 쪼개짐(등록 102/240, 중심 RMS 9.3 m)"]
     fn noisy_outliers_register_all_seeds() {
+        // 짝 방향 잡음 1°·이상치 10/20%, 점 방향 이상치 5%. 기준: 240/240 등록, 닮음 정렬 후 중심 RMS < 0.15 m,
+        // 최대 < 0.5 m. 깨끗한 점 방향일 때 같은 시드들의 RMS 가 0.11~0.14 m 이므로 이상치를 걸러 그 수준에 들어야 한다.
         for (frac, rms_lim, max_lim) in [(0.10, 0.15, 0.5), (0.20, 0.15, 0.5)] {
             for seed in 1..=5u64 {
                 let case = Case {
