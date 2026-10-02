@@ -347,6 +347,7 @@ dependencies = [
 name = "skylens-stream"
 version = "0.1.0"
 dependencies = [
+ "image",
  "skylens-core",
 ]
 

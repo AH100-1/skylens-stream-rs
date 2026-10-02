@@ -291,6 +291,21 @@ pub struct ModelSelection {
     pub sigma_px: f64,
 }
 
+/// 순수 평면 짝 하나가 시차 짝으로 잘못 세어질 확률(H 잔차 χ²₂ 99.9% 초과).
+const FALSE_PARALLAX_RATE: f64 = 0.001;
+/// 순수 평면 n 짝에서 시차 짝 수가 필요 수에 우연히 이를 확률의 상한(RANSAC 유의성 `max_chance_prob` 와 같은 값).
+const PARALLAX_CHANCE_PROB: f64 = 1e-6;
+
+/// 평면으로 판정하지 않는 데 필요한 최소 시차 짝 수: 순수 평면 n 짝에서 우연 시차 짝 수
+/// B(n, 0.001) 이 k 이상일 확률이 1e-6 미만인 가장 작은 k(그리고 F 를 정하는 데 필요한 평면 밖 2점 이상).
+/// n = 50·200·300·1000 에서 4·6·6·10. 실측 편대 배치 순수 지면 300점 20 경우의 우연 시차 짝은 0~1
+/// (연구 노트 matching-followup 훑기 표).
+pub fn parallax_needed(n: usize) -> usize {
+    (2..=n)
+        .find(|&k| binomial_tail(n, k, FALSE_PARALLAX_RATE) < PARALLAX_CHANCE_PROB)
+        .unwrap_or(n + 1)
+}
+
 /// 정상 짝(x1, x2)과 그 F 에 대해 F/H 모델을 고른다. `sigma_px` 는 좌표 잡음 표준편차.
 ///
 /// GRIC(Torr 1998): Σ min(e²/σ², λ₃(r−d)) + λ₁ d n + λ₂ k, r = 4, λ₁ = ln r, λ₂ = ln(r n), λ₃ = 2,
@@ -299,10 +314,12 @@ pub struct ModelSelection {
 /// 순수 GRIC 는 평면 밖 짝 비율이 약 19% 미만이면(평면 위 짝마다 F 가 ln 4 를 더 내고 평면 밖 짝마다 H 가
 /// 약 3 을 더 내므로 ln4 − 1 ≈ 0.39 ≈ 2·비율) H 를 고른다. 그러나 F 는 호모그래피 + 평면 밖 두 점으로 정해지므로
 /// 지면 위주 장면에서 건물 몇 %만 있어도 F 가 정해진다. 그래서 GRIC 가 H 를 고르더라도 시차 짝 수가
-/// 순수 평면에서 우연히 나올 수 있는 수(기대 0.001n + 3√(0.001n), 여기에 고정 8)를 넘으면 F 를 고른다.
+/// 순수 평면에서 우연히 나올 수 있는 수([`parallax_needed`], 이항 꼬리 1e-6)에 이르면 F 를 고른다.
 /// 잡음 크기는 호출자 σ 와 정상 짝의 제곱 Sampson 거리 중앙값에서 구한 강건 추정
 /// σ̂ = √(중앙값 / 0.455)(χ²₁ 중앙값) 가운데 큰 쪽을 쓴다(σ 를 실제보다 작게 넘겨도 평면 밖 시차로 잘못 세지 않게).
-/// 정상 짝이 8개 미만이거나, σ 가 유한한 양수가 아니거나, 호모그래피를 맞출 수 없으면 None.
+/// 정상 짝이 8개 미만이거나, 길이가 다르거나, σ 가 유한한 양수가 아니거나, 좌표·F 성분에 유한하지 않은
+/// 값이 있거나, 호모그래피를 맞출 수 없으면 None(유한하지 않은 짝은 GRIC 누산에서 상한값으로 잘려
+/// 판정을 H 쪽으로 기울이므로 제외하지 않고 오류로 돌려준다).
 pub fn select_two_view_model(
     x1: &[Vector2<f64>],
     x2: &[Vector2<f64>],
@@ -310,7 +327,14 @@ pub fn select_two_view_model(
     sigma_px: f64,
 ) -> Option<ModelSelection> {
     let n = x1.len();
-    if n < 8 || n != x2.len() || !sigma_px.is_finite() || sigma_px <= 0.0 {
+    if n < 8
+        || n != x2.len()
+        || !sigma_px.is_finite()
+        || sigma_px <= 0.0
+        || !all_finite(x1)
+        || !all_finite(x2)
+        || !f.iter().all(|v| v.is_finite())
+    {
         return None;
     }
     let mut es: Vec<f64> = x1
@@ -349,8 +373,7 @@ pub fn select_two_view_model(
     let (l1, l2) = (4f64.ln(), (4.0 * nf).ln());
     let gric_f = rho_f + l1 * 3.0 * nf + l2 * 7.0;
     let gric_h = rho_h + l1 * 2.0 * nf + l2 * 8.0;
-    let mu = 0.001 * nf;
-    let parallax_needed = 8 + (mu + 3.0 * mu.sqrt()).ceil() as usize;
+    let parallax_needed = parallax_needed(n);
     let model = if gric_h < gric_f && parallax < parallax_needed {
         TwoViewModel::Homography
     } else {
@@ -783,20 +806,41 @@ fn off_line_count(p: &[Vector2<f64>], th_px: f64) -> usize {
 /// 한 직선 밖 정상 짝이 이보다 적으면 F 가 정해지지 않는다(3차원 직선은 F 에 제약 몇 개만 준다).
 const MIN_OFF_LINE: usize = 8;
 
+/// [`ransac_fundamental`] 의 결과: F 와 정상 짝, 그리고 정상 짝에 대한 두 시점 모델 판정.
+#[derive(Clone, Debug)]
+pub struct FundamentalFit {
+    /// 정상 짝으로 다시 맞춘 기본 행렬(프로베니우스 노름 1, 계수 2).
+    pub f: Matrix3<f64>,
+    /// 짝마다 정상 여부.
+    pub inliers: Vec<bool>,
+    /// 정상 짝에 [`select_two_view_model`] 을 적용한 결과(σ = threshold_px / 3).
+    /// 호모그래피를 맞출 수 없으면 None 이고 그때 `model` 은 Fundamental.
+    pub selection: Option<ModelSelection>,
+    /// `Homography` 이면 평면(또는 시차 없는) 짝이라 F 가 정해지지 않는다 — 이동 방향을 꺼내지 않는다.
+    pub model: TwoViewModel,
+}
+
+impl FundamentalFit {
+    /// 평면 표시: 정상 짝이 호모그래피로 충분히 설명되어 F(이동 방향)를 믿을 수 없다.
+    pub fn is_planar(&self) -> bool {
+        self.model == TwoViewModel::Homography
+    }
+}
+
 /// RANSAC(Fischler & Bolles 1981) + 8점 기본 행렬로 기하 검증.
-/// 반환: (정상 짝으로 다시 맞춘 F, 정상 여부 표시).
+/// 반환: [`FundamentalFit`] (정상 짝으로 다시 맞춘 F, 정상 여부 표시, 평면 판정).
 /// 정상 짝이 `max(8, min_inliers)` 개 미만이거나 정상 비율이 `min_inlier_ratio` 미만이면 None.
 /// 정상 수가 무관한 대응에서 우연히 나올 확률([`chance_inlier_probability`])이 `max_chance_prob` 를 넘으면 None
 /// (시야가 겹치지 않는 짝에서 비율 검사를 지난 우연 짝을 거른다).
 /// 정상 짝이 거의 한 직선 위(짧은 축/긴 축 표준편차 비 0.02 미만)이거나, 한 직선(문턱 threshold_px)
 /// 밖 정상 짝이 어느 영상에서든 8개 미만이면 퇴화로 보고 None.
-/// 평면·순수 회전 판정은 하지 않는다 — 정상 짝에 [`select_two_view_model`] 을 따로 적용한다.
-/// 길이가 다르거나 유한하지 않은 좌표가 있으면 None.
+/// 평면 짝은 거부하지 않고 [`FundamentalFit::model`] 에 `Homography` 로 표시한다(호출자가 표시를 보고
+/// 이동 제약을 뺀다). 길이가 다르거나 유한하지 않은 좌표가 있으면 None.
 pub fn ransac_fundamental(
     x1: &[Vector2<f64>],
     x2: &[Vector2<f64>],
     cfg: &RansacConfig,
-) -> Option<(Matrix3<f64>, Vec<bool>)> {
+) -> Option<FundamentalFit> {
     let n = x1.len();
     if n < 8 || n != x2.len() || !all_finite(x1) || !all_finite(x2) {
         return None;
@@ -943,10 +987,18 @@ pub fn ransac_fundamental(
     if off_line_count(&s1, line_th) < MIN_OFF_LINE || off_line_count(&s2, line_th) < MIN_OFF_LINE {
         return None;
     }
-    // 평면 판정은 여기서 하지 않는다: 같은 위치에서 회전만 한 짝(시선 90° 차이 등)도 호모그래피로
-    // 설명되며 그 짝의 회전은 쓸모가 있다. 호출자가 정상 짝으로 [`select_two_view_model`] 을 불러
-    // 호모그래피가 선택되면 F 에서 이동을 꺼내지 않는다.
-    Some((f, inl))
+    // 평면 판정: 거부하지 않고 표시한다. 실측 편대(카메라 간격 약 10 m, 위치 간 약 1 m)에는 같은 자리에서
+    // 시선만 도는 순수 회전 짝이 없다. 거부하지 않는 이유는 지면 위주 장면에서 평면 짝의 회전은
+    // 호모그래피로도 쓸 수 있고, 정상 짝 수는 겹침 판단(간선 존재)에 쓰이기 때문이다.
+    // 평면 표시가 붙은 F 에서 이동 방향을 꺼내면 안 된다(에피폴이 임의).
+    let selection = select_two_view_model(&s1, &s2, &f, cfg.threshold_px / 3.0);
+    let model = selection.map_or(TwoViewModel::Fundamental, |m| m.model);
+    Some(FundamentalFit {
+        f,
+        inliers: inl,
+        selection,
+        model,
+    })
 }
 
 /// 정답 카메라 두 대로부터 기본 행렬 F = K2⁻ᵀ [t]× R K1⁻¹ (상대 자세 2←1).
@@ -997,6 +1049,15 @@ mod tests {
             let (u1, u2) = (self.next().max(1e-300), self.next());
             (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
         }
+    }
+
+    /// 시험용: [`ransac_fundamental`] 의 (F, 정상 표시).
+    fn ransac_fi(
+        x1: &[Vector2<f64>],
+        x2: &[Vector2<f64>],
+        cfg: &RansacConfig,
+    ) -> Option<(Matrix3<f64>, Vec<bool>)> {
+        ransac_fundamental(x1, x2, cfg).map(|r| (r.f, r.inliers))
     }
 
     fn two_cameras() -> (Camera, Camera) {
@@ -1075,7 +1136,7 @@ mod tests {
     fn ransac_separates_outliers() {
         for (out, seed) in [(0.3, 5u64), (0.5, 9)] {
             let (x1, x2, truth, c1, c2) = correspondences(300, 0.5, out, seed);
-            let (f, inl) = ransac_fundamental(&x1, &x2, &RansacConfig::default()).unwrap();
+            let (f, inl) = ransac_fi(&x1, &x2, &RansacConfig::default()).unwrap();
             let tp = (0..x1.len()).filter(|&i| inl[i] && truth[i]).count();
             let fp = (0..x1.len()).filter(|&i| inl[i] && !truth[i]).count();
             let pos = truth.iter().filter(|&&t| t).count();
@@ -1132,7 +1193,7 @@ mod tests {
                             seed: r,
                             ..RansacConfig::default()
                         };
-                        let est = ransac_fundamental(&x1, &x2, &cfg).map(|(_, inl)| pr(&inl));
+                        let est = ransac_fi(&x1, &x2, &cfg).map(|(_, inl)| pr(&inl));
                         (d, r, gt, est)
                     })
                     .collect::<Vec<_>>()
@@ -1348,7 +1409,7 @@ mod tests {
                         .is_some_and(|e| (e - q).norm() < 2.0)
             })
             .collect();
-        let Some((_, inl)) = ransac_fundamental(&x1, &x2, &RansacConfig::default()) else {
+        let Some((_, inl)) = ransac_fi(&x1, &x2, &RansacConfig::default()) else {
             let pos = truth.iter().filter(|&&t| t).count();
             return (pos as f64 / m.len().max(1) as f64, 0.0, 0.0, 0);
         };
@@ -1750,7 +1811,7 @@ mod tests {
                 min_inlier_ratio: 0.0,
                 ..RansacConfig::default()
             };
-            let cnt = ransac_fundamental(&x1, &x2, &loose)
+            let cnt = ransac_fi(&x1, &x2, &loose)
                 .map(|(_, inl)| inl.iter().filter(|&&b| b).count())
                 .unwrap_or(0);
             eprintln!("seed={seed} 우연 정상 수={cnt}/200");
@@ -1794,7 +1855,7 @@ mod tests {
         for seed in 1..=5u64 {
             // 모든 점 z = 0, σ = 0.5 px: RANSAC 이 낸 F 와 정상 짝으로 모델을 고르면 호모그래피.
             let (x1, x2) = planar_correspondences(200, 0.5, seed);
-            let (f, inl) = ransac_fundamental(&x1, &x2, &cfg).expect("평면 장면에서 RANSAC None");
+            let (f, inl) = ransac_fi(&x1, &x2, &cfg).expect("평면 장면에서 RANSAC None");
             let s1: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x1[i]).collect();
             let s2: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x2[i]).collect();
             let m = select_two_view_model(&s1, &s2, &f, cfg.threshold_px / 3.0).unwrap();
@@ -1875,7 +1936,7 @@ mod tests {
                 let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
                 eprintln!("건물 {bld} seed {seed}: {m:?}");
                 assert_eq!(m.model, TwoViewModel::Fundamental, "건물 {bld} seed {seed}");
-                let (f, inl) = ransac_fundamental(&x1, &x2, &cfg).expect("지면+건물 장면에서 None");
+                let (f, inl) = ransac_fi(&x1, &x2, &cfg).expect("지면+건물 장면에서 None");
                 let s1: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x1[i]).collect();
                 let s2: Vec<_> = (0..x1.len()).filter(|&i| inl[i]).map(|i| x2[i]).collect();
                 let me = select_two_view_model(&s1, &s2, &f, cfg.threshold_px / 3.0).unwrap();
@@ -1976,7 +2037,7 @@ mod tests {
             .count();
         LM_ITERS.with(|v| v.borrow_mut().clear());
         let (c0, w0) = (thread_cpu_ns(), std::time::Instant::now());
-        let (_, inl) = ransac_fundamental(&x1, &x2, &RansacConfig::default()).unwrap();
+        let (_, inl) = ransac_fi(&x1, &x2, &RansacConfig::default()).unwrap();
         let wall = w0.elapsed().as_secs_f64();
         let cpu = thread_cpu_ns().zip(c0).map(|(b, a)| (b - a) as f64 * 1e-9);
         let lm = LM_ITERS.with(|v| std::mem::take(&mut *v.borrow_mut()));
@@ -2075,7 +2136,7 @@ mod tests {
             let mut confirmed = 0;
             for seed in 1..=10u64 {
                 let (x1, x2, h1, h2) = line_plus_general(k, 0.5, seed);
-                let Some((f, _)) = ransac_fundamental(&x1, &x2, &cfg) else {
+                let Some((f, _)) = ransac_fi(&x1, &x2, &cfg) else {
                     continue;
                 };
                 confirmed += 1;
@@ -2136,6 +2197,8 @@ mod tests {
         }
         eprintln!("거부 {rejected}/{total}, 이전 기준 통과 {legacy_pass}/{total}");
         assert_eq!(rejected, total, "정답 짝 0 인 쌍 거부율 {rejected}/{total}");
+        // 이전 기준이 실제로 통과시키는 경우가 있어야 이 시험이 두 기준을 가른다.
+        assert!(legacy_pass > 0, "이전 기준 통과 {legacy_pass}/{total}");
     }
 
     #[test]
@@ -2149,7 +2212,7 @@ mod tests {
             if nt < 16 {
                 continue;
             }
-            let (_, inl) = ransac_fundamental(&x1, &x2, &cfg)
+            let (_, inl) = ransac_fi(&x1, &x2, &cfg)
                 .unwrap_or_else(|| panic!("seed {seed}: 정답 {nt}/30 인데 거부"));
             let hit = (0..30).filter(|&i| inl[i] && truth[i]).count();
             assert!(
@@ -2327,7 +2390,7 @@ mod tests {
                 let px = |f: &Feature| Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
                 let x1: Vec<_> = m.iter().map(|&(i, _)| px(&fa[i])).collect();
                 let x2: Vec<_> = m.iter().map(|&(_, j)| px(&fb[j])).collect();
-                let Some((f, inl)) = ransac_fundamental(&x1, &x2, &RansacConfig::default()) else {
+                let Some((f, inl)) = ransac_fi(&x1, &x2, &RansacConfig::default()) else {
                     continue;
                 };
                 ok += 1;
@@ -2366,5 +2429,226 @@ mod tests {
             (tot_bad as f64) < 0.05 * tot_ok as f64,
             "회전 오차 > 2° 간선 {tot_bad} / 확정 {tot_ok}"
         );
+    }
+
+    #[test]
+    fn parallax_needed_values() {
+        let v: Vec<_> = [50usize, 200, 300, 1000]
+            .iter()
+            .map(|&n| parallax_needed(n))
+            .collect();
+        eprintln!("필요 시차 짝 n=50,200,300,1000: {v:?}");
+        assert_eq!(v, vec![4, 6, 6, 10]);
+        for n in [50usize, 300, 1000] {
+            let k = parallax_needed(n);
+            assert!(binomial_tail(n, k, 0.001) < 1e-6);
+            assert!(binomial_tail(n, k - 1, 0.001) >= 1e-6);
+        }
+    }
+
+    #[test]
+    fn model_selection_rejects_non_finite_coordinates() {
+        // F-182: NaN·∞ 좌표 하나만 있어도 None(GRIC 누산에서 상한값으로 잘려 H 쪽으로 기울던 경우).
+        let (c1, c2) = two_cameras();
+        let f0 = fundamental_from_cameras(&c1, &c2);
+        let (x1, x2, _, _, _) = correspondences(50, 0.5, 0.0, 1);
+        let base = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+        assert_eq!(base.model, TwoViewModel::Fundamental);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for (which, i) in [(0, 3usize), (1, 3), (0, 49), (1, 0)] {
+                let (mut y1, mut y2) = (x1.clone(), x2.clone());
+                if which == 0 {
+                    y1[i].x = bad;
+                } else {
+                    y2[i].y = bad;
+                }
+                assert!(
+                    select_two_view_model(&y1, &y2, &f0, 0.5).is_none(),
+                    "{bad} 영상 {which} 짝 {i}"
+                );
+            }
+            let mut fb = f0;
+            fb[(1, 2)] = bad;
+            assert!(
+                select_two_view_model(&x1, &x2, &fb, 0.5).is_none(),
+                "F {bad}"
+            );
+        }
+    }
+
+    /// 실측 편대 배치(`SceneConfig::default()`, 960×540) 카메라 `cam` 의 위치 8 과 8+gap 짝.
+    /// 영상 a 의 균일한 픽셀에서 광선을 쏘아 지면 z = 0(비율 1−bld) 또는 높이 3~8 m 건물 지붕(비율 bld)에서 만나는
+    /// 점을 영상 b 로 투영한다(가림 무시). 앞쪽 nb 개가 건물 점. σ px 잡음.
+    #[allow(clippy::type_complexity)]
+    fn formation_pair(
+        cam: crate::synth::CamId,
+        gap: usize,
+        n: usize,
+        bld: f64,
+        sigma: f64,
+        seed: u64,
+    ) -> (Vec<Vector2<f64>>, Vec<Vector2<f64>>, Camera, Camera, usize) {
+        use crate::synth::{Scene, SceneConfig};
+        let scene = Scene::new(SceneConfig::default());
+        let view = |pos: usize| {
+            scene
+                .views
+                .iter()
+                .find(|v| v.cam == cam && v.position == pos)
+                .unwrap()
+                .camera
+        };
+        let (ca, cb) = (view(8), view(8 + gap));
+        let mut g = Lcg(seed * 104_729 + gap as u64);
+        let nb = (n as f64 * bld).round() as usize;
+        let (w, h) = (ca.intrinsics.width as f64, ca.intrinsics.height as f64);
+        let (mut x1, mut x2) = (vec![], vec![]);
+        let o = ca.pose.center();
+        while x1.len() < n {
+            let z = if x1.len() < nb {
+                3.0 + 5.0 * g.next()
+            } else {
+                0.0
+            };
+            let a = Vector2::new(g.next() * w, g.next() * h);
+            let d = ca.unproject(&a, 1.0) - o;
+            if d.z >= 0.0 {
+                continue;
+            }
+            let p = o + d * ((z - o.z) / d.z);
+            let Some(b) = cb.project(&p) else {
+                continue;
+            };
+            if !cb.intrinsics.contains(&b) {
+                continue;
+            }
+            x1.push(a + Vector2::new(g.gauss(), g.gauss()) * sigma);
+            x2.push(b + Vector2::new(g.gauss(), g.gauss()) * sigma);
+        }
+        (x1, x2, ca, cb, nb)
+    }
+
+    /// 추정 F 로 꺼낸 이동 방향과 정답 이동 방향의 각(도). 꺼낼 수 없으면 180.
+    fn translation_angle_deg(
+        f: &Matrix3<f64>,
+        inl: &[bool],
+        x1: &[Vector2<f64>],
+        x2: &[Vector2<f64>],
+        ca: &Camera,
+        cb: &Camera,
+    ) -> f64 {
+        let (k1, k2) = (&ca.intrinsics, &cb.intrinsics);
+        let e = crate::two_view::essential_from_fundamental(f, k1, k2);
+        let n1: Vec<_> = (0..x1.len())
+            .filter(|&i| inl[i])
+            .map(|i| k1.to_normalized(&x1[i]))
+            .collect();
+        let n2: Vec<_> = (0..x2.len())
+            .filter(|&i| inl[i])
+            .map(|i| k2.to_normalized(&x2[i]))
+            .collect();
+        let r = cb.pose.rotation * ca.pose.rotation.inverse();
+        let t = (cb.pose.translation - r * ca.pose.translation).normalize();
+        crate::two_view::recover_pose(&e, &n1, &n2)
+            .map(|p| {
+                p.translation
+                    .normalize()
+                    .dot(&t)
+                    .clamp(-1.0, 1.0)
+                    .acos()
+                    .to_degrees()
+            })
+            .unwrap_or(180.0)
+    }
+
+    /// F-141 훑기: 실측 편대 배치 F 카메라 시간 이웃 1·2·4·8칸 × 건물 0·1·2·3·5% × 시드 1~5
+    /// (300점, σ 0.5 px). 정답 F 로 고른 모델·시차 짝 수, RANSAC 의 평면 표시와 이동 방향 오차를 표로 출력한다.
+    /// 수치 기록용(단언은 `formation_ground_with_buildings_keeps_fundamental` 이 한다).
+    #[test]
+    fn formation_parallax_sweep() {
+        use crate::synth::CamId;
+        let cfg = RansacConfig::default();
+        eprintln!("간격 | 건물 | 시차 짝(정답 F) 최소~최대 | 필요 | F 판정(정답 F) | 평면 표시(RANSAC) | 이동 방향 오차 중앙/최대(°)");
+        for gap in [1usize, 2, 4, 8] {
+            for bld in [0.0, 0.01, 0.02, 0.03, 0.05] {
+                let (mut pmin, mut pmax, mut need, mut nf, mut planar) =
+                    (usize::MAX, 0usize, 0usize, 0usize, 0usize);
+                let mut errs = vec![];
+                for seed in 1..=5u64 {
+                    let (x1, x2, ca, cb, _) = formation_pair(CamId::F, gap, 300, bld, 0.5, seed);
+                    let f0 = fundamental_from_cameras(&ca, &cb);
+                    let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+                    pmin = pmin.min(m.parallax);
+                    pmax = pmax.max(m.parallax);
+                    need = m.parallax_needed;
+                    nf += (m.model == TwoViewModel::Fundamental) as usize;
+                    if let Some(r) = ransac_fundamental(&x1, &x2, &cfg) {
+                        planar += r.is_planar() as usize;
+                        errs.push(translation_angle_deg(&r.f, &r.inliers, &x1, &x2, &ca, &cb));
+                    } else {
+                        errs.push(f64::NAN);
+                    }
+                }
+                errs.sort_by(f64::total_cmp);
+                eprintln!(
+                    "{gap}칸 | {:.0}% | {pmin}~{pmax} | {need} | {nf}/5 | {planar}/5 | {:.2}/{:.2}",
+                    bld * 100.0,
+                    errs[2],
+                    errs[4]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn formation_ground_with_buildings_keeps_fundamental() {
+        // F-141: 실측 편대 배치 기선 1 m(F 카메라 1칸), 건물 5%(15점), σ 0.5 px: 시드 1~5 모두 F 이고
+        // 시차 짝이 필요 수보다 3 이상 많다. 순수 평면은 H.
+        use crate::synth::CamId;
+        for seed in 1..=5u64 {
+            let (x1, x2, ca, cb, _) = formation_pair(CamId::F, 1, 300, 0.05, 0.5, seed);
+            let f0 = fundamental_from_cameras(&ca, &cb);
+            let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+            eprintln!("편대 1칸 건물 5% seed {seed}: {m:?}");
+            assert_eq!(m.model, TwoViewModel::Fundamental, "seed {seed}: {m:?}");
+            assert!(
+                m.parallax >= m.parallax_needed + 3,
+                "seed {seed}: 시차 짝 {} 필요 {}",
+                m.parallax,
+                m.parallax_needed
+            );
+            let (x1, x2, ca, cb, _) = formation_pair(CamId::F, 1, 300, 0.0, 0.5, seed);
+            let f0 = fundamental_from_cameras(&ca, &cb);
+            let m = select_two_view_model(&x1, &x2, &f0, 0.5).unwrap();
+            assert_eq!(m.model, TwoViewModel::Homography, "평면 seed {seed}: {m:?}");
+        }
+    }
+
+    #[test]
+    fn formation_planar_pair_is_flagged() {
+        // F-142: 실측 편대 배치(F·R·L 각 카메라, 1·4칸)의 순수 지면 짝은 RANSAC 이 F 를 내더라도
+        // 평면 표시와 함께 돌려준다. 건물 10% 짝은 표시가 없다.
+        use crate::synth::CamId;
+        let cfg = RansacConfig::default();
+        for cam in CamId::ALL {
+            for gap in [1usize, 4] {
+                for seed in 1..=3u64 {
+                    let (x1, x2, _, _, _) = formation_pair(cam, gap, 200, 0.0, 0.5, seed);
+                    let r = ransac_fundamental(&x1, &x2, &cfg).expect("지면 짝 None");
+                    assert!(
+                        r.is_planar(),
+                        "{cam:?} {gap}칸 seed {seed}: {:?}",
+                        r.selection
+                    );
+                    let (x1, x2, _, _, _) = formation_pair(cam, gap, 300, 0.1, 0.5, seed);
+                    let r = ransac_fundamental(&x1, &x2, &cfg).expect("건물 짝 None");
+                    assert!(
+                        !r.is_planar(),
+                        "{cam:?} {gap}칸 건물 10% seed {seed}: {:?}",
+                        r.selection
+                    );
+                }
+            }
+        }
     }
 }
