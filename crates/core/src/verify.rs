@@ -248,8 +248,13 @@ pub fn verify_dir(dir: &Path) -> Report {
         expected.extend(m.keys().copied());
     }
     if let Ok(rows) = &steps {
+        // 깨진 manifest 의 큰 step 하나가 기대 구역을 수천만 개로 부풀리지 않도록,
+        // 다른 근거(report·PLY)의 구역 수와 정수 단계 줄 수 중 큰 값 + 1 에서 자른다.
+        // 잘린 단계는 check_snapshots 가 "구역 수 초과" 로 FAIL 한다.
+        let ints = rows.iter().filter(|r| r.step.is_some()).count();
+        let cap = expected.len().max(ints) + 1;
         let last = rows.iter().filter_map(|r| r.step).max().unwrap_or(0);
-        expected.extend(0..last);
+        expected.extend(0..last.min(cap));
     }
 
     let items = vec![
@@ -430,15 +435,44 @@ fn check_align(m: &Json, expected: &BTreeSet<usize>) -> Result<(bool, String), S
         spread * 100.0
     );
     if !missing.is_empty() {
-        let _ = write!(msg, "; 정렬 기록 없는 구역 {missing:?}");
+        let _ = write!(msg, "; 정렬 기록 없는 구역 {}", brief(&missing));
     }
     if !extra.is_empty() {
-        let _ = write!(msg, "; 출력에 없는 구역의 정렬 기록 {extra:?}");
+        let _ = write!(msg, "; 출력에 없는 구역의 정렬 기록 {}", brief(&extra));
     }
     if !dup.is_empty() {
-        let _ = write!(msg, "; 중복 정렬 기록 {dup:?}");
+        let _ = write!(msg, "; 중복 정렬 기록 {}", brief(&dup));
     }
     Ok((pass, msg))
+}
+
+/// 긴 번호 목록은 앞 `LIST_HEAD` 개와 전체 개수만 보인다(깨진 입력에서 출력이 커지지 않게).
+const LIST_HEAD: usize = 10;
+
+fn brief<T: std::fmt::Debug>(v: &[T]) -> String {
+    if v.len() <= LIST_HEAD {
+        format!("{v:?}")
+    } else {
+        format!(
+            "{:?} 외 {}개 (총 {}개)",
+            &v[..LIST_HEAD],
+            v.len() - LIST_HEAD,
+            v.len()
+        )
+    }
+}
+
+fn brief_names(v: &[String]) -> String {
+    if v.len() <= LIST_HEAD {
+        v.join(",")
+    } else {
+        format!(
+            "{} 외 {}개 (총 {}개)",
+            v[..LIST_HEAD].join(","),
+            v.len() - LIST_HEAD,
+            v.len()
+        )
+    }
 }
 
 fn missing_of(expected: &BTreeSet<usize>, have: &BTreeMap<usize, PointCloud>) -> Vec<usize> {
@@ -486,10 +520,10 @@ fn check_preview_vs_refined(
         expected.len()
     );
     if !miss_p.is_empty() {
-        let _ = write!(m, ", 초벌 없는 구역 {miss_p:?}");
+        let _ = write!(m, ", 초벌 없는 구역 {}", brief(&miss_p));
     }
     if !miss_r.is_empty() {
-        let _ = write!(m, ", 정밀 없는 구역 {miss_r:?}");
+        let _ = write!(m, ", 정밀 없는 구역 {}", brief(&miss_r));
     }
     Ok((pass, m))
 }
@@ -503,7 +537,7 @@ fn check_overlap(
     }
     let miss = missing_of(expected, r);
     if !miss.is_empty() {
-        return Ok((false, format!("정밀 없는 구역 {miss:?}")));
+        return Ok((false, format!("정밀 없는 구역 {}", brief(&miss))));
     }
     let keys: Vec<usize> = r.keys().copied().collect();
     if keys.len() < 2 {
@@ -586,7 +620,19 @@ fn check_snapshots(
     let have: Vec<usize> = ints.iter().filter_map(|r| r.step).collect();
     let miss_steps: Vec<usize> = want.iter().filter(|k| !have.contains(k)).copied().collect();
     if !miss_steps.is_empty() {
-        problems.push(format!("manifest 에 없는 단계 {miss_steps:?}"));
+        problems.push(format!("manifest 에 없는 단계 {}", brief(&miss_steps)));
+    }
+    let over: Vec<usize> = have
+        .iter()
+        .filter(|&&k| k > expected.len())
+        .copied()
+        .collect();
+    if !over.is_empty() {
+        problems.push(format!(
+            "구역 수 {} 초과 단계 {}",
+            expected.len(),
+            brief(&over)
+        ));
     }
     if have.windows(2).any(|w| w[0] == w[1]) {
         problems.push("중복 단계".into());
@@ -663,14 +709,14 @@ fn check_snapshots(
             .collect();
         extra.sort();
         if !extra.is_empty() {
-            problems.push(format!("manifest 에 없는 파일 {}", extra.join(",")));
+            problems.push(format!("manifest 에 없는 파일 {}", brief_names(&extra)));
         }
     }
     if !missing_files.is_empty() {
-        problems.push(format!("빠진 파일 {}", missing_files.join(",")));
+        problems.push(format!("빠진 파일 {}", brief_names(&missing_files)));
     }
     if !nan_files.is_empty() {
-        problems.push(format!("NaN: {}", nan_files.join(",")));
+        problems.push(format!("NaN: {}", brief_names(&nan_files)));
     }
     let first = ints.first().map_or(f64::NAN, |r| r.points);
     let last = ints.last().map_or(f64::NAN, |r| r.points);
@@ -864,19 +910,22 @@ impl NnIndex {
         if self.nodes.is_empty() || !usable(q) {
             return None;
         }
-        let mut best_d2 = max_r * max_r;
+        // 같은 거리의 상자·점은 더 볼 필요가 없다(`>=` 가지치기, `<` 갱신). 같은 좌표 점이
+        // 많을 때 `>`/`<=` 로 두면 그 점들을 모두 훑어 질의당 O(n) 이 된다. 반경 경계의 점을
+        // 그대로 받도록 시작 상한을 아주 조금 넓힌다.
+        let mut best_d2 = max_r * max_r * (1.0 + 1e-12);
         let mut best: Option<usize> = None;
         let mut stack = vec![0usize];
         while let Some(id) = stack.pop() {
             let n = &self.nodes[id];
-            if self.box_d2(n, q) > best_d2 {
+            if self.box_d2(n, q) >= best_d2 {
                 continue;
             }
             match n.kids {
                 None => {
                     for i in n.start..n.end {
                         let d = self.d2(q, &self.pts[i]);
-                        if d <= best_d2 {
+                        if d < best_d2 {
                             best_d2 = d;
                             best = Some(i);
                         }
@@ -991,7 +1040,7 @@ impl Json {
 pub fn parse_json(s: &str) -> Result<Json, String> {
     let b = s.as_bytes();
     let mut i = 0;
-    let v = parse_value(b, &mut i)?;
+    let v = parse_value(b, &mut i, 0)?;
     skip_ws(b, &mut i);
     if i != b.len() {
         return Err(format!("JSON 위치 {i}: 남는 문자"));
@@ -1015,8 +1064,15 @@ fn expect(b: &[u8], i: &mut usize, c: u8) -> Result<(), String> {
     }
 }
 
-fn parse_value(b: &[u8], i: &mut usize) -> Result<Json, String> {
+/// 배열·객체 중첩 상한. 출력 파일은 깊이 3~4 이므로 넉넉하고, 깨진 파일의 깊은 중첩이
+/// 재귀로 스택을 넘기지 않게 한다.
+pub const JSON_MAX_DEPTH: usize = 64;
+
+fn parse_value(b: &[u8], i: &mut usize, depth: usize) -> Result<Json, String> {
     skip_ws(b, i);
+    if depth >= JSON_MAX_DEPTH && matches!(b.get(*i), Some(b'{' | b'[')) {
+        return Err(format!("JSON 위치 {}: 중첩 깊이 {JSON_MAX_DEPTH} 초과", *i));
+    }
     let err = |i: usize| format!("JSON 위치 {i}: 값이 잘못됨");
     match b.get(*i).copied() {
         Some(b'{') => {
@@ -1031,7 +1087,7 @@ fn parse_value(b: &[u8], i: &mut usize) -> Result<Json, String> {
                 skip_ws(b, i);
                 let k = parse_str(b, i)?;
                 expect(b, i, b':')?;
-                v.push((k, parse_value(b, i)?));
+                v.push((k, parse_value(b, i, depth + 1)?));
                 skip_ws(b, i);
                 match b.get(*i) {
                     Some(b',') => *i += 1,
@@ -1052,7 +1108,7 @@ fn parse_value(b: &[u8], i: &mut usize) -> Result<Json, String> {
                 return Ok(Json::Arr(v));
             }
             loop {
-                v.push(parse_value(b, i)?);
+                v.push(parse_value(b, i, depth + 1)?);
                 skip_ws(b, i);
                 match b.get(*i) {
                     Some(b',') => *i += 1,
@@ -1209,6 +1265,78 @@ mod tests {
         assert!((height_pair_median(&query, &reference, 2.0).unwrap() - 0.5).abs() < 1e-12);
         let t = NnIndex::new(&reference, 2);
         assert!(t.nearest(&[1e30, 0.0, 0.0], 2.0).is_none());
+    }
+
+    /// 같은 좌표 점 20만 개를 기준으로, 질의 20만 개(같은 좌표 10만 + 그 둘레 원 위 10만).
+    /// 가지치기가 같은 거리 상자를 남기면 질의마다 20만 점을 다 훑어 165 s 걸렸다.
+    /// 정답: 같은 좌표 질의는 0, 원 위 질의는 반지름 1.0 → 짝수 개의 중앙 = (0 + 1)/2 = 0.5.
+    #[test]
+    fn nn_median_many_identical_points_is_fast_and_exact() {
+        let n = 200_000;
+        let reference = vec![[10.0, 10.0, 0.0]; n];
+        let query: Vec<[f64; 3]> = (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    [10.0, 10.0, 0.0]
+                } else {
+                    let a = i as f64 * 0.001;
+                    [10.0 + a.cos(), 10.0 + a.sin(), 0.0]
+                }
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        let m = nn_median(&query, &reference).unwrap();
+        let h = height_pair_median(&query, &reference, 2.0).unwrap();
+        let secs = t0.elapsed().as_secs_f64();
+        assert!((m - 0.5).abs() < 1e-9, "{m}");
+        assert_eq!(h, 0.0);
+        assert!(secs < 1.0, "{secs:.3} s");
+    }
+
+    /// 같은 좌표·같은 거리 점이 많은 점군에서 브루트포스와 거리가 같고,
+    /// 반경 정확히 경계의 점도 찾는다(시작 상한을 조금 넓힌 효과).
+    #[test]
+    fn nearest_with_ties_matches_brute_force() {
+        let mut pts = Vec::new();
+        for i in 0..40 {
+            for _ in 0..30 {
+                pts.push([(i % 5) as f64, (i / 5) as f64, 0.0]);
+            }
+        }
+        let g = NnIndex::new(&pts, 3);
+        for qx in 0..12 {
+            for qy in 0..18 {
+                let q = [qx as f64 * 0.5 - 0.5, qy as f64 * 0.5 - 0.5, 0.25];
+                let bf = pts
+                    .iter()
+                    .map(|p| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + 0.0625).sqrt())
+                    .fold(f64::INFINITY, f64::min);
+                let (_, d) = g.nearest(&q, 50.0).unwrap();
+                assert!((d - bf).abs() < 1e-12, "{q:?}: {d} vs {bf}");
+            }
+        }
+        let (_, d) = g.nearest(&[0.0, 0.0, 3.0], 3.0).unwrap();
+        assert_eq!(d, 3.0);
+        assert!(g.nearest(&[0.0, 0.0, 3.0], 2.999).is_none());
+    }
+
+    /// 깊은 중첩은 스택을 넘기지 않고 형식 오류. 깊이 64 바로 아래는 읽는다.
+    #[test]
+    fn json_depth_is_limited() {
+        let ok = format!(
+            "{}{}",
+            "[".repeat(JSON_MAX_DEPTH),
+            "]".repeat(JSON_MAX_DEPTH)
+        );
+        assert!(parse_json(&ok).is_ok());
+        let bad = format!(
+            "{}{}",
+            "[".repeat(JSON_MAX_DEPTH + 1),
+            "]".repeat(JSON_MAX_DEPTH + 1)
+        );
+        assert!(parse_json(&bad).unwrap_err().contains("중첩 깊이"));
+        let huge = format!("{{\"snapshots\":{}", "[".repeat(300_000));
+        assert!(parse_json(&huge).unwrap_err().contains("중첩 깊이"));
     }
 
     #[test]
