@@ -17,6 +17,7 @@ pub mod translation_averaging;
 pub mod triangulation;
 pub mod two_view;
 pub mod undistort;
+pub mod verify;
 pub mod view_selection;
 
 pub use nalgebra;
