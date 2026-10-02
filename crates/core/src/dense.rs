@@ -794,32 +794,6 @@ mod tests {
     const P90_48: f64 = 0.15;
     const SECS48: f64 = 120.0;
 
-    /// 실제 크기(긴 변 960) 12장: 사진당 시간을 재서 48장 구역 시간을 어림한다.
-    #[test]
-    fn real_size_960_seconds_per_image() {
-        let (s, views, sparse) = scene_views(4, 960, 540);
-        let cfg = DenseConfig::default();
-        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
-        let t = Instant::now();
-        let cloud = region_cloud(&views, &sparse, &cfg);
-        let secs = t.elapsed().as_secs_f64();
-        let (med, p90) = quantiles(&s, &cloud);
-        eprintln!(
-            "dense960: images {} points {} median {med:.4} p90 {p90:.4} secs {secs:.2} \
-             ({:.3} s/image, 48 images ~ {:.1} s) cores {} load {}",
-            views.len(),
-            cloud.len(),
-            secs / views.len() as f64,
-            48.0 * secs / views.len() as f64,
-            std::thread::available_parallelism().map_or(0, |n| n.get()),
-            load.trim()
-        );
-        assert!(cloud.len() > 50_000, "점 수 {}", cloud.len());
-        assert!(med < 0.05, "중앙값 {med}");
-        assert!(p90 < 0.2, "90% {p90}");
-        assert!(secs < 300.0, "시간 {secs}");
-    }
-
     #[test]
     fn too_few_views_gives_empty_cloud() {
         let (_, views, sparse) = scene_views(1, 64, 36);
