@@ -1050,8 +1050,8 @@ fn prior_solve(
     }
     let sol: Vec<Vector3<f64>> = if n <= dense_max {
         let mut a = DMatrix::<f64>::zeros(3 * n, 3 * n);
-        for v in 0..n {
-            a.view_mut((3 * v, 3 * v), (3, 3)).copy_from(&diag[v]);
+        for (v, dv) in diag.iter().enumerate().take(n) {
+            a.view_mut((3 * v, 3 * v), (3, 3)).copy_from(dv);
         }
         for (i, j, m) in edges {
             for (r, c, sign) in [(*i, *j, -1.0), (*j, *i, -1.0)] {
@@ -1551,22 +1551,21 @@ mod tests {
         assert_eq!(cfg.spacing, 1.0);
         let scene = Scene::new(cfg);
         (
-            scene.views.iter().map(|v| v.camera.pose.clone()).collect(),
+            scene.views.iter().map(|v| v.camera.pose).collect(),
             scene.gps_enu,
         )
     }
 
     /// 실측 배치의 관측: 짝 일정은 `pairs`(같은 카메라 SPEC §3.2 + 시야 겹침 다른 카메라).
-    fn real_observations(
-        seed: u64,
-        case: &Case,
-        gps_sigma: f64,
-    ) -> (
+    /// (정답 자세, GPS, 전역 회전, 짝 관측).
+    type RealObs = (
         Vec<Pose>,
         Vec<Point3<f64>>,
         Vec<Option<Rotation3<f64>>>,
         Vec<RelativeTranslation>,
-    ) {
+    );
+
+    fn real_observations(seed: u64, case: &Case, gps_sigma: f64) -> RealObs {
         let (poses, gps) = real_formation(seed, gps_sigma);
         let mut rng = Rng(seed);
         let rots: Vec<_> = poses
