@@ -2360,13 +2360,14 @@ mod tests {
 
     /// F-148 매칭 쪽: 실측 편대 배치(`SceneConfig::default()`)의 SPEC 짝 일정 — 같은 카메라
     /// 1·2·3·4·5·8·16칸, 다른 카메라(F→R, F→L, R→L) 위치 차 −4..=4 — 에서 매칭·RANSAC 이
-    /// 확정한 짝마다 F → E → `recover_pose` 회전을 정답 상대 회전 R_b R_aᵀ 와 비교한다.
-    /// 짝 종류별 (시도, 확정, 회전 오차 > 2°) 를 출력하고, 확정 간선 중 2° 초과 비율 < 5% 를 단언한다.
-    /// 시드 1 측정(480×270): 같은 카메라 1·2·3·8칸 2° 초과 0, 4칸 2/3(약 6.5°), 5칸 2/3
-    /// (최대 11.2°), 16칸 1/3(21.8°), 다른 카메라 ±4 는 27 짝 모두 미확정 — 확정 21 중 5 가 틀림.
-    /// 틀린 간선은 모두 같은 카메라 짝이라 겹침 없는 짝 통과가 원인이 아니다. 원인 분리 전이라 무시.
+    /// 짝마다 두 경로의 회전을 정답 상대 회전 R_b R_aᵀ 와 비교한다.
+    /// - F 경로: `ransac_fundamental` 이 확정한 짝의 F → E → `recover_pose`.
+    /// - E 경로: 두 시점 자세 단계·bench 가 쓰는 `ransac_essential_candidates`(정규 좌표, 초점 fx)의
+    ///   첫 후보(= `ransac_essential`)와 2순위 후보 각각 → `recover_pose`.
+    ///
+    /// 짝 종류별 두 경로 확정 수·2° 초과 수·오차를 출력하고, 자세 단계가 쓰는 E 경로 첫 후보의
+    /// 2° 초과 비율 < 5% 를 단언한다(F 경로의 평면 쌍둥이 선택은 출력만 한다).
     #[test]
-    #[ignore = "F-148: 같은 카메라 4·5·16칸에서 회전 오차 2° 초과 5/21, 원인 미분리(노트 남은 문제)"]
     fn formation_pair_schedule_rotation_errors() {
         use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
         use crate::synth::{CamId, Scene, SceneConfig};
@@ -2416,9 +2417,49 @@ mod tests {
                 .collect();
             kinds.push((format!("{a:?}→{b:?} ±4"), v));
         }
-        let (mut tot_ok, mut tot_bad) = (0usize, 0usize);
+        type Stat = (usize, usize, Vec<f64>);
+        let rot_err = |e: &Matrix3<f64>,
+                       inl: &[bool],
+                       x1: &[Vector2<f64>],
+                       x2: &[Vector2<f64>],
+                       va: &crate::synth::View,
+                       vb: &crate::synth::View|
+         -> f64 {
+            let (k1, k2) = (&va.camera.intrinsics, &vb.camera.intrinsics);
+            let n1: Vec<_> = (0..x1.len())
+                .filter(|&i| inl[i])
+                .map(|i| k1.to_normalized(&x1[i]))
+                .collect();
+            let n2: Vec<_> = (0..x2.len())
+                .filter(|&i| inl[i])
+                .map(|i| k2.to_normalized(&x2[i]))
+                .collect();
+            let truth = vb.camera.pose.rotation * va.camera.pose.rotation.inverse();
+            crate::two_view::recover_pose(e, &n1, &n2)
+                .map(|p| (p.rotation * truth.inverse()).angle().to_degrees())
+                .unwrap_or(180.0)
+        };
+        let push = |st: &mut Stat, err: f64| {
+            st.0 += 1;
+            st.1 += (err > 2.0) as usize;
+            st.2.push(err);
+        };
+        let show = |st: &mut Stat| -> String {
+            st.2.sort_by(f64::total_cmp);
+            format!(
+                "확정 {} >2° {} 중앙 {:.3}° 최대 {:.3}°",
+                st.0,
+                st.1,
+                st.2.get(st.2.len() / 2).copied().unwrap_or(f64::NAN),
+                st.2.last().copied().unwrap_or(f64::NAN)
+            )
+        };
+        let mut tot_f: Stat = (0, 0, vec![]);
+        let mut tot_e: Stat = (0, 0, vec![]);
         for (name, list) in &kinds {
-            let (mut ok, mut bad, mut errs) = (0usize, 0usize, Vec::new());
+            let mut sf: Stat = (0, 0, vec![]);
+            let mut se: Stat = (0, 0, vec![]);
+            let mut se2: Stat = (0, 0, vec![]);
             for &(ca, pa, cb, pb) in list {
                 let (va, fa) = feats(ca, pa);
                 let (vb, fb) = feats(cb, pb);
@@ -2426,44 +2467,48 @@ mod tests {
                 let px = |f: &Feature| Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
                 let x1: Vec<_> = m.iter().map(|&(i, _)| px(&fa[i])).collect();
                 let x2: Vec<_> = m.iter().map(|&(_, j)| px(&fb[j])).collect();
-                let Some((f, inl)) = ransac_fi(&x1, &x2, &RansacConfig::default()) else {
-                    continue;
-                };
-                ok += 1;
                 let (k1, k2) = (&va.camera.intrinsics, &vb.camera.intrinsics);
-                let e = crate::two_view::essential_from_fundamental(&f, k1, k2);
-                let n1: Vec<_> = (0..x1.len())
-                    .filter(|&i| inl[i])
-                    .map(|i| k1.to_normalized(&x1[i]))
-                    .collect();
-                let n2: Vec<_> = (0..x2.len())
-                    .filter(|&i| inl[i])
-                    .map(|i| k2.to_normalized(&x2[i]))
-                    .collect();
-                let truth = vb.camera.pose.rotation * va.camera.pose.rotation.inverse();
-                let err = crate::two_view::recover_pose(&e, &n1, &n2)
-                    .map(|p| (p.rotation * truth.inverse()).angle().to_degrees())
-                    .unwrap_or(180.0);
-                if err > 2.0 {
-                    bad += 1;
+                if let Some((f, inl)) = ransac_fi(&x1, &x2, &RansacConfig::default()) {
+                    let e = crate::two_view::essential_from_fundamental(&f, k1, k2);
+                    push(&mut sf, rot_err(&e, &inl, &x1, &x2, &va, &vb));
                 }
-                errs.push(err);
+                let n1: Vec<_> = x1.iter().map(|p| k1.to_normalized(p)).collect();
+                let n2: Vec<_> = x2.iter().map(|p| k2.to_normalized(p)).collect();
+                let cands = crate::two_view::ransac_essential_candidates(
+                    &n1,
+                    &n2,
+                    k1.fx,
+                    &RansacConfig::default(),
+                );
+                if let Some((e, inl)) = cands.first() {
+                    push(&mut se, rot_err(e, inl, &x1, &x2, &va, &vb));
+                }
+                if let Some((e, inl)) = cands.get(1) {
+                    push(&mut se2, rot_err(e, inl, &x1, &x2, &va, &vb));
+                }
             }
-            errs.sort_by(f64::total_cmp);
+            tot_f.0 += sf.0;
+            tot_f.1 += sf.1;
+            tot_e.0 += se.0;
+            tot_e.1 += se.1;
             eprintln!(
-                "짝 종류 {name}: 시도 {}, 확정 {ok}, 회전 오차 > 2° {bad}, 오차 중앙 {:.3}°, 최대 {:.3}°",
+                "짝 종류 {name}: 시도 {} | F 경로 {} | E 경로 첫 후보 {} | E 경로 2순위 {}",
                 list.len(),
-                errs.get(errs.len() / 2).copied().unwrap_or(f64::NAN),
-                errs.last().copied().unwrap_or(f64::NAN)
+                show(&mut sf),
+                show(&mut se),
+                show(&mut se2)
             );
-            tot_ok += ok;
-            tot_bad += bad;
         }
-        eprintln!("전체 확정 {tot_ok}, 회전 오차 > 2° {tot_bad}");
-        assert!(tot_ok > 0);
+        eprintln!(
+            "전체 F 경로 확정 {} >2° {} | E 경로 첫 후보 확정 {} >2° {}",
+            tot_f.0, tot_f.1, tot_e.0, tot_e.1
+        );
+        assert!(tot_e.0 > 0);
         assert!(
-            (tot_bad as f64) < 0.05 * tot_ok as f64,
-            "회전 오차 > 2° 간선 {tot_bad} / 확정 {tot_ok}"
+            (tot_e.1 as f64) < 0.05 * tot_e.0 as f64,
+            "E 경로 회전 오차 > 2° 간선 {} / 확정 {}",
+            tot_e.1,
+            tot_e.0
         );
     }
 
