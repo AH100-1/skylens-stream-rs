@@ -61,9 +61,9 @@ skylens-stream synth <출력 폴더> [폭 높이]
 # 등록 사진 수·구역 사진 수·재투영 오차는 출력 폴더의 report.json 이 있을 때만 판정한다
 skylens-stream verify <출력 폴더>
 
-# 합성 장면으로 끝까지 돌려 보기(synth → run → verify). 느리면 --stride 8 --max-features 800 --dense-width 96 을 더한다
-skylens-stream synth scene 480 270
-skylens-stream run scene out --stride 8 --span 6 --ovl 1 --max-features 800 --dense-width 96
+# 합성 장면으로 끝까지 돌려 보기(synth → run → verify). 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(--span 48)으로 잡는다
+skylens-stream synth scene 320 180
+skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96
 skylens-stream verify out
 
 # 판 번호 출력 ("skylens-stream 0.1.0")
@@ -296,9 +296,9 @@ skylens-stream synth <output dir> [width height]
 # Registered images, region images and reprojection error are decided only when report.json is in the output folder
 skylens-stream verify <output dir>
 
-# Run a synthetic scene end to end (synth -> run -> verify); add --stride 8 --max-features 800 --dense-width 96 if slow
-skylens-stream synth scene 480 270
-skylens-stream run scene out --stride 8 --span 6 --ovl 1 --max-features 800 --dense-width 96
+# Run a synthetic scene end to end (synth -> run -> verify); cross-camera overlap only appears between positions 12-40 apart, so use regions of 40+ positions (--span 48)
+skylens-stream synth scene 320 180
+skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96
 skylens-stream verify out
 
 # Print the version ("skylens-stream 0.1.0")

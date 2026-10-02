@@ -17,7 +17,7 @@ use crate::camera::{Camera, Intrinsics, Pose};
 use crate::dataset::Dataset;
 use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use crate::fusion::{fuse, FusionConfig, FusionView};
-use crate::matching::{candidate_pairs, ratio_match, RansacConfig, PAIR_CROSS, PAIR_TEMPORAL};
+use crate::matching::{ratio_match, RansacConfig, PAIR_TEMPORAL};
 use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::ply::{PointCloud, PointRecord};
 use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
@@ -283,8 +283,43 @@ struct PairMatch {
     t: Option<Vector3<f64>>,
 }
 
+/// 편대 겹침(FEEDBACK F-197)에 맞춘 짝 목록. `views[k] = (카메라 번호 F=0 R=1 L=2, 위치 번호)`.
+/// 같은 카메라는 위치 차 1..=PAIR_TEMPORAL, 같은 위치 근처(차 <= 2)의 다른 카메라,
+/// 카메라 사이는 F(p)–R(p+12..=p+40), F(p)–L(p+16..=p+40) 을 `CROSS_STEP` 간격으로 표본한다.
+/// 결과 (i, j) 는 i < j, 중복 없음, 정렬됨.
+pub fn formation_pairs(views: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    const CROSS_STEP: i64 = 4;
+    let mut out = Vec::new();
+    for i in 0..views.len() {
+        for j in 0..views.len() {
+            if i == j {
+                continue;
+            }
+            let ((ca, pa), (cb, pb)) = (views[i], views[j]);
+            let dist = pa.abs_diff(pb);
+            let ok = if ca == cb {
+                j > i && (1..=PAIR_TEMPORAL).contains(&dist)
+            } else if dist <= 2 {
+                j > i
+            } else if ca == 0 {
+                let d = pb as i64 - pa as i64;
+                let lo = if cb == 1 { 12 } else { 16 };
+                (lo..=40).contains(&d) && (d - lo) % CROSS_STEP == 0
+            } else {
+                false
+            };
+            if ok {
+                out.push((i.min(j), i.max(j)));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> Vec<PairMatch> {
-    let pairs = candidate_pairs(views, PAIR_TEMPORAL, PAIR_CROSS.min(2), 0);
+    let pairs = formation_pairs(views);
     pairs
         .par_iter()
         .filter_map(|&(i, j)| {
@@ -565,6 +600,7 @@ fn dense_cloud(
                 },
                 rgb: small.pixels().map(|p| p.0).collect(),
                 neighbors: Vec::new(),
+                group: Some((i % 3) as u32),
             }
         })
         .collect();
@@ -578,6 +614,8 @@ fn dense_cloud(
         min_views: 2,
         normal_deg: 180.0,
         min_ratio: 0.3,
+        min_groups: 1,
+        same_group_views: None,
     };
     let mut cloud = fuse(&views, &maps, cfg);
     for p in &s.points {

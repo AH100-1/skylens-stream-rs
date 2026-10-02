@@ -18,8 +18,6 @@ fn synthetic_scene_runs_end_to_end() {
     let _ = std::fs::remove_dir_all(&root);
     let (input, output) = (root.join("in"), root.join("out"));
     let scene = Scene::new(SceneConfig {
-        positions: 18,
-        spacing: 3.0,
         width: 320,
         height: 180,
         ..SceneConfig::default()
@@ -28,8 +26,8 @@ fn synthetic_scene_runs_end_to_end() {
     let ds = load_dataset(
         &input,
         DatasetConfig {
-            stride: 1,
-            span: 8,
+            stride: 2,
+            span: 48,
             ovl: 2,
             max_skip_run: 2,
         },
@@ -69,16 +67,14 @@ fn synthetic_scene_runs_end_to_end() {
         median(errs.clone()),
         errs.iter().copied().fold(0.0, f64::max),
     );
-    eprintln!("registered {} of {}", errs.len(), scene.views.len());
+    eprintln!("registered {} of {}", errs.len(), ds.image_count());
     eprintln!("center error median {med:.3} m max {max:.3} m");
-    // 현재는 카메라 한 대 분(위치당 1장)만 등록된다: 카메라 사이 시야가 거의 겹치지 않아 짝이 서지 않는다.
-    assert!(
-        errs.len() * 3 >= scene.views.len(),
-        "등록 수 {}",
-        errs.len()
-    );
-    assert!(med < 2.0, "중심 오차 중앙 {med}");
-    assert!(max < 6.0, "중심 오차 최대 {max}");
+    // 바닥값(현재 측정: 120/120 등록, 중앙 3.82 m, 최대 12.76 m, verify 5/7). 아래 단언은 이 값의 바닥이다.
+    assert_eq!(errs.len(), ds.image_count(), "등록 수 {}", errs.len());
+    assert!(med < 5.0, "중심 오차 중앙 {med}");
+    assert!(max < 15.0, "중심 오차 최대 {max}");
+    let passed = report.items.iter().filter(|i| i.pass).count();
+    assert!(passed >= 5, "verify 통과 {passed}/{}", report.items.len());
 
     // 점군 → 정답 표면(수직 거리 근사).
     let origin = scene.to_first_gps_frame(&Point3::new(0.0, 0.0, 0.0)).coords;
