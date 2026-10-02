@@ -38,6 +38,10 @@ pub const GHOST_RADIUS_M: f64 = 1.5;
 pub const DECIMATE_EVERY: usize = 6;
 /// SPEC §4 초벌 정렬 기준: 정상 짝 잔차 중앙 상한(m).
 pub const FIT_MEDIAN_LIMIT_M: f64 = 6.0;
+/// SPEC §4: 구역 정렬 점쌍 하한.
+pub const ALIGN_MIN_PAIRS: usize = 1000;
+/// SPEC §4: 구역 간 스케일 차 max(s)/min(s) − 1 상한.
+pub const ALIGN_SCALE_TOL: f64 = 0.10;
 
 /// 구역 하나: 번호, 기준 시작 위치, 포함 위치 범위 `[lo, hi)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,22 +303,48 @@ type CellMap = HashMap<(i64, i64, i64), u32, BuildHasherDefault<CellHasher>>;
 
 const NIL: u32 = u32::MAX;
 
-/// 격자 해시 최근접 검사기(반경 고정). 칸마다 힙 할당 없이 평평한 배열 + 칸별 연결 목록.
+/// 격자 해시 반경 검사기(반경 고정). 칸마다 힙 할당 없이 평평한 배열 + 칸별 연결 목록.
+///
+/// 칸 한 변은 반경/√3 이라 칸 대각선이 반경보다 짧다: 질의 점과 같은 칸에 점이 하나라도 있으면
+/// 곧바로 참이다. 이웃 칸은 ±2 칸까지 보되 칸 상자까지의 최소 거리가 반경을 넘는 칸은 건너뛴다.
+/// 넣은 점군마다 경계 상자를 따로 두어, 어느 상자에서도 반경 밖인 질의는 칸을 보지 않고 거짓이다.
+/// 촘촘한 점군에서 질의 비용이 칸 하나의 점 수에 거의 묶이므로 전체 시간이 점 수에 선형에 가깝다.
 pub struct RadiusIndex {
+    radius: f64,
     cell: f64,
     head: CellMap,
     next: Vec<u32>,
     pts: Vec<[f32; 3]>,
+    boxes: Vec<([f64; 3], [f64; 3])>,
+}
+
+/// 점에서 축 정렬 상자까지 제곱 거리.
+fn box_dist2(p: [f64; 3], lo: [f64; 3], hi: [f64; 3]) -> f64 {
+    let mut d2 = 0.0;
+    for i in 0..3 {
+        let d = if p[i] < lo[i] {
+            lo[i] - p[i]
+        } else if p[i] > hi[i] {
+            p[i] - hi[i]
+        } else {
+            0.0
+        };
+        d2 += d * d;
+    }
+    d2
 }
 
 impl RadiusIndex {
     pub fn new(radius: f64) -> Self {
         assert!(radius > 0.0);
         Self {
-            cell: radius,
+            radius,
+            // 반경/√3 보다 조금 작게: 반올림으로 칸 대각선이 반경을 넘지 않도록.
+            cell: radius / 3f64.sqrt() * (1.0 - 1e-9),
             head: CellMap::default(),
             next: Vec::new(),
             pts: Vec::new(),
+            boxes: Vec::new(),
         }
     }
 
@@ -339,11 +369,17 @@ impl RadiusIndex {
     pub fn insert_cloud(&mut self, cloud: &PointCloud) {
         self.pts.reserve(cloud.len());
         self.next.reserve(cloud.len());
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
         for p in &cloud.points {
             if !p.xyz.iter().all(|x| x.is_finite()) {
                 continue;
             }
             let q = [p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64];
+            for i in 0..3 {
+                lo[i] = lo[i].min(q[i]);
+                hi[i] = hi[i].max(q[i]);
+            }
             let k = self.key(q);
             let id = u32::try_from(self.pts.len()).expect("점 수가 u32 범위를 넘음");
             let h = self.head.entry(k).or_insert(NIL);
@@ -351,16 +387,39 @@ impl RadiusIndex {
             *h = id;
             self.pts.push(p.xyz);
         }
+        if lo[0] <= hi[0] {
+            self.boxes.push((lo, hi));
+        }
     }
 
     /// 반경 안(거리 ≤ radius)에 점이 있는가.
     pub fn has_within(&self, p: [f64; 3]) -> bool {
-        let r2 = self.cell * self.cell;
+        let r2 = self.radius * self.radius;
+        if !self
+            .boxes
+            .iter()
+            .any(|(lo, hi)| box_dist2(p, *lo, *hi) <= r2)
+        {
+            return false;
+        }
         let (kx, ky, kz) = self.key(p);
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    let mut i = match self.head.get(&(kx + dx, ky + dy, kz + dz)) {
+        if self.head.contains_key(&(kx, ky, kz)) {
+            return true;
+        }
+        let c = self.cell;
+        for dx in -2i64..=2 {
+            for dy in -2i64..=2 {
+                for dz in -2i64..=2 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let k = (kx + dx, ky + dy, kz + dz);
+                    let lo = [k.0 as f64 * c, k.1 as f64 * c, k.2 as f64 * c];
+                    let hi = [lo[0] + c, lo[1] + c, lo[2] + c];
+                    if box_dist2(p, lo, hi) > r2 {
+                        continue;
+                    }
+                    let mut i = match self.head.get(&k) {
                         Some(&h) => h,
                         None => continue,
                     };
@@ -853,7 +912,9 @@ pub fn snapshot_name(step: Step) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamReport {
     pub manifest: Manifest,
-    /// SPEC §4 위반(스냅샷 단조성·새 영역·NaN, 정렬 실패·잔차 중앙 초과). 비어 있으면 통과.
+    /// SPEC §4 위반 목록. 검사 범위: 구역 0개, 스냅샷 단조성·2단계부터 새 영역·NaN,
+    /// 초벌 정렬 실패, `align` 기록의 점쌍 < [`ALIGN_MIN_PAIRS`]·잔차 중앙 ≥ [`FIT_MEDIAN_LIMIT_M`]·
+    /// 구역 간 스케일 차 > [`ALIGN_SCALE_TOL`]. 비어 있어도 이 범위 밖 기준(재투영·높이 등)은 판정하지 않는다.
     pub issues: Vec<String>,
     /// 한 번에 메모리에 들고 있던 스냅샷 점 수 최댓값.
     pub peak_snapshot_points: usize,
@@ -900,6 +961,9 @@ pub fn write_outputs(
         |s| write_ply_file(dir.join(snapshot_name(s.step)), &s.cloud),
     )?;
     let mut issues = check_snapshots(&summary);
+    if n == 0 {
+        issues.push("구역 0개".to_string());
+    }
     for (r, p) in regions.iter().zip(prelim_aligned) {
         if p.is_none() {
             issues.push(format!("구역 {}: 초벌 정렬 실패", r.index));
@@ -913,6 +977,25 @@ pub fn write_outputs(
                     a.region
                 ));
             }
+        }
+    }
+    for a in &align {
+        if a.pairs < ALIGN_MIN_PAIRS {
+            issues.push(format!(
+                "구역 {}: 정렬 점쌍 {} < {ALIGN_MIN_PAIRS}",
+                a.region, a.pairs
+            ));
+        }
+    }
+    let scales: Vec<f64> = align.iter().filter_map(|a| a.scale).collect();
+    if !scales.is_empty() {
+        let lo = scales.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = scales.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let spread = hi / lo - 1.0;
+        if !(lo > 0.0 && spread <= ALIGN_SCALE_TOL) {
+            issues.push(format!(
+                "구역 간 스케일 차 {spread:.3} > {ALIGN_SCALE_TOL} (최소 {lo:.4}, 최대 {hi:.4})"
+            ));
         }
     }
     let manifest = Manifest::new(summary.entries, align);
@@ -1238,8 +1321,9 @@ mod tests {
     }
 
     /// 오대응 30 %·50 %: 기준(측정 전) 스케일 1 %, 창 안 정상 점 정답 잔차 중앙 < 0.3 m, fit 중앙 < 0.3 m.
-    /// 정상 짝이 과반이므로 트리밍이 정상 쪽으로 수렴하리라 보았으나, 첫 추정(전체 짝 최소제곱)이
-    /// ±20 m 오대응에 끌려 스케일이 0.41 로 무너지고 그 잔차 중앙으로 임계를 잡아 복구하지 못한다.
+    /// 첫 추정을 전체 짝 최소제곱으로 하던 때는 ±20 m 오대응에 끌려 스케일이 0.41 로 무너지고
+    /// 그 잔차 중앙으로 임계를 잡아 복구하지 못했다. 표본 짝 잔차 분위수로 고르는 강건 첫 추정
+    /// ([`robust_fit`]) 뒤에는 복구한다: 30 % 스케일비 1.0000·fit 0.1005, 50 % 1.0002·0.0983.
     #[test]
     fn prelim_alignment_outlier_fractions() {
         for (frac, seed) in [(0.3, 21u64), (0.5, 22)] {
@@ -1533,6 +1617,144 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// 쓰기 쪽 출력 폴더를 출력 검증으로 읽는다: step 은 정수·"final" 이고 스냅샷 항목이 PASS.
+    #[test]
+    fn write_outputs_passes_verify_snapshots() {
+        let n_pos = 26;
+        let regions = split_regions(n_pos, DEFAULT_SPAN, DEFAULT_OVL);
+        let truth = truth_points(n_pos);
+        let refined: Vec<PointCloud> = regions
+            .iter()
+            .map(|r| region_cloud(r, &truth, 0.0))
+            .collect();
+        let prelim: Vec<Option<PointCloud>> = regions
+            .iter()
+            .map(|r| Some(region_cloud(r, &truth, 0.4)))
+            .collect();
+        let dir = unique_dir("verify");
+        write_outputs(&dir, &regions, &prelim, &refined, vec![]).unwrap();
+        let text = std::fs::read_to_string(dir.join("snapshots/manifest.json")).unwrap();
+        assert!(
+            text.contains("\"step\": 1") || text.contains("\"step\":1"),
+            "{text}"
+        );
+        assert!(text.contains("\"final\""), "{text}");
+        assert!(!text.contains("\"01\""), "{text}");
+        let rep = crate::verify::verify_dir(&dir);
+        let it = rep
+            .item(crate::verify::ITEM_SNAPSHOTS)
+            .expect("snapshots 항목");
+        assert!(it.decided && it.pass, "{it:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 정렬 기록 점쌍 하한·스케일 차, 구역 0개가 위반으로 보고된다.
+    #[test]
+    fn write_outputs_reports_align_limits_and_empty() {
+        let n_pos = 26;
+        let regions = split_regions(n_pos, DEFAULT_SPAN, DEFAULT_OVL);
+        let truth = truth_points(n_pos);
+        let refined: Vec<PointCloud> = regions
+            .iter()
+            .map(|r| region_cloud(r, &truth, 0.0))
+            .collect();
+        let prelim: Vec<Option<PointCloud>> = regions
+            .iter()
+            .map(|r| Some(region_cloud(r, &truth, 0.4)))
+            .collect();
+        let dir = unique_dir("limits");
+        let align = vec![
+            AlignRecord {
+                region: 0,
+                pairs: 200,
+                fit_median_m: Some(0.1),
+                scale: Some(0.5),
+            },
+            AlignRecord {
+                region: 1,
+                pairs: 200,
+                fit_median_m: Some(0.1),
+                scale: Some(1.0),
+            },
+        ];
+        let rep = write_outputs(&dir, &regions, &prelim, &refined, align).unwrap();
+        assert_eq!(
+            rep.issues.iter().filter(|s| s.contains("점쌍")).count(),
+            2,
+            "{:?}",
+            rep.issues
+        );
+        assert!(
+            rep.issues.iter().any(|s| s.contains("스케일 차")),
+            "{:?}",
+            rep.issues
+        );
+        // 정상 기록(점쌍 1000, 스케일 차 5 %)은 위반 없음.
+        let ok = vec![
+            AlignRecord {
+                region: 0,
+                pairs: 1000,
+                fit_median_m: Some(0.1),
+                scale: Some(1.0),
+            },
+            AlignRecord {
+                region: 1,
+                pairs: 5000,
+                fit_median_m: Some(0.1),
+                scale: Some(1.05),
+            },
+        ];
+        let rep = write_outputs(&dir, &regions, &prelim, &refined, ok).unwrap();
+        assert!(rep.issues.is_empty(), "{:?}", rep.issues);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let dir = unique_dir("empty");
+        let rep = write_outputs(&dir, &[], &[], &[], vec![]).unwrap();
+        assert!(
+            rep.issues.iter().any(|s| s.contains("구역 0개")),
+            "{:?}",
+            rep.issues
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 촘촘한 점군(칸마다 점 수십 개)에서도 반경 검사가 전수 비교와 같다.
+    #[test]
+    fn ghost_filter_exact_dense() {
+        let mut rng = Rng(9);
+        let mut mk = |n: usize, s: f64| PointCloud {
+            points: (0..n)
+                .map(|_| {
+                    rec(Vector3::new(
+                        rng.next() * s,
+                        rng.next() * s,
+                        rng.next() * 1.0,
+                    ))
+                })
+                .collect(),
+        };
+        // 4 m × 4 m 판에 3000 점(반경 칸에 수십 점) + 그 둘레 7 m 상자에 질의 3000 점.
+        let base = mk(3000, 2.0);
+        let probe = mk(3000, 7.0);
+        let mut idx = RadiusIndex::new(GHOST_RADIUS_M);
+        idx.insert_cloud(&base);
+        let fast = remove_ghosts(&probe, &idx);
+        let brute: Vec<PointRecord> = probe
+            .points
+            .iter()
+            .filter(|p| {
+                !base.points.iter().any(|q| {
+                    let d: f64 = (0..3)
+                        .map(|i| (p.xyz[i] as f64 - q.xyz[i] as f64).powi(2))
+                        .sum();
+                    d <= GHOST_RADIUS_M * GHOST_RADIUS_M
+                })
+            })
+            .copied()
+            .collect();
+        assert_eq!(fast.points, brute);
+        assert!(!fast.is_empty() && fast.len() < probe.len());
+    }
+
     /// 둘째 구역 짝 0: 패닉 없이 모든 파일, manifest 에 null, 위반 보고.
     #[test]
     fn write_outputs_with_failed_alignment() {
@@ -1608,6 +1830,44 @@ mod tests {
         let refined = vec![PointCloud { points: vec![] }; 2];
         let res = write_outputs(unique_dir("len"), &regions, &[None], &refined, vec![]);
         assert!(res.is_err());
+    }
+
+    /// 점 수에 따른 스냅샷 시간: 구역 3 × 10만/20만/40만 점(측정용).
+    /// `cargo test --release -p skylens-core -- --ignored snapshot_scaling --nocapture`.
+    #[test]
+    #[ignore = "측정용"]
+    fn snapshot_scaling() {
+        let mut times = Vec::new();
+        for per in [100_000usize, 200_000, 400_000] {
+            let mut rng = Rng(78);
+            let mut mk = |k: usize, dz: f64| PointCloud {
+                points: (0..per)
+                    .map(|_| {
+                        rec(Vector3::new(
+                            k as f64 * 12.0 + 7.0 + rng.next() * 7.0,
+                            rng.next() * 15.0,
+                            dz + rng.next() * 2.0,
+                        ))
+                    })
+                    .collect(),
+            };
+            let refined: Vec<PointCloud> = (0..3).map(|k| mk(k, 0.0)).collect();
+            let prelim: Vec<Option<PointCloud>> = (0..3).map(|k| Some(mk(k, 0.4))).collect();
+            let t = std::time::Instant::now();
+            for_each_snapshot(
+                &prelim,
+                &refined,
+                GHOST_RADIUS_M,
+                DECIMATE_EVERY,
+                |_| Ok(()),
+            )
+            .unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            eprintln!("구역 3 × {per} 점: {secs:.3} s");
+            times.push(secs);
+        }
+        // 선형이면 4배, 제곱이면 16배. 측정 흔들림을 넉넉히 보아 8배 미만.
+        assert!(times[2] / times[0] < 8.0, "{times:?}");
     }
 
     /// 큰 점군 속도: 구역 7 × 초벌·정밀 각 200만 점.
