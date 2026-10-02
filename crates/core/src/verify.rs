@@ -249,10 +249,10 @@ pub fn verify_dir(dir: &Path) -> Report {
     }
     if let Ok(rows) = &steps {
         // 깨진 manifest 의 큰 step 하나가 기대 구역을 수천만 개로 부풀리지 않도록,
-        // 다른 근거(report·PLY)의 구역 수와 정수 단계 줄 수 중 큰 값 + 1 에서 자른다.
-        // 잘린 단계는 check_snapshots 가 "구역 수 초과" 로 FAIL 한다.
+        // 다른 근거(report·PLY)의 구역 수와 정수 단계 줄 수 중 큰 값에서 자른다(정상 출력은
+        // 정수 단계 줄 수 = 구역 수). 잘린 단계는 check_snapshots 가 "구역 수 초과" 로 FAIL 한다.
         let ints = rows.iter().filter(|r| r.step.is_some()).count();
-        let cap = expected.len().max(ints) + 1;
+        let cap = expected.len().max(ints);
         let last = rows.iter().filter_map(|r| r.step).max().unwrap_or(0);
         expected.extend(0..last.min(cap));
     }
