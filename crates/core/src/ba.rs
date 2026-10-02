@@ -1503,6 +1503,240 @@ mod tests {
         }
     }
 
+    /// SPEC §6 실측 편대 배치(3대 × `positions` 위치, 위치 간 1.0 m, 방향 −3°/+125°/−116°,
+    /// 기울기 60°)의 정답 문제. 카메라 종류마다 내부 파라미터 그룹 하나(F, R, L 순서).
+    /// 점은 지형 위 0~3 m, 세 장 이상에 보이는 것만.
+    fn formation_scene(seed: u64, positions: usize, n_pts: usize) -> (BaProblem, Rng) {
+        use crate::synth::{terrain_height, CamId, Scene, SceneConfig};
+        let sc = Scene::new(SceneConfig {
+            positions,
+            ..SceneConfig::default()
+        });
+        let base = sc.views[0].camera.intrinsics;
+        let groups: Vec<DistortedIntrinsics> = (0..3)
+            .map(|g| {
+                let mut k = base.with_distortion(true_intr().dist);
+                k.fx *= 1.0 + 0.01 * g as f64;
+                k.fy = k.fx * 1.004;
+                k
+            })
+            .collect();
+        let camera_group: Vec<usize> = sc
+            .views
+            .iter()
+            .map(|v| CamId::ALL.iter().position(|&c| c == v.cam).unwrap())
+            .collect();
+        let poses: Vec<Pose> = sc.views.iter().map(|v| v.camera.pose).collect();
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let (w, h) = (base.width as f64, base.height as f64);
+        let x_end = (positions as f64 - 1.0) * sc.config.spacing;
+        let mut points = Vec::new();
+        let mut observations = Vec::new();
+        while points.len() < n_pts {
+            let (x, y) = (rng.uni(-60.0, x_end + 60.0), rng.uni(-60.0, 60.0));
+            let p = Point3::new(x, y, terrain_height(x, y) + rng.uni(0.0, 3.0));
+            let mut seen = Vec::new();
+            for (c, pose) in poses.iter().enumerate() {
+                let xc = pose.transform(&p);
+                if xc.z <= 0.0 {
+                    continue;
+                }
+                let px = groups[camera_group[c]].project_camera(&xc);
+                if px.x > 0.0 && px.x < w && px.y > 0.0 && px.y < h {
+                    seen.push((c, px));
+                }
+            }
+            if seen.len() < 3 {
+                continue;
+            }
+            let i = points.len();
+            points.push(p);
+            for (c, px) in seen {
+                observations.push(Observation {
+                    camera: c,
+                    point: i,
+                    pixel: px,
+                });
+            }
+        }
+        (
+            BaProblem {
+                groups,
+                camera_group,
+                poses,
+                points,
+                observations,
+            },
+            rng,
+        )
+    }
+
+    /// 정답 대비 오차: (내정 RMS, 내정 3px 초과 수, 정렬 중심 RMS m, 정렬 점 RMS m).
+    /// 정렬은 카메라 중심 닮음 정렬(Umeyama)을 점에도 같이 적용한다.
+    fn errors_vs_truth(p: &BaProblem, gt: &BaProblem, inlier: &[bool]) -> (f64, usize, f64, f64) {
+        let (mut sq, mut n, mut over3) = (0.0, 0.0, 0);
+        for (o, &ok) in p.observations.iter().zip(inlier) {
+            if ok {
+                let k = p.groups[p.camera_group[o.camera]];
+                let r =
+                    k.project_camera(&p.poses[o.camera].transform(&p.points[o.point])) - o.pixel;
+                sq += r.norm_squared();
+                n += 1.0;
+                if r.norm() > 3.0 {
+                    over3 += 1;
+                }
+            }
+        }
+        let (s, r, t) = similarity(&p.poses, &gt.poses);
+        let ce: f64 = p
+            .poses
+            .iter()
+            .zip(&gt.poses)
+            .map(|(a, b)| (s * r * a.center().coords + t - b.center().coords).norm_squared())
+            .sum();
+        let pe: f64 = p
+            .points
+            .iter()
+            .zip(&gt.points)
+            .map(|(a, b)| (s * r * a.coords + t - b.coords).norm_squared())
+            .sum();
+        (
+            (sq / n).sqrt(),
+            over3,
+            (ce / p.poses.len() as f64).sqrt(),
+            (pe / p.points.len() as f64).sqrt(),
+        )
+    }
+
+    /// est 중심 → gt 중심 닮음 변환 (s, R, t).
+    fn similarity(est: &[Pose], gt: &[Pose]) -> (f64, Matrix3<f64>, Vector3<f64>) {
+        let a: Vec<Vector3<f64>> = est.iter().map(|p| p.center().coords).collect();
+        let b: Vec<Vector3<f64>> = gt.iter().map(|p| p.center().coords).collect();
+        let n = a.len() as f64;
+        let ma = a.iter().sum::<Vector3<f64>>() / n;
+        let mb = b.iter().sum::<Vector3<f64>>() / n;
+        let mut cov = Matrix3::zeros();
+        let mut va = 0.0;
+        for (x, y) in a.iter().zip(&b) {
+            cov += (y - mb) * (x - ma).transpose();
+            va += (x - ma).norm_squared();
+        }
+        let svd = (cov / n).svd(true, true);
+        let (u, vt) = (svd.u.unwrap(), svd.v_t.unwrap());
+        let mut d = Matrix3::identity();
+        if (u * vt).determinant() < 0.0 {
+            d[(2, 2)] = -1.0;
+        }
+        let r = u * d * vt;
+        let s = svd.singular_values.component_mul(&d.diagonal()).sum() / (va / n);
+        (s, r, mb - s * r * ma)
+    }
+
+    /// F-036: 실측 편대 배치(3대 × 12위치)에서 정답 포즈에 잡음(σ = 0.5 px)과 이상치(관측 10%,
+    /// 20~60 px)를 넣고 포즈·점을 작게 섭동한 뒤 Huber·Cauchy 결과를 정답과 비교한다.
+    /// 내부 파라미터는 정답으로 고정한다: 위치 간 1.0 m 기선에서 내부 파라미터를 풀면 이상치 없는
+    /// 최소제곱도 100회 안에 수렴하지 않고 정렬 중심 오차 약 1 m 가 남는다(시드 41, 연구 노트).
+    /// 섭동이 크면(이동 0.3 m) 내부 파라미터를 고정해도 같다.
+    ///
+    /// 기준의 근거:
+    /// - 잡음만 있을 때 최소제곱 해의 잔차 RMS 기댓값은 σ√2·√(1 − p/(2m)) (p 자유 파라미터,
+    ///   m 관측). 같은 잡음·같은 시작에서 이상치 없는 최소제곱 실행이 이를 0.95~1.05 로 맞춘다.
+    /// - 그 깨끗한 최소제곱 해의 중심·점 오차가 이 잡음에서 얻을 수 있는 하한(최대우도) 기준이다.
+    ///   강건 손실은 이상치가 있어도 내정 RMS < 1.2·σ√2(Cauchy)·1.5·σ√2(Huber),
+    ///   중심·점 오차 < 기준의 1.5배(Cauchy)·2.5배(Huber), 중심 오차 < 0.05 m.
+    /// - 이상치를 그대로 받는 최소제곱은 내정 RMS > 3·σ√2 여야 시험이 이상치를 구분한다.
+    #[test]
+    #[ignore = "편대 배치에서 이상치 없는 최소제곱도 잔차는 잡음 하한(RMS/기댓값 0.992)인데 정렬 중심 오차 1.2 m·100회 미수렴(시드 41): 기하가 약한 방향이 남아 중심 0.05 m 기준을 못 맞춘다"]
+    fn robust_losses_on_formation_scene() {
+        let sigma = 0.5;
+        let clean = sigma * 2f64.sqrt();
+        for seed in 41u64..=50 {
+            let (gt, mut rng) = formation_scene(seed, 12, 600);
+            let mut noisy = gt.clone();
+            add_noise(&mut noisy, &mut rng, sigma);
+            let mut inlier = vec![true; noisy.observations.len()];
+            let mut dirty = noisy.clone();
+            for (i, o) in dirty.observations.iter_mut().enumerate() {
+                if rng.next() < 0.1 {
+                    let ang = rng.uni(0.0, std::f64::consts::TAU);
+                    o.pixel += Vector2::new(ang.cos(), ang.sin()) * rng.uni(20.0, 60.0);
+                    inlier[i] = false;
+                }
+            }
+            // 같은 섭동을 깨끗한 문제와 이상치 문제에 함께 준다.
+            let mut start = noisy.clone();
+            // 초기 복원 뒤 정밀화를 가정한 작은 섭동(회전 0.002 rad, 이동 0.05 m, 점 0.05 m).
+            for c in 1..start.poses.len() {
+                let w = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.002;
+                let dt = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.05;
+                start.poses[c] = apply_pose(&start.poses[c], &[w.x, w.y, w.z, dt.x, dt.y, dt.z]);
+            }
+            for x in &mut start.points {
+                *x += Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.05;
+            }
+            noisy.poses = start.poses.clone();
+            noisy.points = start.points.clone();
+            noisy.groups = start.groups.clone();
+            dirty.poses = start.poses.clone();
+            dirty.points = start.points.clone();
+            dirty.groups = start.groups.clone();
+            let opts = |loss| BaOptions {
+                loss,
+                max_iterations: 100,
+                default_free_intrinsics: [false; 8],
+                ..Default::default()
+            };
+            let all = vec![true; inlier.len()];
+            let mut ref_p = noisy.clone();
+            let rep = bundle_adjust(&mut ref_p, &opts(Loss::Squared));
+            let params = 6 * gt.poses.len() - 7 + 3 * rep.num_tracks_used;
+            let m = rep.num_observations_used as f64;
+            let expect = clean * (1.0 - params as f64 / (2.0 * m)).sqrt();
+            let (_, _, ref_c, ref_x) = errors_vs_truth(&ref_p, &gt, &all);
+            let run = |loss| {
+                let mut p = dirty.clone();
+                let r = bundle_adjust(&mut p, &opts(loss));
+                (errors_vs_truth(&p, &gt, &inlier), r)
+            };
+            let ((l2_rms, ..), _) = run(Loss::Squared);
+            let ((hu_rms, hu_o, hu_c, hu_x), hu_r) = run(Loss::Huber(1.0));
+            let ((ca_rms, ca_o, ca_c, ca_x), ca_r) = run(Loss::Cauchy(1.0));
+            eprintln!(
+                "seed {seed}: cams {} tracks {} obs {} | clean L2 rms/expect {:.4} c {:.4} x {:.4} it {} | \
+                 L2+out inlier {l2_rms:.3} | Huber {hu_rms:.3} >3px {hu_o} c {hu_c:.4} x {hu_x:.4} it {} | \
+                 Cauchy {ca_rms:.3} >3px {ca_o} c {ca_c:.4} x {ca_x:.4} it {}",
+                gt.poses.len(),
+                rep.num_tracks_used,
+                rep.num_observations_used,
+                rep.final_rms / expect,
+                ref_c,
+                ref_x,
+                rep.iterations,
+                hu_r.iterations,
+                ca_r.iterations,
+            );
+            assert!(rep.converged, "seed {seed} {:?}", rep.stop);
+            assert!((rep.final_rms / expect - 1.0).abs() < 0.05, "seed {seed}");
+            assert!(ref_c < 0.05, "seed {seed} clean center {ref_c}");
+            assert!(l2_rms > 3.0 * clean, "seed {seed} L2 {l2_rms}");
+            assert!(hu_r.refined && ca_r.refined, "seed {seed}");
+            assert!(hu_rms < 1.5 * clean, "seed {seed} Huber {hu_rms}");
+            assert!(
+                ca_rms < 1.2 * clean && ca_o == 0,
+                "seed {seed} Cauchy {ca_rms} {ca_o}"
+            );
+            assert!(hu_c < 0.05 && ca_c < 0.05, "seed {seed} {hu_c} {ca_c}");
+            assert!(
+                ca_c < 1.5 * ref_c + 1e-3 && ca_x < 1.5 * ref_x,
+                "seed {seed} Cauchy"
+            );
+            assert!(
+                hu_c < 2.5 * ref_c + 1e-3 && hu_x < 2.5 * ref_x,
+                "seed {seed} Huber"
+            );
+        }
+    }
+
     /// 선형 탐색으로 누적하던 슈어 소거(이전 방식)와 결과가 비트 단위로 같다.
     #[test]
     fn schur_matches_linear_search_accumulation() {
