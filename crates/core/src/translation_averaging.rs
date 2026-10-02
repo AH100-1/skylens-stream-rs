@@ -960,6 +960,265 @@ fn average_core(
     }
 }
 
+/// 카메라 중심의 위치 사전(예: GPS). 방향 제약만으로는 정해지지 않는 축척·한 직선 방향 위치를 정한다.
+#[derive(Clone, Debug)]
+pub struct PositionPrior {
+    pub camera: usize,
+    /// 사전 위치(방향 제약과 같은 세계 틀).
+    pub position: Point3<f64>,
+    /// 위치 잡음 표준편차(m, 축마다). 0 이하·NaN 이면 쓰지 않는다.
+    pub sigma: f64,
+}
+
+/// 사전 결합 풀이 설정.
+#[derive(Clone, Debug)]
+pub struct PriorConfig {
+    /// 짝 이동 방향 각 잡음 표준편차(rad). 방향 제약 위치 잔차 = 길이 × 각 오차 이므로 길이에 비례해 무게를 준다.
+    pub direction_sigma_rad: f64,
+    /// 무게를 줄 때 쓰는 최소 간선 길이(m).
+    pub min_length: f64,
+    /// 첫 회 길이 하한(m). 재가중이 진행되며 `min_length` 로 줄어든다.
+    pub start_min_length: f64,
+    /// 강건 재가중 횟수.
+    pub iterations: usize,
+    /// 재가중 첫 회 코시 각 척도(rad). 마지막 회에 `TranslationConfig::robust_sigma_rad` 가 되도록 줄인다.
+    pub start_sigma_rad: f64,
+}
+
+impl Default for PriorConfig {
+    fn default() -> Self {
+        Self {
+            direction_sigma_rad: 1f64.to_radians(),
+            min_length: 0.5,
+            start_min_length: 20.0,
+            iterations: 30,
+            start_sigma_rad: 20f64.to_radians(),
+        }
+    }
+}
+
+/// 위치 사전 결합 선형 풀이: min Σ a_e |(I − d dᵀ)(c_i − c_j)|² + Σ b_i |c_i − g_i|².
+/// 정점 수가 `dense_max` 이하면 밀집 숄레스키, 크면 블록 야코비 선조건 켤레 기울기.
+fn prior_solve(
+    n: usize,
+    edges: &[(usize, usize, Matrix3<f64>)],
+    prior: &[Option<(Vector3<f64>, f64)>],
+    dense_max: usize,
+) -> Option<Vec<Vector3<f64>>> {
+    let mut diag = vec![Matrix3::zeros(); n];
+    let mut rhs = vec![Vector3::zeros(); n];
+    for (v, p) in prior.iter().enumerate() {
+        if let Some((g, b)) = p {
+            diag[v] += Matrix3::identity() * *b;
+            rhs[v] += g * *b;
+        }
+    }
+    for (i, j, m) in edges {
+        diag[*i] += m;
+        diag[*j] += m;
+    }
+    let sol: Vec<Vector3<f64>> = if n <= dense_max {
+        let mut a = DMatrix::<f64>::zeros(3 * n, 3 * n);
+        for v in 0..n {
+            a.view_mut((3 * v, 3 * v), (3, 3)).copy_from(&diag[v]);
+        }
+        for (i, j, m) in edges {
+            for (r, c, sign) in [(*i, *j, -1.0), (*j, *i, -1.0)] {
+                let mut blk = a.view_mut((3 * r, 3 * c), (3, 3));
+                blk += m * sign;
+            }
+        }
+        // 어떤 정점도 사전이 없고 간선도 없으면 특이하므로 작은 릿지를 더한다.
+        for k in 0..3 * n {
+            a[(k, k)] += 1e-9;
+        }
+        let b = DVector::from_iterator(3 * n, rhs.iter().flat_map(|v| v.iter().cloned()));
+        let x = a.cholesky().map(|c| c.solve(&b))?;
+        (0..n)
+            .map(|v| Vector3::new(x[3 * v], x[3 * v + 1], x[3 * v + 2]))
+            .collect()
+    } else {
+        let inv: Vec<Matrix3<f64>> = diag
+            .iter()
+            .map(|d| (d + Matrix3::identity() * 1e-9).try_inverse())
+            .collect::<Option<_>>()?;
+        let mul = |x: &[Vector3<f64>]| -> Vec<Vector3<f64>> {
+            let mut y: Vec<Vector3<f64>> = (0..n).map(|v| diag[v] * x[v]).collect();
+            for (i, j, m) in edges {
+                y[*i] -= m * x[*j];
+                y[*j] -= m * x[*i];
+            }
+            y
+        };
+        let dot = |a: &[Vector3<f64>], b: &[Vector3<f64>]| -> f64 {
+            a.iter().zip(b).map(|(p, q)| p.dot(q)).sum()
+        };
+        let mut x: Vec<Vector3<f64>> = (0..n).map(|v| inv[v] * rhs[v]).collect();
+        let ax = mul(&x);
+        let mut r: Vec<Vector3<f64>> = (0..n).map(|v| rhs[v] - ax[v]).collect();
+        let mut z: Vec<Vector3<f64>> = (0..n).map(|v| inv[v] * r[v]).collect();
+        let mut p = z.clone();
+        let mut rz = dot(&r, &z);
+        let tol = 1e-12 * dot(&rhs, &rhs).max(1e-300);
+        for _ in 0..3000 {
+            if dot(&r, &r) <= tol {
+                break;
+            }
+            let ap = mul(&p);
+            let alpha = rz / dot(&p, &ap).max(1e-300);
+            for v in 0..n {
+                x[v] += p[v] * alpha;
+                r[v] -= ap[v] * alpha;
+            }
+            z = (0..n).map(|v| inv[v] * r[v]).collect();
+            let rz_new = dot(&r, &z);
+            let beta = rz_new / rz.max(1e-300);
+            rz = rz_new;
+            for v in 0..n {
+                p[v] = z[v] + p[v] * beta;
+            }
+        }
+        x
+    };
+    sol.iter()
+        .all(|v| v.iter().all(|c| c.is_finite()))
+        .then_some(sol)
+}
+
+/// 위치 사전과 함께 카메라 중심을 구한다(결과는 사전과 같은 틀·미터 단위).
+///
+/// 방향 제약만으로는 한 줄로 나는 짧은 기선(축척 퇴화)·카메라 간 짝 부족 때문에 위치가 정해지지 않으므로
+/// 사전 위치(GPS)를 약한 앵커로 함께 푼다. 간선 무게는 1/(길이·각 잡음)² × 코시 각 가중이고, 코시 척도를
+/// 넓은 값에서 `robust_sigma_rad` 까지 줄이며 다시 푼다(처음부터 좁히면 이상치에 끌린다).
+/// 등록: 회전·사전이 있고 정상 간선이 하나 이상 있는 카메라.
+pub fn average_translations_with_prior(
+    rotations: &[Option<Rotation3<f64>>],
+    observations: &[RelativeTranslation],
+    priors: &[PositionPrior],
+    cfg: &TranslationConfig,
+    pcfg: &PriorConfig,
+) -> TranslationResult {
+    let n = rotations.len();
+    let rotations = &finite_rotations(rotations);
+    let mut rejected = [0usize; 2];
+    let mut prior: Vec<Option<(Vector3<f64>, f64)>> = vec![None; n];
+    for p in priors {
+        let ok = p.camera < n
+            && p.sigma > 0.0
+            && p.sigma.is_finite()
+            && p.position.coords.iter().all(|x| x.is_finite());
+        if ok {
+            prior[p.camera] = Some((p.position.coords, 1.0 / (p.sigma * p.sigma)));
+        }
+    }
+    // 회전 일관성·유효성.
+    let mut edges = Vec::new();
+    for (idx, o) in observations.iter().enumerate() {
+        let valid = o.i < n
+            && o.j < n
+            && o.i != o.j
+            && o.weight > 0.0
+            && o.weight.is_finite()
+            && o.direction.norm() > 1e-12
+            && o.direction.iter().all(|x| x.is_finite());
+        let (Some(ri), Some(rj)) = (
+            valid.then(|| rotations[o.i]).flatten(),
+            valid.then(|| rotations[o.j]).flatten(),
+        ) else {
+            rejected[0] += 1;
+            continue;
+        };
+        if let Some(rij) = o.rotation {
+            if crate::math::rotation_angle_between(&rij, &(rj * ri.inverse()))
+                > cfg.rotation_consistency_rad
+            {
+                rejected[0] += 1;
+                continue;
+            }
+        }
+        if prior[o.i].is_none() && prior[o.j].is_none() {
+            // 사전이 없는 정점끼리만 이어진 간선도 쓸 수 있지만 축척이 정해지지 않는다. 여기서는 쓰지 않는다.
+            rejected[0] += 1;
+            continue;
+        }
+        edges.push(Edge {
+            idx,
+            i: o.i,
+            j: o.j,
+            d: (rj.inverse() * o.direction).normalize(),
+            w: o.weight,
+        });
+    }
+    let mut res = TranslationResult {
+        centers: vec![None; n],
+        points: Vec::new(),
+        residuals_rad: vec![f64::NAN; observations.len()],
+        inliers: vec![false; observations.len()],
+        rejected,
+    };
+    if edges.is_empty() {
+        return res;
+    }
+    let mut c: Vec<Vector3<f64>> = prior
+        .iter()
+        .map(|p| p.map(|p| p.0).unwrap_or_else(Vector3::zeros))
+        .collect();
+    let mut rob = vec![1.0; edges.len()];
+    let iters = pcfg.iterations.max(1);
+    let (s0, s1) = (
+        pcfg.start_sigma_rad,
+        cfg.robust_sigma_rad.min(pcfg.start_sigma_rad),
+    );
+    let proj = |d: &Vector3<f64>| Matrix3::identity() - d * d.transpose();
+    let mut sol = c.clone();
+    for it in 0..iters {
+        let frac = if iters > 1 {
+            it as f64 / (iters - 1) as f64
+        } else {
+            1.0
+        };
+        let sigma = s0 * (s1 / s0).powf(frac);
+        // 길이 하한을 넓은 값에서 `min_length` 로 줄인다: 처음에는 짧은 간선의 무게가 이상치에 끌리지 않게 한다.
+        let floor = pcfg.start_min_length * (pcfg.min_length / pcfg.start_min_length).powf(frac);
+        let sys: Vec<(usize, usize, Matrix3<f64>)> = edges
+            .iter()
+            .zip(&rob)
+            .map(|(e, r)| {
+                let len = (c[e.i] - c[e.j]).norm().max(floor);
+                let a = e.w * r / (len * pcfg.direction_sigma_rad).powi(2);
+                (e.i, e.j, proj(&e.d) * a)
+            })
+            .collect();
+        let Some(x) = prior_solve(n, &sys, &prior, cfg.dense_max_vertices) else {
+            return res;
+        };
+        sol = x;
+        c.clone_from(&sol);
+        for (e, r) in edges.iter().zip(rob.iter_mut()) {
+            let th = angle_between(&e.d, &(c[e.i] - c[e.j]));
+            *r = 1.0 / (1.0 + (th / sigma).powi(2));
+        }
+    }
+    let mut has_edge = vec![false; n];
+    for e in &edges {
+        let th = angle_between(&e.d, &(sol[e.i] - sol[e.j]));
+        res.residuals_rad[e.idx] = th;
+        if th <= cfg.outlier_threshold_rad {
+            res.inliers[e.idx] = true;
+            has_edge[e.i] = true;
+            has_edge[e.j] = true;
+        } else {
+            res.rejected[1] += 1;
+        }
+    }
+    for v in 0..n {
+        if has_edge[v] && prior[v].is_some() && rotations[v].is_some() {
+            res.centers[v] = Some(Point3::from(sol[v]));
+        }
+    }
+    res
+}
+
 /// 추정 중심을 정답에 닮음 변환(축척·회전·이동)으로 맞춘 뒤 정점별 거리 오차를 돌려준다.
 /// 둘 중 하나라도 None 인 정점은 건너뛴다.
 pub fn similarity_aligned_errors(
@@ -1004,6 +1263,7 @@ mod tests {
     use super::*;
     use crate::camera::Pose;
     use crate::math::Vector2;
+    use crate::synth::{Scene, SceneConfig};
     use crate::triangulation::{triangulate_tracks, TriangulationConfig};
 
     struct Rng(u64);
@@ -1222,6 +1482,137 @@ mod tests {
         (poses, rots, obs)
     }
 
+    /// 실측 배치(`SceneConfig::default()`)의 정답 자세와 GPS(σ `gps_sigma`, 시드별). 번호 = 위치·3 + 카메라.
+    fn real_formation(seed: u64, gps_sigma: f64) -> (Vec<Pose>, Vec<Point3<f64>>) {
+        let cfg = SceneConfig {
+            seed,
+            gps_sigma,
+            ..SceneConfig::default()
+        };
+        let d = SceneConfig::default();
+        // 편대 오프셋·방위·내려다보는 각이 실측 값 그대로임을 확인한다(F-213).
+        assert_eq!(cfg.heading_deg, [-3.0, 125.0, -116.0]);
+        assert_eq!(cfg.tilt_deg, [60.0; 3]);
+        assert_eq!(cfg.offsets, d.offsets);
+        assert_eq!(cfg.spacing, 1.0);
+        let scene = Scene::new(cfg);
+        (
+            scene.views.iter().map(|v| v.camera.pose.clone()).collect(),
+            scene.gps_enu,
+        )
+    }
+
+    /// 실측 배치의 관측: 짝 일정은 `pairs`(같은 카메라 SPEC §3.2 + 시야 겹침 다른 카메라).
+    fn real_observations(
+        seed: u64,
+        case: &Case,
+        gps_sigma: f64,
+    ) -> (
+        Vec<Pose>,
+        Vec<Point3<f64>>,
+        Vec<Option<Rotation3<f64>>>,
+        Vec<RelativeTranslation>,
+    ) {
+        let (poses, gps) = real_formation(seed, gps_sigma);
+        let mut rng = Rng(seed);
+        let rots: Vec<_> = poses
+            .iter()
+            .map(|p| Some(Rotation3::new(rng.vec3() * 0.1f64.to_radians()) * p.rotation))
+            .collect();
+        let mut obs = Vec::new();
+        for (i, j) in pairs(&poses) {
+            if rng.unit() < case.unobservable_frac {
+                continue;
+            }
+            let (pi, pj) = (&poses[i], &poses[j]);
+            let truth = (pj.rotation * (pi.center() - pj.center())).normalize();
+            let dir = if rng.unit() < case.outlier_frac {
+                rng.vec3().normalize()
+            } else {
+                Rotation3::new(rng.vec3() * case.noise_deg.to_radians()) * truth
+            };
+            obs.push(RelativeTranslation {
+                i,
+                j,
+                direction: dir,
+                rotation: Some(pj.rotation * pi.rotation.inverse()),
+                weight: 1.0,
+            });
+        }
+        (poses, gps, rots, obs)
+    }
+
+    /// 진단: 실측 배치에서 방법별 등록 수·RMS·최대(짝 이상치 10·20%, 시드 1~5).
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_real_formation() {
+        let seeds: Vec<u64> = std::env::var("DIAG_SEEDS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_else(|| (1..=5).collect());
+        let gsig: f64 = std::env::var("DIAG_GPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.5);
+        for frac in [-1.0f64, 0.0, 0.10, 0.20] {
+            for &seed in &seeds {
+                let case = Case {
+                    noise_deg: if frac < 0.0 { 0.0 } else { 1.0 },
+                    outlier_frac: frac.max(0.0),
+                    unobservable_frac: 0.05,
+                };
+                let (poses, gps, rots, obs) = real_observations(seed, &case, gsig);
+                let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+                let cfg = TranslationConfig::default();
+                let old = std::env::var("DIAG_OLD").is_ok();
+                let (ra, ma, rb, mb, na, nb) = if old {
+                    let a = average_translations(&rots, &obs, &cfg);
+                    let (ra, ma) = stats(&similarity_aligned_errors(&a.centers, &truth));
+                    let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, POINTS.2);
+                    let b = average_translations_with_points(&rots, &obs, &pobs, &cfg);
+                    let (rb, mb) = stats(&similarity_aligned_errors(&b.centers, &truth));
+                    (ra, ma, rb, mb, a.registered(), b.registered())
+                } else {
+                    (0.0, 0.0, 0.0, 0.0, 0, 0)
+                };
+                let pri: Vec<_> = gps
+                    .iter()
+                    .enumerate()
+                    .map(|(k, g)| PositionPrior {
+                        camera: k,
+                        position: *g,
+                        sigma: gsig,
+                    })
+                    .collect();
+                let c = average_translations_with_prior(
+                    &rots,
+                    &obs,
+                    &pri,
+                    &cfg,
+                    &PriorConfig::default(),
+                );
+                let (rc, mc) = stats(&similarity_aligned_errors(&c.centers, &truth));
+                let raw: Vec<f64> = c
+                    .centers
+                    .iter()
+                    .zip(&truth)
+                    .filter_map(|(e, t)| e.map(|e| (e - t).norm()))
+                    .collect();
+                println!(
+                    "RAW rms {:.3} inl {}",
+                    stats(&raw).0,
+                    c.inliers.iter().filter(|b| **b).count()
+                );
+                let gps_opt: Vec<_> = gps.iter().map(|g| Some(*g)).collect();
+                let (rg, _) = stats(&similarity_aligned_errors(&gps_opt, &truth));
+                println!(
+                    "REAL frac {frac} seed {seed} pairs {} | pairs-only reg {} rms {ra:.2} max {ma:.2} | +points reg {} rms {rb:.2} max {mb:.2} | +gps reg {} rms {rc:.3} max {mc:.3} (gps alone {rg:.2})",
+                    obs.len(), na, nb, c.registered()
+                );
+            }
+        }
+    }
+
     fn stats(e: &[f64]) -> (f64, f64) {
         let rms = (e.iter().map(|x| x * x).sum::<f64>() / e.len() as f64).sqrt();
         (rms, e.iter().cloned().fold(0.0, f64::max))
@@ -1272,6 +1663,46 @@ mod tests {
                     a.registered(), b.registered(), c.registered()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn prior_real_formation_noiseless_is_better_than_gps() {
+        // 실측 배치·방향 잡음 0·이상치 0·GPS σ 1.5 m: 사전 결합 풀이는 GPS 단독(RMS ~2.5 m)보다 낫다(측정 0.74~0.76 m).
+        // 잡음·이상치가 있는 경우는 아직 목표(RMS ≤ 0.5 m)에 못 미친다(노트 참조).
+        for seed in [1u64, 2] {
+            let case = Case {
+                noise_deg: 0.0,
+                outlier_frac: 0.0,
+                unobservable_frac: 0.05,
+            };
+            let (poses, gps, rots, obs) = real_observations(seed, &case, 1.5);
+            let pri: Vec<_> = gps
+                .iter()
+                .enumerate()
+                .map(|(k, g)| PositionPrior {
+                    camera: k,
+                    position: *g,
+                    sigma: 1.5,
+                })
+                .collect();
+            let res = average_translations_with_prior(
+                &rots,
+                &obs,
+                &pri,
+                &TranslationConfig::default(),
+                &PriorConfig::default(),
+            );
+            let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+            let raw: Vec<f64> = res
+                .centers
+                .iter()
+                .zip(&truth)
+                .filter_map(|(e, t)| e.map(|e| (e - t).norm()))
+                .collect();
+            let (rms, max) = stats(&raw);
+            assert_eq!(res.registered(), 240);
+            assert!(rms < 1.0 && max < 5.0, "rms {rms} max {max}");
         }
     }
 
