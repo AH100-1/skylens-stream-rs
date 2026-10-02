@@ -8,9 +8,10 @@ use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
 
 const USAGE: &str = "사용법:\n  skylens-stream ply-info <파일.ply>\n  skylens-stream synth <출력 폴더> [폭 높이]\n  \
-     (출력 폴더는 빈 문자열 불가, 폭·높이는 16..=8192 의 숫자만(부호 불가), 둘 다 주거나 둘 다 생략)\n  \
      skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N]\n  \
-     skylens-stream --version\n  skylens-stream --help";
+     skylens-stream verify <출력 폴더>\n  \
+     skylens-stream --version\n  skylens-stream --help\n  \
+     (출력 폴더는 빈 문자열 불가, 폭·높이는 16..=8192 의 숫자만(부호 불가), 둘 다 주거나 둘 다 생략)";
 
 /// 합성 영상 폭·높이 하한(특징 검출 최소 크기)과 상한.
 const MIN_SIDE: u32 = 16;
@@ -85,6 +86,7 @@ fn main() -> ExitCode {
             }
         }
         ["run", input, output, rest @ ..] => run::run(input, output, rest),
+        ["verify", dir] => skylens_core::verify::run_cli(dir),
         ["--help" | "-h"] => {
             println!("{USAGE}");
             ExitCode::SUCCESS
