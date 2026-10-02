@@ -180,7 +180,12 @@ fn check(
                 len: v.rgb.len(),
             });
         }
-        if let Some(&j) = v.neighbors.iter().find(|&&j| j >= n || j == i) {
+        if let Some((_, &j)) = v
+            .neighbors
+            .iter()
+            .enumerate()
+            .find(|&(a, &j)| j >= n || j == i || v.neighbors[..a].contains(&j))
+        {
             return Err(FusionError::BadNeighbor {
                 view: i,
                 neighbor: j,
@@ -191,7 +196,7 @@ fn check(
 }
 
 /// 기준 화소 하나의 후보: 기준 화소 번호, 기준 3D 점, 동의한 (사진, 화소, 3D 점).
-/// 마지막 값은 필요한 동의 사진 수(기준 포함).
+/// 마지막 값은 아직 쓰이지 않은 화소로 보이는 이웃 사진 수(기준 제외).
 type Candidate = (usize, Point3<f64>, Vec<(usize, usize, Point3<f64>)>, usize);
 
 /// 시험용 기록: 점마다 (기준 사진, 기준 화소, 동의 (사진, 화소)).
@@ -259,6 +264,12 @@ pub fn try_fuse(
         keys.len() >= cfg.min_groups
     };
 
+    // 기준 포함 필요한 동의 사진 수: min_views 와, 기준 포함 보이는 사진 수의 min_ratio 배.
+    let need_of = |seen: usize| -> usize {
+        cfg.min_views
+            .max((cfg.min_ratio * (seen + 1) as f64).ceil() as usize)
+    };
+
     for r in 0..n {
         let rm = &depth_maps[r];
         let rc = &views[r].camera;
@@ -294,10 +305,12 @@ pub fn try_fuse(
                         };
                         let jidx = qy * jm.w + qx;
                         let Some(dj) = jm.get(qx, qy) else { continue };
-                        seen += 1;
+                        // 이미 다른 점에 쓰인 이웃 화소는 동의할 수 없으므로 비율의
+                        // 분모에서도 뺀다.
                         if used_ref[j][jidx] {
                             continue;
                         }
+                        seen += 1;
                         let yw = jc.unproject(&center(qx, qy), dj as f64);
                         let yc = rc.pose.transform(&yw);
                         if yc.z <= 0.0 {
@@ -321,20 +334,20 @@ pub fn try_fuse(
                         }
                         agree.push((j, jidx, yw));
                     }
-                    let need = cfg
-                        .min_views
-                        .max((cfg.min_ratio * (seen + 1) as f64).ceil() as usize);
+                    let need = need_of(seen);
                     if agree.len() + 1 >= need && groups_ok(r, &agree) {
-                        out.push((ridx, xw, agree, need));
+                        out.push((ridx, xw, agree, seen));
                     }
                 }
                 out
             })
             .collect();
 
-        for (ridx, xw, mut agree, need) in rows.into_iter().flatten() {
-            // 같은 기준 사진의 앞 화소가 먼저 쓴 이웃 화소는 뺀다.
+        for (ridx, xw, mut agree, seen) in rows.into_iter().flatten() {
+            // 같은 기준 사진의 앞 화소가 먼저 쓴 이웃 화소는 빼고, 비율의 분모에서도 뺀다.
+            let before = agree.len();
             agree.retain(|&(j, jidx, _)| !used[j][jidx]);
+            let need = need_of(seen - (before - agree.len()));
             if agree.len() + 1 < need || !groups_ok(r, &agree) {
                 continue;
             }
@@ -978,6 +991,105 @@ mod tests {
         assert_eq!(big, 0);
     }
 
+    /// 같은 높이 5 m 에서 나란히 내려다보는 사진 6장(평행 시선). 같은 높이 사진들은
+    /// 깊이를 같은 배율 s 로 틀리면 지면을 z = 5(1 − s) 가짜 평면으로 옮겨 서로 맞는다.
+    fn level_row() -> Vec<Camera> {
+        (0..6)
+            .map(|k| {
+                let e = Point3::new(-1.0 + 0.4 * k as f64, 0.25 * (k % 2) as f64, 5.0);
+                look_at(e, Point3::new(e.x + 1.5, e.y, 0.0), W, H, 60.0)
+            })
+            .collect()
+    }
+
+    fn scaled(m: &DepthMap, s: f32) -> DepthMap {
+        let mut m = m.clone();
+        for d in m.depth.iter_mut().filter(|d| **d > 0.0) {
+            *d *= s;
+        }
+        m
+    }
+
+    /// 정답 표면에서 `tol` 보다 먼 점 수.
+    fn far_count(sc: &Scene, cloud: &PointCloud, tol: f64) -> usize {
+        cloud
+            .points
+            .iter()
+            .filter(|p| surface_dist(sc, &pt(p)) > tol)
+            .count()
+    }
+
+    /// F-178: 동의는 이웃 목록 안에서만 센다. 맞는 사진 0–2 의 이웃은 틀린 사진 3–5,
+    /// 틀린 사진의 이웃은 맞는 사진만 두면, 서로 동의할 사진이 목록 밖에만 있어 0점.
+    #[test]
+    fn agreement_only_within_neighbor_list() {
+        let cams = level_row();
+        let clean: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        let maps: Vec<DepthMap> = clean
+            .iter()
+            .enumerate()
+            .map(|(i, m)| if i < 3 { m.clone() } else { scaled(m, 1.1) })
+            .collect();
+        let cfg = FusionConfig {
+            min_ratio: 0.0,
+            min_groups: 1,
+            ..FusionConfig::default()
+        };
+        let all = fuse(&views(&cams), &maps, cfg).len();
+        let mut vs = views(&cams);
+        for (i, v) in vs.iter_mut().enumerate() {
+            v.neighbors = if i < 3 { vec![3, 4, 5] } else { vec![0, 1, 2] };
+        }
+        let limited = fuse(&vs, &maps, cfg).len();
+        println!("neighbor list: all views {all} limited {limited}");
+        // 전체와 대조하면 맞는 3장·틀린 3장이 저마다 서로 동의한다.
+        assert!(all > 2000, "all {all}");
+        assert_eq!(limited, 0);
+    }
+
+    /// F-178·F-069: 같은 높이 사진 3장이 같은 배율(1.1)로 틀리고 4장이 맞을 때.
+    /// 틀린 기준 화소에는 틀린 이웃 2장만 동의(기준 포함 3/7)하므로 동의 비율 0 이면
+    /// 가짜 평면 z = −0.5 에 점이 생기고, 0.5(필요 4장)면 생기지 않는다.
+    #[test]
+    fn agreement_ratio_rejects_same_scale_outliers() {
+        // 맞는 사진은 틀린 사진과 같은 자리(가운데는 두 번)에 두어, 가짜 평면이
+        // 비치는 곳을 맞는 4장이 모두 본다.
+        let row = level_row();
+        let cams: Vec<Camera> = [0, 1, 2, 0, 1, 2, 1].iter().map(|&k| row[k]).collect();
+        let maps: Vec<DepthMap> = cams
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let m = render(&SMALL, c);
+                if i < 3 {
+                    scaled(&m, 1.1)
+                } else {
+                    m
+                }
+            })
+            .collect();
+        let vs = views(&cams);
+        let run = |ratio: f64| {
+            let cfg = FusionConfig {
+                min_ratio: ratio,
+                min_groups: 1,
+                ..FusionConfig::default()
+            };
+            let c = fuse(&vs, &maps, cfg);
+            (c.len(), far_count(&SMALL, &c, 0.1))
+        };
+        let (n0, f0) = run(0.0);
+        let (n5, f5) = run(0.5);
+        println!(
+            "same-scale outliers: ratio 0 points {n0} far {f0}; ratio 0.5 points {n5} far {f5}"
+        );
+        // 가짜 평면은 정답에서 0.5 떨어져 있다. 비율 0 에선 틀린 3장 화소 대부분이 점이 된다.
+        assert!(f0 > 1000, "ratio 0 far {f0}");
+        assert_eq!(f5, 0, "ratio 0.5 far {f5}");
+        // 맞는 4장의 지면은 비율 0.5 에서도 남는다.
+        assert!(n5 > 1000, "ratio 0.5 points {n5}");
+    }
+
     #[test]
     fn two_views_give_nothing() {
         let cams = small_cameras();
@@ -1075,6 +1187,15 @@ mod tests {
                 neighbor: 0
             }
         );
+        // F-161: 같은 이웃을 두 번 넣으면 사진 2장으로 3장 동의가 되므로 거절한다.
+        v[0].neighbors = vec![1, 1];
+        assert_eq!(
+            try_fuse(&v, &maps, cfg).unwrap_err(),
+            FusionError::BadNeighbor {
+                view: 0,
+                neighbor: 1
+            }
+        );
     }
 
     #[test]
@@ -1085,6 +1206,27 @@ mod tests {
         let d = FusionConfig::default();
         let cases = [
             (FusionConfig { min_groups: 0, ..d }, "min_groups"),
+            (
+                FusionConfig {
+                    min_ratio: f64::NAN,
+                    ..d
+                },
+                "min_ratio",
+            ),
+            (
+                FusionConfig {
+                    min_ratio: -0.1,
+                    ..d
+                },
+                "min_ratio",
+            ),
+            (
+                FusionConfig {
+                    min_ratio: 1.5,
+                    ..d
+                },
+                "min_ratio",
+            ),
             (
                 FusionConfig {
                     reproj_px: f64::NAN,
@@ -1269,6 +1411,41 @@ mod tests {
         assert!(med < 0.02, "median {med}");
         assert_eq!(far, 0, "far {far}");
         assert!(max < 0.1, "max {max}");
+    }
+
+    /// F-179: 정답 깊이 실측 편대 42장, 이웃 8장. 이미 쓰인 이웃 화소를 비율 분모에서
+    /// 빼므로 동의 비율 0.5 가 0 대비 점·0.25 m 칸을 1% 넘게 잃지 않는다.
+    #[test]
+    fn formation_exact_ratio_keeps_points() {
+        let cams = formation(14, 480, 270);
+        let maps: Vec<DepthMap> = cams.iter().map(|c| render(&FORM, c)).collect();
+        let nb = neighbors_of(&FORM, &cams);
+        let mut vs = views(&cams);
+        for (v, n) in vs.iter_mut().zip(&nb) {
+            v.neighbors = n.clone();
+        }
+        let run = |ratio: f64| {
+            let cfg = FusionConfig {
+                min_ratio: ratio,
+                min_groups: 1,
+                ..FusionConfig::default()
+            };
+            let c = fuse(&vs, &maps, cfg);
+            let cells: std::collections::HashSet<[i64; 3]> = c
+                .points
+                .iter()
+                .map(|p| p.xyz.map(|v| (v as f64 / 0.25).floor() as i64))
+                .collect();
+            (c.len(), cells.len())
+        };
+        let (p0, c0) = run(0.0);
+        let (p5, c5) = run(0.5);
+        println!(
+            "formation exact: ratio 0 points {p0} cells {c0}; ratio 0.5 points {p5} cells {c5}"
+        );
+        assert!(p0 > 300_000, "points {p0}");
+        assert!(p5 * 100 >= p0 * 99, "points {p5} / {p0}");
+        assert!(c5 * 100 >= c0 * 99, "cells {c5} / {c0}");
     }
 
     /// F-113: 실측 편대 48장(16곳), 960×540 융합 시간.
