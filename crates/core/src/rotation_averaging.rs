@@ -1428,11 +1428,64 @@ mod tests {
             // 시간 상한: 단독 측정 2000 정점 전체 0.46~0.70 s. 4 코어를 여러 작업이 나눠 쓰는 부하에서
             // 7배 이상 느려진 적이 없어 5 s 를 상한으로 둔다.
             assert!(total < 5.0, "정점 {n}: {total:.3}s");
-            // 사슬은 오차가 길이를 따라 쌓인다(측정 평균 240/1000 정점 1.4/4.9°). 판별력 있는 정확도 단언은
-            // 선형화 공분산 예측 대비로 바꿔야 하나 2000 정점 역행렬이 무거워 아직 느슨한 상한만 둔다.
+            // 사슬은 오차가 길이를 따라 쌓인다(측정 평균 240/1000 정점 1.4/4.9°) — 전역 정렬 오차는 소수 자유도
+            // 랜덤 워크라 판별력이 없으므로 이웃 정점 사이 상대 회전 오차를 선형화 공분산 예측과 비교한다.
             assert!(mean < 20.0, "평균 {mean}°");
+            for k in [1usize, 4] {
+                let ratio =
+                    chain_relative_error_ratio(&res.rotations, &truth, k, 1f64.to_radians());
+                println!("정점 {n}: 간격 {k} 상대 오차² 평균 / 선형화 예측 = {ratio:.3}");
+                // 240 정점은 안쪽 표본이 40개뿐이라(측정 1.14·1.23) 기록만 한다. 1000·2000 정점은 표본 약
+                // 800·1800 개로 측정 0.96~1.01. 기준 ±25%: 강건 무게의 효율 손실과 표본 흔들림을 덮되,
+                // 정상 간선 일부를 버리거나 무게를 잘못 줘 오차가 예측의 1.25배를 넘게 커지는 결함은 잡는다.
+                if n >= 1000 {
+                    assert!(
+                        (0.8..1.25).contains(&ratio),
+                        "정점 {n} 간격 {k}: 비 {ratio}"
+                    );
+                }
+            }
             assert!(res.inliers.iter().filter(|&&b| !b).count() <= edges.len() / 100);
         }
+    }
+
+    /// 거리 1..4 간선 사슬(단위 무게)에서 두 정점 사이 유효 저항 R(k).
+    /// 무한 사슬 라플라시안의 기호 λ(θ) = Σ_d 2(1 − cos dθ) 로 R(k) = (1/π) ∫_0^π 2(1 − cos kθ)/λ(θ) dθ.
+    /// 등방 잡음 σ(축마다) 최소제곱 해의 선형화 공분산은 L⁺ ⊗ σ²I₃ 이므로 두 정점 상대 회전 오차 각도²의
+    /// 기댓값은 3σ²·R(k)(사슬 양 끝 100 정점을 빼면 무한 사슬 값과 같다고 본다).
+    fn chain_resistance(k: usize) -> f64 {
+        let steps = 200_000;
+        let h = std::f64::consts::PI / steps as f64;
+        (0..steps)
+            .map(|s| {
+                let th = (s as f64 + 0.5) * h;
+                let lam: f64 = (1..=4).map(|d| 2.0 * (1.0 - (d as f64 * th).cos())).sum();
+                2.0 * (1.0 - (k as f64 * th).cos()) / lam
+            })
+            .sum::<f64>()
+            * h
+            / std::f64::consts::PI
+    }
+
+    /// 사슬 안쪽(양 끝 100 정점 제외) 정점 v, v+k 상대 회전 오차 각도² 평균 / 선형화 예측 3σ²R(k).
+    fn chain_relative_error_ratio(
+        est: &[Option<Rotation3<f64>>],
+        truth: &[Rotation3<f64>],
+        k: usize,
+        sigma: f64,
+    ) -> f64 {
+        let n = truth.len();
+        let range = 100..n - 100 - k;
+        let count = range.len() as f64;
+        let mean_sq = range
+            .map(|v| {
+                let d_est = est[v + k].unwrap() * est[v].unwrap().inverse();
+                let d_true = truth[v + k] * truth[v].inverse();
+                angle(&(d_est * d_true.inverse())).powi(2)
+            })
+            .sum::<f64>()
+            / count;
+        mean_sq / (3.0 * sigma * sigma * chain_resistance(k))
     }
 
     /// 띠 촐레스키가 밀집 촐레스키와 같은 해를 내는지(2000 정점 비교의 근거).
