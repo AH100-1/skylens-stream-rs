@@ -11,6 +11,7 @@ pub mod geo;
 pub mod matching;
 pub mod math;
 pub mod ply;
+pub mod pipeline;
 pub mod rotation_averaging;
 pub mod stream;
 pub mod synth;

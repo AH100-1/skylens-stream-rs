@@ -4,18 +4,32 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use skylens_core::dataset::{load_dataset, DatasetConfig};
+use skylens_core::pipeline::{run_pipeline, PipelineConfig};
 
 pub const USAGE: &str =
-    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N]";
+    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N] [--max-features N] [--dense-width N] [--hfov DEG] [--ba-iters N]";
 
 /// 출력 폴더 아래에 만드는 하위 폴더.
 pub const OUTPUT_DIRS: [&str; 3] = ["preview", "refined", "snapshots"];
 
-fn parse_options(rest: &[&str]) -> Result<DatasetConfig, String> {
+fn parse_options(rest: &[&str]) -> Result<(DatasetConfig, PipelineConfig), String> {
     let mut cfg = DatasetConfig::default();
+    let mut pc = PipelineConfig::default();
     let mut it = rest.iter();
     while let Some(&key) = it.next() {
+        if key == "--hfov" {
+            let v = it.next().ok_or("--hfov 뒤에 값이 없음")?;
+            pc.hfov_deg = v
+                .parse()
+                .ok()
+                .filter(|h: &f64| *h > 1.0 && *h < 179.0)
+                .ok_or_else(|| format!("--hfov 값이 1..179 도가 아님: {v}"))?;
+            continue;
+        }
         let slot = match key {
+            "--max-features" => &mut pc.max_features,
+            "--dense-width" => &mut pc.dense_width,
+            "--ba-iters" => &mut pc.ba_iters,
             "--stride" => &mut cfg.stride,
             "--span" => &mut cfg.span,
             "--ovl" => &mut cfg.ovl,
@@ -30,11 +44,14 @@ fn parse_options(rest: &[&str]) -> Result<DatasetConfig, String> {
     if cfg.stride == 0 || cfg.span == 0 {
         return Err("--stride, --span 은 1 이상".into());
     }
-    Ok(cfg)
+    if pc.max_features == 0 || pc.dense_width < 8 {
+        return Err("--max-features 는 1 이상, --dense-width 는 8 이상".into());
+    }
+    Ok((cfg, pc))
 }
 
 pub fn run(input: &str, output: &str, rest: &[&str]) -> ExitCode {
-    let cfg = match parse_options(rest) {
+    let (cfg, pcfg) = match parse_options(rest) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}\n사용법:\n  {USAGE}");
@@ -73,5 +90,17 @@ pub fn run(input: &str, output: &str, rest: &[&str]) -> ExitCode {
     for (i, c) in chunks.iter().enumerate() {
         println!("chunk {i} {}..{}", c.start, c.end);
     }
-    ExitCode::SUCCESS
+    match run_pipeline(&ds, &pcfg, out) {
+        Ok(res) => {
+            for i in &res.issues {
+                println!("issue {i}");
+            }
+            println!("done regions {}", res.regions.len());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
 }
