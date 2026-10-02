@@ -53,7 +53,7 @@ use skylens_core::rotation_averaging::{
     aligned_errors, average_rotations, AveragingConfig, RelativeRotation,
 };
 use skylens_core::synth::{CamId, Scene, SceneConfig};
-use skylens_core::two_view::{ransac_essential, recover_pose};
+use skylens_core::two_view::{recover_pose, verify_pair};
 
 /// 짝 하나의 대응 좌표: (픽셀 a, 픽셀 b, 정규 a, 정규 b).
 type PairCoords = (
@@ -394,19 +394,28 @@ fn pipeline(args: &Args) -> Vec<Row> {
 
     // 5b. 기하 검증: 5점 E RANSAC(짝 사이 병렬).
     let focal = scene.views.first().map_or(1.0, |v| v.camera.intrinsics.fx);
-    let (t, eres) = measure(args.repeat, || {
+    // 신뢰 불가 짝(짧은 기선의 다른 해: 회전도 약 2° 틀림)은 회전 간선에서 뺀다.
+    let (t, vres) = measure(args.repeat, || {
         coords
             .par_iter()
-            .map(|c| ransac_essential(&c.2, &c.3, focal, &rcfg))
+            .map(|c| verify_pair(&c.2, &c.3, focal, &rcfg))
             .collect::<Vec<_>>()
     });
+    let unreliable = vres.iter().flatten().filter(|v| !v.usable_edge()).count();
+    let eres: Vec<_> = vres
+        .into_iter()
+        .map(|v| {
+            v.filter(|v| v.usable_edge())
+                .map(|v| (v.essential, v.inliers))
+        })
+        .collect();
     rows.push(Row {
         name: "RANSAC E(5점)",
         items: np,
         unit: "짝",
         times: t,
         note: format!(
-            "성공 {}/{np} {pair_note}",
+            "성공 {}/{np}, 신뢰 불가 제외 {unreliable} {pair_note}",
             eres.iter().filter(|e| e.is_some()).count()
         ),
     });

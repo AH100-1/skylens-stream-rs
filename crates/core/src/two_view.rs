@@ -945,8 +945,47 @@ pub struct PairReliability {
     pub parallax_deg: f64,
     /// 회전이 다른 다음 후보의 MSAC 비용 / 첫 후보의 MSAC 비용(후보가 하나면 무한대).
     pub cost_ratio: f64,
-    /// 시차와 비용 차가 모두 문턱 이상이면 true. false 인 짝의 이동 방향은 회전·위치 평균에 넣지 않는다.
+    /// 시차와 비용 차가 모두 문턱 이상이면 true. false 인 짝은 이동 방향뿐 아니라 회전도 틀릴 수 있어
+    /// (실측 편대 간격 1 의 다른 해: 회전 1.86~1.98°) [`verify_pair`] 가 회전·위치 간선에서 함께 뺀다.
     pub reliable: bool,
+}
+
+/// 짝 검증 결과: 첫 후보 E, 정상 표시, 신뢰 판정.
+#[derive(Clone, Debug)]
+pub struct VerifiedPair {
+    /// 첫 후보 본질 행렬.
+    pub essential: Matrix3<f64>,
+    /// 대응별 정상 표시.
+    pub inliers: Vec<bool>,
+    /// [`assess_pair`] 판정.
+    pub reliability: PairReliability,
+}
+
+impl VerifiedPair {
+    /// 회전·위치 평균의 간선으로 써도 되는지([`PairReliability::reliable`]).
+    pub fn usable_edge(&self) -> bool {
+        self.reliability.reliable
+    }
+}
+
+/// 짝 기하 검증: [`ransac_essential_candidates`] → [`assess_pair`].
+///
+/// 겹침 없는 짝(정상 수 유의성 미달)은 None. 신뢰 불가 짝도 결과는 돌려주지만 `usable_edge()` 가 false 라
+/// 호출하는 쪽은 회전 간선에서 뺀다. 첫 후보를 그대로 쓰는 [`ransac_essential`] 과 달리 이 함수가 검증 경로다.
+pub fn verify_pair(
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    focal_px: f64,
+    cfg: &RansacConfig,
+) -> Option<VerifiedPair> {
+    let cands = ransac_essential_candidates(n1, n2, focal_px, cfg);
+    let reliability = assess_pair(&cands, n1, n2, focal_px, cfg)?;
+    let (essential, inliers) = cands.into_iter().next()?;
+    Some(VerifiedPair {
+        essential,
+        inliers,
+        reliability,
+    })
 }
 
 /// [`ransac_essential_candidates`] 의 후보 목록으로 첫 후보 자세를 믿을 수 있는지 판정한다.
@@ -1339,6 +1378,122 @@ mod tests {
                 assert!(front > 0.95, "앞쪽 비율 {front}");
             }
         }
+    }
+
+    /// F-158·F-159: 실측 편대 배치 렌더에서 짝 종류별(같은 카메라 간격 1·3·6, 다른 카메라 같은 위치·4칸 차)로
+    /// [`verify_pair`] 의 통과(회전 간선으로 쓰는 짝)와 상대 회전 오차를 집계한다. 간격 1 은 시드 1 F·시드 3 R 이
+    /// 회전 약 2° 의 다른 해로 떨어지는 장면이라, 신뢰 판정이 빠지면 2° 초과 간선이 통과한다.
+    /// 기준: 통과 간선 중 2° 초과 비율 < 5%(F-159), 1.5° 초과 0개(F-158).
+    #[test]
+    fn verified_edges_by_pair_kind_rendered_formation() {
+        use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
+        use crate::matching::{ratio_match, RansacConfig};
+        use crate::synth::{CamId, Scene, SceneConfig};
+        let (w, h) = (480usize, 270usize);
+        let dcfg = DetectorConfig::default();
+        let rcfg = RansacConfig::default();
+        let kinds = [
+            "같은 간격1",
+            "같은 간격3",
+            "같은 간격6",
+            "다른 위치차0",
+            "다른 위치차4",
+        ];
+        // 종류별 [시도, 검증 None, 신뢰 불가, 통과, 통과 중 >1.5°, 통과 중 >2°], 통과 회전 오차 최대.
+        let mut tab = [[0usize; 6]; 5];
+        let mut worst = [0.0f64; 5];
+        for seed in 1..=3u64 {
+            let scene = Scene::new(SceneConfig {
+                width: w as u32,
+                height: h as u32,
+                seed,
+                ..SceneConfig::default()
+            });
+            let view = |cam: CamId, pos: usize| {
+                scene
+                    .views
+                    .iter()
+                    .find(|v| v.cam == cam && v.position == pos)
+                    .unwrap()
+            };
+            let mut pairs = Vec::new();
+            for cam in CamId::ALL {
+                for (k, step) in [1usize, 3, 6].into_iter().enumerate() {
+                    pairs.push((k, view(cam, 0), view(cam, step)));
+                }
+            }
+            for (a, b) in [
+                (CamId::F, CamId::R),
+                (CamId::F, CamId::L),
+                (CamId::R, CamId::L),
+            ] {
+                pairs.push((3, view(a, 0), view(b, 0)));
+                pairs.push((4, view(a, 0), view(b, 4)));
+            }
+            for (kind, va, vb) in pairs {
+                let feat = |v: &crate::synth::View| {
+                    let (img, _) = scene.render(v);
+                    detect_and_describe(&GrayImage::from_rgb(w, h, &img.data), &dcfg)
+                };
+                let (fa, fb) = (feat(va), feat(vb));
+                let m = ratio_match(&fa, &fb, 0.8, true);
+                let px = |f: &Feature| Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
+                let (ka, kb) = (&va.camera.intrinsics, &vb.camera.intrinsics);
+                let a1: Vec<_> = m
+                    .iter()
+                    .map(|&(i, _)| ka.to_normalized(&px(&fa[i])))
+                    .collect();
+                let a2: Vec<_> = m
+                    .iter()
+                    .map(|&(_, j)| kb.to_normalized(&px(&fb[j])))
+                    .collect();
+                let row = &mut tab[kind];
+                row[0] += 1;
+                let Some(v) = verify_pair(&a1, &a2, ka.fx, &rcfg) else {
+                    row[1] += 1;
+                    continue;
+                };
+                let sel = |x: &[Vector2<f64>]| -> Vec<Vector2<f64>> {
+                    x.iter()
+                        .zip(&v.inliers)
+                        .filter(|(_, &ok)| ok)
+                        .map(|(p, _)| *p)
+                        .collect()
+                };
+                let truth = vb.camera.pose.rotation * va.camera.pose.rotation.inverse();
+                let rot = recover_pose(&v.essential, &sel(&a1), &sel(&a2)).map_or(180.0, |p| {
+                    rotation_angle_between(&p.rotation, &truth).to_degrees()
+                });
+                eprintln!(
+                    "edge seed={seed} {:?}{}-{:?}{} kind={} matches={} rot_err={rot:.3} parallax={:.3} ratio={:.3} usable={}",
+                    va.cam, va.position, vb.cam, vb.position, kinds[kind], m.len(),
+                    v.reliability.parallax_deg, v.reliability.cost_ratio, v.usable_edge()
+                );
+                if !v.usable_edge() {
+                    row[2] += 1;
+                    continue;
+                }
+                row[3] += 1;
+                row[4] += (rot > 1.5) as usize;
+                row[5] += (rot > 2.0) as usize;
+                worst[kind] = worst[kind].max(rot);
+            }
+        }
+        let (mut pass, mut bad15, mut bad2) = (0, 0, 0);
+        for (k, r) in tab.iter().enumerate() {
+            eprintln!(
+                "종류 {}: 시도 {} 검증 실패 {} 신뢰 불가 {} 통과 {} >1.5° {} >2° {} 통과 최대 {:.3}°",
+                kinds[k], r[0], r[1], r[2], r[3], r[4], r[5], worst[k]
+            );
+            pass += r[3];
+            bad15 += r[4];
+            bad2 += r[5];
+        }
+        let share = bad2 as f64 / pass.max(1) as f64;
+        eprintln!("통과 {pass}, >1.5° {bad15}, >2° {bad2} ({share:.3})");
+        assert!(pass > 0, "통과 간선 없음");
+        assert_eq!(bad15, 0, "1.5° 초과 통과 간선");
+        assert!(share < 0.05, "2° 초과 비율 {share}");
     }
 
     #[test]
