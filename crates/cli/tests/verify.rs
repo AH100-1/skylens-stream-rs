@@ -606,3 +606,112 @@ fn align_records_must_cover_every_region() {
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("정렬 기록 2개"), "{out}");
 }
+
+/// 구역 1개짜리 폴더를 직접 만든다(report.json 없음): 정밀 = `refined`, 초벌 = `preview`,
+/// manifest = `manifest` 문자열, 스냅샷 PLY 는 `snaps` 이름마다 점 1개.
+fn one_region_dir(
+    tag: &str,
+    preview: Vec<PointRecord>,
+    refined: Vec<PointRecord>,
+    manifest: &str,
+    snaps: &[&str],
+) -> PathBuf {
+    let dir = tmp(tag);
+    for sub in ["preview", "refined", "snapshots"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    write(&dir.join("preview/preview_00_pos0-14.ply"), preview);
+    write(&dir.join("refined/refined_00_pos0-14.ply"), refined);
+    for n in snaps {
+        write(&dir.join("snapshots").join(n), vec![rec(0.0, 0.0, 0.0)]);
+    }
+    std::fs::write(dir.join("snapshots/manifest.json"), manifest).unwrap();
+    dir
+}
+
+/// verify 를 돌려 (종료 코드, 표준 출력 바이트 수, 표준 출력, 걸린 초).
+fn verify_timed(dir: &Path) -> (i32, usize, String, f64) {
+    let t0 = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_skylens-stream"))
+        .arg("verify")
+        .arg(dir)
+        .output()
+        .unwrap();
+    let secs = t0.elapsed().as_secs_f64();
+    std::fs::remove_dir_all(dir).unwrap();
+    (
+        out.status.code().unwrap(),
+        out.stdout.len(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        secs,
+    )
+}
+
+const ONE_STEP_MANIFEST: &str = r#"{"snapshots":[{"step":1,"points":1,"preview_new_area":0},{"step":"final","points":90000}],"align":[{"region":0,"pairs":2000,"fit_median_m":1.0,"scale":1.0}]}"#;
+
+/// F-180: 정밀 9만 점이 모두 (10,10,0), 초벌은 그 둘레 8 m 정사각형 300×300 격자(z 0.5).
+/// 정답: 초벌 점의 최근접은 모두 (10,10,0) 이고 거리 = √(r² + 0.25). 한 변 8 m 정사각형에서
+/// 수평 거리 중앙 r ≈ √(32/π) = 3.19 m → 최근접 중앙 ≈ 3.23 m > 3 m 이므로 FAIL(종료 1).
+/// 고치기 전 같은 입력에서 39.4 s. 상한 1 s 는 정답 비교와 별개의 시간 기준(같은 좌표 점이
+/// 질의마다 잎 하나만 보게 되면 수십 ms 수준).
+#[test]
+fn identical_refined_points_finish_quickly() {
+    let refined = vec![rec(10.0, 10.0, 0.0); 90_000];
+    let mut preview = Vec::with_capacity(90_000);
+    for i in 0..300 {
+        for j in 0..300 {
+            let x = 6.0 + 8.0 * i as f32 / 299.0;
+            let y = 6.0 + 8.0 * j as f32 / 299.0;
+            preview.push(rec(x, y, 0.5));
+        }
+    }
+    let dir = one_region_dir(
+        "same_xyz",
+        preview,
+        refined,
+        ONE_STEP_MANIFEST,
+        &["step_01_1regions.ply"],
+    );
+    let (code, _, out, secs) = verify_timed(&dir);
+    eprintln!("same_xyz verify {secs:.2} s");
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(status(&out, "preview_vs_refined"), "FAIL", "{out}");
+    let nn: f64 = out
+        .split("최근접 중앙 최대 ")
+        .nth(1)
+        .and_then(|t| t.split(" m").next())
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!((nn - 3.23).abs() < 0.05, "최근접 중앙 {nn}\n{out}");
+    assert!(secs < 1.0, "verify {secs:.2} s");
+}
+
+/// F-181: manifest 의 step 하나가 3천만 → 예전에는 빠진 단계 3천만 개를 다 찍어 16 s·1.16 GB.
+/// 이제 구역 수 + 1 에서 잘라 FAIL 하고 목록은 앞 몇 개와 개수만.
+#[test]
+fn huge_step_fails_with_small_output() {
+    let m = r#"{"snapshots":[{"step":30000000,"points":1,"preview_new_area":1},{"step":"final","points":1}],"align":[{"region":0,"pairs":2000,"fit_median_m":1.0,"scale":1.0}]}"#;
+    let g = vec![rec(0.0, 0.0, 0.0)];
+    let dir = one_region_dir("huge_step", g.clone(), g, m, &[]);
+    let (code, bytes, out, secs) = verify_timed(&dir);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(status(&out, "snapshots"), "FAIL", "{out}");
+    assert!(out.contains("구역 수 1 초과 단계 [30000000]"), "{out}");
+    assert!(bytes < 1 << 20, "출력 {bytes} B");
+    assert!(secs < 1.0, "verify {secs:.2} s");
+}
+
+/// F-181: manifest 가 `{"snapshots":` 뒤에 `[` 30만 개 → 예전에는 스택 넘침(종료 134).
+/// 이제 형식 오류로 FAIL(종료 1), 표가 나온다.
+#[test]
+fn deeply_nested_manifest_fails_without_crash() {
+    let m = format!("{{\"snapshots\":{}", "[".repeat(300_000));
+    let g = vec![rec(0.0, 0.0, 0.0)];
+    let dir = one_region_dir("deep_json", g.clone(), g, &m, &[]);
+    let (code, bytes, out, secs) = verify_timed(&dir);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(status(&out, "snapshots"), "FAIL", "{out}");
+    assert!(out.contains("중첩 깊이 64 초과"), "{out}");
+    assert!(bytes < 1 << 20, "출력 {bytes} B");
+    assert!(secs < 1.0, "verify {secs:.2} s");
+}
