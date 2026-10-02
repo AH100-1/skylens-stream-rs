@@ -156,6 +156,25 @@ fn read_header_line<R: BufRead>(
     Ok(l.trim().to_string())
 }
 
+/// 첫 줄 매직 `ply\n` 또는 `ply\r\n` 을 바이트 그대로 확인한다.
+///
+/// 줄 길이·UTF-8 검사보다 먼저 보므로, PLY 가 아닌 파일(JPEG 등 이진 파일, 줄바꿈 없는 긴 글)은
+/// 다른 원인이 아니라 "PLY 매직 없음" 으로 거절된다. 5바이트 넘게 읽지 않는다.
+fn read_magic<R: BufRead>(r: &mut R, used: &mut usize) -> io::Result<()> {
+    let mut head = Vec::with_capacity(5);
+    r.by_ref().take(4).read_to_end(&mut head)?;
+    if head.as_slice() == b"ply\r" {
+        r.by_ref().take(1).read_to_end(&mut head)?;
+    }
+    match head.as_slice() {
+        b"ply\n" | b"ply\r\n" => {
+            *used += head.len();
+            Ok(())
+        }
+        _ => Err(invalid("PLY 매직 없음")),
+    }
+}
+
 /// 이진 리틀엔디언 PLY 의 vertex 원소를 읽는다. vertex 가 첫 원소여야 한다.
 ///
 /// 헤더에는 `format binary_little_endian 1.0` 줄이 정확히 한 번 있어야 하고,
@@ -165,9 +184,7 @@ pub fn read_ply<R: Read>(r: R) -> io::Result<PointCloud> {
     let mut buf = Vec::new();
     let mut used = 0usize;
 
-    if read_header_line(&mut r, &mut buf, &mut used)? != "ply" {
-        return Err(invalid("PLY 매직 없음"));
-    }
+    read_magic(&mut r, &mut used)?;
     let mut count: Option<usize> = None;
     let mut in_vertex = false;
     let mut format_seen = false;
@@ -456,12 +473,39 @@ property double z\nproperty double x\nproperty double y\nend_header\n"
         let mut src = Counting(&data, 0);
         let e = read_ply(&mut src).unwrap_err();
         assert!(e.to_string().contains("헤더 줄이 너무 김"), "{e}");
-        // BufReader 내부 버퍼(8 KiB) 이상은 읽지 않는다.
+        // 줄 상한(4 KiB) + BufReader 버퍼 여유 16 KiB = 20 KiB 이내만 읽는다(기본 버퍼는 8 KiB 라
+        // 실제로는 상한 + 8 KiB 안쪽이지만, 버퍼 크기 변화에 흔들리지 않게 16 KiB 를 둔다).
         assert!(
             src.1 <= MAX_HEADER_LINE + 16 * 1024,
             "읽은 바이트 {}",
             src.1
         );
+    }
+
+    #[test]
+    fn non_ply_input_reports_missing_magic() {
+        // JPEG 머리 바이트: UTF-8 이 아니지만 원인은 매직이 없다는 것.
+        let jpeg = [
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0, b'\n',
+        ];
+        let e = read_ply(&jpeg[..]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("매직"), "{e}");
+        // 줄바꿈 없는 4 KiB 넘는 글: 줄 길이가 아니라 매직으로 거절.
+        let long = "abc".repeat(2000);
+        let e = read_ply(long.as_bytes()).unwrap_err();
+        assert!(e.to_string().contains("매직"), "{e}");
+        // `ply` 로 시작하지만 첫 줄이 `ply` 가 아닌 경우, 앞 공백, 짧은 입력도 매직 없음.
+        for bad in [&b"plyx\n"[..], b" ply\n", b"ply", b"", b"ply\rx", b"PLY\n"] {
+            let e = read_ply(bad).unwrap_err();
+            assert!(e.to_string().contains("매직"), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn accepts_crlf_magic() {
+        let h = "ply\r\nformat binary_little_endian 1.0\r\nelement vertex 0\r\nproperty float x\r\nproperty float y\r\nproperty float z\r\nend_header\n";
+        assert_eq!(read_ply(h.as_bytes()).unwrap().len(), 0);
     }
 
     #[test]
