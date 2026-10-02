@@ -16,6 +16,7 @@ pub mod synth;
 pub mod tracks;
 pub mod two_view;
 pub mod undistort;
+pub mod verify;
 pub mod view_selection;
 
 pub use nalgebra;
