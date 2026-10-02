@@ -572,9 +572,18 @@ mod tests {
     fn chunks_boundary_table_12_2() {
         let six = [0..14, 10..26, 22..38, 34..50, 46..62];
         let table: [(usize, Vec<Range<usize>>); 6] = [
-            (72, [six.to_vec(), vec![58..72]].concat()),
-            (73, [six.to_vec(), vec![58..73]].concat()),
-            (74, [six.to_vec(), vec![58..74]].concat()),
+            (
+                72,
+                six.iter().cloned().chain(std::iter::once(58..72)).collect(),
+            ),
+            (
+                73,
+                six.iter().cloned().chain(std::iter::once(58..73)).collect(),
+            ),
+            (
+                74,
+                six.iter().cloned().chain(std::iter::once(58..74)).collect(),
+            ),
             (75, [six.to_vec(), vec![58..74, 70..75]].concat()),
             (84, [six.to_vec(), vec![58..74, 70..84]].concat()),
             (85, [six.to_vec(), vec![58..74, 70..85]].concat()),
