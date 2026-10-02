@@ -517,8 +517,20 @@ fn sampson_residuals(
 
 #[cfg(test)]
 thread_local! {
-    /// 시험용: `refine_sampson` 호출마다 받아들인 LM 걸음 수(조기 종료 확인).
-    static LM_ITERS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// 시험용: `refine_sampson` 호출마다 (받아들인 LM 걸음 수, 종료 사유).
+    static LM_ITERS: std::cell::RefCell<Vec<(usize, LmStop)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 시험용: Sampson LM 종료 사유.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LmStop {
+    /// 걸음을 받아들였으나 상대 비용 감소가 1e-10 이하.
+    Converged,
+    /// 감쇠를 8번 키워도 비용이 줄지 않음.
+    Stalled,
+    /// 반복 상한에 닿음.
+    Cap,
 }
 
 /// 주어진 대응에서 Sampson 거리 제곱합을 줄이도록 F 를 Levenberg–Marquardt 로 정밀화한다
@@ -555,6 +567,8 @@ fn refine_sampson(
     let mut cost: f64 = rh.iter().map(|e| e * e).sum();
     let mut lambda = 1e-3;
     let mut taken = 0;
+    #[cfg(test)]
+    let mut stop = LmStop::Cap;
     for _ in 0..iters {
         let mut jtj = SMatrix::<f64, 9, 9>::zeros();
         let mut jtr = SMatrix::<f64, 9, 1>::zeros();
@@ -566,6 +580,7 @@ fn refine_sampson(
         }
         jtj.fill_upper_triangle_with_lower_triangle();
         let mut improved = false;
+        let mut accepted = false;
         for _ in 0..8 {
             let mut m = jtj;
             for k in 0..9 {
@@ -588,17 +603,27 @@ fn refine_sampson(
                 cost = c;
                 lambda = (lambda * 0.1).max(1e-9);
                 taken += 1;
+                accepted = true;
                 improved = rel > 1e-10;
                 break;
             }
             lambda *= 10.0;
         }
         if !improved {
+            #[cfg(test)]
+            {
+                stop = if accepted {
+                    LmStop::Converged
+                } else {
+                    LmStop::Stalled
+                };
+            }
+            let _ = accepted;
             break;
         }
     }
     #[cfg(test)]
-    LM_ITERS.with(|v| v.borrow_mut().push(taken));
+    LM_ITERS.with(|v| v.borrow_mut().push((taken, stop)));
     let _ = taken;
     let fp = t2.transpose() * g * t1;
     let n = fp.norm();
@@ -1339,9 +1364,9 @@ mod tests {
         )
     }
 
-    // 실측 편대 배치, 시드 1~3 × F/R/L × 간격 1·3 (18 경우) 측정: 정상 479~729,
-    // 정밀도 0.994~1.000, 재현율 1.000. 정상 수 기준은 최솟값 479 의 약 85%,
-    // 정밀도·재현율은 예전과 같은 0.98 (측정 최솟값보다 0.014 아래).
+    // 실측 편대 배치, 시드 1~3 × F/R/L × 간격 1·3 (18 경우) 측정: 정상 504~703,
+    // 정밀도 0.991~1.000, 재현율 1.000. 정상 수 기준은 최솟값 504 의 약 79%,
+    // 정밀도·재현율은 예전과 같은 0.98 (측정 최솟값보다 0.011 아래).
     const MIN_INL: usize = 400;
     const MIN_PREC: f64 = 0.98;
     const MIN_REC: f64 = 0.98;
@@ -1942,7 +1967,7 @@ mod tests {
     }
 
     /// 대응 4000개(정상 50%, σ 0.5 px) RANSAC 1회: (벽시계 s, 스레드 CPU s, 정상 수, 정답 F 정상 수, LM 걸음 수들).
-    fn ransac_4000_run() -> (f64, Option<f64>, usize, usize, Vec<usize>) {
+    fn ransac_4000_run() -> (f64, Option<f64>, usize, usize, Vec<(usize, LmStop)>) {
         let (x1, x2, _, c1, c2) = correspondences(4000, 0.5, 0.5, 4242);
         let th2 = RansacConfig::default().threshold_px.powi(2);
         let g = fundamental_from_cameras(&c1, &c2);
@@ -1961,7 +1986,9 @@ mod tests {
     }
 
     /// F-027: 대응 4000개에서 정답 F 와 같은 문턱의 정상 수 98% 이상(탐색 실패 없음)이고,
-    /// Sampson LM 이 30회 상한 전에 수렴해 멈추는 경우가 실제로 있다(문턱 단계 6 × 상위 가설 5 + 마무리).
+    /// Sampson LM 은 상대 감소 규칙으로 수렴해 멈춘다(문턱 단계 6 × 상위 가설 5 + 마무리 호출).
+    /// F-139: 종료 사유를 따로 세어, 호출 과반이 '걸음을 받아들인 뒤 수렴' 으로 끝나고
+    /// '첫 걸음부터 감쇠 실패' 정체는 없음을 단언한다(정체 호출 하나로 통과하던 예전 단언 대체).
     #[test]
     fn ransac_4000_correspondences_lm_stops_early() {
         let (_, _, cnt, gt, lm) = ransac_4000_run();
@@ -1969,9 +1996,29 @@ mod tests {
             cnt as f64 >= 0.98 * gt as f64,
             "정상 {cnt} < 정답 F {gt} × 0.98"
         );
+        let count = |s: LmStop| lm.iter().filter(|&&(_, r)| r == s).count();
+        let (conv, stall, cap) = (
+            count(LmStop::Converged),
+            count(LmStop::Stalled),
+            count(LmStop::Cap),
+        );
+        let stall_at_start = lm
+            .iter()
+            .filter(|&&(k, r)| r == LmStop::Stalled && k == 0)
+            .count();
+        eprintln!(
+            "LM 종료 사유: 수렴 {conv}, 정체 {stall}(첫 걸음 정체 {stall_at_start}), 상한 {cap} / 호출 {}",
+            lm.len()
+        );
+        assert!(!lm.is_empty(), "LM 호출 없음");
         assert!(
-            lm.iter().any(|&k| k < 30),
-            "LM 이 한 번도 조기 종료하지 않음"
+            2 * conv > lm.len(),
+            "수렴 종료 {conv} / {} 가 과반 아님",
+            lm.len()
+        );
+        assert_eq!(
+            stall_at_start, 0,
+            "첫 걸음부터 정체한 호출 {stall_at_start}"
         );
     }
 
@@ -2210,5 +2257,114 @@ mod tests {
             assert!(m.contains(&(0, 3)), "dup {dup}: {m:?}");
             assert!(!m.iter().any(|&(i, _)| i == dup), "dup {dup}: {m:?}");
         }
+    }
+
+    /// F-148 매칭 쪽: 실측 편대 배치(`SceneConfig::default()`)의 SPEC 짝 일정 — 같은 카메라
+    /// 1·2·3·4·5·8·16칸, 다른 카메라(F→R, F→L, R→L) 위치 차 −4..=4 — 에서 매칭·RANSAC 이
+    /// 확정한 짝마다 F → E → `recover_pose` 회전을 정답 상대 회전 R_b R_aᵀ 와 비교한다.
+    /// 짝 종류별 (시도, 확정, 회전 오차 > 2°) 를 출력하고, 확정 간선 중 2° 초과 비율 < 5% 를 단언한다.
+    /// 시드 1 측정(480×270): 같은 카메라 1·2·3·8칸 2° 초과 0, 4칸 2/3(약 6.5°), 5칸 2/3
+    /// (최대 11.2°), 16칸 1/3(21.8°), 다른 카메라 ±4 는 27 짝 모두 미확정 — 확정 21 중 5 가 틀림.
+    /// 틀린 간선은 모두 같은 카메라 짝이라 겹침 없는 짝 통과가 원인이 아니다. 원인 분리 전이라 무시.
+    #[test]
+    #[ignore = "F-148: 같은 카메라 4·5·16칸에서 회전 오차 2° 초과 5/21, 원인 미분리(노트 남은 문제)"]
+    fn formation_pair_schedule_rotation_errors() {
+        use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
+        use crate::synth::{CamId, Scene, SceneConfig};
+        let (w, h) = (480usize, 270usize);
+        let scene = Scene::new(SceneConfig {
+            width: w as u32,
+            height: h as u32,
+            seed: 1,
+            ..SceneConfig::default()
+        });
+        let cfg = DetectorConfig::default();
+        let mut cache: std::collections::HashMap<(CamId, usize), Vec<Feature>> =
+            std::collections::HashMap::new();
+        let mut feats = |cam: CamId, pos: usize| -> (crate::synth::View, Vec<Feature>) {
+            let v = scene
+                .views
+                .iter()
+                .find(|v| v.cam == cam && v.position == pos)
+                .unwrap()
+                .clone();
+            let f = cache
+                .entry((cam, pos))
+                .or_insert_with(|| {
+                    let (img, _) = scene.render(&v);
+                    detect_and_describe(&GrayImage::from_rgb(w, h, &img.data), &cfg)
+                })
+                .clone();
+            (v, f)
+        };
+        let base = 8usize;
+        type PairList = Vec<(CamId, usize, CamId, usize)>;
+        let mut kinds: Vec<(String, PairList)> = Vec::new();
+        for gap in [1usize, 2, 3, 4, 5, 8, 16] {
+            let v = CamId::ALL
+                .iter()
+                .map(|&c| (c, base, c, base + gap))
+                .collect();
+            kinds.push((format!("같은 카메라 {gap}칸"), v));
+        }
+        for (a, b) in [
+            (CamId::F, CamId::R),
+            (CamId::F, CamId::L),
+            (CamId::R, CamId::L),
+        ] {
+            let v = (-4i64..=4)
+                .map(|d| (a, base, b, (base as i64 + d) as usize))
+                .collect();
+            kinds.push((format!("{a:?}→{b:?} ±4"), v));
+        }
+        let (mut tot_ok, mut tot_bad) = (0usize, 0usize);
+        for (name, list) in &kinds {
+            let (mut ok, mut bad, mut errs) = (0usize, 0usize, Vec::new());
+            for &(ca, pa, cb, pb) in list {
+                let (va, fa) = feats(ca, pa);
+                let (vb, fb) = feats(cb, pb);
+                let m = ratio_match(&fa, &fb, 0.8, true);
+                let px = |f: &Feature| Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5);
+                let x1: Vec<_> = m.iter().map(|&(i, _)| px(&fa[i])).collect();
+                let x2: Vec<_> = m.iter().map(|&(_, j)| px(&fb[j])).collect();
+                let Some((f, inl)) = ransac_fundamental(&x1, &x2, &RansacConfig::default()) else {
+                    continue;
+                };
+                ok += 1;
+                let (k1, k2) = (&va.camera.intrinsics, &vb.camera.intrinsics);
+                let e = crate::two_view::essential_from_fundamental(&f, k1, k2);
+                let n1: Vec<_> = (0..x1.len())
+                    .filter(|&i| inl[i])
+                    .map(|i| k1.to_normalized(&x1[i]))
+                    .collect();
+                let n2: Vec<_> = (0..x2.len())
+                    .filter(|&i| inl[i])
+                    .map(|i| k2.to_normalized(&x2[i]))
+                    .collect();
+                let truth = vb.camera.pose.rotation * va.camera.pose.rotation.inverse();
+                let err = crate::two_view::recover_pose(&e, &n1, &n2)
+                    .map(|p| (p.rotation * truth.inverse()).angle().to_degrees())
+                    .unwrap_or(180.0);
+                if err > 2.0 {
+                    bad += 1;
+                }
+                errs.push(err);
+            }
+            errs.sort_by(f64::total_cmp);
+            eprintln!(
+                "짝 종류 {name}: 시도 {}, 확정 {ok}, 회전 오차 > 2° {bad}, 오차 중앙 {:.3}°, 최대 {:.3}°",
+                list.len(),
+                errs.get(errs.len() / 2).copied().unwrap_or(f64::NAN),
+                errs.last().copied().unwrap_or(f64::NAN)
+            );
+            tot_ok += ok;
+            tot_bad += bad;
+        }
+        eprintln!("전체 확정 {tot_ok}, 회전 오차 > 2° {tot_bad}");
+        assert!(tot_ok > 0);
+        assert!(
+            (tot_bad as f64) < 0.05 * tot_ok as f64,
+            "회전 오차 > 2° 간선 {tot_bad} / 확정 {tot_ok}"
+        );
     }
 }
