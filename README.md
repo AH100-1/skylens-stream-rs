@@ -11,7 +11,7 @@
 새 구역이 들어올 때마다 빠른 초벌 점군을 먼저 보여 주고, 정밀 계산이 끝난 구역은 정밀본으로 바꿔 끼운다.
 화면에는 단계마다 "이전 구역은 정밀본 + 최신 구역은 초벌" 점군이 나간다.
 
-> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth` 만 있고, 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정 → GPS 정렬 → 구역 분할 → 밀집 준비·융합 → 초벌 정렬·스냅샷 = 점진 스트림)를 묶어 만들어 가는 중이다.
+> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth`·`verify` 만 있고, 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정 → GPS 정렬 → 구역 분할 → 밀집 준비·융합 → 초벌 정렬·스냅샷 = 점진 스트림)를 묶어 만들어 가는 중이다.
 
 ### 설치
 
@@ -31,11 +31,17 @@ Rust stable 1.88 이상이 필요하다.
   images/camR_0000.jpg ...   # 오른쪽
   images/camL_0000.jpg ...   # 왼쪽
   gps.txt                    # 한 줄에: 확장자 없는 이미지 이름(camF_0000) 위도 경도(도) 고도(m)
+  truth/cameras.txt          # synth 출력에만: 정답 카메라
+  truth/origin.txt           # synth 출력에만: 정답 좌표 원점
 ```
 
 `gps.txt` 의 이름에는 확장자를 붙이지 않는다(`camF_0000.jpg` 가 아니라 `camF_0000`).
 `synth` 출력도 같은 구조이며, 정답 카메라 `truth/cameras.txt`(한 줄에: 이름 fx fy cx cy 폭 높이, 세계→카메라 R 행 우선 9개, t 3개)와
 정답 좌표 원점 `truth/origin.txt`(`위도 경도 고도` 한 줄)가 더 있다.
+
+좌표계: 출력 좌표는 첫 GPS(첫 영상의 위도·경도·고도)를 원점으로 하는 동-북-위 지역 직교 좌표(미터)다(SPEC §2).
+`truth/cameras.txt` 의 정답 좌표는 첫 GPS 가 아니라 `truth/origin.txt` 를 원점으로 하는 동-북-위(미터)라서, 결과와 비교할 때는
+라이브러리의 `Scene::to_first_gps_frame` 으로 첫 GPS 원점 좌표로 옮긴다(옮기지 않으면 기본 장면에서 고도만 약 27 m 어긋난다).
 
 ### 사용법
 
@@ -49,6 +55,11 @@ skylens-stream ply-info <파일.ply>
 # 출력 폴더가 빈 문자열이거나 폭·높이가 맞지 않으면 아무것도 쓰지 않고 사용법과 종료 코드 2
 # 끝나면 만든 영상 수를 출력 ("views 240"). 쓰기 실패면 오류 메시지와 종료 코드 1
 skylens-stream synth <출력 폴더> [폭 높이]
+
+# 출력 폴더 검사(SPEC §4 검증 기준 일곱 항목을 PASS/FAIL/판정 불가 표로 출력)
+# 종료 코드: FAIL 이 하나라도 있으면 1, FAIL 없이 판정 불가가 있으면 2, 모두 PASS 면 0
+# 등록 사진 수·구역 사진 수·재투영 오차는 출력 폴더의 report.json 이 있을 때만 판정한다
+skylens-stream verify <출력 폴더>
 
 # 판 번호 출력 ("skylens-stream 0.1.0")
 skylens-stream --version
@@ -105,7 +116,9 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 ```
 
 시간 측정(1920×1080 한 장 검출, 7300×7300 매칭): `cargo test --release -- --ignored --test-threads=1 --nocapture timing`
-구간별 시간(합성 240장: 검출·매칭·검증·회전 평균·번들 조정): `cargo bench --bench pipeline -- --quick`(인자 설명은 `crates/core/benches/pipeline.rs` 머리말),
+구간별 시간(합성 장면, 기본 8위치 × 3대 = 24장 480×270, `--full` 이면 240장 960×540): `cargo bench --bench pipeline -- --quick`(인자 설명은 `crates/core/benches/pipeline.rs` 머리말).
+표의 구간은 합성 렌더·특징 검출·짝 생성·비율 매칭·RANSAC F(8점)·RANSAC E(5점)·두 시점 자세·회전 평균(정답 그래프)·회전 평균(검증 결과)·번들 조정이다.
+회전 평균은 정답 상대 회전 그래프와 검증된 짝에서 얻은 그래프 두 가지로 잰다.
 표를 파일로도 남기려면 `cargo bench --bench pipeline -- --quick --json <파일>`.
 
 ### 라이브러리: 두 시점 상대 자세와 삼각측량
@@ -114,8 +127,8 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 use skylens_core::two_view::{essential_from_fundamental, refine_relative_pose, triangulate};
 // 최소 해법이 필요하면 essential_5pt(&n1[..5], &n2[..5]) 가 본질 행렬 후보(최대 10개)를 준다.
 
-// f, inliers: 위 RANSAC 결과. k: 카메라 내부 파라미터(Intrinsics, 왜곡 없음).
-// 렌즈 왜곡이 있는 영상은 k.with_distortion(d).unproject(p) 로 정규화한다.
+// f, inliers: 위 RANSAC 결과. k: 카메라 내부 파라미터(Intrinsics, 왜곡 계수 `dist` 포함).
+// k.to_normalized 가 역왜곡까지 한다. 역왜곡 수렴 여부가 필요하면 k.unproject(p)(실패 시 None).
 let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let e = essential_from_fundamental(&f, &k, &k);
@@ -194,7 +207,9 @@ println!("RMS {:.3} → {:.3} px, {} 회", report.initial_rms, report.final_rms,
   (임계 max(3 × 잔차 중앙값, `floor_m`))으로 `(변환, 정상 표시, 잔차 중앙값)` 을 준다.
   `align_to_enu(&centers, &enu, max_residual_m)` 은 정밀 포즈의 카메라 중심을 동-북-위 좌표에 1회 정렬하고 잔차가 상한을 넘는 대응을 빼고 다시 푼다.
   `gps_align(&centers, &gps, &origin)` 은 위경도(`geo::Geodetic`)를 `origin` 기준 동-북-위로 바꾼 뒤 상한 `GPS_MAX_RESIDUAL_M`(3 m)로 `align_to_enu` 를 부른다.
-  결과 `GpsAlignment` 에는 `sim`·`inliers`·`residuals`·`median_residual` 이 있다. 합성 장면의 원점은 `truth/origin.txt` 다.
+  결과 `GpsAlignment` 에는 `sim`·`inliers`·`residuals`·`median_residual` 이 있다. 상한은 3 m 고정이고, 정상 대응이 3개 미만으로 줄면 첫 추정을 그대로 쓴다.
+  `None` 은 길이 불일치, 대응 3개 미만, NaN·무한대, 카메라 중심이 한 점이거나 일직선인 퇴화 배치일 때다(`umeyama` 와 같은 조건).
+  SPEC §2 출력 좌표로 정렬하려면 `origin` 에 첫 GPS 를 준다(합성 장면은 `Scene::first_gps_origin()`). `truth/origin.txt` 는 정답 좌표의 원점일 뿐 출력 원점이 아니다.
 - `skylens_core::undistort`: `undistort_to_long_side(&img, &k, long_side)` 가 왜곡 있는 사진을 긴 변 `long_side` 화소의 핀홀 사진과 새 `Intrinsics` 로 바꾼다(원본 밖 화소는 0, 쌍선형 보간).
 - `skylens_core::view_selection`: `select_neighbors(&views, &points, k)` 가 희소 점을 함께 본 사진들 가운데 사진마다 이웃 최대 k 장(기본 `DEFAULT_NEIGHBORS` = 8)을 고르고, `depth_range(&view, &points)` 가 깊이 탐색 범위를 준다.
 - `skylens_core::fusion`: `fuse(&views, &depth_maps, FusionConfig)` 가 사진별 깊이 맵을 왕복 재투영 검사로 합쳐 `PointCloud` 를 만든다(동의 사진 수 `min_views` 이상).
@@ -226,7 +241,7 @@ A Rust tool that builds a **progressively refined 3D point cloud** from the vide
 Each time a new region arrives, a fast preview cloud is shown first; once the accurate solve for a region finishes, its preview is swapped for the refined cloud.
 At every step the output is "refined clouds for earlier regions + preview for the newest region".
 
-> Work in progress. The command-line tool currently has only `ply-info` and `synth`; the progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment → GPS alignment → region split → dense preparation and fusion → preview alignment and snapshots = progressive stream).
+> Work in progress. The command-line tool currently has only `ply-info`, `synth` and `verify`; the progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment → GPS alignment → region split → dense preparation and fusion → preview alignment and snapshots = progressive stream).
 
 ### Build
 
@@ -246,11 +261,17 @@ Requires stable Rust 1.88 or newer.
   images/camR_0000.jpg ...   # right camera
   images/camL_0000.jpg ...   # left camera
   gps.txt                    # one line per image: image name without extension (camF_0000) latitude longitude (deg) altitude (m)
+  truth/cameras.txt          # synth output only: ground-truth cameras
+  truth/origin.txt           # synth output only: ground-truth coordinate origin
 ```
 
 Names in `gps.txt` carry no extension (`camF_0000`, not `camF_0000.jpg`).
 `synth` writes the same layout plus ground-truth cameras in `truth/cameras.txt` (one line per image: name fx fy cx cy width height, 9 entries of the world→camera R row-major, 3 entries of t) and
 the ground-truth coordinate origin in `truth/origin.txt` (one line: `latitude longitude altitude`).
+
+Coordinates: output coordinates are local east-north-up Cartesian coordinates (metres) whose origin is the first GPS fix (latitude, longitude and altitude of the first image) (SPEC §2).
+The ground-truth coordinates in `truth/cameras.txt` are east-north-up (metres) about `truth/origin.txt`, not about the first GPS fix, so before comparing them with results
+move them into the first-GPS frame with `Scene::to_first_gps_frame` in the library (without it the default scene is off by about 27 m in altitude alone).
 
 ### Usage
 
@@ -264,6 +285,11 @@ skylens-stream ply-info <file.ply>
 # An empty output path or invalid width/height writes nothing and prints usage with exit code 2
 # Prints the number of images written when done ("views 240"); write errors print a message and exit with code 1
 skylens-stream synth <output dir> [width height]
+
+# Check an output folder (prints the seven SPEC §4 criteria as a PASS/FAIL/undecided table)
+# Exit code: 1 if any FAIL, 2 if no FAIL but some undecided, 0 if all PASS
+# Registered images, region images and reprojection error are decided only when report.json is in the output folder
+skylens-stream verify <output dir>
 
 # Print the version ("skylens-stream 0.1.0")
 skylens-stream --version
@@ -320,8 +346,10 @@ if let Some((f, inliers)) = ransac_fundamental(&x1, &x2, &RansacConfig::default(
 ```
 
 Timing (detection on one 1920×1080 image, 7300×7300 matching): `cargo test --release -- --ignored --test-threads=1 --nocapture timing`
-Per-stage timing (synthetic 240 images: detection, matching, verification, rotation averaging, bundle adjustment): `cargo bench --bench pipeline -- --quick` (arguments are described at the top of `crates/core/benches/pipeline.rs`),
-to also save the table as a file, `cargo bench --bench pipeline -- --quick --json <file>`.
+Per-stage timing (synthetic scene, default 8 positions × 3 cameras = 24 images at 480×270, 240 images at 960×540 with `--full`): `cargo bench --bench pipeline -- --quick` (arguments are described at the top of `crates/core/benches/pipeline.rs`).
+The table rows are synthetic render (합성 렌더), feature detection (특징 검출), pair generation (짝 생성), ratio matching (비율 매칭), RANSAC F (8-point), RANSAC E (5-point), two-view pose (두 시점 자세), rotation averaging on the ground-truth graph (회전 평균(정답 그래프)), rotation averaging on the verified result (회전 평균(검증 결과)) and bundle adjustment (번들 조정).
+Rotation averaging is timed twice: on the ground-truth relative-rotation graph and on the graph from verified pairs.
+To also save the table as a file, `cargo bench --bench pipeline -- --quick --json <file>`.
 
 ### Library: two-view relative pose and triangulation
 
@@ -329,8 +357,8 @@ to also save the table as a file, `cargo bench --bench pipeline -- --quick --jso
 use skylens_core::two_view::{essential_from_fundamental, refine_relative_pose, triangulate};
 // For a minimal solver, essential_5pt(&n1[..5], &n2[..5]) returns essential-matrix candidates (up to 10).
 
-// f, inliers: the RANSAC result above. k: camera intrinsics (Intrinsics, no distortion).
-// For images with lens distortion, normalize with k.with_distortion(d).unproject(p).
+// f, inliers: the RANSAC result above. k: camera intrinsics (Intrinsics, including the distortion coefficients `dist`).
+// k.to_normalized also removes the distortion. If you need to know whether undistortion converged, use k.unproject(p) (None on failure).
 let n1: Vec<_> = x1.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let n2: Vec<_> = x2.iter().zip(&inliers).filter(|(_, &ok)| ok).map(|(p, _)| k.to_normalized(p)).collect();
 let e = essential_from_fundamental(&f, &k, &k);
@@ -409,7 +437,9 @@ These stages are not wired into the command line yet.
   (threshold max(3 × median residual, `floor_m`)) and returns `(transform, inlier flags, median residual)`.
   `align_to_enu(&centers, &enu, max_residual_m)` aligns the camera centres of the refined poses to east-north-up coordinates once, drops correspondences whose residual exceeds the limit and solves again.
   `gps_align(&centers, &gps, &origin)` converts latitude/longitude (`geo::Geodetic`) to east-north-up about `origin` and calls `align_to_enu` with the limit `GPS_MAX_RESIDUAL_M` (3 m).
-  The result `GpsAlignment` holds `sim`, `inliers`, `residuals` and `median_residual`. For the synthetic scene the origin is `truth/origin.txt`.
+  The result `GpsAlignment` holds `sim`, `inliers`, `residuals` and `median_residual`. The limit is fixed at 3 m, and if fewer than 3 inliers remain the first estimate is kept.
+  It returns `None` for a length mismatch, fewer than 3 correspondences, NaN/infinite values, or a degenerate layout where the camera centres coincide or lie on a line (the same conditions as `umeyama`).
+  To align into the SPEC §2 output frame, pass the first GPS fix as `origin` (for the synthetic scene, `Scene::first_gps_origin()`). `truth/origin.txt` is only the origin of the ground-truth coordinates, not the output origin.
 - `skylens_core::undistort`: `undistort_to_long_side(&img, &k, long_side)` turns a distorted image into a pinhole image whose long side is `long_side` pixels, plus the new `Intrinsics` (pixels outside the source are 0, bilinear interpolation).
 - `skylens_core::view_selection`: `select_neighbors(&views, &points, k)` picks up to k neighbours per image among the images that share sparse points (default `DEFAULT_NEIGHBORS` = 8), and `depth_range(&view, &points)` gives the depth search range.
 - `skylens_core::fusion`: `fuse(&views, &depth_maps, FusionConfig)` merges per-image depth maps with a round-trip reprojection check into a `PointCloud` (at least `min_views` agreeing images).
