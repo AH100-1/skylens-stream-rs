@@ -41,6 +41,10 @@ pub struct FusionView {
     /// 동의 검사에 쓸 사진 번호(`views` 안 위치). SPEC §3.6 의 사진별 이웃 8장
     /// (`view_selection::select_neighbors` 결과)을 넘긴다. 비어 있으면 나머지 모든 사진.
     pub neighbors: Vec<usize>,
+    /// 같은 높이·자세로 나란히 찍는 촬영 무리(예: 드론 번호). `None` 이면 혼자 한 무리.
+    /// 한 무리 사진들은 깊이가 같은 배율로 틀리면 가짜 평면에서 서로 맞아떨어지므로
+    /// [`FusionConfig::min_groups`] 로 다른 무리 시선을 요구한다.
+    pub group: Option<u32>,
 }
 
 /// 융합 설정.
@@ -58,6 +62,8 @@ pub struct FusionConfig {
     /// 같은 높이에서 나란히 찍은 사진들은 깊이가 같은 배율로 틀리면 지면 아래
     /// 가상 평면에서 서로 맞아떨어지므로, 동의 수만으로는 그런 점을 거를 수 없다.
     pub min_ratio: f64,
+    /// 기준 사진을 포함해 동의 사진들이 걸친 서로 다른 무리 수의 하한(≥ 1).
+    pub min_groups: usize,
 }
 
 impl Default for FusionConfig {
@@ -68,6 +74,7 @@ impl Default for FusionConfig {
             min_views: 3,
             normal_deg: 30.0,
             min_ratio: 0.5,
+            min_groups: 2,
         }
     }
 }
@@ -128,6 +135,9 @@ fn check(
     }
     if cfg.min_views == 0 {
         return Err(FusionError::BadConfig("min_views"));
+    }
+    if cfg.min_groups == 0 {
+        return Err(FusionError::BadConfig("min_groups"));
     }
     if !(cfg.min_ratio >= 0.0 && cfg.min_ratio <= 1.0) {
         return Err(FusionError::BadConfig("min_ratio"));
@@ -227,6 +237,28 @@ pub fn try_fuse(
         Vector3::new(c[0] as f64, c[1] as f64, c[2] as f64)
     };
 
+    // 기준 사진과 동의 사진들이 걸친 무리 수가 min_groups 이상인가.
+    // 무리가 없는 사진은 저마다 한 무리(사진 번호를 열쇠로)로 센다.
+    let group_key = |v: usize| -> (bool, usize) {
+        match views[v].group {
+            Some(g) => (true, g as usize),
+            None => (false, v),
+        }
+    };
+    let groups_ok = |r: usize, agree: &[(usize, usize, Point3<f64>)]| -> bool {
+        let mut keys = vec![group_key(r)];
+        for a in agree {
+            if keys.len() >= cfg.min_groups {
+                break;
+            }
+            let k = group_key(a.0);
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        keys.len() >= cfg.min_groups
+    };
+
     for r in 0..n {
         let rm = &depth_maps[r];
         let rc = &views[r].camera;
@@ -292,7 +324,7 @@ pub fn try_fuse(
                     let need = cfg
                         .min_views
                         .max((cfg.min_ratio * (seen + 1) as f64).ceil() as usize);
-                    if agree.len() + 1 >= need {
+                    if agree.len() + 1 >= need && groups_ok(r, &agree) {
                         out.push((ridx, xw, agree, need));
                     }
                 }
@@ -303,7 +335,7 @@ pub fn try_fuse(
         for (ridx, xw, mut agree, need) in rows.into_iter().flatten() {
             // 같은 기준 사진의 앞 화소가 먼저 쓴 이웃 화소는 뺀다.
             agree.retain(|&(j, jidx, _)| !used[j][jidx]);
-            if agree.len() + 1 < need {
+            if agree.len() + 1 < need || !groups_ok(r, &agree) {
                 continue;
             }
             let k = (agree.len() + 1) as f64;
@@ -599,6 +631,7 @@ mod tests {
                     c.intrinsics.width as usize * c.intrinsics.height as usize
                 ],
                 neighbors: Vec::new(),
+                group: None,
             })
             .collect()
     }
@@ -918,6 +951,33 @@ mod tests {
         assert!(cloud.is_empty(), "points {} max {max}", cloud.len());
     }
 
+    /// 법선 일관성 검사만 거르는 경우: 깊이는 정답 그대로, 사진 0 의 법선만 카메라
+    /// x 축으로 돌린다. 3장 모두 동의해야 하므로 기준각(30°)을 넘으면 점이 없다.
+    #[test]
+    fn normal_check_rejects_tilted_normals() {
+        let t = Point3::new(3.0, 0.0, 0.0);
+        let cams: Vec<Camera> = (0..3)
+            .map(|k| look_at(Point3::new(-1.0, 0.3 * k as f64, 5.0), t, W, H, 60.0))
+            .collect();
+        let clean: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        let base = fuse(&views(&cams), &clean, FusionConfig::default()).len();
+        let tilted = |deg: f64| {
+            let rot = Rotation3::from_axis_angle(&Vector3::x_axis(), deg.to_radians());
+            let mut maps = clean.clone();
+            for n in maps[0].normal.iter_mut() {
+                let v = rot * Vector3::new(n[0] as f64, n[1] as f64, n[2] as f64);
+                *n = [v.x as f32, v.y as f32, v.z as f32];
+            }
+            fuse(&views(&cams), &maps, FusionConfig::default()).len()
+        };
+        let (small, big) = (tilted(20.0), tilted(45.0));
+        println!("normal tilt: clean {base} 20° {small} 45° {big}");
+        assert!(base > 1000, "clean {base}");
+        // 20° 는 기준 안: 깊이가 같으므로 점 수도 같다.
+        assert_eq!(small, base);
+        assert_eq!(big, 0);
+    }
+
     #[test]
     fn two_views_give_nothing() {
         let cams = small_cameras();
@@ -1024,6 +1084,7 @@ mod tests {
         let vs = views(&cams);
         let d = FusionConfig::default();
         let cases = [
+            (FusionConfig { min_groups: 0, ..d }, "min_groups"),
             (
                 FusionConfig {
                     reproj_px: f64::NAN,
@@ -1107,7 +1168,6 @@ mod tests {
 
     /// F-069·F-070: 실측 편대 42장(14곳), 480×270, 잡음 σ 0.1%, 이상치 10%.
     #[test]
-    #[ignore = "동의 비율 0.5 뒤 0.3 m 초과 5점·최대 11.5 m: 같은 높이 사진들의 같은 배율 이상치가 지면 아래 가상 평면에서 맞아떨어짐"]
     fn formation_noisy_with_outliers() {
         let cams = formation(14, 480, 270);
         let mut rng = Rng(0x0bad_cafe_1234_5678);
@@ -1123,8 +1183,10 @@ mod tests {
         println!("neighbors F7 {:?} R7 {:?} L7 {:?}", nb[21], nb[22], nb[23]);
         assert!(nb.iter().all(|v| v.len() == 8), "{nb:?}");
         let mut vs = views(&cams);
-        for (v, n) in vs.iter_mut().zip(&nb) {
+        // 사진 순서는 위치마다 F·R·L.
+        for (i, (v, n)) in vs.iter_mut().zip(&nb).enumerate() {
             v.neighbors = n.clone();
+            v.group = Some((i % 3) as u32);
         }
         let cfg = FusionConfig::default();
         super::TRACE.with(|t| t.borrow_mut().clear());
