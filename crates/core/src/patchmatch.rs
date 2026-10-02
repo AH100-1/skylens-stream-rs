@@ -152,6 +152,11 @@ pub struct Config {
     pub refine_perturbations: usize,
     /// 쓰는 이웃 최대 수(앞에서부터). SPEC §3.6 은 8.
     pub max_neighbors: usize,
+    /// 원 해상도 층 마지막 반복에서 깊이를 고정하고 법선만 흔드는 단계 수(척도 0.04 부터 반씩).
+    pub normal_steps: usize,
+    /// 가장 거친 층이 아닌 층에서 화소마다 비용 계산에 쓰는 이웃 수. 층 시작 때 현재 가설로
+    /// 이웃마다 비용을 재서 낮은 순서로 이만큼 고른다. 0 이면 전부.
+    pub fine_neighbors: usize,
     /// 난수 씨앗.
     pub seed: u64,
 }
@@ -170,6 +175,8 @@ impl Default for Config {
             perturbations: 3,
             refine_perturbations: 1,
             max_neighbors: 8,
+            fine_neighbors: 4,
+            normal_steps: 3,
             seed: 0x5eed,
         }
     }
@@ -313,6 +320,16 @@ impl Tables {
     }
 }
 
+/// 한 층의 반복 계획. `level` 은 난수 분리용.
+#[derive(Clone, Copy)]
+struct Sched {
+    iterations: usize,
+    perturbations: usize,
+    normal_steps: usize,
+    level: usize,
+    coarsest: bool,
+}
+
 /// 피라미드 한 층의 문맥.
 struct Ctx<'a> {
     w: usize,
@@ -386,6 +403,19 @@ impl Ctx<'_> {
 
     /// 화소 (x, y) 에서 가설의 비용.
     fn cost(&self, x: usize, y: usize, rp: &Vector3<f32>, patch: &RefPatch, hyp: &Hyp) -> f32 {
+        self.cost_masked(x, y, rp, patch, hyp, u32::MAX)
+    }
+
+    /// `mask` 의 비트가 선 이웃만으로 계산한 비용.
+    fn cost_masked(
+        &self,
+        x: usize,
+        y: usize,
+        rp: &Vector3<f32>,
+        patch: &RefPatch,
+        hyp: &Hyp,
+        mask: u32,
+    ) -> f32 {
         let ndr = hyp.n.dot(rp);
         if ndr >= -1e-6 || hyp.depth.is_nan() || hyp.depth <= 0.0 {
             return MAX_COST;
@@ -395,10 +425,17 @@ impl Ctx<'_> {
         let mk = self.kinv.transpose() * (hyp.n / c);
         let q = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, 1.0);
         let mut buf = [MAX_COST; MAX_NEIGHBORS];
-        let m = self.neighbors.len();
-        for (slot, (g, img)) in buf.iter_mut().zip(&self.neighbors) {
+        let mut m = 0;
+        for (j, (g, img)) in self.neighbors.iter().enumerate() {
+            if mask & (1 << j) == 0 {
+                continue;
+            }
             let h = g.a + g.kt * mk.transpose();
-            *slot = ncc_cost(&q, patch, &h, img);
+            buf[m] = ncc_cost(&q, patch, &h, img);
+            m += 1;
+        }
+        if m == 0 {
+            return MAX_COST;
         }
         let costs = &mut buf[..m];
         let k = self.cfg.top_k.clamp(1, m);
@@ -469,15 +506,14 @@ impl Ctx<'_> {
     }
 
     /// 한 층에서 전파·정련을 `iterations` 회. `level` 은 난수 분리용.
-    fn run(
-        &self,
-        hyps: &mut [Hyp],
-        costs: &mut [f32],
-        iterations: usize,
-        perturbations: usize,
-        level: usize,
-        coarsest: bool,
-    ) {
+    fn run(&self, hyps: &mut [Hyp], costs: &mut [f32], masks: &[u32], sched: Sched) {
+        let Sched {
+            iterations,
+            perturbations,
+            normal_steps,
+            level,
+            coarsest,
+        } = sched;
         const OFFS: [(isize, isize); 8] = [
             (-1, 0),
             (1, 0),
@@ -511,14 +547,19 @@ impl Ctx<'_> {
                                 i as u64,
                                 (it * 2 + color) as u64,
                             );
+                            let mask = masks[i];
                             let try_hyp = |cand: Hyp, best: &mut Hyp, best_c: &mut f32| {
-                                let c = self.cost(x, y, &rp, &patch, &cand);
+                                let c = self.cost_masked(x, y, &rp, &patch, &cand, mask);
                                 if c < *best_c {
                                     *best = cand;
                                     *best_c = c;
                                 }
                             };
-                            // 공간 전파(반대 색 이웃의 평면을 이 화소로 옮김).
+                            // 공간 전파(반대 색 이웃의 평면을 이 화소로 옮김). 이미 잰 평면
+                            // (법선이 같고 옮긴 깊이가 같음)은 비용이 같으므로 다시 재지 않는다.
+                            let mut tried = [(Vector3::zeros(), 0.0f32); OFFS.len() + 1];
+                            tried[0] = (best.n, best.depth);
+                            let mut nt = 1;
                             for &(dx, dy) in &OFFS {
                                 let nx = x as isize + dx;
                                 let ny = y as isize + dy;
@@ -534,6 +575,14 @@ impl Ctx<'_> {
                                 let Some(d) = self.transfer_depth(&rf, &nh, &rp) else {
                                     continue;
                                 };
+                                if tried[..nt]
+                                    .iter()
+                                    .any(|(n, td)| *n == nh.n && (td - d).abs() <= 1e-6 * d)
+                                {
+                                    continue;
+                                }
+                                tried[nt] = (nh.n, d);
+                                nt += 1;
                                 try_hyp(Hyp { depth: d, n: nh.n }, &mut best, &mut best_c);
                             }
                             // 무작위 섭동 정련: 척도를 줄여 가며.
@@ -569,6 +618,22 @@ impl Ctx<'_> {
                                 );
                                 try_hyp(Hyp { depth: d, n: nn }, &mut best, &mut best_c);
                             }
+                            if it + 1 == iterations {
+                                let mut s = 0.04;
+                                for _ in 0..normal_steps {
+                                    let nn = self.perturb_normal(&mut rng, &best.n, s, &rp);
+                                    let b = best;
+                                    try_hyp(
+                                        Hyp {
+                                            depth: b.depth,
+                                            n: nn,
+                                        },
+                                        &mut best,
+                                        &mut best_c,
+                                    );
+                                    s *= 0.5;
+                                }
+                            }
                             (best_c < start_c).then_some((i, best, best_c))
                         })
                     })
@@ -581,18 +646,34 @@ impl Ctx<'_> {
         }
     }
 
-    /// 모든 화소의 현재 가설 비용.
-    fn eval_all(&self, hyps: &[Hyp]) -> Vec<f32> {
+    /// 모든 화소의 현재 가설 비용과, 이웃을 `keep` 장으로 줄인 마스크(현재 가설에서
+    /// 이웃별 비용이 낮은 순). `keep` 이 0 이거나 이웃 수 이상이면 전부.
+    fn eval_all(&self, hyps: &[Hyp], keep: usize) -> (Vec<f32>, Vec<u32>) {
+        let m = self.neighbors.len();
+        let all = if m >= 32 { u32::MAX } else { (1u32 << m) - 1 };
         (0..self.w * self.h)
             .into_par_iter()
             .map(|i| {
                 let (x, y) = (i % self.w, i / self.w);
-                match self.ref_patch(x, y) {
-                    Some(p) => self.cost(x, y, &self.ray(x, y), &p, &hyps[i]),
-                    None => MAX_COST,
+                let Some(p) = self.ref_patch(x, y) else {
+                    return (MAX_COST, all);
+                };
+                let rp = self.ray(x, y);
+                if keep == 0 || keep >= m {
+                    return (self.cost(x, y, &rp, &p, &hyps[i]), all);
                 }
+                let mut per = [(MAX_COST, 0usize); MAX_NEIGHBORS];
+                for (j, slot) in per.iter_mut().enumerate().take(m) {
+                    *slot = (self.cost_masked(x, y, &rp, &p, &hyps[i], 1 << j), j);
+                }
+                let per = &mut per[..m];
+                per.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                let mask = per[..keep].iter().fold(0u32, |a, &(_, j)| a | (1 << j));
+                let k = self.cfg.top_k.clamp(1, keep);
+                let c = per[..k].iter().map(|v| v.0).sum::<f32>() / k as f32;
+                (c, mask)
             })
-            .collect()
+            .unzip()
     }
 }
 
@@ -609,6 +690,25 @@ struct Level {
 /// `0 < 최소 < 최대` 인 유한값이어야 하며, 아니면 모든 화소가 무효인 지도를 돌려준다.
 /// `neighbors` 는 앞에서부터 [`Config::max_neighbors`] 장만 쓴다.
 pub fn estimate(ref_view: &View, neighbors: &[View], range: (f64, f64), cfg: &Config) -> DepthMap {
+    estimate_profiled(ref_view, neighbors, range, cfg, None)
+}
+
+/// 층별 걸린 시간(초): 층 시작 비용 계산, 전파·정련.
+#[derive(Clone, Debug)]
+pub struct LevelTime {
+    pub width: usize,
+    pub eval_s: f64,
+    pub run_s: f64,
+}
+
+/// [`estimate`] 와 같고, `profile` 이 있으면 층마다 시간을 거친 층부터 채운다.
+pub fn estimate_profiled(
+    ref_view: &View,
+    neighbors: &[View],
+    range: (f64, f64),
+    cfg: &Config,
+    mut profile: Option<&mut Vec<LevelTime>>,
+) -> DepthMap {
     let w = ref_view.image.width;
     let h = ref_view.image.height;
     let range_ok = range.0.is_finite() && range.1.is_finite() && range.0 > 0.0 && range.0 < range.1;
@@ -711,14 +811,31 @@ pub fn estimate(ref_view: &View, neighbors: &[View], range: (f64, f64), cfg: &Co
                     .collect()
             }
         };
-        let mut costs = ctx.eval_all(&hyps);
         let coarsest = li == top;
+        let t0 = std::time::Instant::now();
+        let (mut costs, masks) = ctx.eval_all(&hyps, if coarsest { 0 } else { cfg.fine_neighbors });
+        let t1 = std::time::Instant::now();
         let (iters, perts) = if coarsest {
             (cfg.iterations, cfg.perturbations)
         } else {
             (cfg.refine_iterations, cfg.refine_perturbations)
         };
-        ctx.run(&mut hyps, &mut costs, iters, perts, li, coarsest);
+        let nsteps = if li == 0 { cfg.normal_steps } else { 0 };
+        let sched = Sched {
+            iterations: iters,
+            perturbations: perts,
+            normal_steps: nsteps,
+            level: li,
+            coarsest,
+        };
+        ctx.run(&mut hyps, &mut costs, &masks, sched);
+        if let Some(p) = profile.as_deref_mut() {
+            p.push(LevelTime {
+                width: ctx.w,
+                eval_s: (t1 - t0).as_secs_f64(),
+                run_s: t1.elapsed().as_secs_f64(),
+            });
+        }
         state = Some((hyps, costs, ctx.kinv, ctx.w));
     }
 
@@ -929,6 +1046,7 @@ mod tests {
 
     struct Stats {
         median_rel: f64,
+        p90_rel: f64,
         within_1pct: f64,
         median_normal_deg: f64,
         count: usize,
@@ -960,8 +1078,10 @@ mod tests {
         };
         let count = rel.len();
         let within = rel.iter().filter(|&&r| r < 0.01).count() as f64 / count as f64;
+        let median_rel = med(&mut rel);
         Stats {
-            median_rel: med(&mut rel),
+            median_rel,
+            p90_rel: rel[rel.len() * 9 / 10],
             within_1pct: within,
             median_normal_deg: med(&mut ang),
             count,
@@ -1222,6 +1342,18 @@ mod tests {
         assert!(dm.depth.iter().all(|d| d.is_finite()));
     }
 
+    /// 프로세스 최대 상주 메모리(kB, Linux /proc). 없으면 0.
+    fn peak_rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmHWM:"))
+                    .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
     /// 960×540, 이웃 8장 한 장 시간(목표 ≤ 0.7 s). cargo test --release -- --ignored timing_960
     #[test]
     #[ignore = "시간 측정용(4 코어 측정 기계 부하 상태에서 목표 0.7 s 미달, 노트 참조)"]
@@ -1233,9 +1365,27 @@ mod tests {
         };
         let cams = rig8(960, 540, 1.0, 10.0);
         let (refv, ns, gt) = views(&cams, &scene);
+        let hwm0 = peak_rss_kb();
+        let mut prof = Vec::new();
         let t = std::time::Instant::now();
-        let dm = estimate(&refv, &ns, (5.0, 20.0), &Config::default());
+        let dm = estimate_profiled(&refv, &ns, (5.0, 20.0), &Config::default(), Some(&mut prof));
         let el = t.elapsed().as_secs_f64();
+        let hwm1 = peak_rss_kb();
+        for p in &prof {
+            eprintln!(
+                "층 너비 {}: 시작 비용 {:.3} s, 전파·정련 {:.3} s",
+                p.width, p.eval_s, p.run_s
+            );
+        }
+        eprintln!(
+            "최대 상주 메모리: 추정 전 {} kB, 후 {} kB (증가 {} kB)",
+            hwm0,
+            hwm1,
+            hwm1.saturating_sub(hwm0)
+        );
+        if let Ok(l) = std::fs::read_to_string("/proc/loadavg") {
+            eprintln!("부하 평균: {}", l.trim());
+        }
         let n_gt = Vector3::new(0.3, -0.15, -1.0).normalize();
         let s = stats(
             &dm,
@@ -1250,5 +1400,48 @@ mod tests {
         report("960×540", &s);
         assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
         assert!(el <= 0.7, "{el:.2} s > 0.7 s");
+    }
+
+    /// 같은 장면에서 이전 설정(이웃 전부·법선 단계 없음)과 기본 설정을 번갈아 잰다.
+    /// cargo test --release -- --ignored ab_960 --nocapture
+    #[test]
+    #[ignore = "시간 비교용(측정 기계 부하에 따라 값이 달라짐)"]
+    fn ab_960() {
+        let scene = Scene::Slanted {
+            z0: 10.0,
+            a: 0.3,
+            b: -0.15,
+        };
+        let cams = rig8(960, 540, 1.0, 10.0);
+        let (refv, ns, gt) = views(&cams, &scene);
+        let n_gt = Vector3::new(0.3, -0.15, -1.0).normalize();
+        let old = Config {
+            fine_neighbors: 0,
+            normal_steps: 0,
+            ..Config::default()
+        };
+        let new = Config::default();
+        for round in 0..2 {
+            for (name, cfg) in [("이전", &old), ("기본", &new)] {
+                let t = std::time::Instant::now();
+                let dm = estimate(&refv, &ns, (5.0, 20.0), cfg);
+                let el = t.elapsed().as_secs_f64();
+                let s = stats(
+                    &dm,
+                    &gt,
+                    |_| n_gt,
+                    |x, y| x >= 8 && y >= 8 && x < 952 && y < 532,
+                );
+                let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+                eprintln!(
+                    "회 {round} {name}: {el:.2} s, 중앙 {:.5}, 90% {:.5}, 1% 이내 {:.3}, 법선 {:.2}°, 부하 {}",
+                    s.median_rel,
+                    s.p90_rel,
+                    s.within_1pct,
+                    s.median_normal_deg,
+                    load.split_whitespace().next().unwrap_or("?")
+                );
+            }
+        }
     }
 }
