@@ -549,9 +549,9 @@ mod tests {
         assert_eq!(chunk_ranges(27, 12, 2), vec![0..14, 10..26, 22..27]);
         // 80 곳 전후: 81·82·86 곳은 7구역(마지막 구역만 늘어남), 87 곳부터 8구역.
         let head = vec![0..14, 10..26, 22..38, 34..50, 46..62, 58..74];
-        for (n, tail) in [(81, vec![70..81]), (82, vec![70..82]), (86, vec![70..86])] {
+        for n in [81, 82, 86] {
             let mut want = head.clone();
-            want.extend(tail);
+            want.push(70..n);
             assert_eq!(chunk_ranges(n, 12, 2), want, "n={n}");
         }
         let mut want = head.clone();
