@@ -526,6 +526,34 @@ pub fn average_translations_with_points(
     );
     if a.0 < b.0 || a.1 < b.1 || (a.1 == b.1 && a.2 < b.2) {
         let mut back = stage;
+        // 출발 해의 점으로 카메라마다 광선 교차 위치를 다시 구해, 짝 간선만으로는 등록되지 못했거나(강성 부족)
+        // 점 광선 지지가 눈에 띄게 적은 카메라를 광선 교차 위치로 바꾼다.
+        for (cam, cam_obs) in by_cam.iter().enumerate().take(n_cam) {
+            let pts: Vec<(Vector3<f64>, Vector3<f64>, Vector3<f64>)> = cam_obs
+                .iter()
+                .filter_map(|&k| {
+                    let x = start[n_cam + point_observations[k].point]?;
+                    Some((x, rays[k]?, rays[k]?))
+                })
+                .collect();
+            let lines: Vec<(Vector3<f64>, Vector3<f64>)> =
+                pts.iter().map(|(x, r, _)| (*x, -*r)).collect();
+            let Some(cand) = robust_ray_point(&lines, gate) else {
+                continue;
+            };
+            let support = |c: &Vector3<f64>| {
+                pts.iter()
+                    .filter(|(x, r, _)| angle_between(&(x - c), r) <= gate)
+                    .count()
+            };
+            let better = match back.centers[cam] {
+                None => true,
+                Some(cur) => support(&cand) >= support(&cur.coords) + RAY_SWAP_MARGIN,
+            };
+            if better {
+                back.centers[cam] = Some(Point3::from(cand));
+            }
+        }
         // 정밀화와 같은 셈: 쓰지 못한 점 관측도 무효로 센다.
         back.rejected[0] += rays.iter().filter(|r| r.is_none()).count();
         back.points = start[n_cam..].iter().map(|x| x.map(Point3::from)).collect();
@@ -533,6 +561,9 @@ pub fn average_translations_with_points(
     }
     refined
 }
+
+/// 광선 교차 위치로 카메라를 바꿀 때 요구하는 점 광선 지지 수 차이.
+const RAY_SWAP_MARGIN: usize = 3;
 
 /// 해의 짝 간선 품질: (등록 수, 짝 간선 정상 수, −짝 각 잔차 중앙). 클수록 낫다.
 fn pair_score(res: &TranslationResult, n_obs: usize) -> (usize, usize, f64) {
@@ -1695,6 +1726,31 @@ mod tests {
                     a.registered(), b.registered(), c.registered()
                 );
             }
+        }
+    }
+
+    /// 진단: 실패하던 세 경우만 단계별로 본다.
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_three_cases() {
+        for (pf, frac, seed) in [(0.0, 0.2, 10u64), (0.05, 0.2, 6), (0.05, 0.2, 9)] {
+            let case = Case {
+                noise_deg: 1.0,
+                outlier_frac: frac,
+                unobservable_frac: 0.05,
+            };
+            let (poses, rots, obs) = observations(seed, &case);
+            let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+            let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, pf);
+            let cfg = TranslationConfig::default();
+            let a = average_core(&rots, &obs, &[], &cfg, None);
+            let (ra, ma) = stats(&similarity_aligned_errors(&a.centers, &truth));
+            let b = average_translations_with_points(&rots, &obs, &pobs, &cfg);
+            let (rb, mb) = stats(&similarity_aligned_errors(&b.centers, &truth));
+            println!(
+                "DIAG3 pf {pf} seed {seed}: stage reg {} rms {ra:.3} max {ma:.3} score {:?} | final reg {} rms {rb:.3} max {mb:.3} score {:?}",
+                a.registered(), pair_score(&a, obs.len()), b.registered(), pair_score(&b, obs.len())
+            );
         }
     }
 
