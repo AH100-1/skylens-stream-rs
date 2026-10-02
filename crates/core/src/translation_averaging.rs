@@ -528,8 +528,8 @@ pub fn average_translations_with_points(
         let mut back = stage;
         // 출발 해의 점으로 카메라마다 광선 교차 위치를 다시 구해, 짝 간선만으로는 등록되지 못했거나(강성 부족)
         // 점 광선 지지가 눈에 띄게 적은 카메라를 광선 교차 위치로 바꾼다.
-        for cam in 0..n_cam {
-            let pts: Vec<(Vector3<f64>, Vector3<f64>, Vector3<f64>)> = by_cam[cam]
+        for (cam, cam_obs) in by_cam.iter().enumerate().take(n_cam) {
+            let pts: Vec<(Vector3<f64>, Vector3<f64>, Vector3<f64>)> = cam_obs
                 .iter()
                 .filter_map(|&k| {
                     let x = start[n_cam + point_observations[k].point]?;
