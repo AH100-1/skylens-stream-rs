@@ -1,7 +1,7 @@
 //! 구역 밀집 복원(SPEC §3.6): 왜곡 보정·축소 → 이웃·깊이 범위 → 사진별 깊이·법선 → 융합.
 //!
-//! 사진별 깊이 단계는 임시 평면 스윕([`sweep_depth`])이다. 깊이 추정 모듈이 합쳐지면
-//! [`estimate_depth`] 안의 호출 한 줄만 바꾸면 된다.
+//! 사진별 깊이 단계는 [`DepthEstimator`] 함수 포인터 하나로 바꿔 끼운다. 기본값은
+//! 거친-세밀 평면 스윕([`sweep_depth`])이고, [`region_cloud_with`] 로 다른 추정기를 넘긴다.
 
 use crate::camera::{Camera, Intrinsics};
 use crate::fusion::{self, DepthMap, FusionConfig, FusionView};
@@ -54,17 +54,22 @@ pub const SWEEP_NEIGHBORS: usize = 3;
 const HALF: usize = 2;
 /// 이 비용(1 − NCC 평균)을 넘는 화소는 깊이를 비운다.
 const MAX_COST: f32 = 0.35;
+/// 거친 단계 비용 상한(세밀 단계가 다시 걸러 주므로 느슨하게).
+const COARSE_MAX_COST: f32 = 0.5;
+/// 거친-세밀은 긴 변이 이 값 이상일 때만 쓴다(더 작으면 반해상도 창이 너무 거칠어 화소를 잃는다).
+const MIN_COARSE_LONG_SIDE: usize = 384;
 /// NCC 분산 안정화 항(회색 0..255 단위의 분산).
 const VAR_EPS: f32 = 25.0;
 
-struct Prepared {
-    camera: Camera,
-    gray: Vec<f32>,
-    rgb: Vec<[u8; 3]>,
-    valid: Vec<bool>,
+/// 깊이 추정기가 받는 보정된 사진: 핀홀 자세, 회색 영상, 색, 유효 화소 표시.
+pub struct DepthView {
+    pub camera: Camera,
+    pub gray: Vec<f32>,
+    pub rgb: Vec<[u8; 3]>,
+    pub valid: Vec<bool>,
 }
 
-fn prepare(v: &DenseView, max_width: u32) -> Option<Prepared> {
+fn prepare(v: &DenseView, max_width: u32) -> Option<DepthView> {
     let (iw, ih) = (v.image.width(), v.image.height());
     if iw == 0 || ih == 0 {
         return None;
@@ -77,7 +82,7 @@ fn prepare(v: &DenseView, max_width: u32) -> Option<Prepared> {
         .iter()
         .map(|c| 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32)
         .collect();
-    Some(Prepared {
+    Some(DepthView {
         camera: Camera {
             intrinsics: u.pinhole,
             pose: v.camera.pose,
@@ -101,30 +106,117 @@ fn bilinear(img: &[f32], w: usize, h: usize, x: f64, y: f64) -> Option<f32> {
     Some(top * (1.0 - ay) + bot * ay)
 }
 
-/// 기준 사진 `r` 의 깊이·법선을 임시 평면 스윕으로 추정한다.
-///
-/// 깊이 가설은 `[near, far]` 를 역깊이 균등으로 [`SWEEP_HYPOTHESES`] 개 나누고,
-/// 각 가설마다 이웃 사진(상위 [`SWEEP_NEIGHBORS`])을 기준 사진으로 되감아 5×5 NCC 를 모아
-/// 평균 비용이 가장 낮은 가설을 포물선으로 보정해 고른다. 법선은 깊이 기울기에서 얻는다.
-fn sweep_depth(r: &Prepared, nbrs: &[&Prepared], near: f64, far: f64) -> DepthMap {
-    let k = r.camera.intrinsics;
-    let (w, h) = (k.width as usize, k.height as usize);
+/// 평면 스윕 설정.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SweepConfig {
+    /// 가설 수(거친 단계, 또는 거친-세밀을 쓰지 않을 때 전체).
+    pub hypotheses: usize,
+    /// 거친-세밀: 반해상도로 먼저 훑고 전체 해상도에서는 그 깊이 둘레만 찾는다.
+    pub coarse_to_fine: bool,
+    /// 세밀 단계 가설 수(홀수).
+    pub fine_hypotheses: usize,
+    /// 세밀 단계 탐색 반폭(거친 역깊이 간격의 배수).
+    pub fine_span: f32,
+}
+
+impl Default for SweepConfig {
+    fn default() -> Self {
+        Self {
+            hypotheses: SWEEP_HYPOTHESES,
+            coarse_to_fine: true,
+            fine_hypotheses: 9,
+            fine_span: 2.0,
+        }
+    }
+}
+
+/// 사진별 깊이 추정기 자리: `estimate(기준, 이웃, (가까움, 멂), 설정) -> DepthMap`.
+/// 패치매치 추정기도 같은 모양으로 꽂는다.
+pub type DepthEstimator = fn(&DepthView, &[&DepthView], (f64, f64), &SweepConfig) -> DepthMap;
+
+type InvDepthAt<'a> = &'a (dyn Fn(usize, usize) -> f32 + Sync);
+
+fn empty_map(w: usize, h: usize) -> DepthMap {
     let n = w * h;
-    let mut map = DepthMap {
+    DepthMap {
         w,
         h,
         depth: vec![f32::NAN; n],
         normal: vec![[0.0; 3]; n],
         cost: vec![f32::INFINITY; n],
-    };
-    if nbrs.is_empty() || !(near > 0.0 && far > near) || w < 2 * HALF + 2 || h < 2 * HALF + 2 {
-        return map;
     }
-    let nh = SWEEP_HYPOTHESES;
-    let (inv_near, inv_far) = (1.0 / near, 1.0 / far);
-    let hyp_depth = |i: usize| 1.0 / (inv_near + (inv_far - inv_near) * i as f64 / (nh - 1) as f64);
+}
 
-    // 기준 → 이웃 상대 자세.
+/// 2×2 상자 평균으로 반해상도 사진을 만든다(색은 비운다).
+fn downsample(v: &DepthView) -> DepthView {
+    let k = v.camera.intrinsics;
+    let (w, h) = (k.width as usize, k.height as usize);
+    let (w2, h2) = (w / 2, h / 2);
+    let mut gray = vec![0.0f32; w2 * h2];
+    let mut valid = vec![false; w2 * h2];
+    gray.par_chunks_mut(w2.max(1))
+        .zip(valid.par_chunks_mut(w2.max(1)))
+        .enumerate()
+        .for_each(|(y, (g, va))| {
+            for x in 0..w2 {
+                let i = 2 * y * w + 2 * x;
+                g[x] = 0.25 * (v.gray[i] + v.gray[i + 1] + v.gray[i + w] + v.gray[i + w + 1]);
+                va[x] = v.valid[i] && v.valid[i + 1] && v.valid[i + w] && v.valid[i + w + 1];
+            }
+        });
+    let intr = Intrinsics {
+        fx: k.fx * 0.5,
+        fy: k.fy * 0.5,
+        cx: k.cx * 0.5,
+        cy: k.cy * 0.5,
+        width: w2 as u32,
+        height: h2 as u32,
+        dist: k.dist,
+    };
+    DepthView {
+        camera: Camera {
+            intrinsics: intr,
+            pose: v.camera.pose,
+        },
+        gray,
+        rgb: Vec::new(),
+        valid,
+    }
+}
+
+/// 기준 창 평균과 (안정화한) 분산. 가장자리는 (0, 0).
+fn ref_stats(r: &DepthView, w: usize, h: usize) -> Vec<(f32, f32)> {
+    let mut st = vec![(0.0f32, 0.0f32); w * h];
+    let cnt = ((2 * HALF + 1) * (2 * HALF + 1)) as f32;
+    st.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        if y < HALF || y + HALF >= h {
+            return;
+        }
+        for (x, o) in row.iter_mut().enumerate() {
+            if x < HALF || x + HALF >= w {
+                continue;
+            }
+            let (mut sr, mut srr) = (0.0f32, 0.0f32);
+            for dy in 0..=2 * HALF {
+                let base = (y + dy - HALF) * w + x - HALF;
+                for dx in 0..=2 * HALF {
+                    let v = r.gray[base + dx];
+                    sr += v;
+                    srr += v * v;
+                }
+            }
+            let mr = sr / cnt;
+            *o = (mr, srr / cnt - mr * mr + VAR_EPS);
+        }
+    });
+    st
+}
+
+/// 화소별 역깊이 가설 `inv_at(화소, 가설)` 에 대한 비용 부피(가설 우선 배치, `hi * n + 화소`).
+fn cost_volume(r: &DepthView, nbrs: &[&DepthView], nh: usize, inv_at: InvDepthAt) -> Vec<f32> {
+    let k = r.camera.intrinsics;
+    let (w, h) = (k.width as usize, k.height as usize);
+    let n = w * h;
     let rel: Vec<(crate::math::Matrix3<f64>, Vector3<f64>)> = nbrs
         .iter()
         .map(|nb| {
@@ -133,7 +225,6 @@ fn sweep_depth(r: &Prepared, nbrs: &[&Prepared], near: f64, far: f64) -> DepthMa
             (rm, t)
         })
         .collect();
-    // 기준 화소의 정규 좌표 광선.
     let rays: Vec<[f64; 2]> = (0..n)
         .map(|i| {
             let p = Vector2::new((i % w) as f64 + 0.5, (i / w) as f64 + 0.5);
@@ -141,13 +232,12 @@ fn sweep_depth(r: &Prepared, nbrs: &[&Prepared], near: f64, far: f64) -> DepthMa
             [q.x, q.y]
         })
         .collect();
-
-    // 비용 부피: 화소 × 가설.
+    let stats = ref_stats(r, w, h);
+    let cnt = ((2 * HALF + 1) * (2 * HALF + 1)) as f32;
+    let need = nbrs.len().min(2);
     let mut volume = vec![f32::INFINITY; n * nh];
     let mut warped: Vec<Vec<f32>> = vec![vec![f32::NAN; n]; nbrs.len()];
-    let mut vol_t = vec![f32::INFINITY; n];
-    for hi in 0..nh {
-        let d = hyp_depth(hi);
+    for (hi, vol_t) in volume.chunks_mut(n).enumerate() {
         for (j, nb) in nbrs.iter().enumerate() {
             let (rm, t) = &rel[j];
             let nk = nb.camera.intrinsics;
@@ -157,9 +247,15 @@ fn sweep_depth(r: &Prepared, nbrs: &[&Prepared], near: f64, far: f64) -> DepthMa
                 .enumerate()
                 .for_each(|(y, row)| {
                     for (x, o) in row.iter_mut().enumerate() {
-                        let ray = rays[y * w + x];
-                        let xc = rm * Vector3::new(ray[0] * d, ray[1] * d, d) + t;
+                        let i = y * w + x;
                         *o = f32::NAN;
+                        let inv = inv_at(i, hi);
+                        if !(inv.is_finite() && inv > 0.0) {
+                            continue;
+                        }
+                        let d = 1.0 / inv as f64;
+                        let ray = rays[i];
+                        let xc = rm * Vector3::new(ray[0] * d, ray[1] * d, d) + t;
                         if xc.z > 1e-6 {
                             let p = nk.to_pixel(&Vector2::new(xc.x / xc.z, xc.y / xc.z));
                             if let Some(v) = bilinear(&nb.gray, nw, nh_, p.x, p.y) {
@@ -170,26 +266,15 @@ fn sweep_depth(r: &Prepared, nbrs: &[&Prepared], near: f64, far: f64) -> DepthMa
                 });
         }
         let warped_ref = &warped;
+        let stats = &stats;
         vol_t.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
             for (x, o) in row.iter_mut().enumerate() {
-                *o = f32::INFINITY;
                 if x < HALF || y < HALF || x + HALF >= w || y + HALF >= h {
                     continue;
                 }
-                // 기준 창 통계.
-                let (mut sr, mut srr) = (0.0f32, 0.0f32);
-                for dy in 0..=2 * HALF {
-                    let base = (y + dy - HALF) * w + x - HALF;
-                    for dx in 0..=2 * HALF {
-                        let v = r.gray[base + dx];
-                        sr += v;
-                        srr += v * v;
-                    }
-                }
-                let cnt = ((2 * HALF + 1) * (2 * HALF + 1)) as f32;
-                let mr = sr / cnt;
-                let vr = srr / cnt - mr * mr + VAR_EPS;
+                let (mr, vr) = stats[y * w + x];
                 let (mut acc, mut m) = (0.0f32, 0usize);
+                let (mut m1, mut m2) = (f32::INFINITY, f32::INFINITY);
                 for wj in warped_ref {
                     let (mut sw, mut sww, mut srw) = (0.0f32, 0.0f32, 0.0f32);
                     let mut ok = true;
@@ -213,57 +298,88 @@ fn sweep_depth(r: &Prepared, nbrs: &[&Prepared], near: f64, far: f64) -> DepthMa
                     let vw = sww / cnt - mw * mw + VAR_EPS;
                     let cov = srw / cnt - mr * mw;
                     let ncc = (cov / (vr * vw).sqrt()).clamp(-1.0, 1.0);
-                    acc += 1.0 - ncc;
+                    let c = 1.0 - ncc;
+                    acc += c;
                     m += 1;
+                    if c < m1 {
+                        m2 = m1;
+                        m1 = c;
+                    } else if c < m2 {
+                        m2 = c;
+                    }
                 }
                 // 이웃 하나만 보이는 화소는 신뢰하지 않는다(이웃이 둘 이상일 때).
-                let need = nbrs.len().min(2);
+                // 이웃이 셋 이상 보이면 가장 좋은 둘의 평균(가려진 이웃에 강건).
                 if m >= need && m > 0 {
-                    *o = acc / m as f32;
+                    *o = if m >= 3 {
+                        0.5 * (m1 + m2)
+                    } else {
+                        acc / m as f32
+                    };
                 }
             }
         });
-        for i in 0..n {
-            volume[i * nh + hi] = vol_t[i];
-        }
     }
+    volume
+}
 
-    // 최소 가설 선택 + 포물선 보정.
-    let dm = &mut map;
-    dm.depth
+/// 비용 부피에서 최소 가설을 고르고 포물선으로 보정해 깊이·비용 맵을 만든다.
+fn select_depth(
+    valid: &[bool],
+    volume: &[f32],
+    nh: usize,
+    w: usize,
+    h: usize,
+    inv_at: InvDepthAt,
+    max_cost: f32,
+) -> DepthMap {
+    let n = w * h;
+    let mut map = empty_map(w, h);
+    map.depth
         .par_iter_mut()
-        .zip(dm.cost.par_iter_mut())
+        .zip(map.cost.par_iter_mut())
         .enumerate()
         .for_each(|(i, (dep, cost))| {
-            if !r.valid[i] {
+            if !valid[i] {
                 return;
             }
-            let c = &volume[i * nh..(i + 1) * nh];
             let (mut bi, mut bc) = (usize::MAX, f32::INFINITY);
-            for (hi, &v) in c.iter().enumerate() {
+            for hi in 0..nh {
+                let v = volume[hi * n + i];
                 if v < bc {
                     bc = v;
                     bi = hi;
                 }
             }
-            if bi == usize::MAX || bc > MAX_COST {
+            if bi == usize::MAX || bc > max_cost {
                 return;
             }
             let mut pos = bi as f64;
-            if bi > 0 && bi + 1 < nh && c[bi - 1].is_finite() && c[bi + 1].is_finite() {
-                let (a, b, cc) = (c[bi - 1] as f64, c[bi] as f64, c[bi + 1] as f64);
-                let den = a - 2.0 * b + cc;
-                if den > 1e-9 {
-                    pos += (0.5 * (a - cc) / den).clamp(-0.5, 0.5);
+            if bi > 0 && bi + 1 < nh {
+                let (a, cc) = (volume[(bi - 1) * n + i], volume[(bi + 1) * n + i]);
+                if a.is_finite() && cc.is_finite() {
+                    let (a, b, cc) = (a as f64, bc as f64, cc as f64);
+                    let den = a - 2.0 * b + cc;
+                    if den > 1e-9 {
+                        pos += (0.5 * (a - cc) / den).clamp(-0.5, 0.5);
+                    }
                 }
             }
-            let inv = inv_near + (inv_far - inv_near) * pos / (nh - 1) as f64;
-            *dep = (1.0 / inv) as f32;
-            *cost = bc;
+            let (i0, i1) = (inv_at(i, 0) as f64, inv_at(i, 1) as f64);
+            let inv = i0 + (i1 - i0) * pos;
+            if inv > 0.0 && inv.is_finite() {
+                *dep = (1.0 / inv) as f32;
+                *cost = bc;
+            }
         });
-    // 이웃 3×3 중앙값과 1% 이상 어긋나는 외톨이 제거.
-    let snapshot = dm.depth.clone();
-    dm.depth.par_iter_mut().enumerate().for_each(|(i, d)| {
+    map
+}
+
+/// 이웃 3×3 중앙값과 5% 이상 어긋나는 외톨이를 지운다.
+fn remove_outliers(map: &mut DepthMap) {
+    let (w, h) = (map.w, map.h);
+    let snapshot = map.depth.clone();
+    map.depth.par_iter_mut().enumerate().for_each(|(i, d)| {
         if d.is_nan() {
             return;
         }
@@ -293,6 +409,85 @@ fn sweep_depth(r: &Prepared, nbrs: &[&Prepared], near: f64, far: f64) -> DepthMa
             *d = f32::NAN;
         }
     });
+}
+
+/// 한 해상도에서 `[near, far]` 전체를 역깊이 균등으로 훑는다(거친-세밀 없이).
+fn full_sweep(
+    r: &DepthView,
+    nbrs: &[&DepthView],
+    near: f64,
+    far: f64,
+    nh: usize,
+    max_cost: f32,
+) -> DepthMap {
+    let k = r.camera.intrinsics;
+    let (w, h) = (k.width as usize, k.height as usize);
+    let nh = nh.max(2);
+    let (inv_near, inv_far) = (1.0 / near, 1.0 / far);
+    let step = (inv_far - inv_near) / (nh - 1) as f64;
+    let inv_at = move |_i: usize, hi: usize| (inv_near + step * hi as f64) as f32;
+    let volume = cost_volume(r, nbrs, nh, &inv_at);
+    select_depth(&r.valid, &volume, nh, w, h, &inv_at, max_cost)
+}
+
+/// 기준 사진 `r` 의 깊이·법선을 평면 스윕으로 추정한다(기본 추정기).
+///
+/// 거친 단계는 반해상도에서 `[near, far]` 를 역깊이 균등으로 `cfg.hypotheses` 개 훑고,
+/// 세밀 단계는 전체 해상도에서 거친 깊이 둘레 ± `fine_span` 간격만 `fine_hypotheses` 개로 찾는다.
+/// 각 가설마다 이웃 사진을 기준 사진으로 되감아 5×5 NCC 비용을 모으고 평균이 가장 낮은 가설을
+/// 포물선으로 보정해 고른다. 법선은 깊이 기울기에서 얻는다.
+pub fn sweep_depth(
+    r: &DepthView,
+    nbrs: &[&DepthView],
+    range: (f64, f64),
+    cfg: &SweepConfig,
+) -> DepthMap {
+    let (near, far) = range;
+    let k = r.camera.intrinsics;
+    let (w, h) = (k.width as usize, k.height as usize);
+    if nbrs.is_empty() || !(near > 0.0 && far > near) || w < 2 * HALF + 2 || h < 2 * HALF + 2 {
+        return empty_map(w, h);
+    }
+    let mut map = if cfg.coarse_to_fine && w.max(h) >= MIN_COARSE_LONG_SIDE {
+        let rc = downsample(r);
+        let nc: Vec<DepthView> = nbrs.iter().map(|nb| downsample(nb)).collect();
+        let ncr: Vec<&DepthView> = nc.iter().collect();
+        let nhc = cfg.hypotheses.max(2);
+        let coarse = full_sweep(&rc, &ncr, near, far, nhc, COARSE_MAX_COST);
+        let (wc, hc) = (coarse.w, coarse.h);
+        let nf = cfg.fine_hypotheses.max(3) | 1;
+        // 역깊이 간격(가까울수록 큰 역깊이라 far 쪽이 음수 방향).
+        let cstep = ((1.0 / far - 1.0 / near) / (nhc - 1) as f64) as f32;
+        let fstep = cstep * cfg.fine_span / ((nf - 1) / 2) as f32;
+        let cd = &coarse.depth;
+        let inv_at = move |i: usize, hi: usize| {
+            let (x, y) = ((i % w) / 2, (i / w) / 2);
+            let (x, y) = (x.min(wc - 1), y.min(hc - 1));
+            let mut d = cd[y * wc + x];
+            if !(d.is_finite() && d > 0.0) {
+                // 거친 깊이가 비면 3×3 안에서 가장 가까운(큰 역깊이 아닌) 값을 빌린다.
+                'nb: for dy in y.saturating_sub(1)..(y + 2).min(hc) {
+                    for dx in x.saturating_sub(1)..(x + 2).min(wc) {
+                        let c = cd[dy * wc + dx];
+                        if c.is_finite() && c > 0.0 {
+                            d = c;
+                            break 'nb;
+                        }
+                    }
+                }
+            }
+            if d.is_finite() && d > 0.0 {
+                1.0 / d + fstep * (hi as f32 - (nf / 2) as f32)
+            } else {
+                f32::NAN
+            }
+        };
+        let volume = cost_volume(r, nbrs, nf, &inv_at);
+        select_depth(&r.valid, &volume, nf, w, h, &inv_at, MAX_COST)
+    } else {
+        full_sweep(r, nbrs, near, far, cfg.hypotheses, MAX_COST)
+    };
+    remove_outliers(&mut map);
     fill_normals(&mut map, &k);
     map
 }
@@ -343,11 +538,6 @@ fn fill_normals(map: &mut DepthMap, k: &Intrinsics) {
         });
 }
 
-/// 사진별 깊이 추정 자리. 깊이 추정 모듈이 합쳐지면 이 함수 안의 호출만 바꾼다.
-fn estimate_depth(r: &Prepared, nbrs: &[&Prepared], near: f64, far: f64) -> DepthMap {
-    sweep_depth(r, nbrs, near, far)
-}
-
 /// 구역 하나의 밀집 점군: 사진들과 희소 점으로 깊이를 구해 융합한다.
 ///
 /// 희소 점의 관측 사진은 점이 화면 안·카메라 앞에 투영되는 사진으로 잡는다.
@@ -356,8 +546,25 @@ pub fn region_cloud(
     sparse_points: &[[f64; 3]],
     cfg: &DenseConfig,
 ) -> PointCloud {
+    region_cloud_with(
+        views,
+        sparse_points,
+        cfg,
+        sweep_depth,
+        &SweepConfig::default(),
+    )
+}
+
+/// [`region_cloud`] 와 같고, 사진별 깊이 추정기와 그 설정을 고를 수 있다.
+pub fn region_cloud_with(
+    views: &[DenseView],
+    sparse_points: &[[f64; 3]],
+    cfg: &DenseConfig,
+    estimate: DepthEstimator,
+    sweep: &SweepConfig,
+) -> PointCloud {
     // 1. 왜곡 보정·축소. 실패한 사진은 건너뛴다(빈 깊이 맵).
-    let prepared: Vec<Option<Prepared>> = views
+    let prepared: Vec<Option<DepthView>> = views
         .par_iter()
         .map(|v| prepare(v, cfg.max_width))
         .collect();
@@ -367,7 +574,7 @@ pub fn region_cloud(
     if ok.len() < 2 {
         return PointCloud::default();
     }
-    let preps: Vec<&Prepared> = ok.iter().map(|&i| prepared[i].as_ref().unwrap()).collect();
+    let preps: Vec<&DepthView> = ok.iter().map(|&i| prepared[i].as_ref().unwrap()).collect();
 
     // 희소 점 관측자.
     let sparse: Vec<SparsePoint> = sparse_points
@@ -402,14 +609,15 @@ pub fn region_cloud(
 
     // 3. 사진별 깊이·법선.
     let maps: Vec<DepthMap> = (0..preps.len())
+        .into_par_iter()
         .map(|i| {
             let (near, far) = view_selection::depth_range(&vs[i], &sparse);
-            let nb: Vec<&Prepared> = neighbors[i]
+            let nb: Vec<&DepthView> = neighbors[i]
                 .iter()
                 .take(SWEEP_NEIGHBORS)
                 .map(|&j| preps[j])
                 .collect();
-            estimate_depth(preps[i], &nb, near, far)
+            estimate(preps[i], &nb, (near, far), sweep)
         })
         .collect();
 
@@ -421,6 +629,7 @@ pub fn region_cloud(
             camera: v.camera,
             rgb: v.rgb.clone(),
             neighbors: neighbors[i].clone(),
+            group: None,
         })
         .collect();
     let fcfg = FusionConfig {
@@ -513,6 +722,102 @@ mod tests {
         assert!(*q(0.5).unwrap() < 0.15, "중앙값 {:?}", q(0.5));
         assert!(*q(0.9).unwrap() < 0.5, "90% {:?}", q(0.9));
         assert!(secs < 60.0, "시간 {secs}");
+    }
+
+    fn quantiles(s: &Scene, cloud: &PointCloud) -> (f64, f64) {
+        let mut d: Vec<f64> = cloud
+            .points
+            .iter()
+            .map(|p| surface_dist(s, &p.xyz))
+            .collect();
+        d.sort_by(f64::total_cmp);
+        let q = |f: f64| d[((d.len() as f64 * f) as usize).min(d.len() - 1)];
+        (q(0.5), q(0.9))
+    }
+
+    /// 편대 장면 48장(16 위치 × 3 드론), 긴 변 480 화소: 점 수·표면 거리·시간.
+    #[test]
+    fn formation_region_48_images() {
+        let (s, views, sparse) = scene_views(16, 480, 270);
+        assert_eq!(views.len(), 48);
+        let cfg = DenseConfig {
+            max_width: 480,
+            ..DenseConfig::default()
+        };
+        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        let t = Instant::now();
+        let cloud = region_cloud(&views, &sparse, &cfg);
+        let secs = t.elapsed().as_secs_f64();
+        assert!(!cloud.has_nan());
+        assert!(!cloud.is_empty());
+        let (med, p90) = quantiles(&s, &cloud);
+        eprintln!(
+            "dense48: images {} points {} median {med:.4} p90 {p90:.4} secs {secs:.2} \
+             ({:.3} s/image) cores {} load {}",
+            views.len(),
+            cloud.len(),
+            secs / views.len() as f64,
+            std::thread::available_parallelism().map_or(0, |n| n.get()),
+            load.trim()
+        );
+        assert!(cloud.len() > POINTS48, "점 수 {}", cloud.len());
+        assert!(med < MEDIAN48, "중앙값 {med}");
+        assert!(p90 < P90_48, "90% {p90}");
+        assert!(secs < SECS48, "시간 {secs}");
+    }
+
+    #[test]
+    fn coarse_to_fine_vs_full_sweep() {
+        let (s, views, sparse) = scene_views(4, 192, 108);
+        let cfg = DenseConfig {
+            max_width: 192,
+            ..DenseConfig::default()
+        };
+        for ctf in [false, true] {
+            let sw = SweepConfig {
+                coarse_to_fine: ctf,
+                ..SweepConfig::default()
+            };
+            let t = Instant::now();
+            let cloud = region_cloud_with(&views, &sparse, &cfg, sweep_depth, &sw);
+            let (med, p90) = quantiles(&s, &cloud);
+            eprintln!(
+                "ctf {ctf}: points {} median {med:.4} p90 {p90:.4} secs {:.2}",
+                cloud.len(),
+                t.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    const POINTS48: usize = 300_000;
+    const MEDIAN48: f64 = 0.05;
+    const P90_48: f64 = 0.15;
+    const SECS48: f64 = 120.0;
+
+    /// 실제 크기(긴 변 960) 12장: 사진당 시간을 재서 48장 구역 시간을 어림한다.
+    #[test]
+    fn real_size_960_seconds_per_image() {
+        let (s, views, sparse) = scene_views(4, 960, 540);
+        let cfg = DenseConfig::default();
+        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        let t = Instant::now();
+        let cloud = region_cloud(&views, &sparse, &cfg);
+        let secs = t.elapsed().as_secs_f64();
+        let (med, p90) = quantiles(&s, &cloud);
+        eprintln!(
+            "dense960: images {} points {} median {med:.4} p90 {p90:.4} secs {secs:.2} \
+             ({:.3} s/image, 48 images ~ {:.1} s) cores {} load {}",
+            views.len(),
+            cloud.len(),
+            secs / views.len() as f64,
+            48.0 * secs / views.len() as f64,
+            std::thread::available_parallelism().map_or(0, |n| n.get()),
+            load.trim()
+        );
+        assert!(cloud.len() > 50_000, "점 수 {}", cloud.len());
+        assert!(med < 0.05, "중앙값 {med}");
+        assert!(p90 < 0.2, "90% {p90}");
+        assert!(secs < 300.0, "시간 {secs}");
     }
 
     #[test]
