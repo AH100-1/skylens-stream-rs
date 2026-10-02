@@ -960,6 +960,37 @@ mod tests {
         (res.registered(), rms, max)
     }
 
+    /// 진단: 점 제약 유무별 등록 수·RMS (잡음 1°, 이상치 10·20%, 시드 1~5).
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_point_constraints() {
+        for frac in [0.10, 0.20] {
+            for seed in 1..=5u64 {
+                let case = Case {
+                    noise_deg: 1.0,
+                    outlier_frac: frac,
+                    unobservable_frac: 0.05,
+                };
+                let (poses, rots, obs) = observations(seed, &case);
+                let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+                let cfg = TranslationConfig::default();
+                let a = average_translations(&rots, &obs, &cfg);
+                let (ra, _) = stats(&similarity_aligned_errors(&a.centers, &truth));
+                let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, POINTS.2);
+                let b = average_translations_with_points(&rots, &obs, &pobs, &cfg);
+                let (rb, _) = stats(&similarity_aligned_errors(&b.centers, &truth));
+                let (_, pobs0) = point_observations(seed, &poses, POINTS.0, POINTS.1, 0.0);
+                let c = average_translations_with_points(&rots, &obs, &pobs0, &cfg);
+                let (rc, _) = stats(&similarity_aligned_errors(&c.centers, &truth));
+                println!(
+                    "DIAG frac {frac} seed {seed} pairs {} rej {:?}/{:?}/{:?} | nopts reg {} rms {ra:.3} | pts reg {} rms {rb:.3} | pts-clean reg {} rms {rc:.3}",
+                    obs.len(), a.rejected, b.rejected, c.rejected,
+                    a.registered(), b.registered(), c.registered()
+                );
+            }
+        }
+    }
+
     #[test]
     fn noiseless_exact() {
         let case = Case {
