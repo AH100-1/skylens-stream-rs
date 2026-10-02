@@ -61,6 +61,7 @@ use skylens_core::two_view::{ransac_essential, recover_pose};
 
 #[path = "support/args.rs"]
 mod args;
+use args::Args;
 
 /// 짝 하나의 대응 좌표: (픽셀 a, 픽셀 b, 정규 a, 정규 b).
 type PairCoords = (
