@@ -566,6 +566,46 @@ mod tests {
         assert_eq!(chunk_ranges(10, 0, 2), Vec::<Range<usize>>::new());
     }
 
+    /// 80 곳 근처 경계 위치 수의 정답 구역 표(SPAN 12, OVL 2, SPEC §3.5 범위식으로 손 계산).
+    /// start 72 꼬리는 72 + 2 < n 일 때(n ≥ 75)만 새 위치를 가지므로 73·74 곳은 6구역.
+    #[test]
+    fn chunks_boundary_table_12_2() {
+        let six = [0..14, 10..26, 22..38, 34..50, 46..62];
+        let table: [(usize, Vec<Range<usize>>); 6] = [
+            (72, [six.to_vec(), vec![58..72]].concat()),
+            (73, [six.to_vec(), vec![58..73]].concat()),
+            (74, [six.to_vec(), vec![58..74]].concat()),
+            (75, [six.to_vec(), vec![58..74, 70..75]].concat()),
+            (84, [six.to_vec(), vec![58..74, 70..84]].concat()),
+            (85, [six.to_vec(), vec![58..74, 70..85]].concat()),
+        ];
+        for (n, want) in table {
+            let got = chunk_ranges(n, 12, 2);
+            assert_eq!(got, want, "n={n}");
+            // 새 위치 0 인 구역 없음: 각 구역 끝이 앞 구역 끝보다 뒤.
+            for w in got.windows(2) {
+                assert!(w[1].end > w[0].end, "n={n}: {got:?}");
+            }
+        }
+    }
+
+    /// 로더 구역과 스트림 구역이 같은 규칙을 따른다(SPEC §3.5 기본값과 퇴화 범위 포함).
+    #[test]
+    fn chunks_match_stream_regions() {
+        for n in 1..=200 {
+            for span in [4, 12] {
+                for ovl in [0, 2] {
+                    let ours = chunk_ranges(n, span, ovl);
+                    let theirs: Vec<Range<usize>> = crate::stream::split_regions(n, span, ovl)
+                        .iter()
+                        .map(|r| r.lo..r.hi)
+                        .collect();
+                    assert_eq!(ours, theirs, "{n} {span} {ovl}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn frame_names() {
         assert_eq!(frame_of_name("camF_0003.jpg"), Some(3));
