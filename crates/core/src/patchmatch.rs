@@ -178,7 +178,7 @@ impl Default for Config {
             step: 2,
             iterations: 4,
             refine_iterations: 1,
-            coarse_width: 240,
+            coarse_width: 120,
             sigma_color: 0.1,
             sigma_spatial: 3.0,
             top_k: 3,
@@ -721,7 +721,7 @@ struct Level {
 /// `0 < 최소 < 최대` 인 유한값이어야 하며, 아니면 모든 화소가 무효인 지도를 돌려준다.
 /// `neighbors` 는 앞에서부터 [`Config::max_neighbors`] 장만 쓴다.
 pub fn estimate(ref_view: &View, neighbors: &[View], range: (f64, f64), cfg: &Config) -> DepthMap {
-    estimate_profiled(ref_view, neighbors, range, cfg, None)
+    estimate_fast(ref_view, neighbors, range, cfg)
 }
 
 /// 층별 걸린 시간(초): 층 시작 비용 계산, 전파·정련.
@@ -975,6 +975,8 @@ fn ncc_cost(q: &Vector3<f32>, patch: &RefPatch, h: &Matrix3<f32>, img: &GrayImag
 const FAST_TOP_K: usize = 3;
 /// 고운 층에서 이 비용 미만이면 갱신을 건너뛴다.
 const FAST_SKIP_COST: f32 = 0.0;
+/// 고운 층에서 전파 후보로 삼는 이웃 가설의 비용 상한(1 − NCC).
+const FAST_TAU_KEEP: f32 = 0.9;
 
 /// 빠른 경로의 평면 가설 하나: 기준 카메라 z 깊이, 단위 법선(카메라를 향함), 집계 비용.
 #[derive(Clone, Copy)]
@@ -1176,6 +1178,7 @@ impl FCtx<'_> {
         mean: f32,
         istd: f32,
         msk: u8,
+        limit: f32,
     ) -> f32 {
         let den = n.dot(m);
         if den >= -1e-3 {
@@ -1183,12 +1186,13 @@ impl FCtx<'_> {
         }
         let nv = self.kinv.transpose() * (n / (d * den));
         let used = if self.nbrs.len() >= 8 {
-            msk.count_ones() as usize
+            msk.count_ones() as usize + (self.nbrs.len() - 8)
         } else {
             self.nbrs.len()
         };
         let k = FAST_TOP_K.min(used.max(1));
         let mut best = [MAX_COST; FAST_TOP_K];
+        let mut left = used;
         for j in 0..self.nbrs.len() {
             if j < 8 && msk >> j & 1 == 0 {
                 continue;
@@ -1197,6 +1201,14 @@ impl FCtx<'_> {
             for b in best.iter_mut().take(k) {
                 if c < *b {
                     std::mem::swap(&mut c, b);
+                }
+            }
+            // 조기 중단: 남은 이웃이 모두 0 이어도 상위 k 합이 한계 이상이면 더 재지 않는다.
+            left = left.saturating_sub(1);
+            if left < k {
+                let lb: f32 = best[..k - left].iter().sum();
+                if lb >= limit * k as f32 {
+                    return MAX_COST;
                 }
             }
         }
@@ -1285,6 +1297,7 @@ impl FCtx<'_> {
                     self.mean[i],
                     self.istd[i],
                     self.mask[i],
+                    f32::INFINITY,
                 );
             }
         });
@@ -1349,7 +1362,7 @@ impl FCtx<'_> {
                 continue;
             }
             let c = &cur[ny as usize * self.w + nx as usize];
-            if c.c >= MAX_COST {
+            if c.c >= sc.prop_max {
                 continue;
             }
             let pm = self.ray(nx as usize, ny as usize);
@@ -1369,7 +1382,7 @@ impl FCtx<'_> {
             }
             tried[nt] = (d, c.n);
             nt += 1;
-            let cost = self.agg(&q, &m, d, &c.n, p, mean, istd, msk);
+            let cost = self.agg(&q, &m, d, &c.n, p, mean, istd, msk, best.c);
             if cost < best.c {
                 best = FHyp { d, n: c.n, c: cost };
             }
@@ -1394,7 +1407,7 @@ impl FCtx<'_> {
                 cand[2] = (dd, b0.n);
             }
             for (d, n) in cand {
-                let cost = self.agg(&q, &m, d, &n, p, mean, istd, msk);
+                let cost = self.agg(&q, &m, d, &n, p, mean, istd, msk, best.c);
                 if cost < best.c {
                     best = FHyp { d, n, c: cost };
                 }
@@ -1406,7 +1419,7 @@ impl FCtx<'_> {
             let (a, b) = (1.0 / self.range.0, 1.0 / self.range.1);
             let d = 1.0 / (a + (b - a) * rng.f());
             let n = self.random_normal(&mut rng, &m);
-            let cost = self.agg(&q, &m, d, &n, p, mean, istd, msk);
+            let cost = self.agg(&q, &m, d, &n, p, mean, istd, msk, best.c);
             if cost < best.c {
                 best = FHyp { d, n, c: cost };
             }
@@ -1427,6 +1440,8 @@ struct FSched {
     n_prop: usize,
     /// 이 비용 미만인 화소는 건너뛴다(고운 층에서 이미 맞은 화소).
     skip_below: f32,
+    /// 이 비용 이상인 이웃 가설은 전파 후보에서 뺀다.
+    prop_max: f32,
 }
 
 struct FLevel {
@@ -1511,7 +1526,15 @@ pub fn estimate_fast_profiled(
         })
         .collect();
     let range32 = (range.0 as f32, range.1 as f32);
-    let offs = fast_offsets(cfg.radius, cfg.step);
+    let offs_coarse = fast_offsets(cfg.radius, cfg.step);
+    let offs_fine = fast_offsets(
+        cfg.radius,
+        if cfg.fine_step == 0 {
+            cfg.step
+        } else {
+            cfg.fine_step
+        },
+    );
 
     type LevelState = (Vec<FHyp>, usize, usize, Matrix3<f32>, Vec<u8>);
     let mut state: Option<LevelState> = None;
@@ -1520,6 +1543,11 @@ pub fn estimate_fast_profiled(
     for li in (0..levels.len()).rev() {
         let lv = &levels[li];
         let (lw, lh) = (lv.img[0].w, lv.img[0].h);
+        let offs = if li + 1 < levels.len() {
+            &offs_fine
+        } else {
+            &offs_coarse
+        };
         let kinv64 = lv.k[0].try_inverse().expect("내부 행렬은 가역");
         let nbrs: Vec<(NeighborGeom, &FImg)> = rel
             .iter()
@@ -1669,6 +1697,7 @@ pub fn estimate_fast_profiled(
                     8
                 },
                 skip_below: if coarsest { 0.0 } else { FAST_SKIP_COST },
+                prop_max: if coarsest { MAX_COST } else { FAST_TAU_KEEP },
             };
             for color in 0..2usize {
                 let tag = fast_hash(cfg.seed, ((li * 64 + it) * 2 + color) as u64);
@@ -2208,6 +2237,15 @@ mod tests {
     }
 
     /// 프로세스 최대 상주 메모리(kB, Linux /proc). 없으면 0.
+    /// 이 프로세스의 사용자+시스템 CPU 시간(초). 부하가 높은 기계에서 벽시계 대신 비교용.
+    fn cpu_seconds() -> f64 {
+        let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let rest = s.rsplit(')').next().unwrap_or("");
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let tick = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        (tick(11) + tick(12)) / 100.0
+    }
+
     fn peak_rss_kb() -> u64 {
         std::fs::read_to_string("/proc/self/status")
             .ok()
@@ -2552,14 +2590,27 @@ mod tests {
         let cams = rig8(960, 540, 1.0, 10.0);
         let (refv, ns, gt) = views(&cams, &scene);
         let n_gt = Vector3::new(0.3, -0.15, -1.0).normalize();
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        cfg.coarse_width = env("PM_CW", cfg.coarse_width);
+        cfg.fast_iterations = env("PM_IT", cfg.fast_iterations);
+        cfg.refine_iterations = env("PM_RI", cfg.refine_iterations);
+        cfg.perturbations = env("PM_PE", cfg.perturbations);
+        cfg.fine_neighbors = env("PM_FN", cfg.fine_neighbors);
         let load = || std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
         let mut best = f64::INFINITY;
         for round in 0..1 {
             let mut st = Vec::new();
             let t = std::time::Instant::now();
+            let cpu0 = cpu_seconds();
             let dm = estimate_fast_profiled(&refv, &ns, (5.0, 20.0), &cfg, Some(&mut st));
             let el = t.elapsed().as_secs_f64();
+            let cpu = cpu_seconds() - cpu0;
             best = best.min(el);
             let s = stats(
                 &dm,
@@ -2568,12 +2619,13 @@ mod tests {
                 |x, y| x >= 8 && y >= 8 && x < 952 && y < 532,
             );
             eprintln!(
-                "회 {round}: {el:.3} s, 중앙 {:.5}, 1% 이내 {:.3}, 법선 {:.2}°, 부하 {}, 스레드 {}",
+                "회 {round}: {el:.3} s, 중앙 {:.5}, 1% 이내 {:.3}, 법선 {:.2}°, 부하 {}, 스레드 {}, CPU {cpu:.3} s(4 코어 환산 {:.3} s)",
                 s.median_rel,
                 s.within_1pct,
                 s.median_normal_deg,
                 load().trim(),
-                rayon::current_num_threads()
+                rayon::current_num_threads(),
+                cpu / 4.0
             );
             for (n, t) in &st {
                 eprintln!("  {n}: {t:.3} s");
