@@ -39,6 +39,108 @@ pub fn candidate_pairs(
     out
 }
 
+/// 카메라 번호 규약(`synth::CamId::ALL` 순서): 앞 0, 오른쪽 1, 왼쪽 2.
+pub const CAM_FRONT: usize = 0;
+pub const CAM_RIGHT: usize = 1;
+pub const CAM_LEFT: usize = 2;
+
+/// 다른 카메라 짝 일정.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossSchedule {
+    /// SPEC §3.2: 모든 다른 카메라 짝에서 위치 차 0..=`range`.
+    Spec { range: usize },
+    /// 실측 겹침 기반(F-197): F(p)–R(p+`right_min`..=p+`max`), F(p)–L(p+`left_min`..=p+`max`)를
+    /// `step` 간격으로 표본한다. R–L 직접 짝은 겹침이 없어 쓰지 않는다(F 를 거쳐 이어진다).
+    Formation {
+        right_min: usize,
+        left_min: usize,
+        max: usize,
+        step: usize,
+    },
+}
+
+impl CrossSchedule {
+    /// 실측 편대 기본값: F–R·F–L +20..=+40, 4칸 간격. 겹침 12% 미만(+12~+16)은 매칭은 되지만
+    /// 회전 오차가 5~17° 라 뺀다(연구 노트 experiments/formation-pairs.md).
+    pub const FORMATION: CrossSchedule = CrossSchedule::Formation {
+        right_min: 20,
+        left_min: 20,
+        max: 40,
+        step: 4,
+    };
+}
+
+/// 짝 일정 설정. 기본값은 같은 카메라 SPEC 일정 + 실측 겹침 기반 카메라 간 일정.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairSchedule {
+    pub temporal: usize,
+    pub pow2_max: usize,
+    pub cross: CrossSchedule,
+}
+
+impl Default for PairSchedule {
+    fn default() -> Self {
+        Self {
+            temporal: PAIR_TEMPORAL,
+            pow2_max: PAIR_POW2_MAX,
+            cross: CrossSchedule::FORMATION,
+        }
+    }
+}
+
+impl PairSchedule {
+    /// SPEC §3.2 일정(카메라 간 같은 위치 ±`PAIR_CROSS`).
+    pub fn spec() -> Self {
+        Self {
+            cross: CrossSchedule::Spec { range: PAIR_CROSS },
+            ..Self::default()
+        }
+    }
+}
+
+/// `views[k] = (카메라 번호, 촬영 위치 번호)` 에서 [`PairSchedule`] 대로 짝을 만든다.
+/// 같은 카메라 규칙은 [`candidate_pairs`] 와 같다. 결과 (i, j) 는 i < j, 중복 없음, 정렬됨.
+pub fn scheduled_pairs(views: &[(usize, usize)], sch: &PairSchedule) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for i in 0..views.len() {
+        for j in 0..views.len() {
+            if i == j {
+                continue;
+            }
+            let ((ca, pa), (cb, pb)) = (views[i], views[j]);
+            let d = pa.abs_diff(pb);
+            let ok = if ca == cb {
+                j > i && d >= 1 && (d <= sch.temporal || (d.is_power_of_two() && d <= sch.pow2_max))
+            } else {
+                match sch.cross {
+                    CrossSchedule::Spec { range } => j > i && d <= range,
+                    CrossSchedule::Formation {
+                        right_min,
+                        left_min,
+                        max,
+                        step,
+                    } => {
+                        let lo = match (ca, cb) {
+                            (CAM_FRONT, CAM_RIGHT) => Some(right_min),
+                            (CAM_FRONT, CAM_LEFT) => Some(left_min),
+                            _ => None,
+                        };
+                        lo.is_some_and(|lo| {
+                            pb >= pa + lo && pb <= pa + max && (pb - pa - lo) % step.max(1) == 0
+                        })
+                    }
+                }
+            };
+            if ok {
+                out.push((i.min(j), i.max(j)));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// 기술자 제곱 L2 거리. 8칸 누산기로 나눠 더해 벡터화되게 한다.
 #[inline]
 fn sq_dist(p: &[f32; DESC_LEN], r: &[f32; DESC_LEN]) -> f32 {
@@ -2429,6 +2531,276 @@ mod tests {
             (tot_bad as f64) < 0.05 * tot_ok as f64,
             "회전 오차 > 2° 간선 {tot_bad} / 확정 {tot_ok}"
         );
+    }
+
+    /// 편대 합성 장면(480×270, 시드 1)에서 다른 카메라 짝 종류별 정답 겹침·매칭·검증 단계 수치(F-148·F-197·F-209).
+    /// 수치 기록용. `--ignored --nocapture` 로 표를 본다.
+    #[test]
+    #[ignore = "수치 기록용 표(원인 조사)"]
+    fn formation_cross_pair_causes() {
+        use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
+        use crate::synth::{CamId, Scene, SceneConfig};
+        let (w, h) = (480usize, 270usize);
+        let scene = Scene::new(SceneConfig {
+            width: w as u32,
+            height: h as u32,
+            seed: 1,
+            ..SceneConfig::default()
+        });
+        let cfg = DetectorConfig::default();
+        let mut cache: std::collections::HashMap<(CamId, usize), Vec<Feature>> =
+            std::collections::HashMap::new();
+        let mut get = |cam: CamId, pos: usize| {
+            let v = scene
+                .views
+                .iter()
+                .find(|v| v.cam == cam && v.position == pos)
+                .unwrap()
+                .clone();
+            let f = cache
+                .entry((cam, pos))
+                .or_insert_with(|| {
+                    let (img, _) = scene.render(&v);
+                    detect_and_describe(&GrayImage::from_rgb(w, h, &img.data), &cfg)
+                })
+                .clone();
+            (v, f)
+        };
+        let base = 8usize;
+        let mut list: Vec<(CamId, CamId, usize)> = vec![];
+        for d in [12usize, 16, 20, 24, 28, 32, 36, 40] {
+            list.push((CamId::F, CamId::R, d));
+            list.push((CamId::F, CamId::L, d));
+        }
+        for (ca, cb, d) in list {
+            let (va, fa) = get(ca, base);
+            let (vb, fb) = get(cb, base + d);
+            let (a, b) = (&va.camera, &vb.camera);
+            // 정답 겹침: A 6 px 격자 광선 → 표면 → B 투영(화면 안, 가려지지 않음).
+            let (mut tot, mut vis) = (0usize, 0usize);
+            let oa = a.pose.center();
+            let ob = b.pose.center();
+            let mut y = 3.0;
+            while y < h as f64 {
+                let mut x = 3.0;
+                while x < w as f64 {
+                    tot += 1;
+                    let dir = a.unproject(&Vector2::new(x, y), 1.0) - oa;
+                    if let Some(hit) = scene.intersect(&oa, &dir.normalize()) {
+                        if let Some(q) = b.project(&hit.point) {
+                            if b.intrinsics.contains(&q) {
+                                let dv = hit.point - ob;
+                                let ok = scene
+                                    .intersect(&ob, &dv.normalize())
+                                    .is_some_and(|h2| (h2.t - dv.norm()).abs() < 0.3);
+                                if ok {
+                                    vis += 1;
+                                }
+                            }
+                        }
+                    }
+                    x += 6.0;
+                }
+                y += 6.0;
+            }
+            let m = ratio_match(&fa, &fb, 0.8, true);
+            // 정답 대응: A 점의 광선 표면점을 B 에 투영해 2 px 안.
+            let mut good = 0usize;
+            for &(i, j) in &m {
+                let (ka, kb) = (&fa[i].kp, &fb[j].kp);
+                let pa = Vector2::new(ka.x as f64 + 0.5, ka.y as f64 + 0.5);
+                let dir = a.unproject(&pa, 1.0) - oa;
+                if let Some(hit) = scene.intersect(&oa, &dir.normalize()) {
+                    if let Some(q) = b.project(&hit.point) {
+                        if (q - Vector2::new(kb.x as f64 + 0.5, kb.y as f64 + 0.5)).norm() < 2.0 {
+                            good += 1;
+                        }
+                    }
+                }
+            }
+            let px = |f: &Feature| Vector2::new(f.kp.x as f64, f.kp.y as f64);
+            let (k1, k2) = (&a.intrinsics, &b.intrinsics);
+            let n1: Vec<_> = m
+                .iter()
+                .map(|&(i, _)| k1.index_to_normalized(&px(&fa[i])))
+                .collect();
+            let n2: Vec<_> = m
+                .iter()
+                .map(|&(_, j)| k2.index_to_normalized(&px(&fb[j])))
+                .collect();
+            let rcfg = RansacConfig::default();
+            let truth = b.pose.rotation * a.pose.rotation.inverse();
+            let cands = crate::two_view::ransac_essential_candidates(&n1, &n2, k1.fx, &rcfg);
+            let (mut ninl, mut err) = (0usize, f64::NAN);
+            if let Some((e, inl)) = cands.first() {
+                ninl = inl.iter().filter(|&&v| v).count();
+                let s1: Vec<_> = (0..n1.len()).filter(|&i| inl[i]).map(|i| n1[i]).collect();
+                let s2: Vec<_> = (0..n1.len()).filter(|&i| inl[i]).map(|i| n2[i]).collect();
+                err = crate::two_view::recover_pose(e, &s1, &s2)
+                    .map(|p| (p.rotation * truth.inverse()).angle().to_degrees())
+                    .unwrap_or(180.0);
+            }
+            // 후보별 선형 회전 오차(정답으로 고른 최소값 = 후보 선택 한계)와 첫 후보 정밀화 오차.
+            let rot_err = |p: &crate::two_view::RelativePose| {
+                (p.rotation * truth.inverse()).angle().to_degrees()
+            };
+            let mut best = f64::NAN;
+            let mut refined = f64::NAN;
+            for (ci, (e, inl)) in cands.iter().enumerate() {
+                let s1: Vec<_> = (0..n1.len()).filter(|&i| inl[i]).map(|i| n1[i]).collect();
+                let s2: Vec<_> = (0..n1.len()).filter(|&i| inl[i]).map(|i| n2[i]).collect();
+                if let Some(p) = crate::two_view::recover_pose(e, &s1, &s2) {
+                    best = best.min(rot_err(&p));
+                }
+                if ci == 0 {
+                    if let Some(p) = crate::two_view::refine_relative_pose(e, &s1, &s2, 50) {
+                        refined = rot_err(&p);
+                    }
+                }
+            }
+            eprintln!(
+                "{:?}→{:?} +{d:2}: 겹침 {:5.1}% 특징 {}/{} 매칭 {:3} 정답대응 {:3} E정상 {:3} 후보 {} 회전오차 {:.3}° 후보중최소 {:.3}° 첫후보정밀화 {:.3}°",
+                ca, cb, 100.0 * vis as f64 / tot as f64, fa.len(), fb.len(), m.len(), good, ninl, cands.len(), err, best, refined
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_pairs_spec_matches_candidate_pairs() {
+        let views: Vec<(usize, usize)> =
+            (0..30).flat_map(|p| (0..3).map(move |c| (c, p))).collect();
+        let spec = scheduled_pairs(&views, &PairSchedule::spec());
+        assert_eq!(
+            spec,
+            candidate_pairs(&views, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX)
+        );
+        let f = scheduled_pairs(&views, &PairSchedule::default());
+        assert!(f.iter().all(|&(i, j)| i < j));
+        let mut kinds = std::collections::BTreeSet::new();
+        for &(i, j) in &f {
+            let ((ca, pa), (cb, pb)) = (views[i], views[j]);
+            if ca != cb {
+                let ((_, pf), (co, po)) = if ca == CAM_FRONT {
+                    ((ca, pa), (cb, pb))
+                } else {
+                    ((cb, pb), (ca, pa))
+                };
+                assert!(po >= pf + 20 && po <= pf + 40 && (po - pf) % 4 == 0);
+                kinds.insert(co);
+            }
+        }
+        assert_eq!(
+            kinds.into_iter().collect::<Vec<_>>(),
+            vec![CAM_RIGHT, CAM_LEFT]
+        );
+        // 위치 30 개: F(p)–R(p+20..=+40, 4칸) 은 p ≤ 9 에서 3·2·1 개 등. 같은 카메라 짝은 SPEC 과 같다.
+        let same =
+            |v: &Vec<(usize, usize)>| v.iter().filter(|&&(i, j)| views[i].0 == views[j].0).count();
+        assert_eq!(same(&f), same(&spec));
+    }
+
+    /// 편대 합성 장면(480×270, 시드 1)의 기본 짝 일정(카메라 간 F–R·F–L +20..=+40)으로 F 8·R 13·L 13 시점을
+    /// 매칭·5점 RANSAC 검증한다. 검증된 카메라 간 짝의 회전 오차 중앙 ≤ 1°, 검증 짝 그래프가 한 연결 성분.
+    #[test]
+    fn formation_default_schedule_verifies_and_connects() {
+        use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
+        use crate::synth::{CamId, Scene, SceneConfig};
+        let (w, h) = (480usize, 270usize);
+        let scene = Scene::new(SceneConfig {
+            width: w as u32,
+            height: h as u32,
+            seed: 1,
+            ..SceneConfig::default()
+        });
+        let cfg = DetectorConfig::default();
+        let mut sel: Vec<(usize, usize)> = vec![];
+        for p in (0..=28).step_by(4) {
+            sel.push((CAM_FRONT, p));
+        }
+        for p in (20..=68).step_by(4) {
+            sel.push((CAM_RIGHT, p));
+            sel.push((CAM_LEFT, p));
+        }
+        let cam_of = |c: usize| CamId::ALL[c];
+        let views: Vec<_> = sel
+            .iter()
+            .map(|&(c, p)| {
+                scene
+                    .views
+                    .iter()
+                    .find(|v| v.cam == cam_of(c) && v.position == p)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        let feats: Vec<Vec<Feature>> = views
+            .iter()
+            .map(|v| {
+                let (img, _) = scene.render(v);
+                detect_and_describe(&GrayImage::from_rgb(w, h, &img.data), &cfg)
+            })
+            .collect();
+        let pairs = scheduled_pairs(&sel, &PairSchedule::default());
+        let mut parent: Vec<usize> = (0..sel.len()).collect();
+        fn find(p: &mut [usize], x: usize) -> usize {
+            let mut r = x;
+            while p[r] != r {
+                r = p[r];
+            }
+            let mut x = x;
+            while p[x] != r {
+                let n = p[x];
+                p[x] = r;
+                x = n;
+            }
+            r
+        }
+        let (mut cross_err, mut cross_n, mut verified) = (Vec::new(), 0usize, 0usize);
+        for &(i, j) in &pairs {
+            let (a, b) = (&views[i].camera, &views[j].camera);
+            let m = ratio_match(&feats[i], &feats[j], 0.8, true);
+            let nrm = |c: &Camera, f: &Feature| {
+                c.intrinsics
+                    .index_to_normalized(&Vector2::new(f.kp.x as f64, f.kp.y as f64))
+            };
+            let n1: Vec<_> = m.iter().map(|&(x, _)| nrm(a, &feats[i][x])).collect();
+            let n2: Vec<_> = m.iter().map(|&(_, y)| nrm(b, &feats[j][y])).collect();
+            let cands = crate::two_view::ransac_essential_candidates(
+                &n1,
+                &n2,
+                a.intrinsics.fx,
+                &RansacConfig::default(),
+            );
+            let Some((e, inl)) = cands.first() else {
+                continue;
+            };
+            verified += 1;
+            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+            parent[ri] = rj;
+            if sel[i].0 != sel[j].0 {
+                cross_n += 1;
+                let s1: Vec<_> = (0..n1.len()).filter(|&k| inl[k]).map(|k| n1[k]).collect();
+                let s2: Vec<_> = (0..n1.len()).filter(|&k| inl[k]).map(|k| n2[k]).collect();
+                let truth = b.pose.rotation * a.pose.rotation.inverse();
+                let err = crate::two_view::recover_pose(e, &s1, &s2)
+                    .map(|p| (p.rotation * truth.inverse()).angle().to_degrees())
+                    .unwrap_or(180.0);
+                cross_err.push(err);
+            }
+        }
+        cross_err.sort_by(f64::total_cmp);
+        let med = cross_err[cross_err.len() / 2];
+        let comps = (0..sel.len())
+            .filter(|&x| find(&mut parent, x) == x)
+            .count();
+        eprintln!(
+            "짝 {} 검증 {verified}, 카메라 간 검증 {cross_n}, 회전 오차 중앙 {med:.3}° 최대 {:.3}°, 연결 성분 {comps}",
+            pairs.len(),
+            cross_err.last().unwrap()
+        );
+        assert!(cross_n >= 10, "카메라 간 검증 {cross_n}");
+        assert!(med <= 1.0, "회전 오차 중앙 {med}");
+        assert_eq!(comps, 1);
     }
 
     #[test]
