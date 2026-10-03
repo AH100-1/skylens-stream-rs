@@ -127,6 +127,7 @@ fn run_case(positions: usize, seed: u64) -> Acc {
         per_region_err[k.min(last)].push(e);
     }
     // 구역별 초벌·정밀 점군의 정답 표면 편차(부호 있는 높이 중앙, 절댓값 중앙).
+    #[allow(clippy::needless_range_loop)]
     for k in 0..res.regions.len() {
         for kind in ["preview", "refined"] {
             let dir = out.join(kind);
@@ -195,6 +196,7 @@ fn passes(a: &Acc) -> Vec<&str> {
 }
 
 /// 상한은 첫 측정값에 여유를 둔 느슨한 값이다(노트 참고).
+#[allow(clippy::too_many_arguments)]
 fn bounds(
     a: &Acc,
     regions: usize,
