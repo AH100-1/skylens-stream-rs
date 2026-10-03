@@ -597,12 +597,23 @@ pub fn build_snapshots(
     out
 }
 
-/// SPEC §4 스냅샷 기준 검사: 점 수 단조 증가, 2단계부터 초벌 새 영역 > 0, NaN 없음.
+/// 정수 step 사이 점 수 단조 판정(흐름 issue 와 `verify` 가 같이 쓴다): 같은 수는 허용, 감소만 위반.
+/// final 은 정밀 점군 간격 추출 결과라 마지막 step 보다 작을 수 있어 판정에서 뺀다.
+pub fn snapshot_count_decreased(prev_points: f64, next_points: f64) -> bool {
+    next_points < prev_points
+}
+
+/// SPEC §4 스냅샷 기준 검사: 정수 step 점 수 단조 증가(같은 수 허용), 2단계부터 초벌 새 영역 > 0, NaN 없음.
 /// 위반을 사람이 읽을 문장으로 돌려준다(없으면 빈 목록).
 pub fn check_snapshots(summary: &SnapshotSummary) -> Vec<String> {
     let mut issues = Vec::new();
-    for w in summary.entries.windows(2) {
-        if w[1].points <= w[0].points {
+    let ints: Vec<&SnapshotEntry> = summary
+        .entries
+        .iter()
+        .filter(|e| matches!(e.step, Step::Index(_)))
+        .collect();
+    for w in ints.windows(2) {
+        if snapshot_count_decreased(w[0].points as f64, w[1].points as f64) {
             issues.push(format!(
                 "스냅샷 점 수 단조 증가 아님: step {} {} → step {} {}",
                 w[0].step, w[0].points, w[1].step, w[1].points
@@ -1532,9 +1543,39 @@ mod tests {
         assert!(Manifest::from_json(frac).is_err());
     }
 
-    /// 초벌 6000점·정밀 600점 두 구역: 점 수 [100, 1100, 200] → 최종에서 줄어든다. 위반이 보고돼야 한다.
+    /// 정수 step 사이 감소만 위반(같은 수는 허용), final 은 판정에서 빠진다. verify 와 같은 규칙.
     #[test]
-    fn snapshot_violation_reported() {
+    fn snapshot_monotone_rule_integer_steps_only() {
+        let e = |step, points| SnapshotEntry {
+            step,
+            points,
+            preview_new_area: 1,
+        };
+        let sum = |entries| SnapshotSummary {
+            entries,
+            nan_steps: vec![],
+            peak_points: 0,
+        };
+        // 13068 → 12979 가 final 에서 일어나도 위반 아님, 정수 step 사이 같은 수도 허용.
+        let ok = sum(vec![
+            e(Step::Index(1), 13068),
+            e(Step::Index(2), 13068),
+            e(Step::Final, 12979),
+        ]);
+        assert!(check_snapshots(&ok).is_empty());
+        let bad = sum(vec![
+            e(Step::Index(1), 13068),
+            e(Step::Index(2), 12979),
+            e(Step::Final, 20000),
+        ]);
+        let issues = check_snapshots(&bad);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("13068") && issues[0].contains("12979"));
+    }
+
+    /// 초벌 6000점·정밀 600점 두 구역: 점 수 [100, 1100, 200] → 최종에서 줄어들지만 final 은 판정 밖이다.
+    #[test]
+    fn snapshot_final_decrease_not_reported() {
         let grid = |n: usize, x0: f64| PointCloud {
             points: (0..n)
                 .map(|i| {
@@ -1560,8 +1601,7 @@ mod tests {
         let pts: Vec<usize> = summary.entries.iter().map(|e| e.points).collect();
         assert_eq!(pts, vec![100, 1100, 200]);
         let issues = check_snapshots(&summary);
-        assert_eq!(issues.len(), 1, "{issues:?}");
-        assert!(issues[0].contains("단조"));
+        assert!(issues.is_empty(), "{issues:?}");
         // NaN 은 따로 보고된다.
         let mut bad = grid(600, 0.0);
         bad.points[0].xyz[2] = f32::NAN;
