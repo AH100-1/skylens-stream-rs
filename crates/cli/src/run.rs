@@ -7,7 +7,7 @@ use skylens_core::dataset::{load_dataset, DatasetConfig};
 use skylens_core::pipeline::{run_pipeline, DenseMethod, PipelineConfig, PositionMethod};
 
 pub const USAGE: &str =
-    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N] [--max-features N] [--dense-width N] [--hfov DEG] [--ba-iters N] [--dense-method sweep|patchmatch] [--position gps|translation-averaging] [--preview-ba-iters N] [--gps-sigma-h M] [--gps-sigma-v M] [--tri-loose-frac F] [--tri-median-k K] [--tri-min-px PX] [--list-only]";
+    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N] [--max-features N] [--dense-width N] [--hfov DEG] [--ba-iters N] [--dense-method sweep|patchmatch] [--position gps|translation-averaging] [--preview-ba-iters N] [--gps-sigma-h M] [--gps-sigma-v M] [--tri-loose-frac F] [--tri-median-k K] [--tri-min-px PX] [--tri-refine-iters N] [--preview-min-ray DEG] [--list-only]";
 
 /// 출력 폴더 아래에 만드는 하위 폴더.
 pub const OUTPUT_DIRS: [&str; 3] = ["preview", "refined", "snapshots"];
@@ -59,6 +59,7 @@ fn parse_options(rest: &[&str]) -> Result<(DatasetConfig, PipelineConfig, bool),
             "--tri-loose-frac" => Some(&mut pc.tri_loose_frac),
             "--tri-median-k" => Some(&mut pc.tri_median_k),
             "--tri-min-px" => Some(&mut pc.tri_min_px),
+            "--preview-min-ray" => Some(&mut pc.preview_min_ray_deg),
             _ => None,
         };
         if let Some(slot) = fslot {
@@ -72,6 +73,7 @@ fn parse_options(rest: &[&str]) -> Result<(DatasetConfig, PipelineConfig, bool),
         }
         let slot = match key {
             "--preview-ba-iters" => &mut pc.preview_ba_iters,
+            "--tri-refine-iters" => &mut pc.tri_refine_iters,
             "--max-features" => &mut pc.max_features,
             "--dense-width" => &mut pc.dense_width,
             "--ba-iters" => &mut pc.ba_iters,
