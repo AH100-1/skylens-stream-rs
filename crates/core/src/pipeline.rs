@@ -23,13 +23,13 @@ use crate::fusion::{fuse, FusionConfig, FusionView};
 use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig};
 use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::ply::{PointCloud, PointRecord};
-use crate::translation_averaging::{
-    average_translations_with_points, PointObservation, RelativeTranslation, TranslationConfig,
-};
 use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
 use crate::stream::{
     align_region, align_window, apply_alignments, point_pairs, split_regions, write_outputs,
     AlignRecord, Region, Track,
+};
+use crate::translation_averaging::{
+    average_translations_with_points, PointObservation, RelativeTranslation, TranslationConfig,
 };
 use crate::two_view::{ransac_essential, recover_pose};
 
