@@ -1857,6 +1857,44 @@ mod tests {
         }
     }
 
+    /// 진단: 최대 오차 카메라의 점 관측 수·짝 직선 수 (시드·짝 이상치·점 이상치는 환경변수 DIAG_CASES="시드:짝:점,...").
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_worst_camera() {
+        let cases = std::env::var("DIAG_CASES").unwrap_or_else(|_| "15:0.2:0.0,7:0.1:0.05".into());
+        for spec in cases.split(',') {
+            let v: Vec<&str> = spec.split(':').collect();
+            let (seed, frac, pfrac): (u64, f64, f64) = (
+                v[0].parse().unwrap(),
+                v[1].parse().unwrap(),
+                v[2].parse().unwrap(),
+            );
+            let case = Case {
+                noise_deg: 1.0,
+                outlier_frac: frac,
+                unobservable_frac: 0.05,
+            };
+            let (poses, rots, obs) = observations(seed, &case);
+            let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, pfrac);
+            let res =
+                average_translations_with_points(&rots, &obs, &pobs, &TranslationConfig::default());
+            let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+            let errs = similarity_aligned_errors(&res.centers, &truth);
+            let mut idx: Vec<usize> = (0..errs.len()).collect();
+            idx.sort_by(|&a, &b| errs[b].total_cmp(&errs[a]));
+            for &c in idx.iter().take(5) {
+                let n_pt = pobs.iter().filter(|o| o.camera == c).count();
+                let n_pair = obs.iter().filter(|o| o.i == c || o.j == c).count();
+                println!(
+                    "seed {seed} pair {frac} point {pfrac}: cam {c} err {:.3} m point obs {n_pt} pair lines {n_pair}",
+                    errs[c]
+                );
+            }
+            let mean_pt = pobs.len() as f64 / 240.0;
+            println!("  mean point obs per camera {mean_pt:.1}");
+        }
+    }
+
     #[test]
     fn refine_center_keeps_previous_when_underconstrained() {
         let cur = Vector3::new(1.0, 2.0, 30.0);
