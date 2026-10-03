@@ -175,6 +175,13 @@ pub struct Config {
     /// 1(기본)은 가까운 네 이웃 법선의 평균 한 번만, 2 이상부터 그 뒤에 무작위 법선 섭동
     /// (`skip_probes - 1` 회, 진폭은 시도마다 절반)을 더한다.
     pub skip_probes: usize,
+    /// `estimate_fast`: 섭동 폭을 반복 번호가 아니라 화소의 현재 비용으로 정한다
+    /// (비용 ≤ 0.6 이면 ×1/4, ≤ 0.8 이면 ×1/2, 그 밖 ×1; 기준 폭 깊이 ±0.3%, 법선 ±16°/±10°).
+    /// 후보가 비용을 개선할 때마다 그 화소의 폭을 반으로 줄인다. 화소를 건너뛰지는 않는다.
+    /// 가장 거친 층은 기존 일정을 쓴다(거친 층에서 좁은 폭은 법선 수렴을 해친다: 160×120 에서 확인).
+    pub cost_adaptive: bool,
+    /// `cost_adaptive` 와 함께: 비용 ≤ 0.6 인 화소는 단계마다 후보를 3 개 대신 1 개만 시험한다.
+    pub adaptive_fewer: bool,
 }
 
 impl Default for Config {
@@ -201,6 +208,8 @@ impl Default for Config {
             fine_prop: 4,
             skip_cost: 0.08,
             skip_probes: 1,
+            cost_adaptive: false,
+            adaptive_fewer: false,
         }
     }
 }
@@ -1074,6 +1083,8 @@ struct FCtx<'a> {
     range: (f32, f32),
     /// 화소별 쓸 이웃 비트마스크(비트 j = 이웃 j). 거친 층 첫 반복 뒤 비용이 낮은 쪽만 남긴다.
     mask: Vec<u8>,
+    /// 진단 계수: [방문, 건너뜀, 저비용 섭동].
+    stat: [std::sync::atomic::AtomicU64; 3],
 }
 
 /// 창 안 표본값(기준 영상). 가장자리는 가장 가까운 화소로 대치.
@@ -1318,19 +1329,24 @@ impl FCtx<'_> {
             let mut p = FPatch {
                 v: [0.0; MAX_SAMPLES],
             };
+            let mut cnt = [0u64; 3];
             let mut x = (y + color) & 1;
             while x < w {
                 let i = y * w + x;
                 if self.istd[i] != 0.0 {
-                    if let Some(h) = self.update(cur, x, y, tag, sc, &mut p) {
+                    if let Some(h) = self.update(cur, x, y, tag, sc, &mut p, &mut cnt) {
                         row[x] = h;
                     }
                 }
                 x += 2;
             }
+            for (a, c) in self.stat.iter().zip(cnt) {
+                a.fetch_add(c, std::sync::atomic::Ordering::Relaxed);
+            }
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn update(
         &self,
         cur: &[FHyp],
@@ -1339,6 +1355,7 @@ impl FCtx<'_> {
         tag: u64,
         sc: &FSched,
         p: &mut FPatch,
+        cnt: &mut [u64; 3],
     ) -> Option<FHyp> {
         const PAT: [(i32, i32); 8] = [
             (0, -1),
@@ -1360,8 +1377,10 @@ impl FCtx<'_> {
         let mut tried = [(0.0f32, Vector3::<f32>::zeros()); 9];
         let mut nt = 1;
         tried[0] = (best.d, best.n);
+        cnt[0] += 1;
         // 전파: 가까운 4 + 먼 4 표본(반대 색 화소)의 평면을 이 화소 광선으로 옮긴다.
         if best.c < sc.skip_below {
+            cnt[1] += 1;
             // 건너뛴 화소: 깊이는 두고 법선만 작게 흔든다(법선 정확도 유지).
             // 가까운 네 이웃 법선의 평균을 후보로 한 번 시험(국소 평활).
             if sc.skip_probes > 0 {
@@ -1445,16 +1464,33 @@ impl FCtx<'_> {
             }
         }
         // 정제: 섭동 폭을 단계마다 절반으로.
-        let mut ad = sc.amp_d;
-        let mut an = sc.amp_n;
+        let good = sc.adaptive && best.c <= 0.6;
+        if good {
+            cnt[2] += 1;
+        }
+        // 비용 기반 폭: 개선 때마다 반으로.
+        let mut mult = if !sc.adaptive || best.c > 0.8 {
+            1.0
+        } else if best.c > 0.6 {
+            0.5
+        } else {
+            0.25
+        };
+        let mut ad = if sc.adaptive { 0.003 } else { sc.amp_d };
+        let mut an = if sc.adaptive { 0.28 } else { sc.amp_n };
         for _ in 0..sc.steps {
+            let (ea, en) = if sc.adaptive {
+                (ad * mult, an * mult)
+            } else {
+                (ad, an)
+            };
             let dd =
-                (best.d * (1.0 + ad * (2.0 * rng.f() - 1.0))).clamp(self.range.0, self.range.1);
+                (best.d * (1.0 + ea * (2.0 * rng.f() - 1.0))).clamp(self.range.0, self.range.1);
             let dn = best.n
                 + Vector3::new(
-                    an * (2.0 * rng.f() - 1.0),
-                    an * (2.0 * rng.f() - 1.0),
-                    an * (2.0 * rng.f() - 1.0),
+                    en * (2.0 * rng.f() - 1.0),
+                    en * (2.0 * rng.f() - 1.0),
+                    en * (2.0 * rng.f() - 1.0),
                 );
             let nn = dn / dn.norm();
             let ok_n = nn.dot(&m) < -0.05 * m.norm() && nn.iter().all(|v| v.is_finite());
@@ -1463,14 +1499,27 @@ impl FCtx<'_> {
                 cand[1] = (b0.d, b0.n);
                 cand[2] = (dd, b0.n);
             }
-            for (d, n) in cand {
+            let used = if good && sc.fewer {
+                &cand[2..]
+            } else {
+                &cand[..]
+            };
+            let before = best.c;
+            for &(d, n) in used {
                 let cost = self.agg(&q, &m, d, &n, p, mean, istd, msk, best.c);
                 if cost < best.c {
                     best = FHyp { d, n, c: cost };
                 }
             }
-            ad *= 0.5;
-            an *= 0.5;
+            if sc.adaptive {
+                if best.c < before {
+                    mult *= 0.5;
+                }
+                an = 0.175;
+            } else {
+                ad *= 0.5;
+                an *= 0.5;
+            }
         }
         if sc.fresh {
             let (a, b) = (1.0 / self.range.0, 1.0 / self.range.1);
@@ -1501,6 +1550,9 @@ struct FSched {
     prop_max: f32,
     /// 건너뛴 화소의 법선 전용 섭동 횟수.
     skip_probes: usize,
+    /// 이 비용 미만이면 섭동 폭·후보 수를 줄인다(0 이면 끔).
+    adaptive: bool,
+    fewer: bool,
 }
 
 struct FLevel {
@@ -1632,6 +1684,7 @@ pub fn estimate_fast_profiled(
             istd: vec![0.0; lw * lh],
             range: range32,
             mask: vec![0xFF; lw * lh],
+            stat: Default::default(),
         };
         // 기준 창 평균·표준편차 역수 캐시.
         {
@@ -1647,6 +1700,7 @@ pub fn estimate_fast_profiled(
                 istd: Vec::new(),
                 range: range32,
                 mask: Vec::new(),
+                stat: Default::default(),
             };
             mean.par_chunks_mut(lw)
                 .zip(istd.par_chunks_mut(lw))
@@ -1757,6 +1811,8 @@ pub fn estimate_fast_profiled(
                 },
                 skip_below: if coarsest { 0.0 } else { cfg.skip_cost },
                 skip_probes: cfg.skip_probes,
+                adaptive: cfg.cost_adaptive && !coarsest,
+                fewer: cfg.adaptive_fewer,
                 prop_max: if coarsest { MAX_COST } else { FAST_TAU_KEEP },
             };
             for color in 0..2usize {
@@ -1770,6 +1826,12 @@ pub fn estimate_fast_profiled(
             }
         }
         mark(format!("L{li} iterations"), &mut stages);
+        if let Some(st) = stages.as_deref_mut() {
+            let g = |k: usize| ctx.stat[k].load(std::sync::atomic::Ordering::Relaxed) as f64;
+            let v = g(0).max(1.0);
+            st.push((format!("L{li} 방문 {} 비율: 건너뜀", g(0)), g(1) / v));
+            st.push((format!("L{li} 비율: 저비용 섭동"), g(2) / v));
+        }
         state = Some((hyps, lw, lh, ctx.kinv, std::mem::take(&mut ctx.mask)));
     }
 
@@ -2697,5 +2759,137 @@ mod tests {
             }
         }
         eprintln!("최소 {best:.3} s");
+    }
+    /// 좋은 화소 섭동 축소 방식도 경사 평면에서 정확도 기준을 지킨다.
+    #[test]
+    fn fast_cost_adaptive_slanted() {
+        let (a, b) = (0.3, -0.15);
+        let scene = Scene::Slanted { z0: 10.0, a, b };
+        let cams = rig(160, 120, 1.0, 10.0);
+        let (refv, ns, gt) = views(&cams, &scene);
+        let cfg = Config {
+            cost_adaptive: true,
+            ..Config::default()
+        };
+        let dm = estimate_fast(&refv, &ns, (5.0, 20.0), &cfg);
+        let n_gt = Vector3::new(a, b, -1.0).normalize();
+        let s = stats(
+            &dm,
+            &gt,
+            |_| n_gt,
+            |x, y| x >= 8 && y >= 8 && x < 152 && y < 112,
+        );
+        report("비용 기반 폭", &s);
+        assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
+        assert!(s.within_1pct > 0.90, "1% 이내 비율 {}", s.within_1pct);
+        assert!(
+            s.median_normal_deg < FAST_NORMAL_DEG,
+            "법선 {}°",
+            s.median_normal_deg
+        );
+    }
+
+    /// 건너뜀 계수 진단: 해상도마다 고운 층에서 실제로 건너뛴 화소 비율을 찍는다.
+    /// cargo test --release -p <크레이트> --lib -- --ignored skip_count_diag --nocapture
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn skip_count_diag() {
+        let scene = Scene::Slanted {
+            z0: 10.0,
+            a: 0.3,
+            b: -0.15,
+        };
+        for (w, h) in [(192u32, 108u32), (960, 540)] {
+            let cams = rig8(w, h, 1.0, 10.0);
+            let (refv, ns, _) = views(&cams, &scene);
+            for sk in [0.0f32, 0.08] {
+                let cfg = Config {
+                    skip_cost: sk,
+                    ..Config::default()
+                };
+                let mut st = Vec::new();
+                estimate_fast_profiled(&refv, &ns, (5.0, 20.0), &cfg, Some(&mut st));
+                for (n, v) in st.iter().filter(|(n, _)| n.contains("비율")) {
+                    eprintln!("{w}x{h} skip_cost {sk}: {n} = {v:.4}");
+                }
+            }
+        }
+    }
+
+    /// 기본 / skip 0.08 / 좋은 화소 축소 비교, 번갈아 7회(벽시계 최소·중앙, CPU, 정확도, 부하).
+    /// cargo test --release -p <크레이트> --lib -- --ignored ab_good_960 --nocapture
+    #[test]
+    #[ignore = "시간 비교용(측정 기계 부하에 따라 값이 달라짐)"]
+    fn ab_good_960() {
+        let scene = Scene::Slanted {
+            z0: 10.0,
+            a: 0.3,
+            b: -0.15,
+        };
+        let cams = rig8(960, 540, 1.0, 10.0);
+        let (refv, ns, gt) = views(&cams, &scene);
+        let n_gt = Vector3::new(0.3, -0.15, -1.0).normalize();
+        let modes: Vec<(&str, Config)> = vec![
+            (
+                "기본(skip 0)",
+                Config {
+                    skip_cost: 0.0,
+                    ..Config::default()
+                },
+            ),
+            ("skip 0.08", Config::default()),
+            (
+                "비용 기반 폭",
+                Config {
+                    skip_cost: 0.0,
+                    cost_adaptive: true,
+                    ..Config::default()
+                },
+            ),
+            (
+                "비용 기반 폭+후보 1",
+                Config {
+                    skip_cost: 0.0,
+                    cost_adaptive: true,
+                    adaptive_fewer: true,
+                    ..Config::default()
+                },
+            ),
+        ];
+        let load = || std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        let mut res: Vec<Vec<(f64, f64)>> = vec![Vec::new(); modes.len()];
+        let mut acc: Vec<Option<Stats>> = (0..modes.len()).map(|_| None).collect();
+        let l0 = load();
+        for _ in 0..7 {
+            for (k, (_, cfg)) in modes.iter().enumerate() {
+                let t = std::time::Instant::now();
+                let c0 = cpu_seconds();
+                let dm = estimate_fast(&refv, &ns, (5.0, 20.0), cfg);
+                res[k].push((t.elapsed().as_secs_f64(), cpu_seconds() - c0));
+                acc[k] = Some(stats(
+                    &dm,
+                    &gt,
+                    |_| n_gt,
+                    |x, y| x >= 8 && y >= 8 && x < 952 && y < 532,
+                ));
+            }
+        }
+        eprintln!(
+            "부하 전 {} 후 {} 스레드 {}",
+            l0.trim(),
+            load().trim(),
+            rayon::current_num_threads()
+        );
+        for (k, (name, _)) in modes.iter().enumerate() {
+            let mut w: Vec<f64> = res[k].iter().map(|r| r.0).collect();
+            let mut c: Vec<f64> = res[k].iter().map(|r| r.1).collect();
+            w.sort_by(|a, b| a.total_cmp(b));
+            c.sort_by(|a, b| a.total_cmp(b));
+            let s = acc[k].as_ref().unwrap();
+            eprintln!(
+                "{name}: 벽시계 최소 {:.3} 중앙 {:.3} s, CPU 최소 {:.3} 중앙 {:.3} s, 깊이 중앙 {:.4}%, 1% 이내 {:.1}%, 법선 {:.2}°",
+                w[0], w[3], c[0], c[3], s.median_rel * 100.0, s.within_1pct * 100.0, s.median_normal_deg
+            );
+        }
     }
 }
