@@ -1001,7 +1001,7 @@ pub fn run_pipeline(
                 median_m: ar.fit_median_m.unwrap_or(f64::NAN),
                 scale: s.s,
             });
-            rec.sim = sim.clone();
+            rec.sim = sim;
             rec.target = Some(k);
             write_decimated(
                 out,
@@ -1234,7 +1234,7 @@ pub fn run_pipeline(
             }
         }
         // 기준 모델이 없거나 겹침이 모자라면 GPS 좌표 그대로(초기 좌표계는 이미 GPS)로 내보낸다.
-        let shown = sim.clone().unwrap_or_else(Similarity::identity);
+        let shown = sim.unwrap_or_else(Similarity::identity);
         write_decimated(
             out,
             &preview_name(r),
@@ -1277,7 +1277,7 @@ pub fn run_pipeline(
     let kept: Vec<Region> = recs.iter().map(|r| r.region).collect();
     let sims: Vec<Option<Similarity>> = recs
         .iter()
-        .map(|r| r.own.as_ref().and_then(|o| o.0.clone()))
+        .map(|r| r.own.as_ref().and_then(|o| o.0))
         .collect();
     let records: Vec<AlignRecord> = recs
         .iter()
