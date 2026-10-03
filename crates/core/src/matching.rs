@@ -60,12 +60,13 @@ pub enum CrossSchedule {
 }
 
 impl CrossSchedule {
-    /// 실측 편대 기본값: F–R·F–L +20..=+40, 4칸 간격. 겹침 12% 미만(+12~+16)은 매칭은 되지만
-    /// 회전 오차가 5~17° 라 뺀다(연구 노트 experiments/formation-pairs.md).
+    /// 실측 편대 기본값: F–R·F–L +28..=+36, 4칸 간격. 겹침이 작은 +12~+24 는 매칭은 되지만 회전 오차 2° 초과가
+    /// 많다(480×270 시드 1: +20 은 12/16, +24 는 5/16). +28..+36 은 48 짝 중 2 개(4.2%)뿐이고 +40 은 다시 2/16 이라
+    /// 뺀다(F-251, 연구 노트 experiments/formation-pairs.md).
     pub const FORMATION: CrossSchedule = CrossSchedule::Formation {
-        right_min: 20,
-        left_min: 20,
-        max: 40,
+        right_min: 28,
+        left_min: 28,
+        max: 36,
         step: 4,
     };
 }
@@ -2685,7 +2686,7 @@ mod tests {
                 } else {
                     ((cb, pb), (ca, pa))
                 };
-                assert!(po >= pf + 20 && po <= pf + 40 && (po - pf) % 4 == 0);
+                assert!(po >= pf + 28 && po <= pf + 36 && (po - pf) % 4 == 0);
                 kinds.insert(co);
             }
         }
@@ -2693,14 +2694,15 @@ mod tests {
             kinds.into_iter().collect::<Vec<_>>(),
             vec![CAM_RIGHT, CAM_LEFT]
         );
-        // 위치 30 개: F(p)–R(p+20..=+40, 4칸) 은 p ≤ 9 에서 3·2·1 개 등. 같은 카메라 짝은 SPEC 과 같다.
+        // 위치 30 개: F(p)–R(p+28..=+36, 4칸) 은 p ≤ 1 에서 3 개 등. 같은 카메라 짝은 SPEC 과 같다.
         let same =
             |v: &Vec<(usize, usize)>| v.iter().filter(|&&(i, j)| views[i].0 == views[j].0).count();
         assert_eq!(same(&f), same(&spec));
     }
 
-    /// 편대 합성 장면(480×270, 시드 1)의 기본 짝 일정(카메라 간 F–R·F–L +20..=+40)으로 F 8·R 13·L 13 시점을
-    /// 매칭·5점 RANSAC 검증한다. 검증된 카메라 간 짝의 회전 오차 중앙 ≤ 1°, 검증 짝 그래프가 한 연결 성분.
+    /// 편대 합성 장면(480×270, 시드 1)의 기본 짝 일정(카메라 간 F–R·F–L +28..=+36)으로 F 8·R 10·L 10 시점을
+    /// 매칭·5점 RANSAC 검증한다. 검증된 카메라 간 짝의 회전 오차 중앙 ≤ 1°, 2° 초과 비율 < 5%, 검증 짝 그래프가 한 연결 성분.
+    /// `--nocapture` 로 카메라·위치차별 2° 초과 표를 낸다.
     #[test]
     fn formation_default_schedule_verifies_and_connects() {
         use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
@@ -2717,7 +2719,7 @@ mod tests {
         for p in (0..=28).step_by(4) {
             sel.push((CAM_FRONT, p));
         }
-        for p in (20..=68).step_by(4) {
+        for p in (28..=64).step_by(4) {
             sel.push((CAM_RIGHT, p));
             sel.push((CAM_LEFT, p));
         }
@@ -2756,6 +2758,7 @@ mod tests {
             r
         }
         let (mut cross_err, mut cross_n, mut verified) = (Vec::new(), 0usize, 0usize);
+        let mut by_off: Vec<(usize, i64, f64)> = Vec::new();
         for &(i, j) in &pairs {
             let (a, b) = (&views[i].camera, &views[j].camera);
             let m = ratio_match(&feats[i], &feats[j], 0.8, true);
@@ -2786,6 +2789,7 @@ mod tests {
                     .map(|p| (p.rotation * truth.inverse()).angle().to_degrees())
                     .unwrap_or(180.0);
                 cross_err.push(err);
+                by_off.push((sel[j].0, sel[j].1 as i64 - sel[i].1 as i64, err));
             }
         }
         cross_err.sort_by(f64::total_cmp);
@@ -2798,6 +2802,30 @@ mod tests {
             pairs.len(),
             cross_err.last().unwrap()
         );
+        let mut over2 = 0usize;
+        for cam in [CAM_RIGHT, CAM_LEFT] {
+            let mut row = String::new();
+            for off in (28..=36).step_by(4) {
+                let v: Vec<f64> = by_off
+                    .iter()
+                    .filter(|t| t.0 == cam && t.1 == off)
+                    .map(|t| t.2)
+                    .collect();
+                let bad = v.iter().filter(|&&e| e > 2.0).count();
+                over2 += bad;
+                row += &format!(" +{off}: {bad}/{}", v.len());
+            }
+            eprintln!(
+                "F–{} 2° 초과{row}",
+                if cam == CAM_RIGHT { "R" } else { "L" }
+            );
+        }
+        let ratio = over2 as f64 / cross_n as f64;
+        eprintln!(
+            "카메라 간 2° 초과 {over2}/{cross_n} = {:.1}%",
+            100.0 * ratio
+        );
+        assert!(ratio < 0.05, "2° 초과 비율 {ratio}");
         assert!(cross_n >= 10, "카메라 간 검증 {cross_n}");
         assert!(med <= 1.0, "회전 오차 중앙 {med}");
         assert_eq!(comps, 1);
