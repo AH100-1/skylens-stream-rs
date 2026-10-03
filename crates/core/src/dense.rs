@@ -562,6 +562,16 @@ pub fn patchmatch_depth(
     range: (f64, f64),
     _sweep: &SweepConfig,
 ) -> DepthMap {
+    patchmatch_depth_with(r, nbrs, range, &crate::patchmatch::Config::default())
+}
+
+/// [`patchmatch_depth`] 와 같고 패치매치 설정을 받는다.
+pub fn patchmatch_depth_with(
+    r: &DepthView,
+    nbrs: &[&DepthView],
+    range: (f64, f64),
+    pm_cfg: &crate::patchmatch::Config,
+) -> DepthMap {
     use crate::patchmatch as pm;
     let to_view = |v: &DepthView| {
         let k = v.camera.intrinsics;
@@ -573,7 +583,7 @@ pub fn patchmatch_depth(
     };
     let rv = to_view(r);
     let nv: Vec<pm::View> = nbrs.iter().map(|n| to_view(n)).collect();
-    let m = pm::estimate(&rv, &nv, range, &pm::Config::default());
+    let m = pm::estimate(&rv, &nv, range, pm_cfg);
     DepthMap {
         w: m.w,
         h: m.h,
@@ -599,6 +609,23 @@ pub fn region_cloud_patchmatch(
     )
 }
 
+/// [`region_cloud_patchmatch`] 와 같고 패치매치 설정을 받는다.
+pub fn region_cloud_patchmatch_with(
+    views: &[DenseView],
+    sparse_points: &[[f64; 3]],
+    cfg: &DenseConfig,
+    pm_cfg: &crate::patchmatch::Config,
+) -> PointCloud {
+    region_cloud_impl(
+        views,
+        sparse_points,
+        cfg,
+        |r, n, range, _| patchmatch_depth_with(r, n, range, pm_cfg),
+        &SweepConfig::default(),
+        cfg.neighbors.max(1),
+    )
+}
+
 /// [`region_cloud`] 와 같고, 사진별 깊이 추정기와 그 설정을 고를 수 있다.
 pub fn region_cloud_with(
     views: &[DenseView],
@@ -614,7 +641,7 @@ fn region_cloud_impl(
     views: &[DenseView],
     sparse_points: &[[f64; 3]],
     cfg: &DenseConfig,
-    estimate: DepthEstimator,
+    estimate: impl Fn(&DepthView, &[&DepthView], (f64, f64), &SweepConfig) -> DepthMap + Sync,
     sweep: &SweepConfig,
     take_nbrs: usize,
 ) -> PointCloud {

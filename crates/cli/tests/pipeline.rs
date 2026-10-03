@@ -19,13 +19,32 @@ struct Case {
     center_med: f64,
     center_max: f64,
     surface_med: f64,
+    surface_p95: f64,
+    over1: f64,
+    points: usize,
+    dense_secs: f64,
     report: skylens_core::verify::Report,
 }
 
 fn run_case(stride: usize, ba_iters: usize, method: DenseMethod) -> Case {
+    run_case_with(
+        stride,
+        ba_iters,
+        method,
+        skylens_core::patchmatch::Config::default(),
+    )
+}
+
+fn run_case_with(
+    stride: usize,
+    ba_iters: usize,
+    method: DenseMethod,
+    pm: skylens_core::patchmatch::Config,
+) -> Case {
     let root = std::env::temp_dir().join(format!(
-        "skylens_pipe_{}_{stride}_{ba_iters}_{method:?}",
-        std::process::id()
+        "skylens_pipe_{}_{stride}_{ba_iters}_{method:?}_{}",
+        std::process::id(),
+        pm.skip_cost
     ));
     let _ = std::fs::remove_dir_all(&root);
     let (input, output) = (root.join("in"), root.join("out"));
@@ -49,6 +68,7 @@ fn run_case(stride: usize, ba_iters: usize, method: DenseMethod) -> Case {
         max_features: 800,
         dense_width: 96,
         dense_method: method,
+        patchmatch: pm,
         hfov_deg: 65.0,
         ba_iters,
         position: if std::env::var("PIPE_POSITION").as_deref() == Ok("ta") {
@@ -128,6 +148,7 @@ fn run_case(stride: usize, ba_iters: usize, method: DenseMethod) -> Case {
         100.0 * over1
     );
     assert!(cloud.len() >= 5000, "점 수 {}", cloud.len());
+    let dense_secs = res.regions.iter().map(|r| r.secs_dense).sum::<f64>();
     let _ = std::fs::remove_dir_all(&root);
     Case {
         registered,
@@ -136,6 +157,10 @@ fn run_case(stride: usize, ba_iters: usize, method: DenseMethod) -> Case {
         center_med: med,
         center_max: max,
         surface_med: sm,
+        surface_p95: p95,
+        over1,
+        points: cloud.len(),
+        dense_secs,
         report,
     }
 }
@@ -272,4 +297,25 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         pa.measured
     );
+}
+
+/// 밀집 깊이 건너뜀 문턱(0 / 0.08)별 끝까지 흐름 비교. 값은 정답 표면 대비로 출력한다.
+#[test]
+#[ignore]
+fn patchmatch_skip_cost_compare() {
+    for skip in [0.0f32, 0.08] {
+        let mut pm = skylens_core::patchmatch::Config::default();
+        pm.skip_cost = skip;
+        let c = run_case_with(2, 15, DenseMethod::PatchMatch, pm);
+        eprintln!(
+            "SKIPCMP skip {skip} points {} median {:.3} p95 {:.3} over1m {:.2}% dense_secs {:.2} load {}",
+            c.points,
+            c.surface_med,
+            c.surface_p95,
+            100.0 * c.over1,
+            c.dense_secs,
+            std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim()
+        );
+        assert!(c.surface_med <= 1.0, "표면 거리 중앙 {}", c.surface_med);
+    }
 }

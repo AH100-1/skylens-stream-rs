@@ -17,7 +17,7 @@ use crate::align::Similarity;
 use crate::ba::{bundle_adjust, BaOptions, BaProblem, Observation, PositionPrior};
 use crate::camera::{Camera, Intrinsics, Pose};
 use crate::dataset::Dataset;
-use crate::dense::{region_cloud, region_cloud_patchmatch, DenseConfig, DenseView};
+use crate::dense::{region_cloud, region_cloud_patchmatch_with, DenseConfig, DenseView};
 use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use crate::fusion::{fuse, FusionConfig, FusionView};
 use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig};
@@ -50,6 +50,8 @@ pub struct PipelineConfig {
     pub dense_width: usize,
     /// 밀집 깊이 방식.
     pub dense_method: DenseMethod,
+    /// `dense_method` 가 PatchMatch 일 때 쓰는 패치매치 설정(건너뜀 문턱 등).
+    pub patchmatch: crate::patchmatch::Config,
     /// 수평 화각(도). 데이터셋에 내부 파라미터가 없으므로 받는다.
     pub hfov_deg: f64,
     pub ba_iters: usize,
@@ -93,6 +95,7 @@ impl Default for PipelineConfig {
             max_features: 1500,
             dense_width: 160,
             dense_method: DenseMethod::Sweep,
+            patchmatch: crate::patchmatch::Config::default(),
             hfov_deg: 65.0,
             ba_iters: 15,
             position: PositionMethod::GpsLeastSquares,
@@ -1241,6 +1244,27 @@ fn dense_cloud(
     dw: usize,
     method: DenseMethod,
 ) -> PointCloud {
+    dense_cloud_pm(
+        s,
+        imgs,
+        k,
+        in_region,
+        dw,
+        method,
+        &crate::patchmatch::Config::default(),
+    )
+}
+
+/// [`dense_cloud`] 에 패치매치 설정을 더한 것.
+fn dense_cloud_pm(
+    s: &Sparse,
+    imgs: &[&ImgData],
+    k: &Intrinsics,
+    in_region: &[bool],
+    dw: usize,
+    method: DenseMethod,
+    pm_cfg: &crate::patchmatch::Config,
+) -> PointCloud {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some() && in_region[i])
         .collect();
@@ -1267,7 +1291,7 @@ fn dense_cloud(
     };
     let mut cloud = match method {
         DenseMethod::Sweep => region_cloud(&views, &pts, &cfg),
-        DenseMethod::PatchMatch => region_cloud_patchmatch(&views, &pts, &cfg),
+        DenseMethod::PatchMatch => region_cloud_patchmatch_with(&views, &pts, &cfg, pm_cfg),
     };
     if cloud.is_empty() {
         cloud = interpolated_cloud(s, &ids, imgs, k, dw);
@@ -1734,13 +1758,14 @@ pub fn run_pipeline(
         // 초벌 점군: 곧바로 만들어 최신 정밀 좌표계로 정렬해 내보낸다.
         let t3 = Instant::now();
         let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
-        let coarse = dense_cloud(
+        let coarse = dense_cloud_pm(
             &well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200),
             &imgs,
             &k,
             &in_region,
             cfg.dense_width,
             cfg.dense_method,
+            &cfg.patchmatch,
         );
         st.secs_dense = t3.elapsed().as_secs_f64();
         st.preview_points = coarse.len();
@@ -1806,6 +1831,7 @@ pub fn run_pipeline(
             let (gps, dw, iters, dmethod) =
                 (gps.clone(), cfg.dense_width, cfg.ba_iters, cfg.dense_method);
             let psig = cfg.prior_sigma();
+            let pm_cfg = cfg.patchmatch.clone();
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
             in_flight += 1;
@@ -1826,7 +1852,7 @@ pub fn run_pipeline(
                 if anchor.is_none() {
                     gps_align_refined(&mut rs, &gps);
                 }
-                let cloud = dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod);
+                let cloud = dense_cloud_pm(&rs, &imgs, &k, &in_region, dw, dmethod, &pm_cfg);
                 let _ = tx.send(RefinedMsg {
                     slot,
                     sparse: rs,
