@@ -14,6 +14,7 @@ fn cfg() -> PipelineConfig {
         dense_width: 80,
         hfov_deg: 65.0,
         ba_iters: 8,
+        ..PipelineConfig::default()
     }
 }
 

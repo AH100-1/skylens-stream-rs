@@ -50,6 +50,7 @@ fn run_case(stride: usize, ba_iters: usize) -> Case {
         dense_width: 96,
         hfov_deg: 65.0,
         ba_iters,
+        ..PipelineConfig::default()
     };
     let t = std::time::Instant::now();
     let res = run_pipeline(&ds, &cfg, &output).unwrap();
