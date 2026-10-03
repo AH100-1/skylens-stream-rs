@@ -712,6 +712,9 @@ pub struct PreviewOpts {
     pub ray_deg: f64,
     /// 초벌 삼각측량 최소 광선 각(도) 덮어쓰기. None 이면 `TriConfig` 값.
     pub tri_deg: Option<f64>,
+    /// 비행 축 둘레 회전을 보는 방향 평균 z 가 가장 작은 각(2° 격자)으로 고른다. 정밀 BA 시작점용:
+    /// 정밀 BA 는 이 축 둘레 회전을 15회 안에 다 못 풀어 시작 롤이 정밀 표면 오차에 그대로 남는다.
+    pub legacy_roll: bool,
 }
 
 impl Default for PreviewOpts {
@@ -725,6 +728,7 @@ impl Default for PreviewOpts {
             vfix: false,
             ray_deg: PREVIEW_MIN_RAY_DEG,
             tri_deg: None,
+            legacy_roll: false,
         }
     }
 }
@@ -881,6 +885,21 @@ fn sparse_init(
     tri: &TriConfig,
     pre_ba: (usize, f64),
 ) -> Result<Sparse, String> {
+    sparse_init_roll(imgs, pm, gps, k, method, tri, pre_ba, false)
+}
+
+/// `sparse_init` 에서 비행 축 둘레 회전 규칙만 고른다(`legacy_roll`, 정밀 BA 시작점은 true).
+#[allow(clippy::too_many_arguments)]
+fn sparse_init_roll(
+    imgs: &[&ImgData],
+    pm: &[PairMatch],
+    gps: &[Vector3<f64>],
+    k: &Intrinsics,
+    method: PositionMethod,
+    tri: &TriConfig,
+    pre_ba: (usize, f64),
+    legacy_roll: bool,
+) -> Result<Sparse, String> {
     sparse_init_with(
         imgs,
         pm,
@@ -889,7 +908,10 @@ fn sparse_init(
         method,
         tri,
         pre_ba,
-        &PreviewOpts::default(),
+        &PreviewOpts {
+            legacy_roll,
+            ..PreviewOpts::default()
+        },
     )
     .map(|r| r.0)
 }
@@ -958,7 +980,23 @@ fn sparse_init_with(
     }
     if axis.norm() > 1e-9 && !valid.is_empty() {
         let axis = nalgebra::Unit::new_normalize(axis);
-        if let Some(theta) = roll_by_level_spread(&axis, &g, &valid) {
+        if opts.legacy_roll {
+            let mut best = (f64::INFINITY, g);
+            for step in 0..180 {
+                let gm = *Rotation3::from_axis_angle(&axis, step as f64 * 2f64.to_radians())
+                    .matrix()
+                    * g;
+                let down: f64 = valid
+                    .iter()
+                    .map(|r| (gm * (r.inverse() * Vector3::z())).z)
+                    .sum::<f64>()
+                    / valid.len() as f64;
+                if down < best.0 {
+                    best = (down, gm);
+                }
+            }
+            g = best.1;
+        } else if let Some(theta) = roll_by_level_spread(&axis, &g, &valid) {
             g = *Rotation3::from_axis_angle(&axis, theta).matrix() * g;
         }
     }
@@ -1957,8 +1995,12 @@ pub fn run_pipeline_with(
                 continue;
             }
         };
+        // 초벌(미리보기)은 위의 광축 높이 분산 롤을 쓰고, 정밀 BA 시작점만 예전 롤 규칙으로 따로 만든다.
+        let coarse_start = start;
+        let start = sparse_init_roll(&imgs, &pm, &gps, &k, cfg.position, &tri, (0, 2.0), true)
+            .unwrap_or_else(|_| coarse_start.clone());
         let init = if cfg.preview_ba_iters > 0 {
-            let mut p = start.clone();
+            let mut p = coarse_start.clone();
             p.rms = run_ba(
                 &mut p,
                 &k,
@@ -1969,7 +2011,7 @@ pub fn run_pipeline_with(
             );
             p
         } else {
-            start.clone()
+            coarse_start
         };
         st.secs_sparse = t2.elapsed().as_secs_f64();
         st.registered = init.poses[n_help..].iter().filter(|p| p.is_some()).count();
