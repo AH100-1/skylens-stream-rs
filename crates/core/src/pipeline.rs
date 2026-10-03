@@ -706,6 +706,12 @@ pub struct PreviewOpts {
     pub min_inl: usize,
     /// 어긋난 간선 제거를 반복하는 횟수(`prune_deg` 가 있을 때).
     pub passes: usize,
+    /// 닮음 정렬 뒤 수직 오프셋을 GPS 높이 중앙값에 맞춘다(`snap` 이 켜져 있을 때).
+    pub vfix: bool,
+    /// 초벌 점군에 남기는 점의 최소 광선 각(도).
+    pub ray_deg: f64,
+    /// 초벌 삼각측량 최소 광선 각(도) 덮어쓰기. None 이면 `TriConfig` 값.
+    pub tri_deg: Option<f64>,
 }
 
 impl Default for PreviewOpts {
@@ -716,6 +722,9 @@ impl Default for PreviewOpts {
             snap: false,
             min_inl: 0,
             passes: 1,
+            vfix: false,
+            ray_deg: PREVIEW_MIN_RAY_DEG,
+            tri_deg: None,
         }
     }
 }
@@ -731,6 +740,9 @@ impl PreviewOpts {
                 Some(("snap", v)) => o.snap = v == "1",
                 Some(("min_inl", v)) => o.min_inl = v.parse().unwrap_or(0),
                 Some(("passes", v)) => o.passes = v.parse().unwrap_or(1),
+                Some(("vfix", v)) => o.vfix = v == "1",
+                Some(("ray", v)) => o.ray_deg = v.parse().unwrap_or(o.ray_deg),
+                Some(("tri", v)) => o.tri_deg = v.parse().ok(),
                 _ => {}
             }
         }
@@ -789,7 +801,7 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
 }
 
 /// 위치 단계 뒤 카메라 중심을 GPS 에 닮음 변환 강건 추정으로 맞춘다(중심·방향 모두).
-fn snap_poses_to_gps(poses: &mut [Option<Pose>], gps: &[Vector3<f64>]) {
+fn snap_poses_to_gps(poses: &mut [Option<Pose>], gps: &[Vector3<f64>], vfix: bool) {
     let ids: Vec<usize> = (0..poses.len()).filter(|&i| poses[i].is_some()).collect();
     let src: Vec<Vector3<f64>> = ids
         .iter()
@@ -799,12 +811,23 @@ fn snap_poses_to_gps(poses: &mut [Option<Pose>], gps: &[Vector3<f64>]) {
     let Some((sim, _, _)) = crate::align::robust_similarity(&src, &dst, 3, 3.0) else {
         return;
     };
-    for &i in &ids {
+    let mut moved: Vec<Vector3<f64>> = ids
+        .iter()
+        .map(|&i| sim.apply_point(&poses[i].unwrap().center().coords))
+        .collect();
+    if vfix {
+        let mut dz: Vec<f64> = moved.iter().zip(&dst).map(|(c, g)| g.z - c.z).collect();
+        dz.sort_by(f64::total_cmp);
+        let off = dz[dz.len() / 2];
+        for c in &mut moved {
+            c.z += off;
+        }
+    }
+    for (a, &i) in ids.iter().enumerate() {
         let p = poses[i].unwrap();
-        let c = sim.apply_point(&p.center().coords);
         poses[i] = Some(Pose::from_center(
             p.rotation * sim.r.inverse(),
-            &Point3::from(c),
+            &Point3::from(moved[a]),
         ));
     }
 }
@@ -942,7 +965,7 @@ fn sparse_init_with(
     }
     stages.placed = poses.clone();
     if opts.snap {
-        snap_poses_to_gps(&mut poses, gps);
+        snap_poses_to_gps(&mut poses, gps, opts.vfix);
     }
     if std::env::var("PIPE_DEBUG").is_ok() {
         let mut ang: Vec<f64> = pm
@@ -986,7 +1009,11 @@ fn sparse_init_with(
                 .collect()
         })
         .collect();
-    let (points, obs, ba_only, stats) = triangulate_tracks(&poses, k, &track_obs, tri);
+    let mut tri_eff = *tri;
+    if let Some(d) = opts.tri_deg {
+        tri_eff.min_deg = d;
+    }
+    let (points, obs, ba_only, stats) = triangulate_tracks(&poses, k, &track_obs, &tri_eff);
     if std::env::var("PIPE_DEBUG").is_ok() {
         eprintln!("debug triangulation {stats:?}");
     }
@@ -1183,8 +1210,9 @@ fn well_conditioned(s: &Sparse, min_deg: f64, keep_min: usize) -> Sparse {
     }
 }
 
-/// 초벌 점의 최소 광선 각(도): 이보다 좁은 점은 초벌 점군·정렬 대응에서 뺀다.
-const PREVIEW_MIN_RAY_DEG: f64 = 2.0;
+/// 초벌 점의 최소 광선 각(도): 이보다 좁은 점은 초벌 점군에서 뺀다(BA 시작점·정밀 쪽은 그대로).
+/// 합성 장면 측정: 2도 → 20도에서 높이 차 2.70 → 1.76 m, 표면 중앙 5.01 → 2.24 m.
+const PREVIEW_MIN_RAY_DEG: f64 = 20.0;
 
 /// 밀집: 구역 사진을 `dense::region_cloud`(보정·이웃·사진별 깊이·융합)에 넘긴다. 희소 점도 함께 담는다.
 /// `dw` 는 보정 뒤 긴 변 화소 수다. 밀집 점이 하나도 안 나오면 희소 점 보간 깊이로 대신한다.
@@ -2205,12 +2233,41 @@ mod diag {
                 .filter_map(|i| Some((init.poses[i]?.center().z - tp[i].center().z).abs()))
                 .collect();
             let mx = |v: &[f64]| v.iter().copied().fold(0.0, f64::max);
+            if std::env::var("SKYLENS_DIAG").is_ok() {
+                // 부호 있는 높이 잔차(초벌 − 정답)를 비행 축 위치(6구간)와 카메라(측면)별 평균으로.
+                let sz: Vec<Option<f64>> = (0..n)
+                    .map(|i| Some(init.poses[i]?.center().z - tp[i].center().z))
+                    .collect();
+                let np = n / 3;
+                let mut bins = vec![(0.0, 0usize); 6];
+                let mut cams = vec![(0.0, 0usize); 3];
+                for (i, v) in sz.iter().enumerate() {
+                    if let Some(v) = v {
+                        let b = (i / 3) * 6 / np;
+                        bins[b].0 += v;
+                        bins[b].1 += 1;
+                        cams[i % 3].0 += v;
+                        cams[i % 3].1 += 1;
+                    }
+                }
+                let f = |v: &[(f64, usize)]| {
+                    v.iter()
+                        .map(|(a, c)| format!("{:+.2}", a / (*c).max(1) as f64))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                eprintln!(
+                    "DIAG dz signed along-axis [{}] by camera [{}]",
+                    f(&bins),
+                    f(&cams)
+                );
+            }
             let origin = scene.to_first_gps_frame(&Point3::new(0.0, 0.0, 0.0)).coords;
             let surf = |p: &Vector3<f64>| {
                 let q = p - origin;
                 (q.z - scene.surface_height(q.x, q.y)).abs()
             };
-            let good = well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200);
+            let good = well_conditioned(&init, opts.ray_deg, 200);
             let (mut align_m, mut vs_dz) = (None, None);
             if full {
                 let mut rs = init.clone();
