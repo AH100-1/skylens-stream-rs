@@ -8,7 +8,7 @@
 //! | `--width W` `--height H` | 480 270 | 렌더 해상도 |
 //! | `--repeat R` | 3 | 같은 입력으로 구간마다 반복하는 횟수(중앙·최소 보고) |
 //! | `--threads T` | 0 | rayon 스레드 수(0 = rayon 기본 = 논리 코어 수) |
-//! | `--max-pairs P` | 0 | 매칭·검증·자세 구간에서 잴 영상 짝 수 상한(0 = 전부). 앞에서부터 고르게 뽑는다 |
+//! | `--max-pairs P` | 0 | 매칭·검증·자세 구간에서 잴 영상 짝 수 상한(0 = 전부). 앞에서부터 고르게 뽑는다. 회전 평균(검증 결과)을 확인할 때는 짝 전부(`--max-pairs 0`)를 명시한다 |
 //! | `--ba-points M` | 3000 | 번들 조정 문제의 점 수 |
 //! | `--full` | | SPEC 기준 규모: `--positions 80 --width 960 --height 540 --repeat 3 --ba-points 20000` 과 같다 |
 //! | `--quick` | | 기본값과 같다(예전 이름, 그대로 받는다) |
@@ -312,13 +312,25 @@ fn pipeline(args: &Args) -> Vec<Row> {
             .map(|c| ransac_essential(&c.2, &c.3, focal, &rcfg))
             .collect::<Vec<_>>()
     });
+    // 짝 종류별(같은 카메라 / 다른 카메라) 성공 수. 짝 상한이 걸리면 뽑힌 짝 안에서만 센다.
+    let kind_count = |same: bool| -> (usize, usize) {
+        let idx: Vec<usize> = (0..np)
+            .filter(|&k| (keys[chosen[k].0].0 == keys[chosen[k].1].0) == same)
+            .collect();
+        (
+            idx.iter().filter(|&&k| eres[k].is_some()).count(),
+            idx.len(),
+        )
+    };
+    let (same_ok, same_n) = kind_count(true);
+    let (cross_ok, cross_n) = kind_count(false);
     rows.push(Row {
         name: "RANSAC E(5점)",
         items: np,
         unit: "짝",
         times: t,
         note: format!(
-            "성공 {}/{np} {pair_note}",
+            "성공 {}/{np}, 같은 카메라 {same_ok}/{same_n}, 다른 카메라 {cross_ok}/{cross_n} {pair_note}",
             eres.iter().filter(|e| e.is_some()).count()
         ),
     });
@@ -404,8 +416,22 @@ fn pipeline(args: &Args) -> Vec<Row> {
             (e.rotation * t.inverse()).angle().to_degrees() > 2.0
         })
         .count();
+    // 통과 간선 그래프의 연결 성분 수(시점 24개가 한 덩어리로 이어졌는지).
+    let mut comp: Vec<usize> = (0..nv).collect();
+    for e in &measured {
+        let (a, b) = (comp[e.i], comp[e.j]);
+        for c in comp.iter_mut() {
+            if *c == b {
+                *c = a;
+            }
+        }
+    }
+    let mut labels = comp.clone();
+    labels.sort_unstable();
+    labels.dedup();
     let bad_note = format!(
-        "간선 오차>2° {}/{} ({:.1}%)",
+        "연결 성분 {}, 간선 오차>2° {}/{} ({:.1}%)",
+        labels.len(),
         bad_edges,
         measured.len(),
         100.0 * bad_edges as f64 / measured.len().max(1) as f64
