@@ -19,6 +19,8 @@ pub mod rotation_averaging;
 pub mod sparse;
 pub mod stream;
 pub mod synth;
+pub mod translation_averaging;
+pub mod triangulation;
 pub mod two_view;
 pub mod undistort;
 pub mod verify;
