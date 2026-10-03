@@ -4,6 +4,7 @@ pub mod align;
 pub mod ba;
 pub mod camera;
 pub mod dataset;
+pub mod dense;
 pub mod distortion;
 pub mod features;
 pub mod fusion;
