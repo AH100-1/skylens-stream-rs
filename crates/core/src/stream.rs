@@ -265,6 +265,133 @@ pub fn align_region(
     (fit.map(|f| f.0), rec)
 }
 
+/// 구역 안 위치 구간별 보정장: 전체 닮음 변환 뒤에 남는 잔차 벡터를 수평 칸별 평균으로 모아 두고,
+/// 질의 점에서 가우스 가중 평균해 더한다. 초벌 모델의 완만한 휨(SPEC §3.7)을 흡수한다.
+#[derive(Clone, Debug)]
+pub struct WarpField {
+    sim: Similarity,
+    /// (칸 중심 수평 좌표, 평균 잔차 벡터, 짝 수)
+    cells: Vec<([f64; 2], Vector3<f64>, f64)>,
+    bw: f64,
+}
+
+/// 보정장 칸 수 상한 방향의 기본 칸 수(긴 변 기준).
+const WARP_GRID: f64 = 12.0;
+
+impl WarpField {
+    /// 전체 닮음 변환 `sim` 과 3D 점 짝에서 만든다. 잔차가 `max(3·med, TRIM_FLOOR_M)` 를 넘는 짝은 뺀다.
+    /// 쓸 짝이 `min_pairs` 미만이면 `None`(전체 닮음만 쓴다).
+    pub fn fit(
+        sim: &Similarity,
+        pairs: &[(Vector3<f64>, Vector3<f64>)],
+        med: f64,
+        min_pairs: usize,
+    ) -> Option<WarpField> {
+        let thr = (3.0 * med).max(TRIM_FLOOR_M);
+        let good: Vec<(Vector3<f64>, Vector3<f64>)> = pairs
+            .iter()
+            .map(|(a, b)| (sim.apply_point(a), *b))
+            .filter(|(x, b)| (b - x).norm() <= thr)
+            .collect();
+        if good.len() < min_pairs {
+            return None;
+        }
+        let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+        for (x, _) in &good {
+            for d in 0..2 {
+                lo[d] = lo[d].min(x[d]);
+                hi[d] = hi[d].max(x[d]);
+            }
+        }
+        let ext = (hi[0] - lo[0]).max(hi[1] - lo[1]);
+        if !(ext.is_finite() && ext > 1e-6) {
+            return None;
+        }
+        let cs = ext / WARP_GRID;
+        let mut acc: HashMap<(i64, i64), (f64, f64, f64, Vector3<f64>)> = HashMap::new();
+        for (x, b) in &good {
+            let key = (
+                ((x.x - lo[0]) / cs).floor() as i64,
+                ((x.y - lo[1]) / cs).floor() as i64,
+            );
+            let e = acc.entry(key).or_insert((0.0, 0.0, 0.0, Vector3::zeros()));
+            e.0 += x.x;
+            e.1 += x.y;
+            e.2 += 1.0;
+            e.3 += b - x;
+        }
+        let mut cells: Vec<_> = acc
+            .into_values()
+            .map(|(sx, sy, n, e)| ([sx / n, sy / n], e / n, n))
+            .collect();
+        cells.sort_by(|a, b| a.0[0].total_cmp(&b.0[0]).then(a.0[1].total_cmp(&b.0[1])));
+        Some(WarpField {
+            sim: *sim,
+            cells,
+            bw: 0.7 * cs,
+        })
+    }
+
+    /// 초벌 점 하나를 정밀 좌표로: 전체 닮음 + 보정장.
+    pub fn apply_point(&self, p: &Vector3<f64>) -> Vector3<f64> {
+        let x = self.sim.apply_point(p);
+        let (mut w, mut e) = (0.0, Vector3::zeros());
+        let mut near = (f64::MAX, Vector3::zeros());
+        for (c, r, n) in &self.cells {
+            let d2 = (c[0] - x.x).powi(2) + (c[1] - x.y).powi(2);
+            if d2 < near.0 {
+                near = (d2, *r);
+            }
+            let k = n.sqrt() * (-d2 / (2.0 * self.bw * self.bw)).exp();
+            w += k;
+            e += k * r;
+        }
+        if w > 1e-12 {
+            x + e / w
+        } else {
+            x + near.1
+        }
+    }
+
+    /// 점군에 적용(법선은 전체 닮음의 회전만).
+    pub fn apply_cloud(&self, cloud: &PointCloud) -> PointCloud {
+        let points = cloud
+            .points
+            .par_iter()
+            .map(|p| {
+                let x = Vector3::new(p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64);
+                let n = Vector3::new(p.normal[0] as f64, p.normal[1] as f64, p.normal[2] as f64);
+                let y = self.apply_point(&x);
+                let m = self.sim.apply_normal(&n);
+                PointRecord {
+                    xyz: [y.x as f32, y.y as f32, y.z as f32],
+                    normal: [m.x as f32, m.y as f32, m.z as f32],
+                    rgb: p.rgb,
+                }
+            })
+            .collect();
+        PointCloud { points }
+    }
+}
+
+/// 보정장이 있는 구역은 보정장으로, 없으면 전체 닮음으로 적용한다.
+pub fn apply_alignments_warped(
+    prelim: &[PointCloud],
+    sims: &[Option<Similarity>],
+    warps: &[Option<WarpField>],
+) -> Vec<Option<PointCloud>> {
+    assert_eq!(prelim.len(), warps.len(), "구역 수 불일치");
+    let base = apply_alignments(prelim, sims);
+    base.into_iter()
+        .zip(prelim)
+        .zip(warps)
+        .map(|((b, c), w)| match (b, w) {
+            (Some(_), Some(w)) => Some(w.apply_cloud(c)),
+            (b, _) => b,
+        })
+        .collect()
+}
+
 /// 구역별 변환(`None` = 정렬 실패)을 초벌 점군에 적용한다. 실패 구역은 `None`.
 pub fn apply_alignments(
     prelim: &[PointCloud],
@@ -1020,6 +1147,39 @@ pub fn write_outputs(
 
 #[cfg(test)]
 mod tests {
+    /// 휜 초벌(포물선 처짐 8 m)을 전체 닮음으로만 맞추면 높이 잔차가 남고, 보정장은 0.3 m 아래로 줄인다.
+    #[test]
+    fn warp_field_absorbs_bending() {
+        let mut pairs = Vec::new();
+        for i in 0..40 {
+            for j in 0..40 {
+                let (x, y) = (i as f64 * 2.5 - 50.0, j as f64 * 2.5 - 50.0);
+                let truth = Vector3::new(x, y, 0.0);
+                let bend = 8.0 * ((x * x + y * y) / 5000.0 - 0.5);
+                pairs.push((Vector3::new(x, y, bend), truth));
+            }
+        }
+        let (src, dst): (Vec<_>, Vec<_>) = pairs.iter().copied().unzip();
+        let (sim, _, med) = robust_fit(&src, &dst).unwrap();
+        let global: Vec<f64> = pairs
+            .iter()
+            .map(|(a, b)| (sim.apply_point(a).z - b.z).abs())
+            .collect();
+        let w = WarpField::fit(&sim, &pairs, med, 200).expect("보정장");
+        let mut warped: Vec<f64> = pairs
+            .iter()
+            .map(|(a, b)| (w.apply_point(a).z - b.z).abs())
+            .collect();
+        let mut g = global;
+        g.sort_by(|a, b| a.total_cmp(b));
+        warped.sort_by(|a, b| a.total_cmp(b));
+        let (gm, wm) = (g[g.len() / 2], warped[warped.len() / 2]);
+        assert!(gm > 1.0, "전체 닮음 중앙 {gm}");
+        assert!(wm < 0.3, "보정장 중앙 {wm}");
+        // 짝이 모자라면 보정장 없음.
+        assert!(WarpField::fit(&sim, &pairs[..50], med, 200).is_none());
+    }
+
     use super::*;
     use nalgebra::{Rotation3, Unit};
 

@@ -26,7 +26,7 @@ use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::ply::{PointCloud, PointRecord};
 use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
 use crate::stream::{
-    align_region, align_window, apply_alignments, point_pairs, split_regions, write_outputs,
+    align_region, align_window, apply_alignments_warped, point_pairs, split_regions, write_outputs,
     AlignRecord, Region, Track,
 };
 use crate::translation_averaging::{
@@ -1183,6 +1183,9 @@ fn well_conditioned(s: &Sparse, min_deg: f64, keep_min: usize) -> Sparse {
     }
 }
 
+/// 구간별 보정장을 세우는 데 필요한 최소 정렬 짝 수.
+const WARP_MIN_PAIRS: usize = 200;
+
 /// 초벌 점의 최소 광선 각(도): 이보다 좁은 점은 초벌 점군·정렬 대응에서 뺀다.
 const PREVIEW_MIN_RAY_DEG: f64 = 2.0;
 
@@ -1318,6 +1321,8 @@ struct RegionRec {
     target: Option<usize>,
     /// 자기 정밀 모델과의 정렬 기록(최종 manifest 용).
     own: Option<(Option<Similarity>, AlignRecord)>,
+    /// 자기 정밀 모델 정렬 뒤 구간별 보정장(전체 닮음의 잔차 흡수).
+    warp: Option<crate::stream::WarpField>,
     refined: Option<(Vec<Track>, PointCloud)>,
     /// 정밀 구역 → 가장 최근 정밀 모델 좌표계 닮음 변환(공유 3D 점 대응).
     rsim: Option<Similarity>,
@@ -1499,11 +1504,14 @@ pub fn run_pipeline_with(
             });
             rec.sim = sim;
             rec.target = Some(k);
-            write_decimated(
-                out,
-                &preview_name(&r),
-                &crate::stream::apply_cloud(s, &rec.coarse),
-            )?;
+            rec.warp = ar
+                .fit_median_m
+                .and_then(|med| crate::stream::WarpField::fit(s, &pairs, med, WARP_MIN_PAIRS));
+            let shown = match &rec.warp {
+                Some(w) => w.apply_cloud(&rec.coarse),
+                None => crate::stream::apply_cloud(s, &rec.coarse),
+            };
+            write_decimated(out, &preview_name(&r), &shown)?;
         }
         rec.own = Some((sim, ar));
         rec.refined = Some((tb, m.cloud));
@@ -1839,6 +1847,7 @@ pub fn run_pipeline_with(
             sim,
             target,
             own: None,
+            warp: None,
             refined: None,
             rsim: None,
             centers: BTreeMap::new(),
@@ -1963,7 +1972,9 @@ pub fn run_pipeline_with(
             }
         })
         .collect();
-    let aligned = apply_alignments(&prelim, &sims);
+    let warps: Vec<Option<crate::stream::WarpField>> =
+        recs.iter().map(|r| r.warp.clone()).collect();
+    let aligned = apply_alignments_warped(&prelim, &sims, &warps);
     let rep = write_outputs(out, &kept, &aligned, &refined, records.clone())
         .map_err(|e| format!("출력 쓰기 실패: {e}"))?;
     live.note(t_now(), "final", recs.last().map_or(0, |r| r.region.index));
