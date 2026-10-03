@@ -27,6 +27,9 @@ use std::collections::HashMap;
 /// SPEC 번들 조정 트랙 상한과 같은 값.
 pub const MAX_TRACKS: usize = 100_000;
 
+/// 지지도 0 간선 합치기 반복 상한.
+const MAX_JOIN_ROUNDS: usize = 1;
+
 /// 한 영상 짝의 검증된 대응.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairMatches {
@@ -504,6 +507,7 @@ pub fn build_tracks_robust(
     keypoints: &[Vec<Vector2<f64>>],
     cfg: &TrackConfig,
     bridge_min_side: usize,
+    min_density: f64,
 ) -> (Vec<Track>, TrackStats) {
     let mut stats = TrackStats::default();
     let mut offset = Vec::with_capacity(keypoints.len() + 1);
@@ -615,27 +619,72 @@ pub fn build_tracks_robust(
             stats.conflicts += 1;
         }
     }
-    // 지지도 0 간선: 성분 쌍마다 잇는 간선 수를 모아 많은 쌍부터(오대응은 대개 단독 간선).
-    let mut zero: Vec<(u32, u32)> = order[first_zero..]
-        .iter()
-        .filter_map(|&e| {
-            let (u, v) = edges[e as usize];
-            let (a, b) = (uf.find(u as usize) as u32, uf.find(v as usize) as u32);
-            (a != b).then_some((a.min(b), a.max(b)))
-        })
-        .collect();
-    zero.par_sort_unstable();
-    let mut groups: Vec<(u32, u32, u32)> = Vec::new();
-    for &(a, b) in &zero {
-        match groups.last_mut() {
-            Some(g) if (g.0, g.1) == (a, b) => g.2 += 1,
-            _ => groups.push((a, b, 1)),
+    // 지지도 0 간선: 성분 쌍마다 (잇는 간선 수 / 두 성분의 영상 쌍 중 짝 목록에 있는 수) 를 밀도로 삼아
+    // 잇는 간선이 많은 쌍부터, 밀도가 문턱 이상일 때만 잇는다. 참 조각은 짝마다 대응이 일정 비율 남아 밀도가 재현율
+    // 근처이고, 큰 두 트랙을 잇는 오대응 하나는 가능한 영상 쌍 수(조각 크기의 곱)에 비해 밀도가 낮다.
+    let mut pair_bits = vec![0u64; keypoints.len() * words];
+    for p in pairs {
+        if p.image_a < keypoints.len() && p.image_b < keypoints.len() && p.image_a != p.image_b {
+            pair_bits[p.image_a * words + p.image_b / 64] |= 1 << (p.image_b % 64);
+            pair_bits[p.image_b * words + p.image_a / 64] |= 1 << (p.image_a % 64);
         }
     }
-    groups.par_sort_unstable_by_key(|g| (std::cmp::Reverse(g.2), g.0, g.1));
-    for &(a, b, _) in &groups {
-        if try_link(&mut uf, &mut bits, a as usize, b as usize) == Some(false) {
-            stats.conflicts += 1;
+    let zero_edges: Vec<u32> = order[first_zero..].to_vec();
+    for _round in 0..MAX_JOIN_ROUNDS {
+        let mut zero: Vec<(u32, u32)> = zero_edges
+            .iter()
+            .filter_map(|&e| {
+                let (u, v) = edges[e as usize];
+                let (a, b) = (uf.find(u as usize) as u32, uf.find(v as usize) as u32);
+                (a != b).then_some((a.min(b), a.max(b)))
+            })
+            .collect();
+        if zero.is_empty() {
+            break;
+        }
+        zero.par_sort_unstable();
+        let mut groups: Vec<(u32, u32, u32)> = Vec::new();
+        for &(a, b) in &zero {
+            match groups.last_mut() {
+                Some(g) if (g.0, g.1) == (a, b) => g.2 += 1,
+                _ => groups.push((a, b, 1)),
+            }
+        }
+        let density = |g: &(u32, u32, u32)| -> f64 {
+            let (ra, rb) = (g.0 as usize, g.1 as usize);
+            let mut potential = 0u32;
+            for wa in 0..words {
+                let mut m = bits[ra * words + wa];
+                while m != 0 {
+                    let i = wa * 64 + m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    for w in 0..words {
+                        potential += (pair_bits[i * words + w] & bits[rb * words + w]).count_ones();
+                    }
+                }
+            }
+            g.2 as f64 / potential.max(1) as f64
+        };
+        let mut scored: Vec<(f64, (u32, u32, u32))> =
+            groups.par_iter().map(|g| (density(g), *g)).collect();
+        scored.par_sort_unstable_by(|x, y| {
+            y.1 .2
+                .cmp(&x.1 .2)
+                .then((x.1 .0, x.1 .1).cmp(&(y.1 .0, y.1 .1)))
+        });
+        let mut merged = false;
+        for &(d, (a, b, _)) in &scored {
+            if d < min_density {
+                continue;
+            }
+            match try_link(&mut uf, &mut bits, a as usize, b as usize) {
+                Some(false) => stats.conflicts += 1,
+                Some(true) => merged = true,
+                None => {}
+            }
+        }
+        if !merged {
+            break;
         }
     }
     drop(bits);
@@ -824,6 +873,17 @@ mod tests {
     /// `swap_percent`: 정답 점 중 이 비율(%)을 1.5 m 옆 격자 점과 모든 짝에서 일관되게 바꿔
     /// 대응시킨다(반복 무늬형 오대응).
     fn synthetic(outlier_per_mille: u64, keep_percent: u64, swap_percent: u64) -> Synthetic {
+        synthetic_seeded(outlier_per_mille, keep_percent, swap_percent, 0)
+    }
+
+    /// `seed` 는 대응 유지·오대응 선택의 해시에 섞는다(0 이면 기본 장면).
+    fn synthetic_seeded(
+        outlier_per_mille: u64,
+        keep_percent: u64,
+        swap_percent: u64,
+        seed: u64,
+    ) -> Synthetic {
+        let salt = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let scene = Scene::new(SceneConfig {
             positions: 12,
             ..SceneConfig::default()
@@ -880,7 +940,7 @@ mod tests {
             }
             let mut m = Vec::new();
             for &(fa, fb, p) in &common {
-                if hash((a as u64) << 44 | (b as u64) << 24 | p as u64 | 1 << 63) % 100
+                if hash((a as u64) << 44 | (b as u64) << 24 | p as u64 | 1 << 63 ^ salt) % 100
                     >= keep_percent
                 {
                     continue;
@@ -898,7 +958,7 @@ mod tests {
             inliers += m.len();
             let k = (m.len() as u64 * outlier_per_mille).div_ceil(1000);
             for t in 0..k {
-                let s = hash((a as u64) << 40 | (b as u64) << 20 | t);
+                let s = hash((a as u64) << 40 | (b as u64) << 20 | t ^ salt);
                 let fa = (s % keypoints[a].len() as u64) as usize;
                 let fb = ((s >> 32) % keypoints[b].len() as u64) as usize;
                 if gt[a][fa] != gt[b][fb] {
@@ -1315,9 +1375,23 @@ mod tests {
 
     /// 시험 기본 다리 끊기 크기(양쪽 6 노드 이상).
     const BRIDGE_SIDE: usize = 6;
+    const MIN_DENSITY: f64 = 0.1;
 
-    fn run_greedy(s: &Synthetic, side: usize) -> (f64, f64, TrackStats, f64) {
-        let (t, st) = build_tracks_robust(&s.pairs, &s.keypoints, &TrackConfig::default(), side);
+    fn run_greedy(s: &Synthetic, side: usize, min_density: f64) -> (f64, f64, TrackStats, f64) {
+        run_greedy_len(s, side, min_density, 2)
+    }
+
+    fn run_greedy_len(
+        s: &Synthetic,
+        side: usize,
+        min_density: f64,
+        min_length: usize,
+    ) -> (f64, f64, TrackStats, f64) {
+        let cfg = TrackConfig {
+            min_length,
+            ..TrackConfig::default()
+        };
+        let (t, st) = build_tracks_robust(&s.pairs, &s.keypoints, &cfg, side, min_density);
         let (p, c) = purity_completeness(s, &t);
         let mean = t.iter().map(|x| x.len()).sum::<usize>() as f64 / t.len() as f64;
         (p, c, st, mean)
@@ -1326,7 +1400,7 @@ mod tests {
     #[test]
     fn greedy_clean_matches_give_exact_tracks() {
         let s = synthetic(0, 100, 0);
-        let (p, c, st, _) = run_greedy(&s, BRIDGE_SIDE);
+        let (p, c, st, _) = run_greedy(&s, BRIDGE_SIDE, MIN_DENSITY);
         eprintln!("greedy clean: purity {p} completeness {c} {st:?}");
         assert_eq!(p, 1.0);
         assert_eq!(c, 1.0);
@@ -1339,8 +1413,8 @@ mod tests {
         for keep in [50, 30] {
             for opm in [0, 10] {
                 let s = synthetic(opm, keep, 0);
-                let (p, c, st, mean) = run_greedy(&s, BRIDGE_SIDE);
-                let (p0, c0, _, _) = run_greedy(&s, 0);
+                let (p, c, st, mean) = run_greedy(&s, BRIDGE_SIDE, MIN_DENSITY);
+                let (p0, c0, _, _) = run_greedy(&s, 0, MIN_DENSITY);
                 let (pd, cd, _, _) = run_policy(&s, ConflictPolicy::Drop);
                 let (ps, cs, _, _) = run_policy(&s, ConflictPolicy::Split);
                 eprintln!(
@@ -1368,9 +1442,25 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn density_sweep() {
+        for keep in [50u64, 30] {
+            for opm in [0u64, 10, 50] {
+                for seed in [1u64, 2, 3] {
+                    let s = synthetic_seeded(opm, keep, 0, seed);
+                    for (d, ml) in [(0.0, 2), (0.0, 3), (0.0, 4), (0.1, 3)] {
+                        let (p, c, _, _) = run_greedy_len(&s, BRIDGE_SIDE, d, ml);
+                        eprintln!("sweep keep {keep} opm {opm} seed {seed} dens {d} len {ml}: purity {p:.4} completeness {c:.4}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn greedy_consistent_swaps_stay_pure() {
         let s = synthetic(0, 100, 1);
-        let (p, c, st, _) = run_greedy(&s, BRIDGE_SIDE);
+        let (p, c, st, _) = run_greedy(&s, BRIDGE_SIDE, MIN_DENSITY);
         eprintln!("greedy consistent swaps: purity {p:.4} completeness {c:.4} {st:?}");
         assert!(p >= 0.99, "순도 {p}");
         assert!(c >= 0.95, "완전도 {c}");
@@ -1379,8 +1469,13 @@ mod tests {
     #[test]
     fn greedy_is_order_independent_and_validates() {
         let s = synthetic(10, 50, 0);
-        let base =
-            build_tracks_robust(&s.pairs, &s.keypoints, &TrackConfig::default(), BRIDGE_SIDE);
+        let base = build_tracks_robust(
+            &s.pairs,
+            &s.keypoints,
+            &TrackConfig::default(),
+            BRIDGE_SIDE,
+            MIN_DENSITY,
+        );
         let mut pairs = s.pairs.clone();
         pairs.reverse();
         for p in pairs.iter_mut() {
@@ -1390,8 +1485,13 @@ mod tests {
                 *m = (m.1, m.0);
             }
         }
-        let flipped =
-            build_tracks_robust(&pairs, &s.keypoints, &TrackConfig::default(), BRIDGE_SIDE);
+        let flipped = build_tracks_robust(
+            &pairs,
+            &s.keypoints,
+            &TrackConfig::default(),
+            BRIDGE_SIDE,
+            MIN_DENSITY,
+        );
         assert_eq!(base.0, flipped.0);
         assert_eq!(base.1, flipped.1);
         // 범위 밖·같은 영상 짝은 세고 버린다.
@@ -1413,7 +1513,8 @@ mod tests {
             },
         ];
         let kp: Vec<Vec<Vector2<f64>>> = vec![vec![Vector2::new(0.0, 0.0); 2]; 2];
-        let (t, st) = build_tracks_robust(&bad, &kp, &TrackConfig::default(), BRIDGE_SIDE);
+        let (t, st) =
+            build_tracks_robust(&bad, &kp, &TrackConfig::default(), BRIDGE_SIDE, MIN_DENSITY);
         assert_eq!(st.invalid_matches, 3);
         assert_eq!(st.edges, 1);
         assert_eq!(t.len(), 1);
@@ -1431,7 +1532,7 @@ mod tests {
             matches: m,
         };
         let pairs = vec![pm(0, 1, vec![(0, 0), (1, 0)]), pm(1, 2, vec![(0, 0)])];
-        let (t, st) = build_tracks_robust(&pairs, &kp, &TrackConfig::default(), 0);
+        let (t, st) = build_tracks_robust(&pairs, &kp, &TrackConfig::default(), 0, MIN_DENSITY);
         for tr in &t {
             let imgs: Vec<usize> = tr.observations.iter().map(|o| o.image).collect();
             let mut d = imgs.clone();
@@ -1482,7 +1583,7 @@ mod tests {
         let (ts, ss) = build_tracks(&pairs, &kp, &TrackConfig::default());
         let split_s = t0.elapsed().as_secs_f64();
         let t0 = std::time::Instant::now();
-        let (tg, sg) = build_tracks_robust(&pairs, &kp, &TrackConfig::default(), 6);
+        let (tg, sg) = build_tracks_robust(&pairs, &kp, &TrackConfig::default(), 6, MIN_DENSITY);
         let greedy_s = t0.elapsed().as_secs_f64();
         eprintln!(
             "scale matches {total}: Drop {drop_s:.2}s tracks {} {sd:?} | Split {split_s:.2}s tracks {} {ss:?} | robust {greedy_s:.2}s tracks {} {sg:?}",
