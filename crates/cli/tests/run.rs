@@ -41,10 +41,12 @@ fn make_dataset(root: &Path, frames: u32) {
     std::fs::write(root.join("gps.txt"), gps).unwrap();
 }
 
+/// 데이터셋 읽기·구역 목록만 본다(복원은 `tests/pipeline.rs` 에서). 단색 사진이라 복원은 돌지 않는다.
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_skylens-stream"))
         .arg("run")
         .args(args)
+        .arg("--list-only")
         .output()
         .unwrap()
 }
