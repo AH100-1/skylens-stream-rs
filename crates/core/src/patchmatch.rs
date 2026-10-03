@@ -1448,7 +1448,8 @@ pub fn estimate_fast_profiled(
     let range32 = (range.0 as f32, range.1 as f32);
     let offs = fast_offsets(cfg.radius, cfg.step);
 
-    let mut state: Option<(Vec<FHyp>, usize, usize, Matrix3<f32>, Vec<u8>)> = None;
+    type LevelState = (Vec<FHyp>, usize, usize, Matrix3<f32>, Vec<u8>);
+    let mut state: Option<LevelState> = None;
     let use_masks = nb.len() <= 8 && cfg.fine_neighbors > 0 && cfg.fine_neighbors < nb.len();
     let top = levels.len() - 1;
     for li in (0..levels.len()).rev() {
