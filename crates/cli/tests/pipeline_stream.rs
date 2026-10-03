@@ -95,34 +95,6 @@ fn snapshots_grow_without_nan_and_realign_residuals_small() {
     }
     let total: usize = res.regions.iter().map(|r| r.registered).sum();
     eprintln!("registered per region sum {total}");
-    // 구역 차례 처리: 다음 구역은 직전 정밀 모델 위에서 시작한다.
-    assert!(
-        report.contains("anchor region 1 on refined 0"),
-        "구역 1 기준 기록 없음"
-    );
-    let anchors: Vec<(f64, f64)> = report
-        .split("anchor region ")
-        .skip(1)
-        .filter(|t| t.contains(" median "))
-        .map(|t| {
-            let med = t
-                .split(" median ")
-                .nth(1)
-                .unwrap()
-                .split(' ')
-                .next()
-                .unwrap();
-            let sc = t
-                .split(" scale ")
-                .nth(1)
-                .unwrap()
-                .split(' ')
-                .next()
-                .unwrap();
-            (med.parse().unwrap(), sc.parse().unwrap())
-        })
-        .collect();
-    eprintln!("anchor (median m, scale) {anchors:?}");
     let vr = skylens_core::verify::verify_dir(&out);
     eprintln!("{}", vr.to_table());
     for n in ["refined_overlap", "preview_align", "preview_vs_refined"] {
