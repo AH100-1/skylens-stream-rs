@@ -55,6 +55,7 @@ fn run_case(stride: usize, ba_iters: usize) -> Case {
         } else {
             PositionMethod::GpsLeastSquares
         },
+        ..PipelineConfig::default()
     };
     let t = std::time::Instant::now();
     let res = run_pipeline(&ds, &cfg, &output).unwrap();
