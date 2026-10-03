@@ -303,7 +303,21 @@ pub fn try_fuse(
         agree.len() + 1 >= need
     };
 
-    for r in 0..n {
+    // Shen 2013: 유효 화소가 많은(깊이 지도 품질이 좋은) 사진부터 기준으로 삼는다.
+    // 같은 수이면 번호 순서.
+    let valid: Vec<usize> = depth_maps
+        .iter()
+        .map(|m| {
+            m.depth
+                .iter()
+                .filter(|d| d.is_finite() && **d > 0.0)
+                .count()
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(valid[i]));
+
+    for &r in &order {
         let rm = &depth_maps[r];
         let rc = &views[r].camera;
         // 이웃 j 화소 jidx 를 올린 점 yw 가 기준 화소(영상 좌표 p, 깊이 d, 세계 법선 nr)와
@@ -1417,7 +1431,7 @@ mod tests {
     /// 사진은 실제 표면을 보므로 교차 무리 검사로 걸러진다. 이웃 8장·전체 대조 모두
     /// 정답 표면 1 m 초과 0점.
     #[test]
-    #[ignore = "F-226 미해결: 다른 드론이 거의 보지 못하는 구역이라 교차 무리 검사가 닿지 않음(이웃 8장 404078점 중 1 m 초과 126670, 전체 대조 424701점 중 112254)"]
+    #[ignore = "F-226 미해결: 이웃 8장 404078점 중 1 m 초과 126670, 전체 대조 424701점 중 112254(광선 충돌 검사를 시도했으나 점 수가 그대로여서 뺌)"]
     fn formation_scaled_drone_rejected() {
         let cams = formation(14, 480, 270);
         let mut rng = Rng(0x5ca1_ed00_dead_beef);
@@ -1621,5 +1635,135 @@ mod tests {
         );
         assert!(cloud.len() > 1_000_000, "points {}", cloud.len());
         assert!(secs < 2.0, "fuse {secs:.2} s");
+    }
+
+    /// F-240: 교차 무리 검사를 직접 잡는 작은 장면. 사진 0~3 은 무리 0 이고 이웃이 서로뿐
+    /// (기준 포함 동의 4장 → 이웃 안에서는 무리 조건 미달), 사진 4·5 는 무리 1 이다.
+    fn cross_group_views(cams: &[Camera]) -> Vec<FusionView> {
+        let mut vs = views(cams);
+        for (i, v) in vs.iter_mut().enumerate() {
+            v.group = Some(u32::from(i >= 4));
+            if i < 4 {
+                v.neighbors = (0..4).filter(|&j| j != i).collect();
+            }
+        }
+        vs
+    }
+
+    /// 무리 0 의 기준 점 수(무리 1 사진 4·5 는 기준으로 쓰이지 않게 이웃을 자기 무리 밖
+    /// 틀린 사진뿐으로 두므로 점이 나오지 않는다).
+    fn cross_group_points(maps: &[DepthMap], cfg: FusionConfig) -> usize {
+        let cams = small_cameras();
+        fuse(&cross_group_views(&cams), maps, cfg).len()
+    }
+
+    /// F-240 (a): 다른 무리 사진이 동의하면 같은 무리 동의가 `same_group_views` 에 못
+    /// 미쳐도 점이 남는다. `s > 0` 인데 같은 무리 규칙(6장)으로만 받는 변이는 0점이 된다.
+    #[test]
+    fn cross_group_agreement_keeps_points() {
+        let cams = small_cameras();
+        let maps: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        let n = cross_group_points(&maps, FusionConfig::default());
+        println!("cross group agree: points {n}");
+        assert!(n > 1000, "points {n}");
+    }
+
+    /// F-240 (b): 다른 무리 사진 4·5 가 그 점을 보지만 깊이가 5% 틀려 동의하지 않으면,
+    /// 같은 무리 동의가 `same_group_views`(4) 이상이어도 버린다. `s > 0` 이어도 같은
+    /// 무리 규칙으로 받는 변이는 점을 남긴다.
+    #[test]
+    fn cross_group_disagreement_rejects_points() {
+        let cams = small_cameras();
+        let mut maps: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        for m in &mut maps[4..] {
+            m.depth.iter_mut().for_each(|d| *d *= 1.05);
+        }
+        let cfg = FusionConfig {
+            same_group_views: Some(4),
+            ..FusionConfig::default()
+        };
+        let clean: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        let n = cross_group_points(&maps, cfg);
+        // 다른 무리가 아예 안 보이면(무리 하나로 지정) 같은 규칙이 점을 받는다.
+        let mut vs = cross_group_views(&cams);
+        vs.iter_mut().for_each(|v| v.group = Some(0));
+        let alone = fuse(&vs[..4], &maps[..4], cfg).len();
+        println!("cross group disagree: points {n} (same group only {alone})");
+        // 무리 1 의 한 사진이 우연히 동의하는 가장자리 점은 비율 0.5 로 남을 수 있다(2% 미만).
+        assert!(n * 50 < cross_group_points(&clean, cfg), "points {n}");
+        assert!(
+            alone > 500 && n * 20 < alone,
+            "same group only {alone}, cross {n}"
+        );
+    }
+
+    /// 거리 분위수(정답 표면 대비).
+    fn dist_quantiles(sc: &Scene, cloud: &PointCloud) -> (f64, f64, f64) {
+        assert!(!cloud.is_empty(), "points 0");
+        let mut e: Vec<f64> = cloud
+            .points
+            .iter()
+            .map(|p| surface_dist(sc, &pt(p)))
+            .collect();
+        let far = e.iter().filter(|&&d| d > 1.0).count() as f64 / e.len() as f64;
+        e.sort_by(f64::total_cmp);
+        (e[e.len() / 2], e[e.len() * 9 / 10], far)
+    }
+
+    /// 정답 깊이 + 잡음 σ 0.1% + 이상치 10% 편대(48장, 480×270, 이웃 8장 + 무리)의
+    /// 거리 중앙·90%·1 m 초과 비율과 융합 시간.
+    #[test]
+    fn formation_stream_quality_and_time() {
+        let cams = formation(16, 480, 270);
+        let mut rng = Rng(0x57ea_0001_beef_cafe);
+        let maps: Vec<DepthMap> = cams
+            .iter()
+            .map(|c| {
+                let mut m = render(&FORM, c);
+                corrupt(&mut m, &mut rng, 0.001, 0.1);
+                m
+            })
+            .collect();
+        let nb = neighbors_of(&FORM, &cams);
+        let mut vs = views(&cams);
+        for (i, v) in vs.iter_mut().enumerate() {
+            v.group = Some((i % 3) as u32);
+            v.neighbors = nb[i].clone();
+        }
+        let t = std::time::Instant::now();
+        let cloud = fuse(&vs, &maps, FusionConfig::default());
+        let secs = t.elapsed().as_secs_f64();
+        let (med, p90, far) = dist_quantiles(&FORM, &cloud);
+        println!(
+            "stream quality: points {} median {med:.4} p90 {p90:.4} >1m ratio {far:.6} fuse {secs:.2} s",
+            cloud.len()
+        );
+        assert!(cloud.len() > 300_000, "points {}", cloud.len());
+        assert!(med < 0.02, "median {med}");
+        assert!(p90 < 0.06, "p90 {p90}");
+        assert_eq!(far, 0.0, ">1m ratio {far}");
+    }
+
+    /// 기준 사진은 유효 화소가 많은 순서로 처리된다: 사진 0 의 깊이를 절반 비우면
+    /// 사진 0 이 기준으로 쓴 점이 사진 1 이후보다 뒤에 나온다.
+    #[test]
+    fn views_processed_by_valid_pixel_count() {
+        let cams = small_cameras();
+        let mut maps: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        for d in maps[0].depth.iter_mut().step_by(2) {
+            *d = 0.0;
+        }
+        TRACE.with(|t| t.borrow_mut().clear());
+        let cloud = fuse(&views(&cams), &maps, FusionConfig::default());
+        let firsts: Vec<usize> = TRACE.with(|t| t.borrow().iter().map(|e| e.0).collect());
+        println!(
+            "order: points {} first refs {:?}",
+            cloud.len(),
+            &firsts[..1]
+        );
+        assert!(cloud.len() > 1000);
+        assert_eq!(firsts[0], 1, "first reference view {}", firsts[0]);
+        let pos0 = firsts.iter().position(|&r| r == 0);
+        assert!(pos0.is_none_or(|p| p > 0));
     }
 }
