@@ -417,6 +417,48 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
         .collect()
 }
 
+/// 검증된 짝 대응을 `tracks::build_tracks` 로 다시점 트랙으로 묶는다. 반환은 성분별 (사진, 특징) 목록.
+fn multi_view_tracks(imgs: &[&ImgData], ms: &[PairList]) -> Vec<Vec<(usize, usize)>> {
+    let keypoints: Vec<Vec<Vector2<f64>>> = imgs
+        .iter()
+        .map(|d| {
+            d.feats
+                .iter()
+                .map(|f| Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5))
+                .collect()
+        })
+        .collect();
+    let pairs: Vec<crate::tracks::PairMatches> = ms
+        .iter()
+        .map(|(i, j, m)| crate::tracks::PairMatches {
+            image_a: *i,
+            image_b: *j,
+            matches: m.clone(),
+        })
+        .collect();
+    let cfg = crate::tracks::TrackConfig {
+        min_length: 2,
+        ..Default::default()
+    };
+    let (tracks, st) = crate::tracks::build_tracks(&pairs, &keypoints, &cfg);
+    if std::env::var("PIPE_DEBUG").is_ok() {
+        let mut h = [0usize; 8];
+        for t in &tracks {
+            h[t.len().min(7)] += 1;
+        }
+        eprintln!("debug tracks {} len-hist(0..7+) {h:?} {st:?}", tracks.len());
+    }
+    tracks
+        .iter()
+        .map(|t| {
+            t.observations
+                .iter()
+                .map(|o| (o.image, o.feature))
+                .collect()
+        })
+        .collect()
+}
+
 /// 회전 평균 → 방향으로 좌표계 맞춤 → 위치 → 삼각측량. 초벌 희소 모델.
 fn sparse_init(
     imgs: &[&ImgData],
@@ -523,13 +565,12 @@ fn sparse_init(
             g.determinant()
         );
     }
-    let counts: Vec<usize> = imgs.iter().map(|d| d.feats.len()).collect();
     let ms: Vec<_> = pm
         .iter()
         .filter(|p| poses[p.i].is_some() && poses[p.j].is_some())
         .map(|p| (p.i, p.j, p.inl.clone()))
         .collect();
-    let tracks = stand_in::build_tracks(&counts, &ms);
+    let tracks = multi_view_tracks(imgs, &ms);
     let (mut points, mut obs) = (Vec::new(), Vec::new());
     for tr in tracks {
         let o: Vec<(usize, usize, Vector2<f64>)> = tr
