@@ -159,6 +159,8 @@ pub struct Config {
     pub fine_neighbors: usize,
     /// 난수 씨앗.
     pub seed: u64,
+    /// `estimate_fast` 의 가장 거친 층 반복 횟수.
+    pub fast_iterations: usize,
 }
 
 impl Default for Config {
@@ -178,6 +180,7 @@ impl Default for Config {
             fine_neighbors: 4,
             normal_steps: 3,
             seed: 0x5eed,
+            fast_iterations: 6,
         }
     }
 }
@@ -902,6 +905,8 @@ fn ncc_cost(q: &Vector3<f32>, patch: &RefPatch, h: &Matrix3<f32>, img: &GrayImag
 
 /// 빠른 경로의 상위 k 시점 집계 개수(Shen 2013).
 const FAST_TOP_K: usize = 3;
+/// 고운 층에서 이 비용 미만이면 갱신을 건너뛴다.
+const FAST_SKIP_COST: f32 = 0.0;
 
 /// 빠른 경로의 평면 가설 하나: 기준 카메라 z 깊이, 단위 법선(카메라를 향함), 집계 비용.
 #[derive(Clone, Copy)]
@@ -1090,6 +1095,7 @@ impl FCtx<'_> {
 
     /// 상위 k 이웃 비용의 평균.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn agg(
         &self,
         q: &Vector3<f32>,
@@ -1212,7 +1218,10 @@ impl FCtx<'_> {
         let mut nt = 1;
         tried[0] = (best.d, best.n);
         // 전파: 가까운 4 + 먼 4 표본(반대 색 화소)의 평면을 이 화소 광선으로 옮긴다.
-        for (dx, dy) in PAT {
+        if best.c < sc.skip_below {
+            return None;
+        }
+        for &(dx, dy) in &PAT[..sc.n_prop] {
             let (nx, ny) = (x as i32 + dx, y as i32 + dy);
             if nx < 0 || ny < 0 || nx >= self.w as i32 || ny >= self.h as i32 {
                 continue;
@@ -1292,6 +1301,10 @@ struct FSched {
     amp_n: f32,
     steps: usize,
     fresh: bool,
+    /// 전파 후보 수(8 이면 가까운 4 + 먼 4, 4 면 가까운 4 만).
+    n_prop: usize,
+    /// 이 비용 미만인 화소는 건너뛴다(고운 층에서 이미 맞은 화소).
+    skip_below: f32,
 }
 
 struct FLevel {
@@ -1322,6 +1335,25 @@ pub fn estimate_fast(
     range: (f64, f64),
     cfg: &Config,
 ) -> DepthMap {
+    estimate_fast_profiled(ref_view, neighbors, range, cfg, None)
+}
+
+/// `estimate_fast` 와 같고, `stages` 가 있으면 단계별 (이름, 초)를 덧붙인다.
+pub fn estimate_fast_profiled(
+    ref_view: &View,
+    neighbors: &[View],
+    range: (f64, f64),
+    cfg: &Config,
+    mut stages: Option<&mut Vec<(String, f64)>>,
+) -> DepthMap {
+    let t_all = std::time::Instant::now();
+    let mut tick = std::time::Instant::now();
+    let mut mark = |name: String, stages: &mut Option<&mut Vec<(String, f64)>>| {
+        if let Some(s) = stages.as_deref_mut() {
+            s.push((name, tick.elapsed().as_secs_f64()));
+        }
+        tick = std::time::Instant::now();
+    };
     let (w, h) = (ref_view.image.width, ref_view.image.height);
     let range_ok = range.0.is_finite() && range.1.is_finite() && range.0 > 0.0 && range.0 < range.1;
     let nb = &neighbors[..neighbors.len().min(cfg.max_neighbors.min(MAX_NEIGHBORS))];
@@ -1346,6 +1378,7 @@ pub fn estimate_fast(
         levels.push(next);
     }
 
+    mark("pyramid".into(), &mut stages);
     let rr = ref_view.camera.pose.rotation.into_inner();
     let tr = ref_view.camera.pose.translation;
     let rel: Vec<(Matrix3<f64>, Vector3<f64>)> = nb
@@ -1469,11 +1502,13 @@ pub fn estimate_fast(
                 }
             }
         }
+        mark(format!("L{li} setup+init"), &mut stages);
         ctx.eval_all(&mut hyps);
+        mark(format!("L{li} eval_all"), &mut stages);
 
         let coarsest = li == top;
         let iters = if coarsest {
-            cfg.iterations
+            cfg.fast_iterations
         } else {
             cfg.refine_iterations
         };
@@ -1492,6 +1527,8 @@ pub fn estimate_fast(
                 amp_n: 0.5 * halve * 0.5f32.powi(lvl_up),
                 steps,
                 fresh: coarsest,
+                n_prop: 8,
+                skip_below: if coarsest { 0.0 } else { FAST_SKIP_COST },
             };
             for color in 0..2usize {
                 let tag = fast_hash(cfg.seed, ((li * 64 + it) * 2 + color) as u64);
@@ -1500,10 +1537,12 @@ pub fn estimate_fast(
                 std::mem::swap(&mut hyps, &mut other);
             }
         }
+        mark(format!("L{li} iterations"), &mut stages);
         state = Some((hyps, lw, lh, ctx.kinv));
     }
 
     let (hyps, lw, lh, _) = state.unwrap();
+    let _ = t_all;
     debug_assert_eq!((lw, lh), (w, h));
     let mut dm = DepthMap::invalid(w, h);
     for (i, hy) in hyps.iter().enumerate() {
@@ -2324,5 +2363,50 @@ mod tests {
         let s = last_fast.unwrap();
         assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
         assert!(s.within_1pct > 0.90, "1% 이내 비율 {}", s.within_1pct);
+    }
+
+    #[test]
+    #[ignore = "시간 측정용(측정 기계 부하에 따라 값이 달라짐)"]
+    fn fast_960() {
+        let scene = Scene::Slanted {
+            z0: 10.0,
+            a: 0.3,
+            b: -0.15,
+        };
+        let cams = rig8(960, 540, 1.0, 10.0);
+        let (refv, ns, gt) = views(&cams, &scene);
+        let n_gt = Vector3::new(0.3, -0.15, -1.0).normalize();
+        let cfg = Config::default();
+        let load = || std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        let mut best = f64::INFINITY;
+        for round in 0..1 {
+            let mut st = Vec::new();
+            let t = std::time::Instant::now();
+            let dm = estimate_fast_profiled(&refv, &ns, (5.0, 20.0), &cfg, Some(&mut st));
+            let el = t.elapsed().as_secs_f64();
+            best = best.min(el);
+            let s = stats(
+                &dm,
+                &gt,
+                |_| n_gt,
+                |x, y| x >= 8 && y >= 8 && x < 952 && y < 532,
+            );
+            eprintln!(
+                "회 {round}: {el:.3} s, 중앙 {:.5}, 1% 이내 {:.3}, 법선 {:.2}°, 부하 {}, 스레드 {}",
+                s.median_rel,
+                s.within_1pct,
+                s.median_normal_deg,
+                load().trim(),
+                rayon::current_num_threads()
+            );
+            for (n, t) in &st {
+                eprintln!("  {n}: {t:.3} s");
+            }
+            if round == 0 {
+                assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
+                assert!(s.within_1pct > 0.90, "1% 이내 비율 {}", s.within_1pct);
+            }
+        }
+        eprintln!("최소 {best:.3} s");
     }
 }
