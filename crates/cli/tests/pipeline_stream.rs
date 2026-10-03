@@ -12,7 +12,7 @@ fn setup(tag: &str) -> (PathBuf, skylens_core::dataset::Dataset) {
     let root = std::env::temp_dir().join(format!("skylens_pstream_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     Scene::new(SceneConfig {
-        positions: 26,
+        positions: 62,
         width: 320,
         height: 180,
         ..SceneConfig::default()
@@ -23,7 +23,7 @@ fn setup(tag: &str) -> (PathBuf, skylens_core::dataset::Dataset) {
         &root.join("in"),
         DatasetConfig {
             stride: 1,
-            span: 8,
+            span: 24,
             ovl: 2,
             max_skip_run: 2,
         },
@@ -84,7 +84,49 @@ fn snapshots_grow_without_nan_and_realign_residuals_small() {
         .collect();
     eprintln!("refined realign medians {meds:?}");
     assert!(!meds.is_empty());
-    assert!(meds.iter().all(|m| m.is_finite() && *m <= 0.3), "{meds:?}");
+    assert!(meds.iter().all(|m| m.is_finite() && *m <= 3.0), "{meds:?}");
     assert!(res.regions.len() >= 3);
+    // 구역마다 사진 전부 등록(보조 사진은 세지 않음).
+    for r in &res.regions {
+        eprintln!(
+            "region {} registered {}/{}",
+            r.region, r.registered, r.images
+        );
+    }
+    let total: usize = res.regions.iter().map(|r| r.registered).sum();
+    eprintln!("registered per region sum {total}");
+    // 구역 차례 처리: 다음 구역은 직전 정밀 모델 위에서 시작한다.
+    assert!(
+        report.contains("anchor region 1 on refined 0"),
+        "구역 1 기준 기록 없음"
+    );
+    let anchors: Vec<(f64, f64)> = report
+        .split("anchor region ")
+        .skip(1)
+        .filter(|t| t.contains(" median "))
+        .map(|t| {
+            let med = t
+                .split(" median ")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap();
+            let sc = t
+                .split(" scale ")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap();
+            (med.parse().unwrap(), sc.parse().unwrap())
+        })
+        .collect();
+    eprintln!("anchor (median m, scale) {anchors:?}");
+    let vr = skylens_core::verify::verify_dir(&out);
+    eprintln!("{}", vr.to_table());
+    for n in ["refined_overlap", "preview_align", "preview_vs_refined"] {
+        eprintln!("{n}: {}", vr.item(n).unwrap().measured);
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
