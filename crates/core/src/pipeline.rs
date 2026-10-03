@@ -907,6 +907,7 @@ fn sparse_init_with(
     };
     // 좌표계 맞춤(Kabsch): 모델 방향 b = Rᵢᵀ(−R_ijᵀ t) → GPS 방향.
     let mut h = Matrix3::zeros();
+    let mut n_kabsch = 0usize;
     let mut dirs_model = Vec::new();
     for (p, _) in pm.iter().zip(&keep_edge).filter(|(_, &k)| k) {
         let (Some(ri), Some(_), Some(t)) = (rots[p.i], rots[p.j], p.t) else {
@@ -917,9 +918,18 @@ fn sparse_init_with(
         let dg = gps[p.j] - gps[p.i];
         if dg.norm() > 3.0 {
             h += b * dg.normalize().transpose() * dg.norm();
+            n_kabsch += 1;
         }
     }
     let svd = h.svd(true, true);
+    // 짝이 3개 미만이거나 가장 큰 특이값이 0 이면 방향을 정할 수 없다(제자리 비행). 직선 비행은
+    // 특이값 하나만 크므로 허용하고 아래에서 비행 축 둘레 회전을 따로 정한다.
+    if n_kabsch < 3 || svd.singular_values.max() < 1e-9 {
+        return Err(format!(
+            "좌표계 맞춤 불가: GPS 3 m 초과 짝 {n_kabsch} 개, 최대 특이값 {:.3e}",
+            svd.singular_values.max()
+        ));
+    }
     let (u, vt) = (svd.u.ok_or("SVD")?, svd.v_t.ok_or("SVD")?);
     let d = (vt.transpose() * u.transpose()).determinant().signum();
     let mut g = vt.transpose() * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, d)) * u.transpose();
@@ -1380,6 +1390,19 @@ struct RegionRec {
     reg_flags: Vec<bool>,
 }
 
+/// 지금까지 내보낸 구역 상태(스냅샷 합성용).
+fn live_state(recs: &[RegionRec]) -> Vec<crate::pipeline_stream::LiveRegion<'_>> {
+    recs.iter()
+        .map(|r| crate::pipeline_stream::LiveRegion {
+            region: r.region,
+            coarse: &r.coarse,
+            coarse_sim: r.sim,
+            refined: r.refined.as_ref().map(|x| &x.1),
+            refined_sim: r.rsim,
+        })
+        .collect()
+}
+
 /// 정밀(BA) 작업 결과.
 struct RefinedMsg {
     slot: usize,
@@ -1443,6 +1466,22 @@ pub fn run_pipeline(
     cfg: &PipelineConfig,
     out: &Path,
 ) -> Result<PipelineResult, String> {
+    run_pipeline_with(
+        ds,
+        cfg,
+        out,
+        crate::pipeline_stream::StreamOptions::default(),
+    )
+}
+
+/// [`run_pipeline`] 의 실행 방식 지정판. 사건 순서는 `snapshots/manifest.json` 의 `events` 와
+/// `snapshots/live/` 의 시점별 스냅샷으로 남는다.
+pub fn run_pipeline_with(
+    ds: &Dataset,
+    cfg: &PipelineConfig,
+    out: &Path,
+    opts: crate::pipeline_stream::StreamOptions,
+) -> Result<PipelineResult, String> {
     use crate::progressive::{
         check_motion, cross_align, median, overlap_window, own_ranges, ReAlign,
     };
@@ -1467,13 +1506,15 @@ pub fn run_pipeline(
     let mut in_flight = 0usize;
     let (tx, rx) = mpsc::channel::<RefinedMsg>();
     let t_now = || t_start.elapsed().as_secs_f64();
+    let mut live = crate::pipeline_stream::LiveLog::new(out).map_err(|e| e.to_string())?;
 
     // 정밀 결과 하나를 반영: 파일 쓰기, 자기 정렬, 대기 중인 초벌 재정렬.
     let handle = |m: RefinedMsg,
                   recs: &mut Vec<RegionRec>,
                   events: &mut Vec<String>,
                   realigns: &mut Vec<ReAlign>,
-                  latest_ref: &mut Option<usize>|
+                  latest_ref: &mut Option<usize>,
+                  live: &mut crate::pipeline_stream::LiveLog|
      -> Result<(), String> {
         let k = m.slot;
         let rec = &mut recs[k];
@@ -1522,6 +1563,7 @@ pub fn run_pipeline(
         rec.own = Some((sim, ar));
         rec.refined = Some((tb, m.cloud));
         *latest_ref = Some(k);
+        live.snapshot(t_now(), "refined_replace", r.index, &live_state(recs))?;
         // 다음 구역의 정밀 작업이 이 모델을 기다리고 있으면 기준을 보낸다.
         if k + 1 < recs.len() {
             if let Some(tx) = recs[k + 1].anchor_tx.take() {
@@ -1535,6 +1577,7 @@ pub fn run_pipeline(
             r.index,
             m.sparse.rms
         ));
+        let n_realign0 = realigns.len();
         // 이미 내보낸, 아직 정밀이 없는 초벌 구역을 새 정밀 모델 좌표로 다시 맞춘다.
         for j in 0..recs.len() {
             if j == k || recs[j].refined.is_some() {
@@ -1609,6 +1652,9 @@ pub fn run_pipeline(
                 queue.push_back(j);
             }
         }
+        if realigns.len() > n_realign0 {
+            live.snapshot(t_now(), "realign", r.index, &live_state(recs))?;
+        }
         Ok(())
     };
 
@@ -1616,13 +1662,27 @@ pub fn run_pipeline(
         // 끝난 정밀 결과를 먼저 반영해 이번 등록·정렬이 최신 모델을 기준으로 삼게 한다.
         while let Ok(m) = rx.try_recv() {
             in_flight -= 1;
-            handle(m, &mut recs, &mut events, &mut realigns, &mut latest_ref)?;
+            handle(
+                m,
+                &mut recs,
+                &mut events,
+                &mut realigns,
+                &mut latest_ref,
+                &mut live,
+            )?;
         }
         // 정밀 작업이 둘 넘게 밀리면 하나가 끝나길 기다린다(코어 과다 경쟁 방지).
         while in_flight >= 2 {
             let m = rx.recv().map_err(|e| e.to_string())?;
             in_flight -= 1;
-            handle(m, &mut recs, &mut events, &mut realigns, &mut latest_ref)?;
+            handle(
+                m,
+                &mut recs,
+                &mut events,
+                &mut realigns,
+                &mut latest_ref,
+                &mut live,
+            )?;
         }
         let mut st = RegionStats {
             region: r.index,
@@ -1653,22 +1713,32 @@ pub fn run_pipeline(
             .copied()
             .filter(|g| !cache.contains_key(g))
             .collect();
-        let loaded: Vec<Result<(usize, ImgData), String>> = need
-            .par_iter()
-            .map(|&g| {
-                Ok((
-                    g,
-                    load(&ds.positions[g / 3].images[g % 3], cfg.max_features)?,
-                ))
-            })
-            .collect();
+        // 사진은 위치 단위로 차례로 도착한다(위치마다 세 카메라 사진을 함께 읽는다).
         let mut load_err = None;
-        for l in loaded {
-            match l {
-                Ok((g, d)) => {
-                    cache.insert(g, Arc::new(d));
+        let mut by_pos: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for &g in &need {
+            by_pos.entry(g / 3).or_default().push(g);
+        }
+        for (p, gs) in &by_pos {
+            let loaded: Vec<Result<(usize, ImgData), String>> = gs
+                .par_iter()
+                .map(|&g| {
+                    Ok((
+                        g,
+                        load(&ds.positions[g / 3].images[g % 3], cfg.max_features)?,
+                    ))
+                })
+                .collect();
+            for l in loaded {
+                match l {
+                    Ok((g, d)) => {
+                        cache.insert(g, Arc::new(d));
+                    }
+                    Err(e) => load_err = Some(e),
                 }
-                Err(e) => load_err = Some(e),
+            }
+            if *p >= r.lo {
+                live.note(t_now(), "arrive_position", *p);
             }
         }
         if let Some(e) = load_err {
@@ -1693,17 +1763,35 @@ pub fn run_pipeline(
         st.secs_matching = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
         let pair_ids: Vec<(usize, usize)> = pm.iter().map(|p| (p.i, p.j)).collect();
-        let init = match check_motion(&gps, &views, &pair_ids).and_then(|_| {
-            sparse_init(
-                &imgs,
-                &pm,
-                &gps,
-                &k,
-                cfg.position,
-                &tri,
-                (cfg.preview_ba_iters, cfg.prior_sigma()),
-            )
-        }) {
+        // 정지 검사는 구역 자기 위치끼리의 짝만 본다(앞 구역에서 온 도우미 사진의 움직임은 세지 않는다).
+        let own_pairs: Vec<(usize, usize)> = pair_ids
+            .iter()
+            .copied()
+            .filter(|&(i, j)| gids[i] / 3 >= r.lo && gids[j] / 3 >= r.lo)
+            .collect();
+        let own_registered = |s: &Sparse| s.poses[n_help..].iter().filter(|p| p.is_some()).count();
+        let init = match check_motion(&gps, &views, &own_pairs)
+            .and_then(|_| {
+                sparse_init(
+                    &imgs,
+                    &pm,
+                    &gps,
+                    &k,
+                    cfg.position,
+                    &tri,
+                    (cfg.preview_ba_iters, cfg.prior_sigma()),
+                )
+            })
+            .and_then(|s| {
+                if own_registered(&s) < 3 {
+                    Err(format!(
+                        "구역 안 사진 등록 {} 장 < 3: 특징이 없어 등록할 수 없음",
+                        own_registered(&s)
+                    ))
+                } else {
+                    Ok(s)
+                }
+            }) {
             Ok(s) => s,
             Err(e) => {
                 skipped.push(format!("구역 {} 건너뜀: {e}", r.index));
@@ -1776,6 +1864,17 @@ pub fn run_pipeline(
             &crate::stream::apply_cloud(&shown, &coarse),
         )?;
         events.push(format!("{:.1}s coarse output region {}", t_now(), r.index));
+        {
+            let mut state = live_state(&recs);
+            state.push(crate::pipeline_stream::LiveRegion {
+                region: *r,
+                coarse: &coarse,
+                coarse_sim: sim,
+                refined: None,
+                refined_sim: None,
+            });
+            live.snapshot(t_now(), "coarse_output", r.index, &state)?;
+        }
         let registered_prev = (n_help..gids.len())
             .filter(|&a| init.poses[a].is_some())
             .map(|a| gids[a])
@@ -1850,16 +1949,44 @@ pub fn run_pipeline(
         } else {
             recs[slot].anchor_tx = Some(anchor_tx);
         }
+        if opts.sequential {
+            while in_flight > 0 {
+                let m = rx.recv().map_err(|e| e.to_string())?;
+                in_flight -= 1;
+                handle(
+                    m,
+                    &mut recs,
+                    &mut events,
+                    &mut realigns,
+                    &mut latest_ref,
+                    &mut live,
+                )?;
+            }
+        }
         // 이 구역을 올린 뒤에 끝난 정밀 결과를 반영한다(방금 올린 초벌도 재정렬 대상이다).
         while let Ok(m) = rx.try_recv() {
             in_flight -= 1;
-            handle(m, &mut recs, &mut events, &mut realigns, &mut latest_ref)?;
+            handle(
+                m,
+                &mut recs,
+                &mut events,
+                &mut realigns,
+                &mut latest_ref,
+                &mut live,
+            )?;
         }
     }
     while in_flight > 0 {
         let m = rx.recv().map_err(|e| e.to_string())?;
         in_flight -= 1;
-        handle(m, &mut recs, &mut events, &mut realigns, &mut latest_ref)?;
+        handle(
+            m,
+            &mut recs,
+            &mut events,
+            &mut realigns,
+            &mut latest_ref,
+            &mut live,
+        )?;
     }
     if recs.is_empty() {
         return Err(format!("모든 구역 실패: {}", skipped.join("; ")));
@@ -1888,6 +2015,8 @@ pub fn run_pipeline(
     let aligned = apply_alignments(&prelim, &sims);
     let rep = write_outputs(out, &kept, &aligned, &refined, records.clone())
         .map_err(|e| format!("출력 쓰기 실패: {e}"))?;
+    live.note(t_now(), "final", recs.last().map_or(0, |r| r.region.index));
+    live.finish(out)?;
     res.issues = skipped;
     res.issues.extend(rep.issues);
     res.align = records;
