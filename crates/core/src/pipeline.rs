@@ -519,6 +519,32 @@ fn sparse_init(
 }
 
 /// 번들 조정(`iters == 0` 이면 재투영 오차만 잰다). 반환: 재투영 RMS(px).
+/// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
+/// BA 는 자유 좌표계에서 움직이므로 정밀 모델을 다시 GPS 좌표계로 돌려놓는다.
+fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity> {
+    let ids: Vec<usize> = (0..s.poses.len())
+        .filter(|&i| s.poses[i].is_some())
+        .collect();
+    let src: Vec<Vector3<f64>> = ids
+        .iter()
+        .map(|&i| s.poses[i].unwrap().center().coords)
+        .collect();
+    let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
+    let (sim, _, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    for &i in &ids {
+        let p = s.poses[i].unwrap();
+        let c = sim.apply_point(&p.center().coords);
+        s.poses[i] = Some(Pose::from_center(
+            p.rotation * sim.r.inverse(),
+            &Point3::from(c),
+        ));
+    }
+    for p in s.points.iter_mut() {
+        *p = sim.apply_point(p);
+    }
+    Some(sim)
+}
+
 fn run_ba(s: &mut Sparse, k: &Intrinsics, iters: usize) -> f64 {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
@@ -724,6 +750,7 @@ pub fn run_pipeline(
                 || {
                     let mut rs = init.clone();
                     rs.rms = run_ba(&mut rs, &k, cfg.ba_iters);
+                    gps_align_refined(&mut rs, &gps);
                     let rc = dense_cloud(&rs, &imgs, &k, &in_region, cfg.dense_width);
                     (rs, rc)
                 },
@@ -747,6 +774,38 @@ pub fn run_pipeline(
                 let c = p.center();
                 centers.insert(*g, [c.x, c.y, c.z]);
             }
+        }
+        if std::env::var("SKYLENS_DIAG").is_ok() {
+            let med = |mut v: Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+            };
+            let dp: Vec<Vector3<f64>> = init
+                .points
+                .iter()
+                .zip(&ref_s.points)
+                .map(|(a, b)| b - a)
+                .collect();
+            let dc: Vec<Vector3<f64>> = (0..gids.len())
+                .filter_map(|a| {
+                    Some(ref_s.poses[a]?.center().coords - init.poses[a]?.center().coords)
+                })
+                .collect();
+            let gi: Vec<f64> = (0..gids.len())
+                .filter_map(|a| Some((init.poses[a]?.center().coords - gps[a]).norm()))
+                .collect();
+            let gr: Vec<f64> = (0..gids.len())
+                .filter_map(|a| Some((ref_s.poses[a]?.center().coords - gps[a]).norm()))
+                .collect();
+            eprintln!(
+                "diag point shift |dxyz| med {:.2} dz med {:.2}; center shift med {:.2} dz {:.2}; gps dist init {:.2} refined {:.2}",
+                med(dp.iter().map(|d| d.norm()).collect()),
+                med(dp.iter().map(|d| d.z.abs()).collect()),
+                med(dc.iter().map(|d| d.norm()).collect()),
+                med(dc.iter().map(|d| d.z.abs()).collect()),
+                med(gi),
+                med(gr)
+            );
         }
         // 초벌 → 정밀 좌표 정렬(공유 3D 점, 같은 사진·같은 특징).
         let (ta, tb) = (to_tracks(&init, &gids), to_tracks(&ref_s, &gids));
