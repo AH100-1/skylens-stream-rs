@@ -91,6 +91,7 @@ struct Sparse {
     /// 점마다 (구역 안 사진 번호, 특징 번호, 픽셀) 관측.
     obs: Vec<Vec<(usize, usize, Vector2<f64>)>>,
     /// 점 문턱을 못 넘었지만 느슨한 문턱 안에서 삼각측량되는 점(BA 에만 넣는다. 점 구름엔 안 쓴다).
+    #[allow(clippy::type_complexity)]
     ba_only: Vec<(Vector3<f64>, Vec<(usize, usize, Vector2<f64>)>)>,
     rms: f64,
 }
@@ -571,7 +572,7 @@ fn triangulate_tracks(
         thr_px: thr,
         ..TriStats::default()
     };
-    let (mut points, mut obs, mut ba_only) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut points, mut obs, ba_only) = (Vec::new(), Vec::new(), Vec::new());
     for (tight, x, ba, nk) in res.into_iter().flatten() {
         st.obs_ba += ba.len();
         if tight {
