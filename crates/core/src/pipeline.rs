@@ -32,7 +32,7 @@ use crate::stream::{
 use crate::translation_averaging::{
     average_translations_with_points, PointObservation, RelativeTranslation, TranslationConfig,
 };
-use crate::two_view::{ransac_essential, recover_pose};
+use crate::two_view::recover_pose;
 
 /// 밀집 단계 사진별 깊이 방식.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,13 +367,21 @@ struct PairMatch {
     t: Option<Vector3<f64>>,
 }
 
+/// 환경 변수 `SKYLENS_RANSAC_STATS` 가 있으면 짝마다 RANSAC 통계를 표준 오류로 낸다(진단용).
+fn ransac_stats_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SKYLENS_RANSAC_STATS").is_some())
+}
+
 fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> Vec<PairMatch> {
     let pairs = scheduled_pairs(views, &PairSchedule::default());
     pairs
         .par_iter()
         .filter_map(|&(i, j)| {
             let (fa, fb) = (&imgs[i].feats, &imgs[j].feats);
+            let t_pair = Instant::now();
             let m = ratio_match(fa, fb, 0.8, true);
+            crate::timing::add("matching_ratio_cpu", t_pair.elapsed().as_secs_f64());
             if m.len() < 20 {
                 return None;
             }
@@ -383,7 +391,24 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                 max_iters: 500,
                 ..RansacConfig::default()
             };
-            let (e, inl) = ransac_essential(&n1, &n2, k.fx, &cfg)?;
+            let t_ransac = Instant::now();
+            let (cands, rs) =
+                crate::two_view::ransac_essential_candidates_stats(&n1, &n2, k.fx, &cfg);
+            let ransac = cands.into_iter().next();
+            crate::timing::add("matching_ransac_cpu", t_ransac.elapsed().as_secs_f64());
+            if ransac_stats_enabled() {
+                eprintln!(
+                    "ransac_stat pair {i} {j} n {} iters {} best_ratio {:.4} skipped {} sample_s {:.5} refine_s {:.5} ok {}",
+                    rs.n,
+                    rs.iters,
+                    rs.best_ratio,
+                    rs.skipped,
+                    rs.secs_sample,
+                    rs.secs_refine,
+                    ransac.is_some()
+                );
+            }
+            let (e, inl) = ransac?;
             let sel = |n: &[Vector2<f64>]| -> Vec<Vector2<f64>> {
                 n.iter()
                     .zip(&inl)
@@ -867,7 +892,10 @@ fn sparse_init_with(
     opts: &PreviewOpts,
 ) -> Result<(Sparse, PreviewStages), String> {
     let n = imgs.len();
+    let t_stage = Instant::now();
     let (rots, keep_edge) = average_pruned(n, pm, opts)?;
+    crate::timing::add("rotation_avg", t_stage.elapsed().as_secs_f64());
+    let t_stage = Instant::now();
     let mut stages = PreviewStages {
         rots: rots.clone(),
         pruned: (keep_edge.iter().filter(|&&k| !k).count(), pm.len()),
@@ -957,6 +985,7 @@ fn sparse_init_with(
             v
         }
     };
+    crate::timing::add("position_avg", t_stage.elapsed().as_secs_f64());
     let mut poses: Vec<Option<Pose>> = vec![None; n];
     for &i in &ids {
         let Some(c) = placed[i] else { continue };
@@ -991,6 +1020,7 @@ fn sparse_init_with(
             g.determinant()
         );
     }
+    let t_stage = Instant::now();
     let ms: Vec<_> = pm
         .iter()
         .filter(|p| poses[p.i].is_some() && poses[p.j].is_some())
@@ -1014,6 +1044,7 @@ fn sparse_init_with(
         tri_eff.min_deg = d;
     }
     let (points, obs, ba_only, stats) = triangulate_tracks(&poses, k, &track_obs, &tri_eff);
+    crate::timing::add("tracks", t_stage.elapsed().as_secs_f64());
     if std::env::var("PIPE_DEBUG").is_ok() {
         eprintln!("debug triangulation {stats:?}");
     }
@@ -1024,10 +1055,14 @@ fn sparse_init_with(
         ba_only,
         rms: 0.0,
     };
+    let t_stage = Instant::now();
     s.rms = run_ba(&mut s, k, 0, None, 2.0, &[]);
+    crate::timing::add("ba_preview", t_stage.elapsed().as_secs_f64());
     if pre_ba.0 > 0 {
         // 짧은 GPS 사전항 BA: 초벌 포즈·점의 스케일·기울기·깊이를 정밀 쪽으로 당긴다.
-        let after = run_ba(&mut s, k, pre_ba.0, Some(gps), pre_ba.1, &[]);
+        let after = crate::timing::timed("ba_preview", || {
+            run_ba(&mut s, k, pre_ba.0, Some(gps), pre_ba.1, &[])
+        });
         if std::env::var("PIPE_DEBUG").is_ok() {
             eprintln!("debug preview ba rms {:.3} -> {after:.3}", s.rms);
         }
@@ -1593,11 +1628,13 @@ fn send_anchor(
 }
 
 fn write_decimated(out: &Path, name: &str, cloud: &PointCloud) -> Result<(), String> {
-    crate::ply::write_ply_file(
-        out.join(name),
-        &crate::stream::decimate(cloud, crate::stream::DECIMATE_EVERY),
-    )
-    .map_err(|e| format!("출력 쓰기 실패: {e}"))
+    crate::timing::timed("write", || {
+        crate::ply::write_ply_file(
+            out.join(name),
+            &crate::stream::decimate(cloud, crate::stream::DECIMATE_EVERY),
+        )
+        .map_err(|e| format!("출력 쓰기 실패: {e}"))
+    })
 }
 
 /// 구역 앞쪽 보조 F 사진 범위: 위치 [lo-HELPER_SPAN, lo-HELPER_MIN].
@@ -1644,6 +1681,7 @@ pub fn run_pipeline_with(
         std::fs::create_dir_all(out.join(sub)).map_err(|e| e.to_string())?;
     }
     let t_start = Instant::now();
+    crate::timing::reset();
     let mut cache: HashMap<usize, Arc<ImgData>> = HashMap::new();
     let mut k_opt: Option<Intrinsics> = None;
     let mut res = PipelineResult::default();
@@ -1685,7 +1723,9 @@ pub fn run_pipeline_with(
         write_decimated(out, &refined_name(&rec.region), &m.cloud)?;
         // 자기 구역 초벌 → 정밀 정렬(SPEC §3.7).
         let r = rec.region;
-        let (sim, ar) = own_align(&rec.ta, &tb, &r, ds.config.ovl, n_pos);
+        let (sim, ar) = crate::timing::timed("align_ghost", || {
+            own_align(&rec.ta, &tb, &r, ds.config.ovl, n_pos)
+        });
         if let Some(s) = &sim {
             realigns.push(ReAlign {
                 secs: t_now(),
@@ -1727,9 +1767,10 @@ pub fn run_pipeline_with(
                 continue;
             }
             let tbk = &recs[k].refined.as_ref().unwrap().0;
-            if let Some((s, n, med)) =
+            let ca = crate::timing::timed("align_ghost", || {
                 region_align(&recs[j].ta, tbk, &recs[j].region, &recs[k].region)
-            {
+            });
+            if let Some((s, n, med)) = ca {
                 realigns.push(ReAlign {
                     secs: t_now(),
                     region: j,
@@ -1761,7 +1802,9 @@ pub fn run_pipeline_with(
                 .iter()
                 .map(|x| x.refined.as_ref().map(|(t, _)| (x.region, t.as_slice())))
                 .collect();
-            crate::progressive::chain_realign_with(&items, k, region_align)
+            crate::timing::timed("align_ghost", || {
+                crate::progressive::chain_realign_with(&items, k, region_align)
+            })
         };
         for st in steps {
             let (j, acc) = (st.region, st.total);
@@ -1855,15 +1898,17 @@ pub fn run_pipeline_with(
             by_pos.entry(g / 3).or_default().push(g);
         }
         for (p, gs) in &by_pos {
-            let loaded: Vec<Result<(usize, ImgData), String>> = gs
-                .par_iter()
-                .map(|&g| {
-                    Ok((
-                        g,
-                        load(&ds.positions[g / 3].images[g % 3], cfg.max_features)?,
-                    ))
-                })
-                .collect();
+            let loaded: Vec<Result<(usize, ImgData), String>> =
+                crate::timing::timed("features", || {
+                    gs.par_iter()
+                        .map(|&g| {
+                            Ok((
+                                g,
+                                load(&ds.positions[g / 3].images[g % 3], cfg.max_features)?,
+                            ))
+                        })
+                        .collect()
+                });
             for l in loaded {
                 match l {
                     Ok((g, d)) => {
@@ -1894,7 +1939,7 @@ pub fn run_pipeline_with(
             .map(|g| ds.positions[g / 3].image_enu[g % 3])
             .collect();
         let t1 = Instant::now();
-        let pm = match_pairs(&imgs, &views, &k);
+        let pm = crate::timing::timed("matching", || match_pairs(&imgs, &views, &k));
         st.secs_matching = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
         let pair_ids: Vec<(usize, usize)> = pm.iter().map(|p| (p.i, p.j)).collect();
@@ -1928,14 +1973,16 @@ pub fn run_pipeline_with(
         };
         let init = if cfg.preview_ba_iters > 0 {
             let mut p = start.clone();
-            p.rms = run_ba(
-                &mut p,
-                &k,
-                cfg.preview_ba_iters,
-                Some(&gps),
-                cfg.prior_sigma(),
-                &[],
-            );
+            p.rms = crate::timing::timed("ba_preview", || {
+                run_ba(
+                    &mut p,
+                    &k,
+                    cfg.preview_ba_iters,
+                    Some(&gps),
+                    cfg.prior_sigma(),
+                    &[],
+                )
+            });
             p
         } else {
             start.clone()
@@ -1964,21 +2011,26 @@ pub fn run_pipeline_with(
         // 초벌 점군: 곧바로 만들어 최신 정밀 좌표계로 정렬해 내보낸다.
         let t3 = Instant::now();
         let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
-        let coarse = dense_cloud(
-            &well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200),
-            &imgs,
-            &k,
-            &in_region,
-            cfg.dense_width,
-            cfg.dense_method,
-        );
+        let coarse = crate::timing::timed("coarse_dense_total", || {
+            dense_cloud(
+                &well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200),
+                &imgs,
+                &k,
+                &in_region,
+                cfg.dense_width,
+                cfg.dense_method,
+            )
+        });
         st.secs_dense = t3.elapsed().as_secs_f64();
         st.preview_points = coarse.len();
         let ta = to_tracks(&init, &gids);
         let (mut sim, mut target) = (None, None);
         if let Some(m) = latest_ref {
             let tbm = &recs[m].refined.as_ref().unwrap().0;
-            if let Some((s, n, med)) = region_align(&ta, tbm, r, &recs[m].region) {
+            let ca = crate::timing::timed("align_ghost", || {
+                region_align(&ta, tbm, r, &recs[m].region)
+            });
+            if let Some((s, n, med)) = ca {
                 realigns.push(ReAlign {
                     secs: t_now(),
                     region: slot,
@@ -2062,11 +2114,15 @@ pub fn run_pipeline_with(
                         fixed.push(*i);
                     }
                 }
-                rs.rms = run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed);
+                rs.rms = crate::timing::timed("ba_refined", || {
+                    run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
+                });
                 if anchor.is_none() {
-                    gps_align_refined(&mut rs, &gps);
+                    crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
                 }
-                let cloud = dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod);
+                let cloud = crate::timing::timed("refined_dense_total", || {
+                    dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod)
+                });
                 let _ = tx.send(RefinedMsg {
                     slot,
                     sparse: rs,
@@ -2153,9 +2209,11 @@ pub fn run_pipeline_with(
             }
         })
         .collect();
-    let aligned = apply_alignments(&prelim, &sims);
-    let rep = write_outputs(out, &kept, &aligned, &refined, records.clone())
-        .map_err(|e| format!("출력 쓰기 실패: {e}"))?;
+    let aligned = crate::timing::timed("align_ghost", || apply_alignments(&prelim, &sims));
+    let rep = crate::timing::timed("write", || {
+        write_outputs(out, &kept, &aligned, &refined, records.clone())
+    })
+    .map_err(|e| format!("출력 쓰기 실패: {e}"))?;
     live.note(t_now(), "final", recs.last().map_or(0, |r| r.region.index));
     live.finish(out)?;
     res.issues = skipped;
@@ -2266,6 +2324,11 @@ pub fn run_pipeline_with(
             .join(", ")
     );
     std::fs::write(out.join("report.json"), report).map_err(|e| e.to_string())?;
+    std::fs::write(
+        out.join("timing.json"),
+        crate::timing::to_json(t_start.elapsed().as_secs_f64()),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(res)
 }
 

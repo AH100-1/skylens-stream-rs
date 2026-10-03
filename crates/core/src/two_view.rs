@@ -729,7 +729,46 @@ pub fn ransac_essential_candidates(
     focal_px: f64,
     cfg: &RansacConfig,
 ) -> Vec<(Matrix3<f64>, Vec<bool>)> {
+    ransac_essential_candidates_stats(n1, n2, focal_px, cfg).0
+}
+
+/// [`ransac_essential_candidates`] 의 한 번 실행 통계(진단용).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RansacStats {
+    /// 대응 수.
+    pub n: usize,
+    /// 실제 돌린 표본 반복 수.
+    pub iters: usize,
+    /// 표본 단계가 끝났을 때 최선 모델의 정상 비율.
+    pub best_ratio: f64,
+    /// 사전 검사로 정상 수 세기를 건너뛴 후보 수.
+    pub skipped: usize,
+    /// 표본 단계·정밀화 단계 시간(초).
+    pub secs_sample: f64,
+    pub secs_refine: f64,
+}
+
+/// [`ransac_essential_candidates`] 와 같고 실행 통계도 돌려준다.
+pub fn ransac_essential_candidates_stats(
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    focal_px: f64,
+    cfg: &RansacConfig,
+) -> (Vec<(Matrix3<f64>, Vec<bool>)>, RansacStats) {
+    let mut stats = RansacStats::default();
+    let r = ransac_essential_inner(n1, n2, focal_px, cfg, &mut stats);
+    (r, stats)
+}
+
+fn ransac_essential_inner(
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    focal_px: f64,
+    cfg: &RansacConfig,
+    stats: &mut RansacStats,
+) -> Vec<(Matrix3<f64>, Vec<bool>)> {
     let n = n1.len();
+    stats.n = n;
     if n < 5
         || n != n2.len()
         || !all_finite(n1)
@@ -757,6 +796,7 @@ pub fn ransac_essential_candidates(
             .wrapping_add(1442695040888963407);
         ((st >> 33) as usize) % m
     };
+    let t_sample = std::time::Instant::now();
     let mut pool: Vec<(Matrix3<f64>, usize)> = Vec::new();
     let mut iters = cfg.max_iters;
     let mut it = 0;
@@ -794,6 +834,10 @@ pub fn ransac_essential_candidates(
             }
         }
     }
+    stats.iters = it;
+    stats.best_ratio = pool.first().map_or(0, |p| p.1) as f64 / n as f64;
+    stats.secs_sample = t_sample.elapsed().as_secs_f64();
+    let t_refine = std::time::Instant::now();
     let cost = |e: &Matrix3<f64>, inl: &[bool]| -> f64 {
         (0..n)
             .filter(|&i| inl[i])
@@ -883,6 +927,7 @@ pub fn ransac_essential_candidates(
             out.push((e, inl, c, k, planar));
         }
     }
+    stats.secs_refine = t_refine.elapsed().as_secs_f64();
     out.sort_by(|a, b| b.2.cmp(&a.2).then(a.3.total_cmp(&b.3)));
     let top = out.first().map_or(0, |o| o.2);
     // F-148: 겹침 없는 짝(대응이 사실상 무작위)도 RANSAC 은 우연히 문턱 띠에 든 대응으로 해를 만든다.
