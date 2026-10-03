@@ -1010,7 +1010,7 @@ const GP_PAIR_GATE_RAD: f64 = 3.0 * std::f64::consts::PI / 180.0;
 const GP_MIN_CAM_OBS: usize = 4;
 const GP_MIN_POINT_VIEWS: usize = 3;
 /// 중심 정밀화가 받아들이는 정규방정식의 최소/최대 고윳값 비 하한.
-const GP_MIN_EIG_RATIO: f64 = 1e-4;
+const GP_MIN_EIG_RATIO: f64 = 1e-3;
 /// 보충 단계에서 카메라를 놓는 데 필요한 직선 지지 수.
 const GP_SUPPLEMENT_SUPPORT: usize = 3;
 
@@ -1149,7 +1149,30 @@ fn refine_center(
     }
     a += Matrix3::identity() * (1e-9 * a.trace().max(1e-12));
     let sol = a.cholesky()?.solve(&rhs);
-    sol.iter().all(|v| v.is_finite()).then_some(sol)
+    if !sol.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    // 채택 조건(비엄격): 문턱 안 제약 수가 줄지 않고 각 잔차 제곱합이 늘지 않을 때만 받아들인다.
+    let (n_old, sse_old) = center_fit(cur, cons);
+    let (n_new, sse_new) = center_fit(&sol, cons);
+    (n_new >= n_old && sse_new <= sse_old * (1.0 + 1e-9) + 1e-12).then_some(sol)
+}
+
+/// 중심 `c` 에서 문턱 안 제약 수와 그 각 잔차 제곱합.
+fn center_fit(c: &Vector3<f64>, cons: &[(Vector3<f64>, Vector3<f64>, f64, f64)]) -> (usize, f64) {
+    let (mut n, mut sse) = (0usize, 0.0);
+    for (o, u, _, gate) in cons {
+        let dx = c - o;
+        if dx.dot(u) <= 0.0 {
+            continue;
+        }
+        let a = angle_between(&dx, u);
+        if a <= *gate {
+            n += 1;
+            sse += a * a;
+        }
+    }
+    (n, sse)
 }
 
 fn global_positioning(
@@ -2014,6 +2037,37 @@ mod tests {
             .collect();
         let c = refine_center(&cur, &good).expect("well constrained");
         assert!((c - cur).norm() < 1e-6, "{c:?}");
+    }
+
+    #[test]
+    fn refine_center_stays_put_for_narrow_noisy_rays() {
+        // 정답 중심 (0,0,30), 광선 8개가 퍼짐 spread_deg 이하로 몰리고 방향 잡음 1°. 정답이 아닌 곳에서 출발.
+        let truth = Vector3::new(0.0, 0.0, 30.0);
+        let gate = 3f64.to_radians();
+        for spread_deg in [0.3f64, 0.6, 1.0] {
+            let r = 30.0 * spread_deg.to_radians().tan();
+            let cons: Vec<_> = (0..8)
+                .map(|k| {
+                    let ph = k as f64 * std::f64::consts::FRAC_PI_4;
+                    let x = Vector3::new(r * ph.cos(), r * ph.sin(), 0.0);
+                    // 결정적 1° 잡음: 서로 다른 축으로 기울인다.
+                    let ax = Vector3::new((k as f64 * 2.3).sin(), (k as f64 * 1.7).cos(), 0.3);
+                    let n = Rotation3::from_axis_angle(
+                        &nalgebra::Unit::new_normalize(ax),
+                        1f64.to_radians(),
+                    );
+                    (x, n * (truth - x).normalize(), 1.0, gate)
+                })
+                .collect();
+            let cur = truth + Vector3::new(0.4, -0.3, 2.0);
+            if let Some(c) = refine_center(&cur, &cons) {
+                assert!(
+                    (c - cur).norm() < 1.0,
+                    "spread {spread_deg} deg moved {} m",
+                    (c - cur).norm()
+                );
+            }
+        }
     }
 
     #[test]
