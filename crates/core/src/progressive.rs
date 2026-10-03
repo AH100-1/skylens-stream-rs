@@ -83,6 +83,49 @@ pub fn median(mut v: Vec<f64>) -> Option<f64> {
     Some(v[v.len() / 2])
 }
 
+/// 연쇄 재정렬 한 칸: 구역 `region` 을 `via` 를 거쳐 최신 구역 좌표계로 옮기는 누적 변환.
+#[derive(Clone, Debug)]
+pub struct ChainStep {
+    pub region: usize,
+    pub via: usize,
+    pub total: Similarity,
+    pub pairs: usize,
+    pub median_m: f64,
+}
+
+/// 정밀 구역들(`items[j] = Some((구역, 정밀 트랙))`)을 최신 정밀 구역 `k` 의 좌표계로 옮기는 변환을 구한다.
+/// 같은 사진·같은 특징의 공유 3D 점으로 겹치는 이웃끼리 닮음 변환을 구하고, 최신 구역과 겹치지 않는
+/// 구역은 겹치는 이웃을 거쳐 변환을 연쇄 합성한다(너비 우선). 최신 구역 자신은 결과에 없다.
+pub fn chain_realign(items: &[Option<(Region, &[Track])>], k: usize) -> Vec<ChainStep> {
+    let mut total: Vec<Option<Similarity>> = vec![None; items.len()];
+    total[k] = Some(Similarity::identity());
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([k]);
+    while let Some(m) = queue.pop_front() {
+        let Some((rm, tm)) = items[m] else { continue };
+        for j in 0..items.len() {
+            let Some((rj, tj)) = items[j] else { continue };
+            if total[j].is_some() {
+                continue;
+            }
+            let Some((s, n, med)) = cross_align(tj, tm, overlap_window(&rj, &rm)) else {
+                continue;
+            };
+            let acc = total[m].as_ref().unwrap().compose(&s);
+            out.push(ChainStep {
+                region: j,
+                via: m,
+                total: acc,
+                pairs: n,
+                median_m: med,
+            });
+            total[j] = Some(acc);
+            queue.push_back(j);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
