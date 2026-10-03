@@ -165,6 +165,10 @@ pub struct Config {
     pub coarse_neighbors: usize,
     /// 난수 씨앗.
     pub seed: u64,
+    /// `estimate_fast` 의 가장 거친 층 반복 횟수.
+    pub fast_iterations: usize,
+    /// `estimate_fast` 의 원 해상도 층 전파 후보 수(4 면 가까운 4 만).
+    pub fine_prop: usize,
 }
 
 impl Default for Config {
@@ -174,19 +178,21 @@ impl Default for Config {
             step: 2,
             iterations: 4,
             refine_iterations: 1,
-            coarse_width: 120,
+            coarse_width: 240,
             sigma_color: 0.1,
             sigma_spatial: 3.0,
-            top_k: 2,
+            top_k: 3,
             perturbations: 3,
             refine_perturbations: 1,
             max_neighbors: 8,
-            fine_neighbors: 2,
-            normal_steps: 0,
+            fine_neighbors: 4,
+            normal_steps: 5,
             fine_step: 4,
             fine_propagation: 4,
             coarse_neighbors: 4,
             seed: 0x5eed,
+            fast_iterations: 4,
+            fine_prop: 4,
         }
     }
 }
@@ -634,8 +640,8 @@ impl Ctx<'_> {
                                 );
                                 try_hyp(Hyp { depth: d, n: nn }, &mut best, &mut best_c);
                             }
-                            if it + 1 == total {
-                                let mut s = 0.04;
+                            if !coarsest || it + 1 == total {
+                                let mut s = if coarsest { 0.08 } else { 0.04 };
                                 for _ in 0..normal_steps {
                                     let nn = self.perturb_normal(&mut rng, &best.n, s, &rp);
                                     let b = best;
@@ -961,6 +967,797 @@ fn ncc_cost(q: &Vector3<f32>, patch: &RefPatch, h: &Matrix3<f32>, img: &GrayImag
     (1.0 - ncc).clamp(0.0, MAX_COST)
 }
 
+// ---------------------------------------------------------------------------
+// estimate_fast: 체커보드 병렬 전파 PatchMatch (Galliani 2015) + 단계식 처리
+// ---------------------------------------------------------------------------
+
+/// 빠른 경로의 상위 k 시점 집계 개수(Shen 2013).
+const FAST_TOP_K: usize = 3;
+/// 고운 층에서 이 비용 미만이면 갱신을 건너뛴다.
+const FAST_SKIP_COST: f32 = 0.0;
+
+/// 빠른 경로의 평면 가설 하나: 기준 카메라 z 깊이, 단위 법선(카메라를 향함), 집계 비용.
+#[derive(Clone, Copy)]
+struct FHyp {
+    d: f32,
+    n: Vector3<f32>,
+    c: f32,
+}
+
+/// 0~1 로 정규화한 회색조 한 장(행 우선).
+struct FImg {
+    w: usize,
+    h: usize,
+    data: Vec<f32>,
+}
+
+impl FImg {
+    /// 유한 값의 최소·최대로 0~1 정규화(NaN 은 NaN 으로 둔다).
+    fn from_gray(g: &GrayImage) -> Self {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &v in g.data.iter().filter(|v| v.is_finite()) {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let span = hi - lo;
+        let data = g
+            .data
+            .iter()
+            .map(|&v| {
+                if !v.is_finite() {
+                    f32::NAN
+                } else if span > 0.0 {
+                    (v - lo) / span
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        Self {
+            w: g.width,
+            h: g.height,
+            data,
+        }
+    }
+
+    fn half(&self) -> Self {
+        let (w, h) = (self.w / 2, self.h / 2);
+        let mut data = vec![0f32; w * h];
+        data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let r0 = &self.data[2 * y * self.w..];
+            let r1 = &self.data[(2 * y + 1) * self.w..];
+            for (x, o) in row.iter_mut().enumerate() {
+                *o = 0.25 * (r0[2 * x] + r0[2 * x + 1] + r1[2 * x] + r1[2 * x + 1]);
+            }
+        });
+        Self { w, h, data }
+    }
+
+    /// 화소 번호 좌표에서 쌍선형 보간. 영상 밖이면 None.
+    #[inline(always)]
+    fn sample(&self, x: f32, y: f32) -> Option<f32> {
+        if !(x >= 0.0 && y >= 0.0) {
+            return None;
+        }
+        let (x0, y0) = (x as usize, y as usize);
+        if x0 + 1 >= self.w || y0 + 1 >= self.h {
+            return None;
+        }
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let i = y0 * self.w + x0;
+        let (a, b) = (self.data[i], self.data[i + 1]);
+        let (c, d) = (self.data[i + self.w], self.data[i + self.w + 1]);
+        Some((a + (b - a) * fx) * (1.0 - fy) + (c + (d - c) * fx) * fy)
+    }
+}
+
+/// 한 층의 문맥. `mean`·`istd` 는 기준 창의 평균·표준편차 역수 캐시(질감 없음이면 istd = 0).
+struct FCtx<'a> {
+    w: usize,
+    h: usize,
+    kinv: Matrix3<f32>,
+    refimg: &'a FImg,
+    nbrs: Vec<(NeighborGeom, &'a FImg)>,
+    offs: Vec<[f32; 2]>,
+    mean: Vec<f32>,
+    istd: Vec<f32>,
+    range: (f32, f32),
+    /// 화소별 쓸 이웃 비트마스크(비트 j = 이웃 j). 거친 층 첫 반복 뒤 비용이 낮은 쪽만 남긴다.
+    mask: Vec<u8>,
+}
+
+/// 창 안 표본값(기준 영상). 가장자리는 가장 가까운 화소로 대치.
+struct FPatch {
+    v: [f32; MAX_SAMPLES],
+}
+
+#[inline]
+fn fast_hash(a: u64, b: u64) -> u64 {
+    let mut z = a.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ b.wrapping_add(0x632b_e59b_d9b4_e019);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// xorshift64*: 화소·반복마다 새로 시드하므로 병렬이어도 결과가 같다.
+struct FRng(u64);
+
+impl FRng {
+    #[inline]
+    fn f(&mut self) -> f32 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        let v = self.0.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        (v >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+impl FCtx<'_> {
+    #[inline]
+    fn ray(&self, x: usize, y: usize) -> Vector3<f32> {
+        self.kinv * Vector3::new(x as f32 + 0.5, y as f32 + 0.5, 1.0)
+    }
+
+    /// 화소 (x, y) 창의 기준 표본값과 (평균, 표준편차 역수)를 만든다.
+    fn gather(&self, x: usize, y: usize, p: &mut FPatch) -> Option<(f32, f32)> {
+        let (mut s, mut s2) = (0.0f32, 0.0f32);
+        let n = self.offs.len();
+        for (k, o) in self.offs.iter().enumerate() {
+            let px = (x as i32 + o[0] as i32).clamp(0, self.w as i32 - 1) as usize;
+            let py = (y as i32 + o[1] as i32).clamp(0, self.h as i32 - 1) as usize;
+            let v = self.refimg.data[py * self.w + px];
+            p.v[k] = v;
+            s += v;
+            s2 += v * v;
+        }
+        let inv = 1.0 / n as f32;
+        let mean = s * inv;
+        let var = s2 * inv - mean * mean;
+        (var >= 1e-6).then(|| (mean, 1.0 / var.sqrt()))
+    }
+
+    /// 한 이웃에서의 1 − NCC. 평면 유도 호모그래피 H = A + (K t)(n/D)ᵀ 를 창 중심에서 한 번
+    /// 만들고 표본마다 열 두 개를 더해 옮긴다(할당 없음).
+    #[inline]
+    fn ncc(
+        &self,
+        j: usize,
+        q: &Vector3<f32>,
+        nv: &Vector3<f32>,
+        p: &FPatch,
+        mean: f32,
+        istd: f32,
+    ) -> f32 {
+        let (g, img) = (&self.nbrs[j].0, self.nbrs[j].1);
+        let kt = g.kt;
+        let base = g.a * q + kt * nv.dot(q);
+        let c0 = g.a.column(0) + kt * nv.x;
+        let c1 = g.a.column(1) + kt * nv.y;
+        let (mut sy, mut sy2, mut sxy) = (0.0f32, 0.0f32, 0.0f32);
+        for (k, o) in self.offs.iter().enumerate() {
+            let pz = base.z + o[0] * c0.z + o[1] * c1.z;
+            if pz <= 1e-6 {
+                return MAX_COST;
+            }
+            let inv = 1.0 / pz;
+            let px = (base.x + o[0] * c0.x + o[1] * c1.x) * inv - 0.5;
+            let py = (base.y + o[0] * c0.y + o[1] * c1.y) * inv - 0.5;
+            let Some(s) = img.sample(px, py) else {
+                return MAX_COST;
+            };
+            sy += s;
+            sy2 += s * s;
+            sxy += s * p.v[k];
+        }
+        let inv_n = 1.0 / self.offs.len() as f32;
+        let my = sy * inv_n;
+        let vy = sy2 * inv_n - my * my;
+        if vy.is_nan() || vy < 1e-6 {
+            return MAX_COST;
+        }
+        let ncc = (sxy * inv_n - my * mean) * istd / vy.sqrt();
+        if !ncc.is_finite() {
+            return MAX_COST;
+        }
+        (1.0 - ncc).clamp(0.0, MAX_COST)
+    }
+
+    /// 상위 k 이웃 비용의 평균.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn agg(
+        &self,
+        q: &Vector3<f32>,
+        m: &Vector3<f32>,
+        d: f32,
+        n: &Vector3<f32>,
+        p: &FPatch,
+        mean: f32,
+        istd: f32,
+        msk: u8,
+    ) -> f32 {
+        let den = n.dot(m);
+        if den >= -1e-3 {
+            return MAX_COST;
+        }
+        let nv = self.kinv.transpose() * (n / (d * den));
+        let used = if self.nbrs.len() >= 8 {
+            msk.count_ones() as usize
+        } else {
+            self.nbrs.len()
+        };
+        let k = FAST_TOP_K.min(used.max(1));
+        let mut best = [MAX_COST; FAST_TOP_K];
+        for j in 0..self.nbrs.len() {
+            if j < 8 && msk >> j & 1 == 0 {
+                continue;
+            }
+            let mut c = self.ncc(j, q, &nv, p, mean, istd);
+            for b in best.iter_mut().take(k) {
+                if c < *b {
+                    std::mem::swap(&mut c, b);
+                }
+            }
+        }
+        best.iter().take(k).sum::<f32>() / k as f32
+    }
+
+    fn random_normal(&self, rng: &mut FRng, m: &Vector3<f32>) -> Vector3<f32> {
+        let rn = m.normalize();
+        for _ in 0..32 {
+            let v = Vector3::new(
+                2.0 * rng.f() - 1.0,
+                2.0 * rng.f() - 1.0,
+                2.0 * rng.f() - 1.0,
+            );
+            let l = v.norm();
+            if !(0.05..=1.0).contains(&l) {
+                continue;
+            }
+            let mut n = v / l;
+            if n.dot(&rn) > 0.0 {
+                n = -n;
+            }
+            if n.dot(&rn) < -0.2 {
+                return n;
+            }
+        }
+        -rn
+    }
+
+    /// 현재 가설로 화소마다 이웃별 비용을 재어 낮은 `keep` 장의 비트마스크를 만든다(이웃 8장 이하).
+    fn pixel_masks(&self, hyps: &[FHyp], keep: usize) -> Vec<u8> {
+        let w = self.w;
+        let nn = self.nbrs.len().min(8);
+        let mut out = vec![0xFFu8; w * self.h];
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let mut p = FPatch {
+                v: [0.0; MAX_SAMPLES],
+            };
+            for (x, o) in row.iter_mut().enumerate() {
+                let i = y * w + x;
+                let hy = &hyps[i];
+                if self.istd[i] == 0.0 {
+                    continue;
+                }
+                let m = self.ray(x, y);
+                let den = hy.n.dot(&m);
+                if den >= -1e-3 {
+                    continue;
+                }
+                self.gather(x, y, &mut p);
+                let q = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, 1.0);
+                let nv = self.kinv.transpose() * (hy.n / (hy.d * den));
+                let mut cs = [(MAX_COST, 0usize); 8];
+                for (j, c) in cs.iter_mut().enumerate().take(nn) {
+                    *c = (self.ncc(j, &q, &nv, &p, self.mean[i], self.istd[i]), j);
+                }
+                cs[..nn].sort_by(|a, b| a.0.total_cmp(&b.0));
+                *o = cs[..keep.min(nn)].iter().fold(0u8, |m, c| m | 1 << c.1);
+            }
+        });
+        out
+    }
+
+    /// 층 안 모든 화소 비용을 현재 가설로 다시 잰다.
+    fn eval_all(&self, hyps: &mut [FHyp]) {
+        let w = self.w;
+        hyps.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let mut p = FPatch {
+                v: [0.0; MAX_SAMPLES],
+            };
+            for (x, hy) in row.iter_mut().enumerate() {
+                let i = y * w + x;
+                if self.istd[i] == 0.0 {
+                    hy.c = MAX_COST;
+                    continue;
+                }
+                self.gather(x, y, &mut p);
+                let m = self.ray(x, y);
+                let q = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, 1.0);
+                hy.c = self.agg(
+                    &q,
+                    &m,
+                    hy.d,
+                    &hy.n,
+                    &p,
+                    self.mean[i],
+                    self.istd[i],
+                    self.mask[i],
+                );
+            }
+        });
+    }
+
+    /// 한 색 반쪽(`color` = (x + y) & 1)의 화소를 동시에 갱신한다. 읽기는 `cur`, 쓰기는 `out`.
+    fn phase(&self, cur: &[FHyp], out: &mut [FHyp], color: usize, tag: u64, sc: &FSched) {
+        let w = self.w;
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let mut p = FPatch {
+                v: [0.0; MAX_SAMPLES],
+            };
+            let mut x = (y + color) & 1;
+            while x < w {
+                let i = y * w + x;
+                if self.istd[i] != 0.0 {
+                    if let Some(h) = self.update(cur, x, y, tag, sc, &mut p) {
+                        row[x] = h;
+                    }
+                }
+                x += 2;
+            }
+        });
+    }
+
+    fn update(
+        &self,
+        cur: &[FHyp],
+        x: usize,
+        y: usize,
+        tag: u64,
+        sc: &FSched,
+        p: &mut FPatch,
+    ) -> Option<FHyp> {
+        const PAT: [(i32, i32); 8] = [
+            (0, -1),
+            (0, 1),
+            (-1, 0),
+            (1, 0),
+            (0, -3),
+            (0, 3),
+            (-3, 0),
+            (3, 0),
+        ];
+        let i = y * self.w + x;
+        let (mean, istd, msk) = (self.mean[i], self.istd[i], self.mask[i]);
+        self.gather(x, y, p);
+        let m = self.ray(x, y);
+        let q = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, 1.0);
+        let mut rng = FRng(fast_hash(tag, i as u64) | 1);
+        let mut best = cur[i];
+        let mut tried = [(0.0f32, Vector3::<f32>::zeros()); 9];
+        let mut nt = 1;
+        tried[0] = (best.d, best.n);
+        // 전파: 가까운 4 + 먼 4 표본(반대 색 화소)의 평면을 이 화소 광선으로 옮긴다.
+        if best.c < sc.skip_below {
+            return None;
+        }
+        for &(dx, dy) in &PAT[..sc.n_prop] {
+            let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+            if nx < 0 || ny < 0 || nx >= self.w as i32 || ny >= self.h as i32 {
+                continue;
+            }
+            let c = &cur[ny as usize * self.w + nx as usize];
+            if c.c >= MAX_COST {
+                continue;
+            }
+            let pm = self.ray(nx as usize, ny as usize);
+            let den = c.n.dot(&m);
+            if den >= -1e-3 {
+                continue;
+            }
+            let d = c.d * c.n.dot(&pm) / den;
+            if !(d >= self.range.0 && d <= self.range.1) {
+                continue;
+            }
+            if tried[..nt]
+                .iter()
+                .any(|t| (t.0 - d).abs() < 1e-4 * d && t.1.dot(&c.n) > 0.99999)
+            {
+                continue;
+            }
+            tried[nt] = (d, c.n);
+            nt += 1;
+            let cost = self.agg(&q, &m, d, &c.n, p, mean, istd, msk);
+            if cost < best.c {
+                best = FHyp { d, n: c.n, c: cost };
+            }
+        }
+        // 정제: 섭동 폭을 단계마다 절반으로.
+        let mut ad = sc.amp_d;
+        let mut an = sc.amp_n;
+        for _ in 0..sc.steps {
+            let dd =
+                (best.d * (1.0 + ad * (2.0 * rng.f() - 1.0))).clamp(self.range.0, self.range.1);
+            let dn = best.n
+                + Vector3::new(
+                    an * (2.0 * rng.f() - 1.0),
+                    an * (2.0 * rng.f() - 1.0),
+                    an * (2.0 * rng.f() - 1.0),
+                );
+            let nn = dn / dn.norm();
+            let ok_n = nn.dot(&m) < -0.05 * m.norm() && nn.iter().all(|v| v.is_finite());
+            let (b0, mut cand) = (best, [(dd, best.n), (best.d, nn), (dd, nn)]);
+            if !ok_n {
+                cand[1] = (b0.d, b0.n);
+                cand[2] = (dd, b0.n);
+            }
+            for (d, n) in cand {
+                let cost = self.agg(&q, &m, d, &n, p, mean, istd, msk);
+                if cost < best.c {
+                    best = FHyp { d, n, c: cost };
+                }
+            }
+            ad *= 0.5;
+            an *= 0.5;
+        }
+        if sc.fresh {
+            let (a, b) = (1.0 / self.range.0, 1.0 / self.range.1);
+            let d = 1.0 / (a + (b - a) * rng.f());
+            let n = self.random_normal(&mut rng, &m);
+            let cost = self.agg(&q, &m, d, &n, p, mean, istd, msk);
+            if cost < best.c {
+                best = FHyp { d, n, c: cost };
+            }
+        }
+        (best.c < cur[i].c).then_some(best)
+    }
+}
+
+/// 한 반복의 계획.
+struct FSched {
+    /// 깊이 상대 섭동 폭(첫 단계).
+    amp_d: f32,
+    /// 법선 섭동 폭(첫 단계).
+    amp_n: f32,
+    steps: usize,
+    fresh: bool,
+    /// 전파 후보 수(8 이면 가까운 4 + 먼 4, 4 면 가까운 4 만).
+    n_prop: usize,
+    /// 이 비용 미만인 화소는 건너뛴다(고운 층에서 이미 맞은 화소).
+    skip_below: f32,
+}
+
+struct FLevel {
+    k: Vec<Matrix3<f64>>,
+    img: Vec<FImg>,
+}
+
+fn fast_offsets(radius: usize, step: usize) -> Vec<[f32; 2]> {
+    let step = step.max(1);
+    let r = (radius / step).max(1) as i32;
+    let mut v = Vec::new();
+    for j in -r..=r {
+        for i in -r..=r {
+            v.push([(i * step as i32) as f32, (j * step as i32) as f32]);
+        }
+    }
+    v.truncate(MAX_SAMPLES);
+    v
+}
+
+/// 빠른 밀집 깊이: [`estimate`] 와 같은 입출력 규약. 저해상도(최대 1/4)에서 무작위 초기화 후
+/// 체커보드 전파·섭동 정제를 돌리고, 평면을 위 층으로 올려 짧게 반복한다. 이웃 시점 선택은
+/// 호출 쪽 몫(앞에서 [`Config::max_neighbors`] 장을 쓴다). 층이 올라가면 현재 가설로 이웃별
+/// 비용을 재어 [`Config::fine_neighbors`] 장만 남긴다.
+pub fn estimate_fast(
+    ref_view: &View,
+    neighbors: &[View],
+    range: (f64, f64),
+    cfg: &Config,
+) -> DepthMap {
+    estimate_fast_profiled(ref_view, neighbors, range, cfg, None)
+}
+
+/// `estimate_fast` 와 같고, `stages` 가 있으면 단계별 (이름, 초)를 덧붙인다.
+pub fn estimate_fast_profiled(
+    ref_view: &View,
+    neighbors: &[View],
+    range: (f64, f64),
+    cfg: &Config,
+    mut stages: Option<&mut Vec<(String, f64)>>,
+) -> DepthMap {
+    let t_all = std::time::Instant::now();
+    let mut tick = std::time::Instant::now();
+    let mut mark = |name: String, stages: &mut Option<&mut Vec<(String, f64)>>| {
+        if let Some(s) = stages.as_deref_mut() {
+            s.push((name, tick.elapsed().as_secs_f64()));
+        }
+        tick = std::time::Instant::now();
+    };
+    let (w, h) = (ref_view.image.width, ref_view.image.height);
+    let range_ok = range.0.is_finite() && range.1.is_finite() && range.0 > 0.0 && range.0 < range.1;
+    let nb = &neighbors[..neighbors.len().min(cfg.max_neighbors.min(MAX_NEIGHBORS))];
+    if !range_ok || nb.is_empty() || w < 2 || h < 2 {
+        return DepthMap::invalid(w, h);
+    }
+    let all = || std::iter::once(ref_view).chain(nb);
+    let mut levels = vec![FLevel {
+        k: all().map(|v| intrinsics_matrix(&v.camera)).collect(),
+        img: all().map(|v| FImg::from_gray(&v.image)).collect(),
+    }];
+    while cfg.coarse_width > 0
+        && levels.last().unwrap().img[0].w >= 2 * cfg.coarse_width
+        && levels.last().unwrap().img[0].h >= 16
+    {
+        let prev = levels.last().unwrap();
+        let half = Matrix3::new(0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0);
+        let next = FLevel {
+            k: prev.k.iter().map(|k| half * k).collect(),
+            img: prev.img.par_iter().map(|g| g.half()).collect(),
+        };
+        levels.push(next);
+    }
+
+    mark("pyramid".into(), &mut stages);
+    let rr = ref_view.camera.pose.rotation.into_inner();
+    let tr = ref_view.camera.pose.translation;
+    let rel: Vec<(Matrix3<f64>, Vector3<f64>)> = nb
+        .iter()
+        .map(|v| {
+            let r_rel = v.camera.pose.rotation.into_inner() * rr.transpose();
+            (r_rel, v.camera.pose.translation - r_rel * tr)
+        })
+        .collect();
+    let range32 = (range.0 as f32, range.1 as f32);
+    let offs = fast_offsets(cfg.radius, cfg.step);
+
+    type LevelState = (Vec<FHyp>, usize, usize, Matrix3<f32>, Vec<u8>);
+    let mut state: Option<LevelState> = None;
+    let use_masks = nb.len() <= 8 && cfg.fine_neighbors > 0 && cfg.fine_neighbors < nb.len();
+    let top = levels.len() - 1;
+    for li in (0..levels.len()).rev() {
+        let lv = &levels[li];
+        let (lw, lh) = (lv.img[0].w, lv.img[0].h);
+        let kinv64 = lv.k[0].try_inverse().expect("내부 행렬은 가역");
+        let nbrs: Vec<(NeighborGeom, &FImg)> = rel
+            .iter()
+            .zip(lv.k[1..].iter().zip(&lv.img[1..]))
+            .map(|((r_rel, t_rel), (kj, img))| {
+                (
+                    NeighborGeom {
+                        a: (kj * r_rel * kinv64).cast(),
+                        kt: (kj * t_rel).cast(),
+                    },
+                    img,
+                )
+            })
+            .collect();
+        let mut ctx = FCtx {
+            w: lw,
+            h: lh,
+            kinv: kinv64.cast(),
+            refimg: &lv.img[0],
+            nbrs,
+            offs: offs.clone(),
+            mean: vec![0.0; lw * lh],
+            istd: vec![0.0; lw * lh],
+            range: range32,
+            mask: vec![0xFF; lw * lh],
+        };
+        // 기준 창 평균·표준편차 역수 캐시.
+        {
+            let (mean, istd) = (&mut ctx.mean, &mut ctx.istd);
+            let c: &FCtx = &FCtx {
+                w: lw,
+                h: lh,
+                kinv: kinv64.cast(),
+                refimg: &lv.img[0],
+                nbrs: Vec::new(),
+                offs: offs.clone(),
+                mean: Vec::new(),
+                istd: Vec::new(),
+                range: range32,
+                mask: Vec::new(),
+            };
+            mean.par_chunks_mut(lw)
+                .zip(istd.par_chunks_mut(lw))
+                .enumerate()
+                .for_each(|(y, (mr, ir))| {
+                    let mut p = FPatch {
+                        v: [0.0; MAX_SAMPLES],
+                    };
+                    for x in 0..lw {
+                        if let Some((m, s)) = c.gather(x, y, &mut p) {
+                            mr[x] = m;
+                            ir[x] = s;
+                        }
+                    }
+                });
+        }
+        // 초기 가설: 맨 위 층은 무작위, 그 아래는 위 층 평면을 옮긴다.
+        let mut hyps = vec![
+            FHyp {
+                d: 0.0,
+                n: Vector3::zeros(),
+                c: MAX_COST,
+            };
+            lw * lh
+        ];
+        match state.take() {
+            None => {
+                let (a, b) = (1.0 / range32.0, 1.0 / range32.1);
+                hyps.par_chunks_mut(lw).enumerate().for_each(|(y, row)| {
+                    for (x, hy) in row.iter_mut().enumerate() {
+                        let mut rng = FRng(fast_hash(cfg.seed, (y * lw + x) as u64) | 1);
+                        let m = ctx.ray(x, y);
+                        hy.d = 1.0 / (a + (b - a) * rng.f());
+                        hy.n = ctx.random_normal(&mut rng, &m);
+                    }
+                });
+            }
+            Some((prev, pw, ph, pkinv, pmask)) => {
+                if use_masks {
+                    ctx.mask
+                        .par_chunks_mut(lw)
+                        .enumerate()
+                        .for_each(|(y, row)| {
+                            for (x, o) in row.iter_mut().enumerate() {
+                                *o = pmask[(y / 2).min(ph - 1) * pw + (x / 2).min(pw - 1)];
+                            }
+                        });
+                }
+                hyps.par_chunks_mut(lw).enumerate().for_each(|(y, row)| {
+                    for (x, hy) in row.iter_mut().enumerate() {
+                        let (px, py) = ((x / 2).min(pw - 1), (y / 2).min(ph - 1));
+                        let s = &prev[py * pw + px];
+                        let pm = pkinv * Vector3::new(px as f32 + 0.5, py as f32 + 0.5, 1.0);
+                        let m = ctx.ray(x, y);
+                        let den = s.n.dot(&m);
+                        let d = if den < -1e-3 {
+                            (s.d * s.n.dot(&pm) / den).clamp(range32.0, range32.1)
+                        } else {
+                            s.d
+                        };
+                        *hy = FHyp {
+                            d,
+                            n: s.n,
+                            c: MAX_COST,
+                        };
+                    }
+                });
+                // 이웃 선택: 현재 가설로 이웃마다 비용을 재어 좋은 쪽만 남긴다.
+                let keep = if cfg.fine_neighbors == 0 {
+                    ctx.nbrs.len()
+                } else {
+                    cfg.fine_neighbors.min(ctx.nbrs.len())
+                };
+                if !use_masks && keep < ctx.nbrs.len() {
+                    ctx.nbrs = fast_select_neighbors(&ctx, &hyps, keep);
+                }
+            }
+        }
+        mark(format!("L{li} setup+init"), &mut stages);
+        ctx.eval_all(&mut hyps);
+        mark(format!("L{li} eval_all"), &mut stages);
+
+        let coarsest = li == top;
+        let iters = if coarsest {
+            cfg.fast_iterations
+        } else {
+            cfg.refine_iterations
+        };
+        let lvl_up = (top - li) as i32;
+        let steps = if coarsest {
+            cfg.perturbations
+        } else {
+            cfg.refine_perturbations
+        };
+        let mut other = hyps.clone();
+        for it in 0..iters {
+            // 섭동 폭은 반복마다 절반(바닥 1/16), 층이 올라갈 때마다 1/4·1/2.
+            let halve = 0.5f32.powi(it as i32).max(0.0625);
+            let sc = FSched {
+                amp_d: 0.1 * halve * 0.25f32.powi(lvl_up),
+                amp_n: 0.5 * halve * 0.5f32.powi(lvl_up),
+                steps,
+                fresh: coarsest,
+                n_prop: if li == 0 && cfg.fine_prop < 8 {
+                    cfg.fine_prop
+                } else {
+                    8
+                },
+                skip_below: if coarsest { 0.0 } else { FAST_SKIP_COST },
+            };
+            for color in 0..2usize {
+                let tag = fast_hash(cfg.seed, ((li * 64 + it) * 2 + color) as u64);
+                other.copy_from_slice(&hyps);
+                ctx.phase(&hyps, &mut other, color, tag, &sc);
+                std::mem::swap(&mut hyps, &mut other);
+            }
+            if coarsest && use_masks && it == 0 {
+                ctx.mask = ctx.pixel_masks(&hyps, cfg.fine_neighbors);
+            }
+        }
+        mark(format!("L{li} iterations"), &mut stages);
+        state = Some((hyps, lw, lh, ctx.kinv, std::mem::take(&mut ctx.mask)));
+    }
+
+    let (hyps, lw, lh, _, _) = state.unwrap();
+    let _ = t_all;
+    debug_assert_eq!((lw, lh), (w, h));
+    let mut dm = DepthMap::invalid(w, h);
+    for (i, hy) in hyps.iter().enumerate() {
+        if hy.c < MAX_COST && hy.d > 0.0 {
+            dm.depth[i] = hy.d;
+            dm.normal[i] = [hy.n.x, hy.n.y, hy.n.z];
+            dm.cost[i] = hy.c;
+        }
+    }
+    dm
+}
+
+/// 격자 표본 화소에서 이웃별 평균 비용을 재어 가장 낮은 `keep` 장을 고른다.
+fn fast_select_neighbors<'a>(
+    ctx: &FCtx<'a>,
+    hyps: &[FHyp],
+    keep: usize,
+) -> Vec<(NeighborGeom, &'a FImg)> {
+    let nn = ctx.nbrs.len();
+    let stride = 4usize;
+    let sums: Vec<f64> = (0..ctx.h / stride)
+        .into_par_iter()
+        .map(|gy| {
+            let mut p = FPatch {
+                v: [0.0; MAX_SAMPLES],
+            };
+            let mut acc = vec![0f64; nn];
+            for gx in 0..ctx.w / stride {
+                let (x, y) = (gx * stride + stride / 2, gy * stride + stride / 2);
+                let i = y * ctx.w + x;
+                if ctx.istd[i] == 0.0 {
+                    continue;
+                }
+                ctx.gather(x, y, &mut p);
+                let hy = &hyps[i];
+                let m = ctx.ray(x, y);
+                let den = hy.n.dot(&m);
+                if den >= -1e-3 {
+                    continue;
+                }
+                let q = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, 1.0);
+                let nv = ctx.kinv.transpose() * (hy.n / (hy.d * den));
+                for (j, a) in acc.iter_mut().enumerate() {
+                    *a += ctx.ncc(j, &q, &nv, &p, ctx.mean[i], ctx.istd[i]) as f64;
+                }
+            }
+            acc
+        })
+        .reduce(
+            || vec![0f64; nn],
+            |mut a, b| {
+                a.iter_mut().zip(&b).for_each(|(x, y)| *x += y);
+                a
+            },
+        );
+    let mut order: Vec<usize> = (0..nn).collect();
+    order.sort_by(|&a, &b| {
+        sums[a]
+            .partial_cmp(&sums[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order.truncate(keep);
+    order.sort_unstable();
+    order
+        .into_iter()
+        .map(|j| {
+            let (g, img) = &ctx.nbrs[j];
+            (NeighborGeom { a: g.a, kt: g.kt }, *img)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,7 +1930,12 @@ mod tests {
                 let i = y * dm.w + x;
                 rel.push((dm.depth[i] as f64 - gt[i]).abs() / gt[i]);
                 let n = dm.normal[i];
-                let n = Vector3::new(n[0] as f64, n[1] as f64, n[2] as f64).normalize();
+                let n = Vector3::new(n[0] as f64, n[1] as f64, n[2] as f64);
+                if n.norm() == 0.0 {
+                    ang.push(180.0);
+                    continue;
+                }
+                let n = n.normalize();
                 ang.push(n.dot(&gt_n(i)).clamp(-1.0, 1.0).acos().to_degrees());
             }
         }
@@ -1227,7 +2029,6 @@ mod tests {
     // 깊이 1% 는 시차 0.14 px 에 해당하므로 부분 화소 정합이 되어야 넘는 기준이다.
 
     #[test]
-    #[ignore = "창 25 표본(반지름 4·간격 2)으로 법선 중앙값 7.4° > 5°, 깊이 기준은 통과(노트 참조)"]
     fn slanted_plane_depth_and_normal() {
         let s = slanted_stats(1.0, &Config::default());
         report("경사 평면", &s);
@@ -1260,7 +2061,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "창 25 표본(반지름 4·간격 2)으로 법선 중앙값 6.9° > 5°, 깊이 기준은 통과(노트 참조)"]
     fn steps_depth() {
         // 기준 시점 정규 x 범위 [-0.6,-0.2), [-0.2,0.2), [0.2,0.6) 에 깊이 8, 10, 12 계단.
         let zs = [(8.0, -0.6, -0.2), (10.0, -0.2, 0.2), (12.0, 0.2, 0.6)];
@@ -1543,5 +2343,246 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- estimate_fast ----
+
+    /// 빠른 경로 법선 기준(도).
+    const FAST_NORMAL_DEG: f64 = 5.0;
+
+    fn fast_slanted(scale: f32) -> Stats {
+        let (a, b) = (0.3, -0.15);
+        let scene = Scene::Slanted { z0: 10.0, a, b };
+        let cams = rig(160, 120, 1.0, 10.0);
+        let (mut refv, mut ns, gt) = views(&cams, &scene);
+        for v in std::iter::once(&mut refv).chain(ns.iter_mut()) {
+            v.image.data.iter_mut().for_each(|p| *p *= scale);
+        }
+        let dm = estimate_fast(&refv, &ns, (5.0, 20.0), &Config::default());
+        let n_gt = Vector3::new(a, b, -1.0).normalize();
+        let m = 8;
+        stats(
+            &dm,
+            &gt,
+            |_| n_gt,
+            |x, y| x >= m && y >= m && x < 160 - m && y < 120 - m,
+        )
+    }
+
+    #[test]
+    fn fast_slanted_plane() {
+        for scale in [1.0f32, 255.0] {
+            let s = fast_slanted(scale);
+            report(&format!("빠른 경사 평면 ×{scale}"), &s);
+            assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
+            assert!(s.within_1pct > 0.90, "1% 이내 비율 {}", s.within_1pct);
+            assert!(
+                s.median_normal_deg < FAST_NORMAL_DEG,
+                "법선 {}°",
+                s.median_normal_deg
+            );
+        }
+    }
+
+    #[test]
+    fn fast_steps_depth() {
+        let zs = [(8.0, -0.6, -0.2), (10.0, -0.2, 0.2), (12.0, 0.2, 0.6)];
+        let steps = zs.iter().map(|&(z, a, b)| (z, a * z, b * z)).collect();
+        let scene = Scene::Steps { steps, back: 16.0 };
+        let cams = rig(160, 120, 1.0, 10.0);
+        let (refv, ns, gt) = views(&cams, &scene);
+        let dm = estimate_fast(&refv, &ns, (5.0, 20.0), &Config::default());
+        let n_gt = Vector3::new(0.0, 0.0, -1.0);
+        let (w, h) = (160usize, 120usize);
+        let m = 8;
+        let near_edge = |x: usize, y: usize| {
+            let g = gt[y * w + x];
+            (x.saturating_sub(6)..(x + 7).min(w)).any(|xx| (gt[y * w + xx] - g).abs() > 0.05 * g)
+        };
+        let s = stats(
+            &dm,
+            &gt,
+            |_| n_gt,
+            |x, y| x >= m && y >= m && x < w - m && y < h - m && !near_edge(x, y),
+        );
+        report("빠른 계단", &s);
+        assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
+        assert!(s.within_1pct > 0.85, "1% 이내 비율 {}", s.within_1pct);
+        assert!(
+            s.median_normal_deg < FAST_NORMAL_DEG,
+            "법선 {}°",
+            s.median_normal_deg
+        );
+    }
+
+    #[test]
+    fn fast_formation_ground() {
+        let (w, h) = (320u32, 180u32);
+        let cams = formation_rig(w, h);
+        let (refv, ns, gt) = views(&cams, &Scene::Ground);
+        let n_gt = (cams[0].pose.rotation * Vector3::new(0.0, 0.0, 1.0)).normalize();
+        let m = 10;
+        let mut worst_normal = 0.0f64;
+        for seed in 0..5u64 {
+            let cfg = Config {
+                seed: 0x5eed + seed,
+                ..Config::default()
+            };
+            let dm = estimate_fast(&refv, &ns, (20.0, 70.0), &cfg);
+            let s = stats(
+                &dm,
+                &gt,
+                |_| n_gt,
+                |x, y| x >= m && y >= m && x < w as usize - m && y < h as usize - m,
+            );
+            report(&format!("빠른 편대 지면 씨앗 {seed}"), &s);
+            assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
+            assert!(s.within_1pct > 0.90, "1% 이내 비율 {}", s.within_1pct);
+            worst_normal = worst_normal.max(s.median_normal_deg);
+        }
+        assert!(worst_normal < 4.0, "법선 중앙 최댓값 {worst_normal}°");
+    }
+
+    #[test]
+    fn fast_deterministic_and_invalid() {
+        let scene = Scene::Slanted {
+            z0: 10.0,
+            a: 0.0,
+            b: 0.0,
+        };
+        let cams = rig(48, 36, 1.0, 10.0);
+        let (mut refv, ns, _) = views(&cams, &scene);
+        let cfg = Config::default();
+        let a = estimate_fast(&refv, &ns, (5.0, 20.0), &cfg);
+        let b = estimate_fast(&refv, &ns, (5.0, 20.0), &cfg);
+        assert_eq!((a.w, a.h), (48, 36));
+        assert_eq!(a.depth, b.depth);
+        assert_eq!(a.normal.len(), 48 * 36);
+        assert!(a
+            .depth
+            .iter()
+            .all(|&d| d == 0.0 || (5.0..=20.0).contains(&d)));
+        let c = estimate_fast(&refv, &[], (5.0, 20.0), &cfg);
+        assert!(c.cost.iter().all(|&v| v == MAX_COST));
+        assert!(c.depth.iter().all(|&d| d == 0.0));
+        for range in [(20.0, 5.0), (0.0, 10.0), (-1.0, 10.0), (5.0, f64::NAN)] {
+            let dm = estimate_fast(&refv, &ns, range, &cfg);
+            assert!(dm.cost.iter().all(|&c| c == MAX_COST), "{range:?}");
+        }
+        let i = 18 * 48 + 24;
+        refv.image.data[i] = f32::NAN;
+        let dm = estimate_fast(&refv, &ns, (5.0, 20.0), &cfg);
+        assert_eq!(dm.cost[i], MAX_COST);
+        assert!(dm.depth.iter().all(|d| d.is_finite()));
+    }
+
+    /// 960×540, 이웃 8장: estimate 와 estimate_fast 를 번갈아 재고 비율을 낸다.
+    /// cargo test --release -- --ignored fast_vs_estimate_960 --nocapture
+    #[test]
+    #[ignore = "시간 측정용(측정 기계 부하에 따라 값이 달라짐)"]
+    fn fast_vs_estimate_960() {
+        let scene = Scene::Slanted {
+            z0: 10.0,
+            a: 0.3,
+            b: -0.15,
+        };
+        let cams = rig8(960, 540, 1.0, 10.0);
+        let (refv, ns, gt) = views(&cams, &scene);
+        let n_gt = Vector3::new(0.3, -0.15, -1.0).normalize();
+        let cfg = Config::default();
+        let load = || {
+            std::fs::read_to_string("/proc/loadavg")
+                .unwrap_or_default()
+                .split_whitespace()
+                .next()
+                .unwrap_or("?")
+                .to_string()
+        };
+        let mut best = [f64::INFINITY; 2];
+        let mut last_fast = None;
+        for round in 0..1 {
+            for which in 0..2 {
+                let t = std::time::Instant::now();
+                let dm = if which == 0 {
+                    estimate(&refv, &ns, (5.0, 20.0), &cfg)
+                } else {
+                    estimate_fast(&refv, &ns, (5.0, 20.0), &cfg)
+                };
+                let el = t.elapsed().as_secs_f64();
+                best[which] = best[which].min(el);
+                let s = stats(
+                    &dm,
+                    &gt,
+                    |_| n_gt,
+                    |x, y| x >= 8 && y >= 8 && x < 952 && y < 532,
+                );
+                eprintln!(
+                    "회 {round} {}: {el:.2} s, 중앙 {:.5}, 1% 이내 {:.3}, 법선 {:.2}°, 부하 {}, 스레드 {}",
+                    ["estimate", "estimate_fast"][which],
+                    s.median_rel,
+                    s.within_1pct,
+                    s.median_normal_deg,
+                    load(),
+                    rayon::current_num_threads()
+                );
+                if which == 1 {
+                    last_fast = Some(s);
+                }
+            }
+        }
+        eprintln!(
+            "최소 시간: estimate {:.2} s, estimate_fast {:.2} s, 비율 {:.1}",
+            best[0],
+            best[1],
+            best[0] / best[1]
+        );
+        let s = last_fast.unwrap();
+        assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
+        assert!(s.within_1pct > 0.90, "1% 이내 비율 {}", s.within_1pct);
+    }
+
+    #[test]
+    #[ignore = "시간 측정용(측정 기계 부하에 따라 값이 달라짐)"]
+    fn fast_960() {
+        let scene = Scene::Slanted {
+            z0: 10.0,
+            a: 0.3,
+            b: -0.15,
+        };
+        let cams = rig8(960, 540, 1.0, 10.0);
+        let (refv, ns, gt) = views(&cams, &scene);
+        let n_gt = Vector3::new(0.3, -0.15, -1.0).normalize();
+        let cfg = Config::default();
+        let load = || std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        let mut best = f64::INFINITY;
+        for round in 0..1 {
+            let mut st = Vec::new();
+            let t = std::time::Instant::now();
+            let dm = estimate_fast_profiled(&refv, &ns, (5.0, 20.0), &cfg, Some(&mut st));
+            let el = t.elapsed().as_secs_f64();
+            best = best.min(el);
+            let s = stats(
+                &dm,
+                &gt,
+                |_| n_gt,
+                |x, y| x >= 8 && y >= 8 && x < 952 && y < 532,
+            );
+            eprintln!(
+                "회 {round}: {el:.3} s, 중앙 {:.5}, 1% 이내 {:.3}, 법선 {:.2}°, 부하 {}, 스레드 {}",
+                s.median_rel,
+                s.within_1pct,
+                s.median_normal_deg,
+                load().trim(),
+                rayon::current_num_threads()
+            );
+            for (n, t) in &st {
+                eprintln!("  {n}: {t:.3} s");
+            }
+            if round == 0 {
+                assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
+                assert!(s.within_1pct > 0.90, "1% 이내 비율 {}", s.within_1pct);
+            }
+        }
+        eprintln!("최소 {best:.3} s");
     }
 }
