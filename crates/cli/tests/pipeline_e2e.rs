@@ -240,13 +240,13 @@ fn expect_items(o: &Outcome, expected: &[(&str, &str)]) {
 }
 
 /// 단구역(README 첫 명령, stride 2 → 40위치 × 3대 = 120장). 4코어 부하 20 에서 run 약 2분.
-/// 실측: verify 6/7 종료 코드 1, 중심 오차 중앙 0.329/최대 2.912 m, 정밀 점 표면 거리 중앙 0.475/95% 1.465 m (점 11054개).
+/// 실측: verify 7/7 종료 코드 0, 중심 오차 중앙 0.329/최대 2.912 m, 정밀 점 표면 거리 중앙 0.475/95% 1.465 m (점 11054개).
 /// 상한은 실측 x 1.2 (0.395, 3.494, 0.570, 1.758).
 #[test]
 fn single_region_end_to_end() {
     let o = pipeline("single", "2");
     assert_eq!(o.m.registered, 120, "등록 수");
-    assert_eq!(o.verify_code, 1, "{}", o.verify);
+    assert_eq!(o.verify_code, 0, "{}", o.verify);
     expect_items(
         &o,
         &[
@@ -254,8 +254,8 @@ fn single_region_end_to_end() {
             ("region_images", "PASS"),
             ("refined_reprojection", "PASS"),
             ("preview_align", "PASS"),
-            // 실패: 최근접 중앙 2.358 m (< 3 통과), 높이 차 중앙 2.657 m (>= 2 미달).
-            ("preview_vs_refined", "FAIL"),
+            // 통과: 최근접 중앙 1.416 m (< 3), 높이 차 중앙 1.553 m (< 2).
+            ("preview_vs_refined", "PASS"),
             ("refined_overlap", "PASS"),
             ("snapshots", "PASS"),
         ],
@@ -264,7 +264,7 @@ fn single_region_end_to_end() {
     assert!(ov.contains("해당 없음"), "구역 1개는 겹침 해당 없음: {ov}");
     let (_, pr) = item(&o.verify, "preview_vs_refined");
     let h = number_after(&pr, "높이 차 중앙 최대 ");
-    assert!(h > 2.0 && h < 3.2, "높이 차 상한: {pr}");
+    assert!(h < 2.0, "높이 차 상한: {pr}");
     assert!(number_after(&pr, "최근접 중앙 최대 ") < 3.0, "{pr}");
     assert!(o.m.center_med < 0.40, "중심 오차 중앙 {}", o.m.center_med);
     assert!(o.m.center_max < 3.5, "중심 오차 최대 {}", o.m.center_max);
