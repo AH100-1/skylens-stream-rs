@@ -17,7 +17,7 @@ use crate::align::Similarity;
 use crate::ba::{bundle_adjust, BaOptions, BaProblem, Observation, PositionPrior};
 use crate::camera::{Camera, Intrinsics, Pose};
 use crate::dataset::Dataset;
-use crate::dense::{region_cloud, DenseConfig, DenseView};
+use crate::dense::{region_cloud, region_cloud_patchmatch, DenseConfig, DenseView};
 use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use crate::fusion::{fuse, FusionConfig, FusionView};
 use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig};
@@ -30,12 +30,23 @@ use crate::stream::{
 };
 use crate::two_view::{ransac_essential, recover_pose};
 
+/// 밀집 단계 사진별 깊이 방식.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseMethod {
+    /// 평면 스윕(기존).
+    Sweep,
+    /// 패치매치(이웃 8장).
+    PatchMatch,
+}
+
 /// 실행 설정.
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
     pub max_features: usize,
     /// 밀집 깊이 맵 폭(px).
     pub dense_width: usize,
+    /// 밀집 깊이 방식.
+    pub dense_method: DenseMethod,
     /// 수평 화각(도). 데이터셋에 내부 파라미터가 없으므로 받는다.
     pub hfov_deg: f64,
     pub ba_iters: usize,
@@ -46,6 +57,7 @@ impl Default for PipelineConfig {
         Self {
             max_features: 1500,
             dense_width: 160,
+            dense_method: DenseMethod::Sweep,
             hfov_deg: 65.0,
             ba_iters: 15,
         }
@@ -788,6 +800,7 @@ fn dense_cloud(
     k: &Intrinsics,
     in_region: &[bool],
     dw: usize,
+    method: DenseMethod,
 ) -> PointCloud {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some() && in_region[i])
@@ -813,7 +826,10 @@ fn dense_cloud(
         depth_rel: DenseConfig::default().depth_rel * scale,
         ..DenseConfig::default()
     };
-    let mut cloud = region_cloud(&views, &pts, &cfg);
+    let mut cloud = match method {
+        DenseMethod::Sweep => region_cloud(&views, &pts, &cfg),
+        DenseMethod::PatchMatch => region_cloud_patchmatch(&views, &pts, &cfg),
+    };
     if cloud.is_empty() {
         cloud = interpolated_cloud(s, &ids, imgs, k, dw);
     }
@@ -971,7 +987,14 @@ pub fn run_pipeline(
                 || {
                     let t = Instant::now();
                     (
-                        dense_cloud(&init, &imgs, &k, &in_region, cfg.dense_width),
+                        dense_cloud(
+                            &init,
+                            &imgs,
+                            &k,
+                            &in_region,
+                            cfg.dense_width,
+                            cfg.dense_method,
+                        ),
                         t.elapsed().as_secs_f64(),
                     )
                 },
@@ -979,7 +1002,14 @@ pub fn run_pipeline(
                     let mut rs = init.clone();
                     rs.rms = run_ba(&mut rs, &k, cfg.ba_iters, Some(&gps));
                     gps_align_refined(&mut rs, &gps);
-                    let rc = dense_cloud(&rs, &imgs, &k, &in_region, cfg.dense_width);
+                    let rc = dense_cloud(
+                        &rs,
+                        &imgs,
+                        &k,
+                        &in_region,
+                        cfg.dense_width,
+                        cfg.dense_method,
+                    );
                     (rs, rc)
                 },
             );

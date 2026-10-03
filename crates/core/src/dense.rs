@@ -555,6 +555,50 @@ pub fn region_cloud(
     )
 }
 
+/// 패치매치 깊이 추정기를 [`DepthEstimator`] 모양으로 감싼 것(설정은 기본값).
+pub fn patchmatch_depth(
+    r: &DepthView,
+    nbrs: &[&DepthView],
+    range: (f64, f64),
+    _sweep: &SweepConfig,
+) -> DepthMap {
+    use crate::patchmatch as pm;
+    let to_view = |v: &DepthView| {
+        let k = v.camera.intrinsics;
+        let data: Vec<f32> = v.gray.iter().map(|g| g / 255.0).collect();
+        pm::View {
+            camera: v.camera,
+            image: pm::GrayImage::new(k.width as usize, k.height as usize, data),
+        }
+    };
+    let rv = to_view(r);
+    let nv: Vec<pm::View> = nbrs.iter().map(|n| to_view(n)).collect();
+    let m = pm::estimate(&rv, &nv, range, &pm::Config::default());
+    DepthMap {
+        w: m.w,
+        h: m.h,
+        depth: m.depth,
+        normal: m.normal,
+        cost: m.cost,
+    }
+}
+
+/// [`region_cloud`] 의 패치매치판: 사진마다 이웃 `cfg.neighbors` 장 전부로 패치매치 깊이를 구해 융합한다.
+pub fn region_cloud_patchmatch(
+    views: &[DenseView],
+    sparse_points: &[[f64; 3]],
+    cfg: &DenseConfig,
+) -> PointCloud {
+    region_cloud_impl(
+        views,
+        sparse_points,
+        cfg,
+        patchmatch_depth,
+        &SweepConfig::default(),
+        cfg.neighbors.max(1),
+    )
+}
+
 /// [`region_cloud`] 와 같고, 사진별 깊이 추정기와 그 설정을 고를 수 있다.
 pub fn region_cloud_with(
     views: &[DenseView],
@@ -562,6 +606,17 @@ pub fn region_cloud_with(
     cfg: &DenseConfig,
     estimate: DepthEstimator,
     sweep: &SweepConfig,
+) -> PointCloud {
+    region_cloud_impl(views, sparse_points, cfg, estimate, sweep, SWEEP_NEIGHBORS)
+}
+
+fn region_cloud_impl(
+    views: &[DenseView],
+    sparse_points: &[[f64; 3]],
+    cfg: &DenseConfig,
+    estimate: DepthEstimator,
+    sweep: &SweepConfig,
+    take_nbrs: usize,
 ) -> PointCloud {
     // 1. 왜곡 보정·축소. 실패한 사진은 건너뛴다(빈 깊이 맵).
     let prepared: Vec<Option<DepthView>> = views
@@ -614,7 +669,7 @@ pub fn region_cloud_with(
             let (near, far) = view_selection::depth_range(&vs[i], &sparse);
             let nb: Vec<&DepthView> = neighbors[i]
                 .iter()
-                .take(SWEEP_NEIGHBORS)
+                .take(take_nbrs)
                 .map(|&j| preps[j])
                 .collect();
             estimate(preps[i], &nb, (near, far), sweep)

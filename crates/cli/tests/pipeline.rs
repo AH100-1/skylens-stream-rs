@@ -2,7 +2,7 @@
 
 use skylens_core::dataset::{load_dataset, DatasetConfig};
 use skylens_core::math::Point3;
-use skylens_core::pipeline::{run_pipeline, PipelineConfig};
+use skylens_core::pipeline::{run_pipeline, DenseMethod, PipelineConfig};
 use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
 use skylens_core::verify::verify_dir;
@@ -14,7 +14,17 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 #[test]
 fn synthetic_scene_runs_end_to_end() {
-    let root = std::env::temp_dir().join(format!("skylens_pipe_{}", std::process::id()));
+    run_end_to_end(DenseMethod::Sweep, 1.0, 5000);
+}
+
+#[test]
+fn synthetic_scene_runs_end_to_end_patchmatch() {
+    run_end_to_end(DenseMethod::PatchMatch, 1.0, 2000);
+}
+
+fn run_end_to_end(method: DenseMethod, max_median: f64, min_points: usize) {
+    let root =
+        std::env::temp_dir().join(format!("skylens_pipe_{}_{:?}", std::process::id(), method));
     let _ = std::fs::remove_dir_all(&root);
     let (input, output) = (root.join("in"), root.join("out"));
     let scene = Scene::new(SceneConfig {
@@ -36,12 +46,17 @@ fn synthetic_scene_runs_end_to_end() {
     let cfg = PipelineConfig {
         max_features: 800,
         dense_width: 96,
+        dense_method: method,
         hfov_deg: 65.0,
         ba_iters: 10,
     };
     let t = std::time::Instant::now();
     let res = run_pipeline(&ds, &cfg, &output).unwrap();
-    eprintln!("secs {:.1}", t.elapsed().as_secs_f64());
+    eprintln!("{method:?} secs {:.1}", t.elapsed().as_secs_f64());
+    eprintln!(
+        "{method:?} dense secs {:.2}",
+        res.regions.iter().map(|r| r.secs_dense).sum::<f64>()
+    );
     for r in &res.regions {
         eprintln!("{r:?}");
     }
@@ -92,13 +107,20 @@ fn synthetic_scene_runs_end_to_end() {
         })
         .collect();
     let over1 = d.iter().filter(|&&v| v > 1.0).count() as f64 / d.len() as f64;
+    let mut sorted = d.clone();
+    sorted.sort_by(f64::total_cmp);
+    let p95 = sorted[(sorted.len() as f64 * 0.95) as usize];
     let sm = median(d);
+    eprintln!(
+        "{method:?} verify pass {passed}/{} p95 {p95:.3} m",
+        report.items.len()
+    );
     eprintln!(
         "cloud points {} surface distance median {sm:.3} m, share over 1 m {:.1}%",
         cloud.len(),
         100.0 * over1
     );
-    assert!(cloud.len() >= 5000, "점 수 {}", cloud.len());
-    assert!(sm <= 1.0, "표면 거리 중앙 {sm}");
+    assert!(cloud.len() >= min_points, "점 수 {}", cloud.len());
+    assert!(sm <= max_median, "표면 거리 중앙 {sm}");
     let _ = std::fs::remove_dir_all(&root);
 }
