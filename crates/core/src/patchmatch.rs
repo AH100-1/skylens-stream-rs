@@ -169,6 +169,10 @@ pub struct Config {
     pub fast_iterations: usize,
     /// `estimate_fast` 의 원 해상도 층 전파 후보 수(4 면 가까운 4 만).
     pub fine_prop: usize,
+    /// `estimate_fast` 고운 층에서 이 비용 미만인 화소는 전파·깊이 섭동을 건너뛴다.
+    pub skip_cost: f32,
+    /// 건너뛴 화소에 깊이를 고정하고 법선만 흔드는 시도 횟수(반복마다).
+    pub skip_probes: usize,
 }
 
 impl Default for Config {
@@ -185,14 +189,16 @@ impl Default for Config {
             perturbations: 3,
             refine_perturbations: 1,
             max_neighbors: 8,
-            fine_neighbors: 4,
+            fine_neighbors: 3,
             normal_steps: 5,
             fine_step: 4,
             fine_propagation: 4,
             coarse_neighbors: 4,
             seed: 0x5eed,
-            fast_iterations: 4,
+            fast_iterations: 3,
             fine_prop: 4,
+            skip_cost: 0.08,
+            skip_probes: 1,
         }
     }
 }
@@ -973,8 +979,6 @@ fn ncc_cost(q: &Vector3<f32>, patch: &RefPatch, h: &Matrix3<f32>, img: &GrayImag
 
 /// 빠른 경로의 상위 k 시점 집계 개수(Shen 2013).
 const FAST_TOP_K: usize = 3;
-/// 고운 층에서 이 비용 미만이면 갱신을 건너뛴다.
-const FAST_SKIP_COST: f32 = 0.0;
 /// 고운 층에서 전파 후보로 삼는 이웃 가설의 비용 상한(1 − NCC).
 const FAST_TAU_KEEP: f32 = 0.9;
 
@@ -1354,7 +1358,56 @@ impl FCtx<'_> {
         tried[0] = (best.d, best.n);
         // 전파: 가까운 4 + 먼 4 표본(반대 색 화소)의 평면을 이 화소 광선으로 옮긴다.
         if best.c < sc.skip_below {
-            return None;
+            // 건너뛴 화소: 깊이는 두고 법선만 작게 흔든다(법선 정확도 유지).
+            // 가까운 네 이웃 법선의 평균을 후보로 한 번 시험(국소 평활).
+            if sc.skip_probes > 0 {
+                let mut sum = Vector3::<f32>::zeros();
+                for (dx, dy) in [(0i32, -1i32), (0, 1), (-1, 0), (1, 0)] {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx >= 0 && ny >= 0 && nx < self.w as i32 && ny < self.h as i32 {
+                        let c = &cur[ny as usize * self.w + nx as usize];
+                        if c.c < sc.prop_max {
+                            sum += c.n;
+                        }
+                    }
+                }
+                let nrm = sum.norm();
+                if nrm > 1e-3 {
+                    let nn = sum / nrm;
+                    if nn.dot(&m) < -0.05 * m.norm() {
+                        let cost = self.agg(&q, &m, best.d, &nn, p, mean, istd, msk, best.c);
+                        if cost < best.c {
+                            best = FHyp {
+                                d: best.d,
+                                n: nn,
+                                c: cost,
+                            };
+                        }
+                    }
+                }
+            }
+            let mut an = sc.amp_n;
+            for _ in 0..sc.skip_probes.saturating_sub(1) {
+                let dn = best.n
+                    + Vector3::new(
+                        an * (2.0 * rng.f() - 1.0),
+                        an * (2.0 * rng.f() - 1.0),
+                        an * (2.0 * rng.f() - 1.0),
+                    );
+                let nn = dn / dn.norm();
+                if nn.dot(&m) < -0.05 * m.norm() && nn.iter().all(|v| v.is_finite()) {
+                    let cost = self.agg(&q, &m, best.d, &nn, p, mean, istd, msk, best.c);
+                    if cost < best.c {
+                        best = FHyp {
+                            d: best.d,
+                            n: nn,
+                            c: cost,
+                        };
+                    }
+                }
+                an *= 0.5;
+            }
+            return (best.c < cur[i].c).then_some(best);
         }
         for &(dx, dy) in &PAT[..sc.n_prop] {
             let (nx, ny) = (x as i32 + dx, y as i32 + dy);
@@ -1442,6 +1495,8 @@ struct FSched {
     skip_below: f32,
     /// 이 비용 이상인 이웃 가설은 전파 후보에서 뺀다.
     prop_max: f32,
+    /// 건너뛴 화소의 법선 전용 섭동 횟수.
+    skip_probes: usize,
 }
 
 struct FLevel {
@@ -1696,7 +1751,8 @@ pub fn estimate_fast_profiled(
                 } else {
                     8
                 },
-                skip_below: if coarsest { 0.0 } else { FAST_SKIP_COST },
+                skip_below: if coarsest { 0.0 } else { cfg.skip_cost },
+                skip_probes: cfg.skip_probes,
                 prop_max: if coarsest { MAX_COST } else { FAST_TAU_KEEP },
             };
             for color in 0..2usize {
@@ -2602,6 +2658,10 @@ mod tests {
         cfg.refine_iterations = env("PM_RI", cfg.refine_iterations);
         cfg.perturbations = env("PM_PE", cfg.perturbations);
         cfg.fine_neighbors = env("PM_FN", cfg.fine_neighbors);
+        cfg.skip_probes = env("PM_SP", cfg.skip_probes);
+        if let Ok(v) = std::env::var("PM_SK") {
+            cfg.skip_cost = v.parse().unwrap_or(cfg.skip_cost);
+        }
         let load = || std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
         let mut best = f64::INFINITY;
         for round in 0..1 {
