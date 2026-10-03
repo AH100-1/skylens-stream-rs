@@ -39,8 +39,13 @@ fn run_case_with(
     position: PositionMethod,
     preview_ba: usize,
 ) -> Case {
+    // 시험은 한 프로세스에서 병렬로 돌고 일부는 인자가 같으므로, 시험 이름(스레드 이름)을 경로에 넣어 작업 폴더를 분리한다.
+    let tag = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace("::", "_");
     let root = std::env::temp_dir().join(format!(
-        "skylens_pipe_{}_{stride}_{ba_iters}_{method:?}_{position:?}_{preview_ba}",
+        "skylens_pipe_{}_{tag}_{stride}_{ba_iters}_{method:?}_{position:?}_{preview_ba}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&root);
