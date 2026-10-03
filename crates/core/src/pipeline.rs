@@ -1174,6 +1174,23 @@ fn run_ba(
     prior_sigma: f64,
     fixed: &[usize],
 ) -> f64 {
+    let rep = run_ba_report(s, k, iters, gps, prior_sigma, fixed);
+    if iters == 0 {
+        rep.initial_rms
+    } else {
+        rep.final_rms
+    }
+}
+
+/// `run_ba` 와 같되 번들 조정 보고 전체(비용·수렴 판정)를 돌려준다.
+fn run_ba_report(
+    s: &mut Sparse,
+    k: &Intrinsics,
+    iters: usize,
+    gps: Option<&[Vector3<f64>]>,
+    prior_sigma: f64,
+    fixed: &[usize],
+) -> crate::ba::BaReport {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
         .collect();
@@ -1232,11 +1249,7 @@ fn run_ba(
             e.0 = p.coords;
         }
     }
-    if iters == 0 {
-        rep.initial_rms
-    } else {
-        rep.final_rms
-    }
+    rep
 }
 
 /// 점마다 관측 광선 사이의 최대 각(도). 광선 각이 작은 점은 깊이가 불안정하다.
@@ -2356,6 +2369,160 @@ mod diag {
             return f64::NAN;
         }
         median(&mut v)
+    }
+
+    /// 정밀 BA 결과(GPS 정렬 뒤)의 정답 대비 회전 오차 한 줄.
+    pub struct RollRow {
+        pub iters: usize,
+        /// 카메라별 세계 회전 오차 Eᵢ = Rᵢ·Tᵢᵀ 의 평균 회전(도)과 비행 축 성분(도, 부호 있음).
+        pub rot_mean_deg: f64,
+        pub rot_axis_deg: f64,
+        pub center_med: f64,
+        pub rms: f64,
+        pub cost: (f64, f64),
+        pub stop: crate::ba::BaStop,
+        pub ba_iters: usize,
+    }
+
+    /// 합성 장면에서 시작 롤 규칙(`legacy`)별로 정밀 BA 를 `iters_list` 회 돌려 정답 대비 회전을 잰다.
+    pub fn refined_roll_rows(legacy: bool, iters_list: &[usize]) -> Vec<RollRow> {
+        let root = std::env::temp_dir().join(format!(
+            "skylens_roll_{}_{}",
+            std::process::id(),
+            legacy as u8
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let scene = Scene::new(SceneConfig {
+            width: 320,
+            height: 180,
+            ..SceneConfig::default()
+        });
+        scene.write_dataset(&root).unwrap();
+        let ds = load_dataset(
+            &root,
+            DatasetConfig {
+                stride: 2,
+                span: 48,
+                ovl: 2,
+                max_skip_run: 2,
+            },
+        )
+        .unwrap();
+        let n = ds.positions.len() * 3;
+        let data: Vec<ImgData> = (0..n)
+            .map(|g| load(&ds.positions[g / 3].images[g % 3], 800).unwrap())
+            .collect();
+        let imgs: Vec<&ImgData> = data.iter().collect();
+        let k = Intrinsics::from_hfov(
+            data[0].rgb.width(),
+            data[0].rgb.height(),
+            65f64.to_radians(),
+        );
+        let views: Vec<(usize, usize)> = (0..n).map(|g| (g % 3, g / 3)).collect();
+        let gps: Vec<Vector3<f64>> = (0..n)
+            .map(|g| ds.positions[g / 3].image_enu[g % 3])
+            .collect();
+        let pm = match_pairs(&imgs, &views, &k);
+        let tp: Vec<Pose> = (0..n)
+            .map(|g| {
+                let name = ds.positions[g / 3].images[g % 3]
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let v = scene.views.iter().find(|v| v.name == name).unwrap();
+                let c = scene.to_first_gps_frame(&v.camera.pose.center());
+                Pose::from_center(v.camera.pose.rotation, &c)
+            })
+            .collect();
+        let mut axis = Vector3::zeros();
+        for g in 1..ds.positions.len() {
+            let d = gps[g * 3] - gps[(g - 1) * 3];
+            axis += d;
+        }
+        let axis = nalgebra::Unit::new_normalize(axis);
+        let start = sparse_init_with(
+            &imgs,
+            &pm,
+            &gps,
+            &k,
+            PipelineConfig::default().position,
+            &TriConfig::from_config(&PipelineConfig::default()),
+            (0, 2.0),
+            &PreviewOpts {
+                legacy_roll: legacy,
+                ..PreviewOpts::default()
+            },
+        )
+        .unwrap()
+        .0;
+        let mut rows = Vec::new();
+        for &iters in iters_list {
+            let mut s = start.clone();
+            let rep = run_ba_report(&mut s, &k, iters, Some(&gps), 2.0, &[]);
+            gps_align_refined(&mut s, &gps).unwrap();
+            let mut m = Matrix3::zeros();
+            for (p, t) in s.poses.iter().zip(&tp) {
+                if let Some(p) = p {
+                    m += (p.rotation * t.rotation.inverse()).matrix();
+                }
+            }
+            let sv = m.svd(true, true);
+            let e = Rotation3::from_matrix_unchecked(sv.u.unwrap() * sv.v_t.unwrap());
+            let (ax, ang) = e
+                .axis_angle()
+                .map(|(a, ang)| (a.into_inner(), ang))
+                .unwrap_or((Vector3::x(), 0.0));
+            let mut cen: Vec<f64> = s
+                .poses
+                .iter()
+                .zip(&tp)
+                .filter_map(|(p, t)| Some((p.as_ref()?.center() - t.center()).norm()))
+                .collect();
+            rows.push(RollRow {
+                iters,
+                rot_mean_deg: ang.to_degrees(),
+                rot_axis_deg: (ang * ax.dot(&axis)).to_degrees(),
+                center_med: median(&mut cen),
+                rms: if iters == 0 {
+                    rep.initial_rms
+                } else {
+                    rep.final_rms
+                },
+                cost: (rep.initial_cost, rep.final_cost),
+                stop: rep.stop,
+                ba_iters: rep.iterations,
+            });
+        }
+        rows
+    }
+
+    /// 시작 롤 규칙 둘(예전 규칙·광축 높이 분산)로 시작한 정밀 BA(15회) 결과가 정답 대비 같은 수준이다:
+    /// GPS 정렬 뒤 평균 회전 오차 < 0.4도, 비행 축 성분 < 0.1도, 두 시작의 축 성분 차 < 0.1도, 중심 중앙 < 0.5 m.
+    /// 실측(단구역 stride 2, 120장): 예전 0.217도/+0.014도/0.326 m, 높이 분산 0.194도/-0.004도/0.328 m.
+    #[test]
+    fn refined_roll_independent_of_start_roll() {
+        let a = refined_roll_rows(true, &[15]).remove(0);
+        let b = refined_roll_rows(false, &[15]).remove(0);
+        for r in [&a, &b] {
+            assert!(r.rot_mean_deg < 0.4, "{}", r.rot_mean_deg);
+            assert!(r.rot_axis_deg.abs() < 0.1, "{}", r.rot_axis_deg);
+            assert!(r.center_med < 0.5, "{}", r.center_med);
+        }
+        assert!((a.rot_axis_deg - b.rot_axis_deg).abs() < 0.1);
+    }
+
+    #[test]
+    #[ignore]
+    fn refined_roll_probe() {
+        for legacy in [true, false] {
+            for r in refined_roll_rows(legacy, &[0, 5, 15, 30, 60]) {
+                eprintln!(
+                    "ROLL legacy={legacy} iters {} rot {:.3} deg axis {:+.3} deg center med {:.3} rms {:.3} cost {:.1}->{:.1} stop {:?} ran {}",
+                    r.iters, r.rot_mean_deg, r.rot_axis_deg, r.center_med, r.rms, r.cost.0, r.cost.1, r.stop, r.ba_iters
+                );
+            }
+        }
     }
 
     /// 합성 장면 정답 포즈(첫 GPS 기준 좌표) 와 비교한 초벌 포즈 단계별 오차 한 줄.
