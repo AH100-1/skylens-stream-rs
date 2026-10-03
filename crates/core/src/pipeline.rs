@@ -1236,6 +1236,7 @@ const PREVIEW_MIN_RAY_DEG: f64 = 2.0;
 
 /// 밀집: 구역 사진을 `dense::region_cloud`(보정·이웃·사진별 깊이·융합)에 넘긴다. 희소 점도 함께 담는다.
 /// `dw` 는 보정 뒤 긴 변 화소 수다. 밀집 점이 하나도 안 나오면 희소 점 보간 깊이로 대신한다.
+#[cfg(test)]
 fn dense_cloud(
     s: &Sparse,
     imgs: &[&ImgData],
