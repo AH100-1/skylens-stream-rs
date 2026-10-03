@@ -1002,6 +1002,11 @@ const GP_HUBER: f64 = 0.1;
 const GP_ITERS: usize = 300;
 const GP_MIN_SCALE: f64 = 1e-5;
 const GP_GATE_RAD: f64 = 2.0 * std::f64::consts::PI / 180.0;
+/// 마지막 정밀 풀이 전에 쓰는 좁은 각 문턱(1.5°).
+const GP_FINAL_GATE_RAD: f64 = 1.5 * std::f64::consts::PI / 180.0;
+const GP_REFINE_ITERS: usize = 5;
+const GP_PAIR_WEIGHT: f64 = 0.1;
+const GP_PAIR_GATE_RAD: f64 = 3.0 * std::f64::consts::PI / 180.0;
 const GP_MIN_CAM_OBS: usize = 4;
 const GP_MIN_POINT_VIEWS: usize = 3;
 /// 보충 단계에서 카메라를 놓는 데 필요한 직선 지지 수.
@@ -1152,11 +1157,11 @@ fn global_positioning(
     let mut active = vec![true; obs.len()];
     let mut x = gp_solve(n_cam, n_pts, &obs, &active, None, 1);
     // 관측 거르기: 각 오차, 카메라 뒤. 거른 뒤 같은 해에서 다시 푼다.
-    for _ in 0..2 {
+    for gate in [GP_GATE_RAD, GP_GATE_RAD, GP_FINAL_GATE_RAD] {
         let mut cnt = vec![0usize; n_cam];
         for (k, &(cam, pt, v, _)) in obs.iter().enumerate() {
             let dx = x[n_cam + pt] - x[cam];
-            active[k] = dx.dot(&v) > 0.0 && angle_between(&dx, &v) <= GP_GATE_RAD;
+            active[k] = dx.dot(&v) > 0.0 && angle_between(&dx, &v) <= gate;
             if active[k] {
                 cnt[cam] += 1;
             }
@@ -1181,7 +1186,7 @@ fn global_positioning(
     let mut centers: Vec<Option<Point3<f64>>> = (0..n_cam)
         .map(|i| (cam_cnt[i] >= GP_MIN_CAM_OBS).then(|| Point3::from(x[i])))
         .collect();
-    let points: Vec<Option<Point3<f64>>> = (0..n_pts)
+    let mut points: Vec<Option<Point3<f64>>> = (0..n_pts)
         .map(|p| (pt_cnt[p] >= GP_MIN_POINT_VIEWS).then(|| Point3::from(x[n_cam + p])))
         .collect();
     // 보충: 점 관측이 모자라 등록되지 못한 카메라를 이미 위치를 아는 정점에서 나오는 직선의 교차로 놓는다.
@@ -1221,6 +1226,77 @@ fn global_positioning(
         if let Some(cand) = robust_ray_point(&lines, GP_GATE_RAD) {
             if support(&cand) > support(&cur.coords) {
                 *slot = Some(Point3::from(cand));
+            }
+        }
+    }
+    // 정밀화: 점 광선(좁은 문턱)과 이웃 짝 방향 직선(작은 가중)을 함께 쓴 각 오차 최소제곱으로 중심을 다듬는다.
+    // 점 광선은 내려다보는 시야에서 깊이 방향이 약해, 가로 이웃 짝 방향이 그 방향을 보강한다.
+    for _ in 0..GP_REFINE_ITERS {
+        // 점 다듬기: 좁은 문턱 안의 카메라 광선만으로 각 오차 최소제곱 교차.
+        let mut acc = vec![(Matrix3::<f64>::zeros(), Vector3::<f64>::zeros(), 0usize); n_pts];
+        for &(cam, pt, v, wt) in &obs {
+            let (Some(c), Some(x)) = (centers[cam], points[pt]) else {
+                continue;
+            };
+            let dx = x.coords - c.coords;
+            if dx.dot(&v) <= 0.0 || angle_between(&dx, &v) > GP_FINAL_GATE_RAD {
+                continue;
+            }
+            let w = wt / dx.norm_squared().max(1e-12);
+            let pr = Matrix3::identity() - v * v.transpose();
+            acc[pt].0 += pr * w;
+            acc[pt].1 += pr * c.coords * w;
+            acc[pt].2 += 1;
+        }
+        for (slot, (a, rhs, n)) in points.iter_mut().zip(acc) {
+            if n < GP_MIN_POINT_VIEWS || slot.is_none() {
+                continue;
+            }
+            let a = a + Matrix3::identity() * (1e-9 * a.trace().max(1e-12));
+            if let Some(sol) = a.cholesky().map(|c| c.solve(&rhs)) {
+                if sol.iter().all(|v| v.is_finite()) {
+                    *slot = Some(Point3::from(sol));
+                }
+            }
+        }
+        let prev = centers.clone();
+        for (cam, slot) in centers.iter_mut().enumerate() {
+            let Some(cur) = prev[cam] else { continue };
+            let mut a = Matrix3::<f64>::zeros();
+            let mut rhs = Vector3::<f64>::zeros();
+            let mut add = |o: &Vector3<f64>, u: &Vector3<f64>, wt: f64, gate: f64| {
+                let dx = cur.coords - o;
+                if dx.dot(u) <= 0.0 || angle_between(&dx, u) > gate {
+                    return;
+                }
+                let w = wt / dx.norm_squared().max(1e-12);
+                let pr = Matrix3::identity() - u * u.transpose();
+                a += pr * w;
+                rhs += pr * o * w;
+            };
+            for &(c, pt, v, wt) in obs.iter().filter(|o| o.0 == cam) {
+                let _ = c;
+                if let Some(p) = points[pt] {
+                    add(&p.coords, &(-v), wt, GP_FINAL_GATE_RAD);
+                }
+            }
+            for pd in pair_dirs.iter().flatten() {
+                let (i, j, d) = *pd;
+                if i == cam {
+                    if let Some(cj) = prev[j] {
+                        add(&cj.coords, &d, GP_PAIR_WEIGHT, GP_PAIR_GATE_RAD);
+                    }
+                } else if j == cam {
+                    if let Some(ci) = prev[i] {
+                        add(&ci.coords, &(-d), GP_PAIR_WEIGHT, GP_PAIR_GATE_RAD);
+                    }
+                }
+            }
+            a += Matrix3::identity() * (1e-9 * a.trace().max(1e-12));
+            if let Some(sol) = a.cholesky().map(|c| c.solve(&rhs)) {
+                if sol.iter().all(|v| v.is_finite()) {
+                    *slot = Some(Point3::from(sol));
+                }
             }
         }
     }
@@ -1596,7 +1672,8 @@ mod tests {
         let res =
             average_translations_with_points(&rots, &obs, &pobs, &TranslationConfig::default());
         let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
-        let (rms, max) = stats(&similarity_aligned_errors(&res.centers, &truth));
+        let errs = similarity_aligned_errors(&res.centers, &truth);
+        let (rms, max) = stats(&errs);
         (res.registered(), rms, max)
     }
 
@@ -1681,7 +1758,7 @@ mod tests {
     #[test]
     fn noisy_outliers_register_all_seeds() {
         // 짝 방향 잡음 1°·짝 이상치 10/20% × 점 방향 이상치 0/5% × 시드 11~13(조정에 쓴 시드 1~10 밖).
-        // 기준(F-214): 모든 경우 등록 ≥ 238/240, 닮음 정렬 후 중심 RMS ≤ 0.6 m(0.3 m 는 일부 경우만 만족). 실패를 모두 모아 한 번에 보인다.
+        // 기준(F-214): 모든 경우 등록 ≥ 238/240, 닮음 정렬 후 중심 RMS ≤ 0.3 m·최대 ≤ 1.0 m. 실패를 모두 모아 한 번에 보인다.
         let mut fails = Vec::new();
         for pfrac in [0.0, 0.05] {
             for frac in [0.10, 0.20] {
@@ -1695,8 +1772,8 @@ mod tests {
                     println!(
                         "point {pfrac} pair {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m"
                     );
-                    if reg < 238 || rms > 0.6 {
-                        fails.push((pfrac, frac, seed, reg, rms));
+                    if reg < 238 || rms > 0.3 || max > 1.0 {
+                        fails.push((pfrac, frac, seed, reg, rms, max));
                     }
                 }
             }
@@ -1734,7 +1811,7 @@ mod tests {
     #[test]
     fn real_layout_points_register_all() {
         // 실측 배치(80곳 × 3대 = 240장). 방향 잡음 없음(전역 회전 0.1° 잡음은 있음): 240/240, 중심 RMS ≤ 0.3 m.
-        // 잡음 1°·짝 이상치 10/20%·점 이상치 5%: 등록 ≥ 238/240, RMS ≤ 0.6 m.
+        // 잡음 1°·짝 이상치 10/20%·점 이상치 5%: 등록 ≥ 238/240, RMS ≤ 0.3 m, 최대 ≤ 1.0 m.
         let mut rows = Vec::new();
         let clean = Case {
             noise_deg: 0.0,
@@ -1758,7 +1835,8 @@ mod tests {
                 let (reg, rms, max) = run_points(seed, &case, 0.05, 400);
                 println!("pair {frac} seed {seed}: reg {reg} rms {rms:.4} max {max:.4}");
                 assert!(reg >= 238, "pair {frac} seed {seed} reg {reg}");
-                assert!(rms <= 0.6, "pair {frac} seed {seed} rms {rms}");
+                assert!(rms <= 0.3, "pair {frac} seed {seed} rms {rms}");
+                assert!(max <= 1.0, "pair {frac} seed {seed} max {max}");
             }
         }
     }
@@ -1927,6 +2005,13 @@ mod tests {
         let res = average_translations(&rots, &obs, &TranslationConfig::default());
         println!("single line: registered {}", res.registered());
         assert!(res.registered() <= 80, "{}", res.registered());
+        if res.registered() > 0 {
+            let truth: Vec<_> = (0..rots.len())
+                .map(|i| observations(5, &case).0[i].center())
+                .collect();
+            let (_, max) = stats(&similarity_aligned_errors(&res.centers, &truth));
+            assert!(max < 0.5, "registered {} max {max}", res.registered());
+        }
     }
 
     #[test]
@@ -1975,6 +2060,7 @@ mod tests {
                 tracks.push(track);
             }
         }
+        // 기본 문턱(4e-3)에서는 23/387 점만 남는다(추정 중심 오차 ~0.3 m 가 재투영에 그대로 실린다): F-218 미해결.
         let cfg = TriangulationConfig {
             max_reprojection: 0.02,
             ..Default::default()
