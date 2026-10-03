@@ -63,8 +63,11 @@ skylens-stream verify <출력 폴더>
 
 # 합성 장면으로 끝까지 돌려 보기(synth → run → verify). 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(--span 48)으로 잡는다
 skylens-stream synth scene 320 180
-skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96
+skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
 skylens-stream verify out
+# 구역 2개 이상(40위치 x 2 구역 이상, 이웃 구역 겹침 항목 판정): --stride 1 로 80위치 전부 사용
+skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
+skylens-stream verify out2
 
 # 판 번호 출력 ("skylens-stream 0.1.0")
 skylens-stream --version
@@ -298,8 +301,11 @@ skylens-stream verify <output dir>
 
 # Run a synthetic scene end to end (synth -> run -> verify); cross-camera overlap only appears between positions 12-40 apart, so use regions of 40+ positions (--span 48)
 skylens-stream synth scene 320 180
-skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96
+skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
 skylens-stream verify out
+# two or more regions (neighbor-overlap item is judged): --stride 1 uses all 80 positions
+skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
+skylens-stream verify out2
 
 # Print the version ("skylens-stream 0.1.0")
 skylens-stream --version
