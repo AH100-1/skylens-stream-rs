@@ -22,13 +22,16 @@
 //! 첫 관측 순으로 정렬한다.
 
 use crate::ba::Observation;
-use crate::math::Vector2;
+use crate::math::{Matrix3, Vector2, Vector3};
 use std::collections::HashMap;
 
-/// 국소 변위 일관성 문턱(화소): 이웃 대응 변위 중앙값과의 차이.
+/// 국소 변위 일관성 기준 문턱(화소): 960x540 영상 기준. 영상 크기에 비례해 늘린다.
 const DISPLACEMENT_TOLERANCE: f64 = 40.0;
-/// 이웃 탐색 격자 칸 크기(화소). 3x3 칸을 본다.
-const DISPLACEMENT_CELL: f64 = 96.0;
+/// 기준 영상 크기(화소).
+const DISPLACEMENT_REF_WIDTH: f64 = 960.0;
+const DISPLACEMENT_REF_HEIGHT: f64 = 540.0;
+/// 국소 아핀 맞춤에 쓰는 최근접 이웃 수.
+const DISPLACEMENT_NEIGHBORS: usize = 24;
 
 /// SPEC 번들 조정 트랙 상한과 같은 값.
 pub const MAX_TRACKS: usize = 100_000;
@@ -404,15 +407,19 @@ pub fn build_tracks(
     (tracks, stats)
 }
 
-/// 짝 안 국소 변위 일관성: 대응마다 같은 짝에서 영상 a 의 가까운 대응들(격자 3x3 칸) 변위의 중앙값과
-/// 비교해 어긋난 정도가 문턱을 넘으면 오대응으로 본다. 이웃이 적으면(증거 부족) 그대로 둔다.
-/// 가까운 점끼리는 같은 표면이라 변위가 부드럽게 변하지만, 우연한 오대응은 변위가 이웃과 무관하다.
+/// 짝 안 국소 변위 일관성: 대응마다 같은 짝에서 영상 a 의 가까운 대응 `DISPLACEMENT_NEIGHBORS` 개(점 중심
+/// 최근접 이웃)로 변위장 `d(u) = t + A u` (국소 아핀, u = 이웃 − 대상 점)를 강건하게 맞추고, 대상 점의
+/// 변위와 예측 `t` 의 차이(잔차)가 문턱을 넘으면 오대응으로 본다. 짝 사이 회전·축척 차가 있어도
+/// 변위장은 위치에 대해 아핀이므로 참 대응의 잔차는 작다. 이웃이 적거나 한 직선 위면(증거 부족) 그대로 둔다.
+///
+/// 맞춤: 최소제곱 → 잔차 중앙 절대편차(MAD)로 이상치 이웃 제외 → 다시 맞춤을 두 번 되풀이한다.
+/// 문턱 = clamp(4 · 1.4826 · MAD, 기준 문턱, 3 · 기준 문턱), 기준 문턱은 영상 크기에 비례
+/// (960x540 에서 40 px). 영상 크기는 영상 a 특징 좌표의 최대값으로 어림한다.
 fn displacement_outliers(
     matches: &[(usize, usize)],
     kp_a: &[Vector2<f64>],
     kp_b: &[Vector2<f64>],
 ) -> Vec<bool> {
-    let (tol, cell) = (DISPLACEMENT_TOLERANCE, DISPLACEMENT_CELL);
     let mut out = vec![false; matches.len()];
     if matches.len() < 8 {
         return out;
@@ -421,6 +428,25 @@ fn displacement_outliers(
         .iter()
         .map(|&(fa, fb)| (kp_a[fa], kp_b[fb] - kp_a[fa]))
         .collect();
+    let (mut max_x, mut max_y) = (0.0f64, 0.0f64);
+    let (mut min_x, mut min_y) = (f64::MAX, f64::MAX);
+    for q in &pos {
+        max_x = max_x.max(q.0.x);
+        max_y = max_y.max(q.0.y);
+        min_x = min_x.min(q.0.x);
+        min_y = min_y.min(q.0.y);
+    }
+    let size = (max_x / DISPLACEMENT_REF_WIDTH).max(max_y / DISPLACEMENT_REF_HEIGHT);
+    if size <= 0.0 || !size.is_finite() {
+        return out;
+    }
+    let tol = DISPLACEMENT_TOLERANCE * size;
+    // 칸당 평균 8 점쯤 되도록 격자 칸을 정한다(점 분포 범위 기준).
+    let area = ((max_x - min_x) * (max_y - min_y)).max(1e-12);
+    let cell = (area * 8.0 / pos.len() as f64)
+        .sqrt()
+        .max(size * 4.0)
+        .max(1e-9);
     let key = |p: &Vector2<f64>| ((p.x / cell).floor() as i64, (p.y / cell).floor() as i64);
     let mut idx: Vec<((i64, i64), usize)> = pos
         .iter()
@@ -428,34 +454,105 @@ fn displacement_outliers(
         .map(|(i, q)| (key(&q.0), i))
         .collect();
     idx.sort_unstable();
-    let (mut dx, mut dy) = (Vec::new(), Vec::new());
+    let k = DISPLACEMENT_NEIGHBORS;
+    let mut cand: Vec<(f64, usize)> = Vec::new();
+    // 이웃 하나: (u / cell, 변위)
+    let mut nb: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(k);
+    let mut res: Vec<f64> = Vec::with_capacity(k);
+    let mut keep: Vec<bool> = Vec::with_capacity(k);
     for (i, q) in pos.iter().enumerate() {
         let (cx, cy) = key(&q.0);
-        dx.clear();
-        dy.clear();
-        for gx in cx - 1..=cx + 1 {
-            for gy in cy - 1..=cy + 1 {
-                let lo = idx.partition_point(|e| e.0 < (gx, gy));
-                for e in idx[lo..].iter().take_while(|e| e.0 == (gx, gy)) {
-                    if e.1 != i {
-                        dx.push(pos[e.1].1.x);
-                        dy.push(pos[e.1].1.y);
+        cand.clear();
+        for ring in 1..=3i64 {
+            cand.clear();
+            for gx in cx - ring..=cx + ring {
+                for gy in cy - ring..=cy + ring {
+                    let lo = idx.partition_point(|e| e.0 < (gx, gy));
+                    for e in idx[lo..].iter().take_while(|e| e.0 == (gx, gy)) {
+                        if e.1 != i {
+                            let d = pos[e.1].0 - q.0;
+                            cand.push((d.x * d.x + d.y * d.y, e.1));
+                        }
                     }
                 }
             }
+            if cand.len() >= k {
+                break;
+            }
         }
-        if dx.len() < 4 {
+        if cand.len() < 8 {
             continue;
         }
-        let med = |v: &mut Vec<f64>| {
-            v.sort_unstable_by(|a, b| a.total_cmp(b));
-            v[v.len() / 2]
+        if cand.len() > k {
+            cand.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
+            cand.truncate(k);
+        }
+        nb.clear();
+        for &(_, j) in &cand {
+            let u = (pos[j].0 - q.0) / cell;
+            nb.push((u.x, u.y, pos[j].1.x - q.1.x, pos[j].1.y - q.1.y));
+        }
+        // 변위는 대상 점 변위를 뺀 값으로 둔다: 맞춘 상수항 t 가 곧 (예측 − 실제) 의 반대 부호 잔차다.
+        keep.clear();
+        keep.resize(nb.len(), true);
+        let mut fit = None;
+        let mut s = 0.0;
+        for round in 0..3 {
+            let Some(f) = fit_affine(&nb, &keep) else {
+                break;
+            };
+            res.clear();
+            for e in &nb {
+                let rx = e.2 - (f[0] + f[1] * e.0 + f[2] * e.1);
+                let ry = e.3 - (f[3] + f[4] * e.0 + f[5] * e.1);
+                res.push((rx * rx + ry * ry).sqrt());
+            }
+            let mut sorted = res.clone();
+            sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+            s = 1.4826 * sorted[sorted.len() / 2];
+            fit = Some(f);
+            if round == 2 {
+                break;
+            }
+            let cut = (3.0 * s).max(tol * 0.25);
+            let mut n = 0;
+            for (kp, r) in keep.iter_mut().zip(&res) {
+                *kp = *r <= cut;
+                n += *kp as usize;
+            }
+            if n < 6 {
+                break;
+            }
+        }
+        let Some(f) = fit else {
+            continue;
         };
-        let (mx, my) = (med(&mut dx), med(&mut dy));
-        let r = ((q.1.x - mx).powi(2) + (q.1.y - my).powi(2)).sqrt();
-        out[i] = r > tol;
+        // 대상 점은 u = 0, 변위 0(뺀 값)이므로 예측 (f[0], f[3]) 가 곧 어긋남이다.
+        let r = (f[0] * f[0] + f[3] * f[3]).sqrt();
+        out[i] = r > (4.0 * s).clamp(tol, 3.0 * tol);
     }
     out
+}
+
+/// `keep` 인 이웃에 대해 `dx = a0 + a1 u + a2 v`, `dy = b0 + b1 u + b2 v` 의 최소제곱 해
+/// `[a0, a1, a2, b0, b1, b2]`. 점이 한 직선 위에 가까우면 `None`.
+fn fit_affine(nb: &[(f64, f64, f64, f64)], keep: &[bool]) -> Option<[f64; 6]> {
+    let mut m = Matrix3::<f64>::zeros();
+    let (mut rx, mut ry) = (Vector3::<f64>::zeros(), Vector3::<f64>::zeros());
+    for (e, _) in nb.iter().zip(keep).filter(|(_, &k)| k) {
+        let v = Vector3::new(1.0, e.0, e.1);
+        m += v * v.transpose();
+        rx += v * e.2;
+        ry += v * e.3;
+    }
+    let det = m.determinant();
+    // 정규화된 좌표(칸 크기 1)에서 기대 크기 대비 너무 작으면 퇴화로 본다.
+    if det.is_nan() || det <= 1e-4 * m[(0, 0)].powi(3) {
+        return None;
+    }
+    let inv = m.try_inverse()?;
+    let (a, b) = (inv * rx, inv * ry);
+    Some([a[0], a[1], a[2], b[0], b[1], b[2]])
 }
 
 /// 두 노드의 성분을 영상이 겹치지 않을 때만 합친다. 이미 같은 성분이면 참(할 일 없음).
@@ -586,7 +683,7 @@ pub fn to_ba_observations(tracks: &[Track]) -> Vec<Observation> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matching::candidate_pairs;
+    use crate::matching::{candidate_pairs, scheduled_pairs, PairSchedule};
     use crate::math::Point3;
     use crate::synth::{CamId, Scene, SceneConfig};
 
@@ -622,15 +719,54 @@ mod tests {
         swap_percent: u64,
         seed: u64,
     ) -> Synthetic {
+        synthetic_scene(
+            outlier_per_mille,
+            keep_percent,
+            swap_percent,
+            seed,
+            &SceneOpts::default(),
+        )
+    }
+
+    /// 장면 선택: 위치 수, 영상 크기, 카메라 간 짝 포함 여부.
+    struct SceneOpts {
+        positions: usize,
+        width: u32,
+        height: u32,
+        /// 참이면 실측 편대 짝 일정(F–R·F–L 위치 차 +20..40 포함), 거짓이면 기존 후보 짝.
+        formation_pairs: bool,
+    }
+
+    impl Default for SceneOpts {
+        fn default() -> Self {
+            Self {
+                positions: 12,
+                width: 960,
+                height: 540,
+                formation_pairs: false,
+            }
+        }
+    }
+
+    fn synthetic_scene(
+        outlier_per_mille: u64,
+        keep_percent: u64,
+        swap_percent: u64,
+        seed: u64,
+        opts: &SceneOpts,
+    ) -> Synthetic {
         let sd = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let scene = Scene::new(SceneConfig {
-            positions: 12,
+            positions: opts.positions,
+            width: opts.width,
+            height: opts.height,
             ..SceneConfig::default()
         });
+        let x_end = 40.0 + opts.positions.saturating_sub(12) as f64;
         // 경로 주변 표면 위 격자 점.
         let mut points = Vec::new();
         let mut x = -10.0;
-        while x <= 40.0 {
+        while x <= x_end {
             let mut y = -30.0;
             while y <= 30.0 {
                 points.push(Point3::new(x, y, scene.surface_height(x, y)));
@@ -668,7 +804,12 @@ mod tests {
             .collect();
         let mut pairs = Vec::new();
         let (mut outliers, mut inliers) = (0, 0);
-        for (a, b) in candidate_pairs(&views, 5, 4, 16) {
+        let cand = if opts.formation_pairs {
+            scheduled_pairs(&views, &PairSchedule::default())
+        } else {
+            candidate_pairs(&views, 5, 4, 16)
+        };
+        for (a, b) in cand {
             let common: Vec<(usize, usize, usize)> = gt[a]
                 .iter()
                 .enumerate()
@@ -679,7 +820,7 @@ mod tests {
             }
             let mut m = Vec::new();
             for &(fa, fb, p) in &common {
-                if hash((a as u64) << 44 | (b as u64) << 24 | p as u64 | 1 << 63 ^ sd) % 100
+                if hash(((a as u64) << 44 | (b as u64) << 24 | p as u64 | 1 << 63) ^ sd) % 100
                     >= keep_percent
                 {
                     continue;
@@ -697,7 +838,7 @@ mod tests {
             inliers += m.len();
             let k = (m.len() as u64 * outlier_per_mille).div_ceil(1000);
             for t in 0..k {
-                let s = hash((a as u64) << 40 | (b as u64) << 20 | t ^ sd);
+                let s = hash(((a as u64) << 40 | (b as u64) << 20 | t) ^ sd);
                 let fa = (s % keypoints[a].len() as u64) as usize;
                 let fb = ((s >> 32) % keypoints[b].len() as u64) as usize;
                 if gt[a][fa] != gt[b][fb] {
@@ -1232,5 +1373,162 @@ mod tests {
             crate::ba::select_tracks(sel.len(), &obs, 10),
             vec![0, 1, 2, 3]
         );
+    }
+
+    /// 영상 b 특징만 중심 기준으로 `deg` 도 돌린 짝에서 변위 거름이 버리는 참 대응 수(참 대응 합계 포함)와
+    /// 무작위 오대응 검출 수(오대응 합계 포함).
+    fn rotation_filter_counts(s: &Synthetic, deg: f64, size: (f64, f64)) -> [usize; 4] {
+        let (c, sn) = (deg.to_radians().cos(), deg.to_radians().sin());
+        let ctr = Vector2::new(size.0 / 2.0, size.1 / 2.0);
+        let mut r = [0usize; 4];
+        for p in &s.pairs {
+            let kb: Vec<Vector2<f64>> = s.keypoints[p.image_b]
+                .iter()
+                .map(|q| {
+                    let d = q - ctr;
+                    ctr + Vector2::new(c * d.x - sn * d.y, sn * d.x + c * d.y)
+                })
+                .collect();
+            let flags = displacement_outliers(&p.matches, &s.keypoints[p.image_a], &kb);
+            for (&(fa, fb), &bad) in p.matches.iter().zip(&flags) {
+                if s.gt[p.image_a][fa] == s.gt[p.image_b][fb] {
+                    r[0] += bad as usize;
+                    r[1] += 1;
+                } else {
+                    r[2] += bad as usize;
+                    r[3] += 1;
+                }
+            }
+        }
+        r
+    }
+
+    #[test]
+    fn displacement_filter_survives_pair_rotation() {
+        // 오대응 0: 짝 사이 회전 0·30·60·120 도에서 버리는 참 대응 <= 1%.
+        // 무작위 오대응 1%: 검출률 >= 95%.
+        let clean = synthetic(0, 100, 0);
+        let noisy = synthetic(10, 100, 0);
+        let mut failures = Vec::new();
+        for deg in [0.0, 30.0, 60.0, 120.0] {
+            let [lost, total, _, _] = rotation_filter_counts(&clean, deg, (960.0, 540.0));
+            let [_, _, hit, bad] = rotation_filter_counts(&noisy, deg, (960.0, 540.0));
+            let (lost_rate, det) = (lost as f64 / total as f64, hit as f64 / bad as f64);
+            eprintln!("rotation {deg}: true dropped {lost}/{total} ({lost_rate:.4}) outlier detected {hit}/{bad} ({det:.4})");
+            if lost_rate > 0.01 || det < 0.95 {
+                failures.push(format!("{deg}: {lost_rate} {det}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn displacement_filter_scales_with_image_size() {
+        // 같은 배치를 1920x1080 으로 렌더해도 같은 비율로 걸러야 한다.
+        let opts = SceneOpts {
+            width: 1920,
+            height: 1080,
+            ..SceneOpts::default()
+        };
+        let clean = synthetic_scene(0, 100, 0, 1, &opts);
+        let noisy = synthetic_scene(10, 100, 0, 1, &opts);
+        for deg in [0.0, 60.0] {
+            let [lost, total, _, _] = rotation_filter_counts(&clean, deg, (1920.0, 1080.0));
+            let [_, _, hit, bad] = rotation_filter_counts(&noisy, deg, (1920.0, 1080.0));
+            eprintln!("1920x1080 rotation {deg}: true dropped {lost}/{total} outlier detected {hit}/{bad}");
+            assert!(lost as f64 <= 0.01 * total as f64);
+            assert!(hit as f64 >= 0.95 * bad as f64);
+        }
+    }
+
+    #[test]
+    fn sparse_recall_two_resolutions() {
+        // 실측 편대 배치, 재현율 50·30% × 오대응 0·1%, 두 해상도(1920x1080 은 시드 1~3).
+        let mut failures = Vec::new();
+        for (w, h, seeds) in [(960u32, 540u32, 0..=0u64), (1920, 1080, 1..=3)] {
+            let opts = SceneOpts {
+                width: w,
+                height: h,
+                ..SceneOpts::default()
+            };
+            for keep in [50, 30] {
+                for opm in [0, 10] {
+                    let (mut pmin, mut cmin, mut gap) = (2.0f64, 2.0f64, 2.0f64);
+                    for seed in seeds.clone() {
+                        let s = synthetic_scene(opm, keep, 0, seed, &opts);
+                        let (ps, cs, _, _) = run_policy(&s, ConflictPolicy::Split);
+                        let (_, cd, _, _) = run_policy(&s, ConflictPolicy::Drop);
+                        pmin = pmin.min(ps);
+                        cmin = cmin.min(cs);
+                        gap = gap.min(cs - cd);
+                    }
+                    eprintln!("{w}x{h} keep {keep} opm {opm}: Split min purity {pmin:.4} min completeness {cmin:.4} min (Split - Drop) {gap:.4}");
+                    if pmin < 0.99 || cmin < 0.97 || (opm == 0 && gap < -0.01) {
+                        failures.push(format!(
+                            "{w}x{h} keep {keep} opm {opm}: {pmin} {cmin} {gap}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn cross_camera_pairs_keep_tracks_whole() {
+        // 편대 짝 일정(F–R·F–L 위치 차 +20..40)이 들어가는 44 위치 장면, 참 대응만 + 오대응 1%.
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        let mut failures = Vec::new();
+        for (keep, opm) in [(100, 0), (50, 10)] {
+            let s = synthetic_scene(opm, keep, 0, 1, &opts);
+            let cross = s
+                .pairs
+                .iter()
+                // 영상 번호 = 위치 * 3 + 카메라 번호.
+                .filter(|p| p.image_a % 3 != p.image_b % 3)
+                .count();
+            let (ps, cs, st, _) = run_policy(&s, ConflictPolicy::Split);
+            eprintln!(
+                "cross scene keep {keep} opm {opm}: pairs {} cross-camera {cross} inconsistent {} Split purity {ps:.4} completeness {cs:.4}",
+                s.pairs.len(), st.inconsistent
+            );
+            assert!(cross > 0);
+            if ps < 0.99 || cs < 0.97 {
+                failures.push(format!("keep {keep} opm {opm}: {ps} {cs}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn seeds_change_the_kept_matches() {
+        // 시드가 해시 키 전체에 섞이는지: 시드 1·2 의 같은 짝(첫 짝; 영상 (0,1) 은 공통 점이 16 개
+        // 미만이라 짝이 없다) 유지 대응 집합이 다르고, 겹침 비율(전체 대비)이 유지율^2 +- 0.05.
+        let all = synthetic(0, 100, 0);
+        let (ia, ib) = (all.pairs[0].image_a, all.pairs[0].image_b);
+        let pair = |s: &Synthetic| -> Vec<(usize, usize)> {
+            s.pairs
+                .iter()
+                .find(|p| (p.image_a, p.image_b) == (ia, ib))
+                .expect("first pair")
+                .matches
+                .clone()
+        };
+        let total = pair(&all).len();
+        assert!(total >= 200, "{total}");
+        for keep in [50u64, 30] {
+            let a = pair(&synthetic_seeded(0, keep, 0, 1));
+            let b = pair(&synthetic_seeded(0, keep, 0, 2));
+            assert_ne!(a, b);
+            let both = a.iter().filter(|m| b.contains(m)).count();
+            let frac = both as f64 / total as f64;
+            let want = (keep as f64 / 100.0).powi(2);
+            eprintln!("keep {keep}: overlap {frac:.4} expected {want:.4} of {total}");
+            assert!((frac - want).abs() <= 0.05, "{frac} vs {want}");
+        }
     }
 }
