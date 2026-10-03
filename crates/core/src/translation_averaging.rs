@@ -1011,8 +1011,13 @@ const GP_MIN_CAM_OBS: usize = 4;
 const GP_MIN_POINT_VIEWS: usize = 3;
 /// 중심 정밀화가 받아들이는 정규방정식의 최소/최대 고윳값 비 하한.
 const GP_MIN_EIG_RATIO: f64 = 1e-3;
-/// 보충 단계에서 카메라를 놓는 데 필요한 직선 지지 수.
-const GP_SUPPLEMENT_SUPPORT: usize = 3;
+/// 보충 단계에서 카메라를 놓는 데 필요한 직선 지지의 하한 비율(전체 직선 대비). 지지 수는 이 비율의 올림과
+/// `GP_MIN_CAM_OBS` 중 큰 값 이상이어야 한다.
+const GP_SUPPLEMENT_FRAC: f64 = 0.5;
+
+fn supplement_support(n_lines: usize) -> usize {
+    ((n_lines as f64 * GP_SUPPLEMENT_FRAC).ceil() as usize).max(GP_MIN_CAM_OBS)
+}
 
 fn gp_uniform(state: &mut u64) -> f64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -1340,7 +1345,7 @@ fn global_positioning(
                 .count()
         };
         let mut found = robust_ray_point(&lines, GP_GATE_RAD)
-            .filter(|c| supported(c, &lines, GP_GATE_RAD) >= GP_SUPPLEMENT_SUPPORT);
+            .filter(|c| supported(c, &lines, GP_GATE_RAD) >= supplement_support(lines.len()));
         if found.is_none() {
             for &(other, d) in &cam_pairs[cam] {
                 if let Some(co) = registered_at[other] {
@@ -1349,7 +1354,7 @@ fn global_positioning(
             }
             let gate = cfg.outlier_threshold_rad;
             found = robust_ray_point(&lines, gate)
-                .filter(|c| supported(c, &lines, gate) >= GP_SUPPLEMENT_SUPPORT);
+                .filter(|c| supported(c, &lines, gate) >= supplement_support(lines.len()));
         }
         centers[cam] = found.map(Point3::from);
     }
@@ -1769,6 +1774,42 @@ mod tests {
         // 무잡음·정확한 회전이면 해는 닮음 변환을 빼고 유일하다. 장면 크기 ~80 m 에 대해 1e-6 m
         // 은 상대 ~1e-8 로, 배정밀도 선형 풀이 오차에 여유를 둔 값이다.
         assert!(max < 1e-6, "rms {rms} max {max}");
+    }
+
+    /// F-289: 점 관측이 모두 틀린 카메라는 보충 단계에서 적은 지지로 엉뚱한 위치에 놓이면 안 된다.
+    /// 시드 11, 점 400, 짝 이상치 10%, 카메라 19·100 의 점 관측 방향을 10~20° 무작위로 바꾼다.
+    #[test]
+    fn supplement_rejects_cameras_with_all_wrong_point_rays() {
+        let case = Case {
+            noise_deg: 1.0,
+            outlier_frac: 0.10,
+            unobservable_frac: 0.05,
+        };
+        let (poses, rots, obs) = observations(11, &case);
+        let (_, mut pobs) = point_observations(11, &poses, 400, POINTS.1, 0.0);
+        let bad_cams = [19usize, 100];
+        let mut rng = Rng(0xBAD);
+        for o in pobs.iter_mut().filter(|o| bad_cams.contains(&o.camera)) {
+            let angle = (10.0 + 10.0 * rng.unit()).to_radians();
+            let axis = o.bearing.cross(&rng.vec3()).normalize();
+            o.bearing = Rotation3::new(axis * angle) * o.bearing;
+        }
+        let res =
+            average_translations_with_points(&rots, &obs, &pobs, &TranslationConfig::default());
+        let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+        let errs = similarity_aligned_errors(&res.centers, &truth);
+        for cam in bad_cams {
+            if res.centers[cam].is_none() {
+                println!("camera {cam}: unregistered");
+                continue;
+            }
+            let idx = res.centers[..cam].iter().filter(|c| c.is_some()).count();
+            println!("camera {cam}: error {:.3} m", errs[idx]);
+            assert!(errs[idx] < 1.0, "camera {cam} error {} m", errs[idx]);
+        }
+        let (rms, max) = stats(&errs);
+        println!("registered {} rms {rms:.4} max {max:.4}", res.registered());
+        assert!(rms < 0.3 && max < 1.0, "rms {rms} max {max}");
     }
 
     #[test]
