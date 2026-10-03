@@ -178,8 +178,29 @@ fn stream_order_events_and_numbers_match_sequential() {
             "{e:?}"
         );
     }
+    // 정밀 모델은 BA 의 이상치 제거로 초벌보다 점이 적을 수 있다(이 작은 장면은 초벌 18 점, 정밀 11 점).
+    // 그래서 점 수 크기 비교 대신 구성을 정확히 단언한다: 각 시점 스냅샷의 점 수는
+    // 그 시점에 정밀로 교체된 구역은 정밀 출력 파일, 나머지는 초벌 출력 파일의 점 수 합과 같다.
+    let count = |dir: &str, region: usize| -> usize {
+        let pre = format!("{dir}_{region:02}_");
+        let f = std::fs::read_dir(so.join(dir))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(&pre))
+            .unwrap();
+        read_ply_file(f).unwrap().len()
+    };
+    let (n_pre, n_ref) = (
+        [count("preview", 0), count("preview", 1)],
+        [count("refined", 0), count("refined", 1)],
+    );
+    assert_eq!(ev[c0].points, n_pre[0], "구역 0 초벌 직후");
+    assert_eq!(ev[c1].points, n_pre[0] + n_pre[1], "구역 1 초벌 직후");
+    assert_eq!(ev[r0].points, n_ref[0] + n_pre[1], "구역 0 정밀 교체 직후");
+    assert_eq!(ev[r1].points, n_ref[0] + n_ref[1], "구역 1 정밀 교체 직후");
     let last_snap = ev.iter().rev().find(|e| e.snapshot.is_some()).unwrap();
-    assert!(last_snap.points >= ev[c0].points, "{last_snap:?}");
+    assert_eq!(last_snap.points, n_ref[0] + n_ref[1], "{last_snap:?}");
+    assert!(last_snap.points > 0, "{last_snap:?}");
 
     // 수치: 순차 방식과 같은 범위.
     let reg = |r: &PipelineResult| r.regions.iter().map(|x| x.registered).sum::<usize>();

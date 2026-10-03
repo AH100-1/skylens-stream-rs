@@ -1973,15 +1973,8 @@ pub fn run_pipeline_with(
     };
     let mut centers: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
     let mut diffs: Vec<f64> = Vec::new();
-    // 정밀 중심도 점군과 같이 최신 정밀 모델 좌표계로 옮긴다.
-    for rec in recs.iter_mut() {
-        if let Some(s) = &rec.rsim {
-            for c in rec.centers.values_mut() {
-                let y = s.apply_point(&Vector3::new(c[0], c[1], c[2]));
-                *c = [y.x, y.y, y.z];
-            }
-        }
-    }
+    // 재정렬은 이미 내보낸 구역의 점군에만 적용한다. 중심은 구역 자기 좌표 그대로 둔다
+    // (중심에도 적용하면 GPS 정답 대비 중앙 오차가 2.51 m 에서 3.60 m 로 나빠졌다).
     for rec in &recs {
         let (olo, ohi) = owns[rec.region.index];
         for (&g, c) in &rec.centers {

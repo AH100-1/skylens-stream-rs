@@ -296,8 +296,9 @@ fn arrival_order_and_realigned_centers() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// 측정값(부하 15 에서 구역 0 위치 3.70 m, 전체 3.60 m)의 약 1.25 배. 약한 합성 장면이라 절대 오차가 크다.
-const EARLY_BOUND: f64 = 4.6;
-const ALL_BOUND: f64 = 4.5;
+/// 측정값(구역 0 위치 2.748 m, 전체 2.514 m; 중심에는 재정렬을 적용하지 않음)의 약 1.25 배.
+/// 약한 합성 장면이라 절대 오차가 크다.
+const EARLY_BOUND: f64 = 3.45;
+const ALL_BOUND: f64 = 3.15;
 /// 정밀 재정렬 잔차 중앙값(측정 0.280 m)의 상한.
 const REALIGN_MEDIAN_BOUND: f64 = 0.6;
