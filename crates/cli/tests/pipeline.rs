@@ -69,12 +69,33 @@ fn synthetic_scene_runs_end_to_end() {
     );
     eprintln!("registered {} of {}", errs.len(), ds.image_count());
     eprintln!("center error median {med:.3} m max {max:.3} m");
-    // 바닥값(현재 측정: 120/120 등록, 중앙 3.82 m, 최대 12.76 m, verify 5/7). 아래 단언은 이 값의 바닥이다.
     assert_eq!(errs.len(), ds.image_count(), "등록 수 {}", errs.len());
-    assert!(med < 5.0, "중심 오차 중앙 {med}");
-    assert!(max < 15.0, "중심 오차 최대 {max}");
+    assert!(med < 1.5, "중심 오차 중앙 {med}");
+    assert!(max < 6.0, "중심 오차 최대 {max}");
     let passed = report.items.iter().filter(|i| i.pass).count();
+    // 7/7 은 못 맞췄다(실패: preview_align 잔차 중앙 8.6 m, preview_vs_refined 높이 차 중앙 4.16 m).
+    // 현재값 5/7 을 하한으로 고정하고, 초벌 정렬 잔차는 현재값 근처 상한을 둔다.
     assert!(passed >= 5, "verify 통과 {passed}/{}", report.items.len());
+    let failed: Vec<&str> = report
+        .items
+        .iter()
+        .filter(|i| !i.pass)
+        .map(|i| i.name)
+        .collect();
+    assert!(
+        failed
+            .iter()
+            .all(|n| ["preview_align", "preview_vs_refined"].contains(n)),
+        "예상 밖 실패 {failed:?}"
+    );
+    assert!(res.align.iter().all(|a| a.pairs >= 1000), "정렬 점쌍");
+    assert!(
+        res.align
+            .iter()
+            .all(|a| a.fit_median_m.is_some_and(|m| m < 10.0)),
+        "정렬 잔차 {:?}",
+        res.align
+    );
 
     // 점군 → 정답 표면(수직 거리 근사).
     let origin = scene.to_first_gps_frame(&Point3::new(0.0, 0.0, 0.0)).coords;
@@ -97,6 +118,6 @@ fn synthetic_scene_runs_end_to_end() {
         "cloud points {} surface distance median {sm:.3} m",
         cloud.len()
     );
-    assert!(sm < 6.0, "표면 거리 중앙 {sm}");
+    assert!(sm < 3.5, "표면 거리 중앙 {sm}");
     let _ = std::fs::remove_dir_all(&root);
 }
