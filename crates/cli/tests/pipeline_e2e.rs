@@ -240,8 +240,8 @@ fn expect_items(o: &Outcome, expected: &[(&str, &str)]) {
 }
 
 /// 단구역(README 첫 명령, stride 2 → 40위치 × 3대 = 120장). 4코어 부하 20 에서 run 약 2분.
-/// 실측: verify 7/7 종료 코드 0, 중심 오차 중앙 0.329/최대 2.912 m, 정밀 점 표면 거리 중앙 0.475/95% 1.465 m (점 11054개).
-/// 상한은 실측 x 1.2 (0.395, 3.494, 0.570, 1.758).
+/// 실측: verify 7/7 종료 코드 0, 중심 오차 중앙 0.340/최대 1.051 m, 정밀 점 표면 거리 중앙 0.498/95% 1.896 m (점 11156개).
+/// 상한: 중심 최대는 실측 x 1.2 로 조임(1.26). 나머지는 이전 상한 유지(0.40, 0.57, 1.758). 점 95% 는 실측 1.896 이 이전 상한 1.758 을 넘어 이 시험은 실패한다(남은 문제).
 #[test]
 fn single_region_end_to_end() {
     let o = pipeline("single", "2");
@@ -254,7 +254,7 @@ fn single_region_end_to_end() {
             ("region_images", "PASS"),
             ("refined_reprojection", "PASS"),
             ("preview_align", "PASS"),
-            // 통과: 최근접 중앙 1.416 m (< 3), 높이 차 중앙 1.553 m (< 2).
+            // 통과: 최근접 중앙 1.109 m (< 3), 높이 차 중앙 1.114 m (< 2).
             ("preview_vs_refined", "PASS"),
             ("refined_overlap", "PASS"),
             ("snapshots", "PASS"),
@@ -267,21 +267,21 @@ fn single_region_end_to_end() {
     assert!(h < 2.0, "높이 차 상한: {pr}");
     assert!(number_after(&pr, "최근접 중앙 최대 ") < 3.0, "{pr}");
     assert!(o.m.center_med < 0.40, "중심 오차 중앙 {}", o.m.center_med);
-    assert!(o.m.center_max < 3.5, "중심 오차 최대 {}", o.m.center_max);
+    assert!(o.m.center_max < 1.26, "중심 오차 최대 {}", o.m.center_max);
     assert!(o.m.surface_med < 0.57, "점 중앙 {}", o.m.surface_med);
     assert!(o.m.surface_p95 < 1.76, "점 95% {}", o.m.surface_p95);
     assert!(
-        o.m.points >= 11054 * 4 / 5 && o.m.points <= 11054 * 6 / 5,
+        o.m.points >= 11156 * 4 / 5 && o.m.points <= 11156 * 6 / 5,
         "점 수 {}",
         o.m.points
     );
 }
 
 /// 구역 2개(README 둘째 명령, stride 1 → 80위치 × 3대 = 240장): refined_overlap 이 실제로 판정된다.
-/// 시험 전체 약 3 분(부하 낮을 때 179 초, 부하 22 에서는 run 만 332 초). 실측: verify 6/7 종료 코드 1, 중심 오차 중앙 0.290/최대 3.115 m,
-/// 정밀 점 표면 거리 중앙 0.494/95% 3.022 m (점 19855개). 상한은 실측 x 1.2.
-/// 실패 항목: preview_vs_refined (높이 차 중앙 최대 5.829 m, 최근접 4.923 m). preview_align 은 통과: 구역 간 점쌍을 구역의
-/// 모든 이미지 관측으로 만들어 점쌍 최소 1221 (정렬 창 12장만 쓰면 324), 스케일 차 0.05% (창만 쓰면 8.26%), 잔차 중앙 최대 5.130 m.
+/// 시험 전체 약 3 분(부하 낮을 때 179 초, 부하 22 에서는 run 만 332 초). 실측: verify 6/7 종료 코드 1, 중심 오차 중앙 0.290/최대 3.119 m,
+/// 정밀 점 표면 거리 중앙 0.305/95% 2.242 m (점 20123개). 상한은 실측 x 1.2.
+/// 실패 항목: preview_vs_refined (높이 차 중앙 최대 4.555 m, 최근접 3.515 m; 초벌 광선 각 거름 하한 50점 적용 전 5.829/4.923). preview_align 은 SPEC 기준은 통과하나
+/// 점쌍 최소 1170, 스케일 차 1.66%, 잔차 중앙 최대 5.012 m 로 이전 상한(점쌍 1200 이상, 스케일 차 1.0% 이하)을 못 맞춘다(남은 문제).
 #[test]
 fn two_region_end_to_end() {
     let o = pipeline("two", "1");
@@ -308,20 +308,20 @@ fn two_region_end_to_end() {
         "높이 차 하한(실패 유지): {pr}"
     );
     assert!(
-        number_after(&pr, "높이 차 중앙 최대 ") < 7.0,
+        number_after(&pr, "높이 차 중앙 최대 ") < 5.5,
         "높이 차 상한: {pr}"
     );
-    assert!(number_after(&pr, "최근접 중앙 최대 ") < 5.9, "{pr}");
+    assert!(number_after(&pr, "최근접 중앙 최대 ") < 4.2, "{pr}");
     let (_, pa) = item(&o.verify, "preview_align");
     assert!(number_after(&pa, "점쌍 최소 ") >= 1200.0, "{pa}");
     assert!(number_after(&pa, "구역 간 스케일 차 ") <= 1.0, "{pa}");
     assert!(number_after(&pa, "잔차 중앙 최대 ") < 6.0, "{pa}");
     assert!(o.m.center_med < 0.35, "중심 오차 중앙 {}", o.m.center_med);
     assert!(o.m.center_max < 3.75, "중심 오차 최대 {}", o.m.center_max);
-    assert!(o.m.surface_med < 0.60, "점 중앙 {}", o.m.surface_med);
-    assert!(o.m.surface_p95 < 3.63, "점 95% {}", o.m.surface_p95);
+    assert!(o.m.surface_med < 0.37, "점 중앙 {}", o.m.surface_med);
+    assert!(o.m.surface_p95 < 2.70, "점 95% {}", o.m.surface_p95);
     assert!(
-        o.m.points >= 19855 * 4 / 5 && o.m.points <= 19855 * 6 / 5,
+        o.m.points >= 20123 * 4 / 5 && o.m.points <= 20123 * 6 / 5,
         "점 수 {}",
         o.m.points
     );

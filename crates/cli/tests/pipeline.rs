@@ -232,7 +232,7 @@ fn synthetic_single_region_end_to_end() {
     // 구역 1개: 이웃 겹침은 해당 없음.
     let ov = c.report.item("refined_overlap").unwrap();
     assert!(ov.measured.contains("해당 없음"), "{}", ov.measured);
-    // 통과: 최근접 중앙 1.416 m (< 3 m), 높이 차 중앙 1.553 m (< 2 m). 초벌 점 광선 각 20도 이상만 남김.
+    // 통과: 최근접 중앙 1.109 m (< 3 m), 높이 차 중앙 1.114 m (< 2 m). 초벌 점은 최대 사잇각 쌍 + 전 관측 가우스-뉴턴, 광선 각 20도 이상만 남김.
     check_item(&c, "preview_vs_refined", true);
     let pr = c.report.item("preview_vs_refined").unwrap();
     assert!(
@@ -273,7 +273,7 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         ov.measured
     );
-    // 미달: 높이 차 중앙 최대 5.829 m, 최근접 4.923 m (목표 높이 차 < 2 m, 최근접 < 3 m).
+    // 미달: 높이 차 중앙 최대 4.555 m, 최근접 3.515 m (목표 높이 차 < 2 m, 최근접 < 3 m).
     check_item(&c, "preview_vs_refined", false);
     let pr = c.report.item("preview_vs_refined").unwrap();
     eprintln!(
@@ -286,8 +286,8 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         pr.measured
     );
-    // 통과: 구역 간 대응을 구역의 모든 이미지 관측으로 만들어 점쌍 최소 1221 (창 안 12장만 쓰면 324),
-    // 구역 간 스케일 차 0.05%, 잔차 중앙 최대 5.130 m (< 6 m).
+    // 통과: 구역 간 대응을 구역의 모든 이미지 관측으로 만들어 점쌍 최소 1170 (창 안 12장만 쓰면 324),
+    // 구역 간 스케일 차 1.66%, 잔차 중앙 최대 5.012 m (< 6 m).
     check_item(&c, "preview_align", true);
     let pa = c.report.item("preview_align").unwrap();
     assert!(
