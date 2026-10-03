@@ -1048,6 +1048,16 @@ mod tests {
             &SparseConfig {
                 max_features: 1200,
                 record_stages: true,
+                // 이 시험의 바닥값은 겹침 12·16 칸부터 매 칸 짝을 쓰는 일정으로 쟀다(기본 일정은 +20 부터 4칸 간격).
+                pair_schedule: PairSchedule {
+                    cross: crate::matching::CrossSchedule::Formation {
+                        right_min: 12,
+                        left_min: 16,
+                        max: 40,
+                        step: 1,
+                    },
+                    ..PairSchedule::default()
+                },
                 ..SparseConfig::default()
             },
         )
