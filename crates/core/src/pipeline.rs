@@ -588,6 +588,124 @@ fn triangulate_tracks(
     (points, obs, ba_only, st)
 }
 
+/// 초벌 포즈 단계 선택(후보 비교용). 기본값은 비교에서 가장 좋았던 조합.
+#[derive(Clone, Copy, Debug)]
+pub struct PreviewOpts {
+    /// 회전 평균 뒤 상대 회전과 이 각(도)보다 어긋나는 간선을 빼고 다시 평균한다.
+    pub prune_deg: Option<f64>,
+    /// 위치 단계의 GPS 사전 가중(1/m).
+    pub prior: f64,
+    /// 위치 단계 뒤 카메라 중심을 GPS 에 닮음 변환 강건 추정으로 맞춘다.
+    pub snap: bool,
+    /// 이보다 정상 대응이 적은 간선은 회전 평균에 넣지 않는다.
+    pub min_inl: usize,
+    /// 어긋난 간선 제거를 반복하는 횟수(`prune_deg` 가 있을 때).
+    pub passes: usize,
+}
+
+impl Default for PreviewOpts {
+    fn default() -> Self {
+        Self {
+            prune_deg: Some(10.0),
+            prior: 1.0,
+            snap: false,
+            min_inl: 0,
+            passes: 1,
+        }
+    }
+}
+
+impl PreviewOpts {
+    /// 비교 실험용: `prune=10,prior=0.5,snap=1` 꼴 문자열로 기본값을 덮어쓴다.
+    pub fn parse(spec: &str) -> Self {
+        let mut o = Self::default();
+        for kv in spec.split(',') {
+            match kv.split_once('=') {
+                Some(("prune", v)) => o.prune_deg = v.parse().ok().filter(|d: &f64| *d > 0.0),
+                Some(("prior", v)) => o.prior = v.parse().unwrap_or(o.prior),
+                Some(("snap", v)) => o.snap = v == "1",
+                Some(("min_inl", v)) => o.min_inl = v.parse().unwrap_or(0),
+                Some(("passes", v)) => o.passes = v.parse().unwrap_or(1),
+                _ => {}
+            }
+        }
+        o
+    }
+}
+
+/// 초벌 포즈 단계별 중간 결과(진단용).
+#[derive(Clone, Debug, Default)]
+pub struct PreviewStages {
+    /// 회전 평균 직후 회전(모델 좌표계, 좌표계 맞춤 전).
+    pub rots: Vec<Option<Rotation3<f64>>>,
+    /// 좌표계 맞춤 + 위치 단계 직후 포즈(GPS 닮음 변환 전).
+    pub placed: Vec<Option<Pose>>,
+    /// 회전 평균 뒤 뺀 간선 수 / 전체.
+    pub pruned: (usize, usize),
+}
+
+/// 회전 평균 + 상대 회전과 어긋나는 간선 제거 뒤 재평균. 반환: 회전, 간선 유지 표시.
+fn average_pruned(
+    n: usize,
+    pm: &[PairMatch],
+    opts: &PreviewOpts,
+) -> Result<(Vec<Option<Rotation3<f64>>>, Vec<bool>), String> {
+    let mk = |keep: &[bool]| -> Vec<RelativeRotation> {
+        pm.iter()
+            .zip(keep)
+            .filter(|(_, &k)| k)
+            .map(|(p, _)| RelativeRotation {
+                i: p.i,
+                j: p.j,
+                rotation: p.rot,
+                weight: p.inl.len() as f64,
+            })
+            .collect()
+    };
+    let mut keep: Vec<bool> = pm.iter().map(|p| p.inl.len() >= opts.min_inl).collect();
+    let ra = average_rotations(n, &mk(&keep), &AveragingConfig::default())
+        .ok_or("회전 평균 실패: 쓸 수 있는 간선 없음")?;
+    let mut rots = ra.rotations;
+    if let Some(deg) = opts.prune_deg {
+        for _ in 0..opts.passes.max(1) {
+            for (kp, p) in keep.iter_mut().zip(pm) {
+                *kp = *kp
+                    && match (rots[p.i], rots[p.j]) {
+                        (Some(a), Some(b)) => {
+                            (b * a.inverse() * p.rot.inverse()).angle().to_degrees() <= deg
+                        }
+                        _ => false,
+                    };
+            }
+            if let Some(r2) = average_rotations(n, &mk(&keep), &AveragingConfig::default()) {
+                rots = r2.rotations;
+            }
+        }
+    }
+    Ok((rots, keep))
+}
+
+/// 위치 단계 뒤 카메라 중심을 GPS 에 닮음 변환 강건 추정으로 맞춘다(중심·방향 모두).
+fn snap_poses_to_gps(poses: &mut [Option<Pose>], gps: &[Vector3<f64>]) {
+    let ids: Vec<usize> = (0..poses.len()).filter(|&i| poses[i].is_some()).collect();
+    let src: Vec<Vector3<f64>> = ids
+        .iter()
+        .map(|&i| poses[i].unwrap().center().coords)
+        .collect();
+    let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
+    let Some((sim, _, _)) = crate::align::robust_similarity(&src, &dst, 3, 3.0) else {
+        return;
+    };
+    for &i in &ids {
+        let p = poses[i].unwrap();
+        let c = sim.apply_point(&p.center().coords);
+        poses[i] = Some(Pose::from_center(
+            p.rotation * sim.r.inverse(),
+            &Point3::from(c),
+        ));
+    }
+}
+
 /// 회전 평균 → 방향으로 좌표계 맞춤 → 위치 → 삼각측량. 초벌 희소 모델.
 fn sparse_init(
     imgs: &[&ImgData],
@@ -595,23 +713,27 @@ fn sparse_init(
     gps: &[Vector3<f64>],
     k: &Intrinsics,
 ) -> Result<Sparse, String> {
+    sparse_init_with(imgs, pm, gps, k, &PreviewOpts::default()).map(|r| r.0)
+}
+
+fn sparse_init_with(
+    imgs: &[&ImgData],
+    pm: &[PairMatch],
+    gps: &[Vector3<f64>],
+    k: &Intrinsics,
+    opts: &PreviewOpts,
+) -> Result<(Sparse, PreviewStages), String> {
     let n = imgs.len();
-    let edges: Vec<RelativeRotation> = pm
-        .iter()
-        .map(|p| RelativeRotation {
-            i: p.i,
-            j: p.j,
-            rotation: p.rot,
-            weight: p.inl.len() as f64,
-        })
-        .collect();
-    let ra = average_rotations(n, &edges, &AveragingConfig::default())
-        .ok_or("회전 평균 실패: 쓸 수 있는 간선 없음")?;
-    let rots = ra.rotations;
+    let (rots, keep_edge) = average_pruned(n, pm, opts)?;
+    let mut stages = PreviewStages {
+        rots: rots.clone(),
+        pruned: (keep_edge.iter().filter(|&&k| !k).count(), pm.len()),
+        ..Default::default()
+    };
     // 좌표계 맞춤(Kabsch): 모델 방향 b = Rᵢᵀ(−R_ijᵀ t) → GPS 방향.
     let mut h = Matrix3::zeros();
     let mut dirs_model = Vec::new();
-    for p in pm {
+    for (p, _) in pm.iter().zip(&keep_edge).filter(|(_, &k)| k) {
         let (Some(ri), Some(_), Some(t)) = (rots[p.i], rots[p.j], p.t) else {
             continue;
         };
@@ -664,11 +786,15 @@ fn sparse_init(
         .map(|&(i, j, b)| (loc[&i], loc[&j], (g * b).normalize()))
         .collect();
     let gl: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
-    let centers = stand_in::solve_centers(&gl, &dirs, 0.2).ok_or("위치 풀이 실패")?;
+    let centers = stand_in::solve_centers(&gl, &dirs, opts.prior).ok_or("위치 풀이 실패")?;
     let mut poses: Vec<Option<Pose>> = vec![None; n];
     for (a, &i) in ids.iter().enumerate() {
         let r = Rotation3::from_matrix_unchecked(rots[i].unwrap().matrix() * g.transpose());
         poses[i] = Some(Pose::from_center(r, &Point3::from(centers[a])));
+    }
+    stages.placed = poses.clone();
+    if opts.snap {
+        snap_poses_to_gps(&mut poses, gps);
     }
     if std::env::var("PIPE_DEBUG").is_ok() {
         let mut ang: Vec<f64> = pm
@@ -725,7 +851,7 @@ fn sparse_init(
         rms: 0.0,
     };
     s.rms = run_ba(&mut s, k, 0, None);
-    Ok(s)
+    Ok((s, stages))
 }
 
 /// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
@@ -847,6 +973,7 @@ fn well_conditioned(s: &Sparse, min_deg: f64, keep_min: usize) -> Sparse {
         poses: s.poses.clone(),
         points: keep.iter().map(|&p| s.points[p]).collect(),
         obs: keep.iter().map(|&p| s.obs[p].clone()).collect(),
+        ba_only: s.ba_only.clone(),
         rms: s.rms,
     }
 }
@@ -1157,6 +1284,208 @@ mod diag {
         median(&mut v)
     }
 
+    /// 합성 장면 정답 포즈(첫 GPS 기준 좌표) 와 비교한 초벌 포즈 단계별 오차 한 줄.
+    pub struct StageRow {
+        pub rot_free_med: f64,
+        pub rot_free_max: f64,
+        pub placed_c_med: f64,
+        pub placed_rot_med: f64,
+        pub final_c_med: f64,
+        pub final_c_max: f64,
+        pub final_dz_med: f64,
+        pub final_rot_med: f64,
+        pub pruned: (usize, usize),
+        pub preview_align_m: Option<f64>,
+        pub vs_refined_dz: Option<f64>,
+        pub surf_med: f64,
+    }
+
+    pub fn stage_rows(list: &[PreviewOpts], full: bool) -> Vec<StageRow> {
+        let root = std::env::temp_dir().join(format!("skylens_stage_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let scene = Scene::new(SceneConfig {
+            width: 320,
+            height: 180,
+            ..SceneConfig::default()
+        });
+        scene.write_dataset(&root).unwrap();
+        let ds = load_dataset(
+            &root,
+            DatasetConfig {
+                stride: 2,
+                span: 48,
+                ovl: 2,
+                max_skip_run: 2,
+            },
+        )
+        .unwrap();
+        let n = ds.positions.len() * 3;
+        let gids: Vec<usize> = (0..n).collect();
+        let data: Vec<ImgData> = gids
+            .iter()
+            .map(|g| load(&ds.positions[g / 3].images[g % 3], 800).unwrap())
+            .collect();
+        let imgs: Vec<&ImgData> = data.iter().collect();
+        let k = Intrinsics::from_hfov(
+            data[0].rgb.width(),
+            data[0].rgb.height(),
+            65f64.to_radians(),
+        );
+        let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
+        let gps: Vec<Vector3<f64>> = gids
+            .iter()
+            .map(|g| ds.positions[g / 3].image_enu[g % 3])
+            .collect();
+        let pm = match_pairs(&imgs, &views, &k);
+        let mut out = Vec::new();
+        for opts in list {
+            let (init, st) = sparse_init_with(&imgs, &pm, &gps, &k, opts).unwrap();
+            let tp: Vec<Pose> = gids
+                .iter()
+                .map(|&g| {
+                    let name = ds.positions[g / 3].images[g % 3]
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                    let v = scene.views.iter().find(|v| v.name == name).unwrap();
+                    let c = scene.to_first_gps_frame(&v.camera.pose.center());
+                    Pose::from_center(v.camera.pose.rotation, &c)
+                })
+                .collect();
+            // 좌표계 무관 회전 오차: 전역 회전 Q = polar(Σ Rᵢᵀ Tᵢ) 로 맞춘 뒤.
+            let mut m = Matrix3::zeros();
+            for i in 0..n {
+                if let Some(r) = st.rots[i] {
+                    m += r.matrix().transpose() * tp[i].rotation.matrix();
+                }
+            }
+            let sv = m.svd(true, true);
+            let q = Rotation3::from_matrix_unchecked(sv.u.unwrap() * sv.v_t.unwrap());
+            let free: Vec<f64> = (0..n)
+                .filter_map(|i| {
+                    Some(
+                        (st.rots[i]? * q * tp[i].rotation.inverse())
+                            .angle()
+                            .to_degrees(),
+                    )
+                })
+                .collect();
+            let rot_of = |ps: &[Option<Pose>]| -> Vec<f64> {
+                (0..n)
+                    .filter_map(|i| {
+                        Some(
+                            (ps[i]?.rotation * tp[i].rotation.inverse())
+                                .angle()
+                                .to_degrees(),
+                        )
+                    })
+                    .collect()
+            };
+            let cen_of = |ps: &[Option<Pose>]| -> Vec<f64> {
+                (0..n)
+                    .filter_map(|i| Some((ps[i]?.center() - tp[i].center()).norm()))
+                    .collect()
+            };
+            let fin_c = cen_of(&init.poses);
+            let dz: Vec<f64> = (0..n)
+                .filter_map(|i| Some((init.poses[i]?.center().z - tp[i].center().z).abs()))
+                .collect();
+            let mx = |v: &[f64]| v.iter().copied().fold(0.0, f64::max);
+            let origin = scene.to_first_gps_frame(&Point3::new(0.0, 0.0, 0.0)).coords;
+            let surf = |p: &Vector3<f64>| {
+                let q = p - origin;
+                (q.z - scene.surface_height(q.x, q.y)).abs()
+            };
+            let good = well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200);
+            let (mut align_m, mut vs_dz) = (None, None);
+            if full {
+                let mut rs = init.clone();
+                run_ba(&mut rs, &k, 10, Some(&gps));
+                gps_align_refined(&mut rs, &gps);
+                let region = split_regions(ds.positions.len(), ds.config.span, ds.config.ovl)[0];
+                let win = (region.lo, region.hi);
+                let (ta, tb) = (to_tracks(&good, &gids), to_tracks(&rs, &gids));
+                let pairs = point_pairs(&ta, &tb, |i| (i / 3) as usize, win);
+                let (sim, rec) = align_region(&region, &pairs);
+                align_m = rec.fit_median_m;
+                let inr = vec![true; n];
+                let rc = dense_cloud(&rs, &imgs, &k, &inr, 96);
+                let pc = dense_cloud(&good, &imgs, &k, &inr, 96);
+                let xyz = |c: &PointCloud| -> Vec<[f64; 3]> {
+                    c.points
+                        .iter()
+                        .map(|p| [p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64])
+                        .collect()
+                };
+                if let Some(sm) = sim {
+                    vs_dz = height_pair_median(&xyz(&apply_cloud(&sm, &pc)), &xyz(&rc), 2.0);
+                }
+            }
+            out.push(StageRow {
+                rot_free_med: med(free.clone()),
+                rot_free_max: mx(&free),
+                placed_c_med: med(cen_of(&st.placed)),
+                placed_rot_med: med(rot_of(&st.placed)),
+                final_c_med: med(fin_c.clone()),
+                final_c_max: mx(&fin_c),
+                final_dz_med: med(dz),
+                final_rot_med: med(rot_of(&init.poses)),
+                pruned: st.pruned,
+                preview_align_m: align_m,
+                vs_refined_dz: vs_dz,
+                surf_med: med(good.points.iter().map(&surf).collect()),
+            });
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    /// 기본 초벌 포즈 단계의 숫자 기준(합성 장면 정답 대비). 측정: 중심 중앙 1.11 m·회전 중앙 0.82°
+    /// (끔: 어긋난 간선 제거·사전 1 → 3.21 m·2.54°).
+    #[test]
+    fn preview_default_pose_error_bounds() {
+        let rows = stage_rows(
+            &[
+                PreviewOpts::default(),
+                PreviewOpts::parse("prune=0,prior=0.2"),
+            ],
+            false,
+        );
+        let (new, old) = (&rows[0], &rows[1]);
+        assert!(
+            new.pruned.0 > 0 && new.pruned.0 * 10 < new.pruned.1,
+            "{:?}",
+            new.pruned
+        );
+        assert!(new.placed_rot_med < 1.2, "{}", new.placed_rot_med);
+        assert!(new.placed_c_med < 1.6, "{}", new.placed_c_med);
+        assert!(new.final_c_max < 5.0, "{}", new.final_c_max);
+        assert!(
+            new.placed_c_med < 0.6 * old.placed_c_med,
+            "{} {}",
+            new.placed_c_med,
+            old.placed_c_med
+        );
+        assert!(new.placed_rot_med < 0.6 * old.placed_rot_med);
+    }
+
+    #[test]
+    #[ignore]
+    fn preview_candidates() {
+        let specs = std::env::var("SKYLENS_CANDS").unwrap_or_else(|_| "".into());
+        let full = std::env::var("SKYLENS_FULL").is_ok();
+        let list: Vec<PreviewOpts> = specs.split(';').map(PreviewOpts::parse).collect();
+        for (spec, r) in specs.split(';').zip(stage_rows(&list, full)) {
+            eprintln!(
+                "STAGE [{spec}] rotfree med {:.2} max {:.2} pruned {:?} | placed c {:.2} rot {:.2} | final c {:.2} max {:.2} dz {:.2} rot {:.2} | align {:?} vs_refined {:?} surf {:.2}",
+                r.rot_free_med, r.rot_free_max, r.pruned, r.placed_c_med, r.placed_rot_med,
+                r.final_c_med, r.final_c_max, r.final_dz_med, r.final_rot_med,
+                r.preview_align_m, r.vs_refined_dz, r.surf_med
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn diagnose_preview() {
@@ -1198,7 +1527,7 @@ mod diag {
         let pm = match_pairs(&imgs, &views, &k);
         let init = sparse_init(&imgs, &pm, &gps, &k).unwrap();
         let mut rs = init.clone();
-        run_ba(&mut rs, &k, 10);
+        run_ba(&mut rs, &k, 10, Some(&gps));
         gps_align_refined(&mut rs, &gps);
         // 정답 카메라(첫 GPS 기준 좌표).
         let truth_pose = |g: usize| -> Pose {
