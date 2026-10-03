@@ -1806,16 +1806,13 @@ mod tests {
 
     /// 규모 시험용 합성 장면: 카메라 n_cam 대(격자 위 지붕 높이), 점 n_pts 개(바닥 부근),
     /// 카메라마다 per_cam 개 점을 무작위로 본다(무잡음, 회전은 무작위). 점 번호는 `shift` 만큼 민다.
-    fn scale_scene(
-        n_cam: usize,
-        n_pts: usize,
-        per_cam: usize,
-        shift: usize,
-    ) -> (
+    type Scene = (
         Vec<Option<Rotation3<f64>>>,
         Vec<PointObservation>,
         Vec<Point3<f64>>,
-    ) {
+    );
+
+    fn scale_scene(n_cam: usize, n_pts: usize, per_cam: usize, shift: usize) -> Scene {
         let mut rng = Rng(0xC0FFEE ^ n_pts as u64);
         let side = (n_cam as f64).sqrt().ceil() as usize;
         let centers: Vec<Point3<f64>> = (0..n_cam)
