@@ -1153,36 +1153,46 @@ pub fn run_pipeline(
             }
         }
         // 이미 내보낸 정밀 구역도 새 정밀 모델 좌표계로 다시 맞춘다(공유 3D 점 대응 닮음 변환).
-        for j in 0..recs.len() {
-            if j == k || recs[j].refined.is_none() {
-                continue;
+        // 새 구역과 겹치지 않는 구역은 겹치는 이웃을 거쳐 변환을 연쇄 합성한다.
+        let mut total: Vec<Option<Similarity>> = vec![None; recs.len()];
+        total[k] = Some(Similarity::identity());
+        let mut queue = std::collections::VecDeque::from([k]);
+        while let Some(m) = queue.pop_front() {
+            for j in 0..recs.len() {
+                if total[j].is_some() || recs[j].refined.is_none() {
+                    continue;
+                }
+                let tm = &recs[m].refined.as_ref().unwrap().0;
+                let tj = &recs[j].refined.as_ref().unwrap().0;
+                let Some((s, n, med)) = crate::pipeline_stream::realign_refined(
+                    (&recs[j].region, tj),
+                    (&recs[m].region, tm),
+                ) else {
+                    continue;
+                };
+                let acc = total[m].as_ref().unwrap().compose(&s);
+                realigns.push(ReAlign {
+                    secs: t_now(),
+                    region: j,
+                    target: k,
+                    pairs: n,
+                    median_m: med,
+                    scale: acc.s,
+                });
+                let jr = recs[j].region;
+                let moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
+                write_decimated(out, &refined_name(&jr), &moved)?;
+                events.push(format!(
+                    "{:.1}s realign refined {} to refined {} via {} pairs {n} median {med:.3} m",
+                    t_now(),
+                    jr.index,
+                    recs[k].region.index,
+                    recs[m].region.index
+                ));
+                recs[j].rsim = Some(acc);
+                total[j] = Some(acc);
+                queue.push_back(j);
             }
-            let tbk = &recs[k].refined.as_ref().unwrap().0;
-            let tj = &recs[j].refined.as_ref().unwrap().0;
-            let Some((s, n, med)) = crate::pipeline_stream::realign_refined(
-                (&recs[j].region, tj),
-                (&recs[k].region, tbk),
-            ) else {
-                continue;
-            };
-            realigns.push(ReAlign {
-                secs: t_now(),
-                region: j,
-                target: k,
-                pairs: n,
-                median_m: med,
-                scale: s.s,
-            });
-            let jr = recs[j].region;
-            let moved = crate::stream::apply_cloud(&s, &recs[j].refined.as_ref().unwrap().1);
-            write_decimated(out, &refined_name(&jr), &moved)?;
-            events.push(format!(
-                "{:.1}s realign refined {} to refined {} pairs {n} median {med:.3} m",
-                t_now(),
-                jr.index,
-                recs[k].region.index
-            ));
-            recs[j].rsim = Some(s);
         }
         Ok(())
     };
