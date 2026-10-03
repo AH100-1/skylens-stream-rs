@@ -974,7 +974,7 @@ fn ncc_cost(q: &Vector3<f32>, patch: &RefPatch, h: &Matrix3<f32>, img: &GrayImag
 /// 빠른 경로의 상위 k 시점 집계 개수(Shen 2013).
 const FAST_TOP_K: usize = 3;
 /// 고운 층에서 이 비용 미만이면 갱신을 건너뛴다.
-const FAST_SKIP_COST: f32 = 0.0;
+const FAST_SKIP_COST: f32 = 0.08;
 /// 고운 층에서 전파 후보로 삼는 이웃 가설의 비용 상한(1 − NCC).
 const FAST_TAU_KEEP: f32 = 0.9;
 
