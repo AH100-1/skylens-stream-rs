@@ -12,6 +12,7 @@ pub mod geo;
 pub mod matching;
 pub mod math;
 pub mod pipeline;
+pub mod pipeline_stream;
 pub mod ply;
 pub mod progressive;
 pub mod rotation_averaging;

@@ -904,6 +904,8 @@ struct RegionRec {
     /// 자기 정밀 모델과의 정렬 기록(최종 manifest 용).
     own: Option<(Option<Similarity>, AlignRecord)>,
     refined: Option<(Vec<Track>, PointCloud)>,
+    /// 정밀 구역 → 가장 최근 정밀 모델 좌표계 닮음 변환(공유 3D 점 대응).
+    rsim: Option<Similarity>,
     centers: BTreeMap<usize, [f64; 3]>,
     registered_prev: Vec<usize>,
 }
@@ -1048,6 +1050,38 @@ pub fn run_pipeline(
                 ));
             }
         }
+        // 이미 내보낸 정밀 구역도 새 정밀 모델 좌표계로 다시 맞춘다(공유 3D 점 대응 닮음 변환).
+        for j in 0..recs.len() {
+            if j == k || recs[j].refined.is_none() {
+                continue;
+            }
+            let tbk = &recs[k].refined.as_ref().unwrap().0;
+            let tj = &recs[j].refined.as_ref().unwrap().0;
+            let Some((s, n, med)) = crate::pipeline_stream::realign_refined(
+                (&recs[j].region, tj),
+                (&recs[k].region, tbk),
+            ) else {
+                continue;
+            };
+            realigns.push(ReAlign {
+                secs: t_now(),
+                region: j,
+                target: k,
+                pairs: n,
+                median_m: med,
+                scale: s.s,
+            });
+            let jr = recs[j].region;
+            let moved = crate::stream::apply_cloud(&s, &recs[j].refined.as_ref().unwrap().1);
+            write_decimated(out, &refined_name(&jr), &moved)?;
+            events.push(format!(
+                "{:.1}s realign refined {} to refined {} pairs {n} median {med:.3} m",
+                t_now(),
+                jr.index,
+                recs[k].region.index
+            ));
+            recs[j].rsim = Some(s);
+        }
         Ok(())
     };
 
@@ -1139,6 +1173,14 @@ pub fn run_pipeline(
             st.registered,
             st.images
         ));
+        {
+            let flags: Vec<bool> = init.poses.iter().map(|p| p.is_some()).collect();
+            let tab = crate::pipeline_stream::missing_by_camera(&gids, &flags);
+            events.push(format!(
+                "registration table region {}: cam0 {} missing {:?}; cam1 {} missing {:?}; cam2 {} missing {:?}",
+                r.index, tab[0].0, tab[0].1, tab[1].0, tab[1].1, tab[2].0, tab[2].1
+            ));
+        }
         let slot = recs.len();
         // 정밀(BA)은 다른 스레드에서: 끝나면 메시지로 돌아온다.
         {
@@ -1213,6 +1255,7 @@ pub fn run_pipeline(
             target,
             own: None,
             refined: None,
+            rsim: None,
             centers: BTreeMap::new(),
             registered_prev,
         });
@@ -1243,7 +1286,13 @@ pub fn run_pipeline(
     let prelim: Vec<PointCloud> = recs.iter().map(|r| r.coarse.clone()).collect();
     let refined: Vec<PointCloud> = recs
         .iter()
-        .map(|r| r.refined.as_ref().unwrap().1.clone())
+        .map(|r| {
+            let c = &r.refined.as_ref().unwrap().1;
+            match &r.rsim {
+                Some(s) => crate::stream::apply_cloud(s, c),
+                None => c.clone(),
+            }
+        })
         .collect();
     let aligned = apply_alignments(&prelim, &sims);
     let rep = write_outputs(out, &kept, &aligned, &refined, records.clone())
