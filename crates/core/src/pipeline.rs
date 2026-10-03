@@ -69,6 +69,10 @@ pub struct PipelineConfig {
     pub gps_sigma_v: f64,
     /// 초벌 점군을 만들기 전 GPS 사전항 BA 반복 수. 0 이면 BA 없이(SPEC §초벌) 닮음 정렬 포즈 그대로.
     pub preview_ba_iters: usize,
+    /// 초벌 점별 각도 정제(가우스–뉴턴) 회수. 0 이면 끈다.
+    pub tri_refine_iters: usize,
+    /// 초벌 점군에 남기는 점의 최소 광선 각(도).
+    pub preview_min_ray_deg: f64,
 }
 
 impl PipelineConfig {
@@ -103,6 +107,8 @@ impl Default for PipelineConfig {
             gps_sigma_h: 2.0,
             gps_sigma_v: 2.0,
             preview_ba_iters: 0,
+            tri_refine_iters: 4,
+            preview_min_ray_deg: PREVIEW_MIN_RAY_DEG,
         }
     }
 }
@@ -231,6 +237,123 @@ pub mod stand_in {
         max_px: f64,
         min_deg: f64,
     ) -> Option<(Vector3<f64>, Vec<bool>)> {
+        triangulate_robust_refined(cams, max_px, min_deg, 0)
+    }
+
+    /// 관측 광선(세계 좌표 단위 벡터)과 카메라 중심.
+    fn observed_rays(cams: &[(Camera, Vector2<f64>)]) -> Vec<(Vector3<f64>, Vector3<f64>)> {
+        cams.iter()
+            .map(|(cam, px)| {
+                let n = cam.intrinsics.to_normalized(px);
+                let u = (cam.pose.rotation.inverse() * Vector3::new(n.x, n.y, 1.0)).normalize();
+                (cam.pose.center().coords, u)
+            })
+            .collect()
+    }
+
+    /// 두 광선의 중점. 평행에 가까우면 None.
+    fn midpoint(
+        a: &(Vector3<f64>, Vector3<f64>),
+        b: &(Vector3<f64>, Vector3<f64>),
+    ) -> Option<Vector3<f64>> {
+        let w = a.0 - b.0;
+        let (d, e) = (a.1.dot(&w), b.1.dot(&w));
+        let c = a.1.dot(&b.1);
+        let den = 1.0 - c * c;
+        if den < 1e-12 {
+            return None;
+        }
+        let s = (c * e - d) / den;
+        let t = (e - c * d) / den;
+        Some(((a.0 + a.1 * s) + (b.0 + b.1 * t)) * 0.5)
+    }
+
+    /// 카메라를 고정한 점별 각도 잔차 정제(번들 조정이 아니다). 초기값은 광선 사잇각이 가장 큰
+    /// 쌍의 중점, 그 뒤 모든 관측의 각도 잔차 (I − uuᵀ)·d̂ (d̂ = 점 방향)를 가우스–뉴턴으로
+    /// `iters` 회 줄인다(감쇠 포함, 비용이 늘면 멈춘다). 실패하면 `x0` 를 그대로 돌려준다.
+    pub fn refine_angular(
+        cams: &[(Camera, Vector2<f64>)],
+        x0: Vector3<f64>,
+        iters: usize,
+    ) -> Vector3<f64> {
+        let rays = observed_rays(cams);
+        let cost = |x: &Vector3<f64>| -> Option<f64> {
+            let mut c = 0.0;
+            for (o, u) in &rays {
+                let d = x - o;
+                let n = d.norm();
+                if !n.is_finite() || n <= 1e-9 || d.dot(u) <= 0.0 {
+                    return None;
+                }
+                let r = (d / n) - u * (d.dot(u) / n);
+                c += r.norm_squared();
+            }
+            Some(c)
+        };
+        // 초기값: 사잇각이 가장 큰 쌍(같은 거리 기준 기선이 가장 긴 쪽).
+        let mut best = (0.0f64, None);
+        for i in 0..rays.len() {
+            for j in i + 1..rays.len() {
+                let s = rays[i].1.cross(&rays[j].1).norm();
+                if s > best.0 {
+                    best = (s, midpoint(&rays[i], &rays[j]));
+                }
+            }
+        }
+        let mut x = match best.1 {
+            Some(m) if cost(&m).is_some() => m,
+            _ => x0,
+        };
+        let mut c = match cost(&x) {
+            Some(c) => c,
+            None => return x0,
+        };
+        let mut lambda = 1e-6;
+        for _ in 0..iters {
+            let mut h = Matrix3::zeros();
+            let mut g = Vector3::zeros();
+            for (o, u) in &rays {
+                let d = x - o;
+                let n = d.norm();
+                let dh = d / n;
+                let p = Matrix3::identity() - u * u.transpose();
+                let jm = p * (Matrix3::identity() - dh * dh.transpose()) / n;
+                let r = p * dh;
+                h += jm.transpose() * jm;
+                g += jm.transpose() * r;
+            }
+            let tr = h.trace() / 3.0;
+            let mut stepped = false;
+            for _ in 0..6 {
+                let hd = h + Matrix3::identity() * (lambda * tr);
+                if let Some(dx) = hd.lu().solve(&(-g)) {
+                    let xn = x + dx;
+                    if let Some(cn) = cost(&xn) {
+                        if cn <= c {
+                            x = xn;
+                            c = cn;
+                            lambda = (lambda * 0.3).max(1e-9);
+                            stepped = true;
+                            break;
+                        }
+                    }
+                }
+                lambda *= 10.0;
+            }
+            if !stepped {
+                break;
+            }
+        }
+        x
+    }
+
+    /// [`triangulate_robust`] 에 점별 각도 정제(`refine_iters` 회, 0 이면 끔)를 더한 것.
+    pub fn triangulate_robust_refined(
+        cams: &[(Camera, Vector2<f64>)],
+        max_px: f64,
+        min_deg: f64,
+        refine_iters: usize,
+    ) -> Option<(Vector3<f64>, Vec<bool>)> {
         let mut keep: Vec<bool> = cams
             .iter()
             .map(|(_, px)| px.x.is_finite() && px.y.is_finite())
@@ -256,9 +379,12 @@ pub mod stand_in {
                 a += m;
                 b += m * cam.pose.center().coords;
             }
-            let x = a.lu().solve(&b)?;
+            let mut x = a.lu().solve(&b)?;
             if !x.iter().all(|v| v.is_finite()) {
                 return None;
+            }
+            if refine_iters > 0 {
+                x = refine_angular(&sub, x, refine_iters);
             }
             // 카메라 뒤·투영 불가·비유한 오차는 무한대로 보아 가장 먼저 버린다.
             let errs: Vec<f64> = sub
@@ -466,6 +592,8 @@ struct TriConfig {
     /// 점 문턱의 하한(px).
     min_px: f64,
     min_deg: f64,
+    /// 점별 각도 정제 회수(0 이면 선형 최소제곱 그대로).
+    refine_iters: usize,
 }
 
 impl TriConfig {
@@ -475,6 +603,7 @@ impl TriConfig {
             median_k: c.tri_median_k,
             min_px: c.tri_min_px,
             min_deg: 4.0,
+            refine_iters: c.tri_refine_iters,
         }
     }
 }
@@ -532,7 +661,8 @@ fn triangulate_tracks(
             if cams.len() != o.len() {
                 return None;
             }
-            let (x, keep) = stand_in::triangulate_robust(&cams, loose, tri.min_deg)?;
+            let (x, keep) =
+                stand_in::triangulate_robust_refined(&cams, loose, tri.min_deg, tri.refine_iters)?;
             let e = cams
                 .iter()
                 .zip(keep)
@@ -569,7 +699,7 @@ fn triangulate_tracks(
         .map(|(o, c)| {
             let (x0, _) = c.as_ref()?;
             let cams = cams_of(o);
-            match stand_in::triangulate_robust(&cams, thr, tri.min_deg) {
+            match stand_in::triangulate_robust_refined(&cams, thr, tri.min_deg, tri.refine_iters) {
                 Some((x, keep)) => {
                     let nk = keep.iter().filter(|&&kp| kp).count();
                     Some((true, x, loose_obs(o, &x), nk))
@@ -1794,7 +1924,7 @@ pub fn run_pipeline_with(
         let t3 = Instant::now();
         let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
         let coarse = dense_cloud(
-            &well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200),
+            &well_conditioned(&init, cfg.preview_min_ray_deg, 200),
             &imgs,
             &k,
             &in_region,
@@ -2928,5 +3058,69 @@ mod tri_tests {
         assert!(s.rms < 0.7 && all_rms < 0.7, "{} {all_rms}", s.rms);
         assert!(med < 1.5, "{med}");
         let _ = &sc.truth;
+    }
+
+    /// 작은 사잇각(기선 4 m / 높이 80 m, 약 2.9도)에서 깊이 오차: 점별 각도 정제가 선형보다 나쁘지 않다.
+    /// 같은 잡음(0.7 px)으로 점 400 개: 두 시점과, 가까운 연속 프레임 + 먼 쌍 여러 시점.
+    fn depth_stats(centers: &[Vector3<f64>], refine: usize, seed: u64) -> (f64, f64) {
+        let mut rng = Rng(seed);
+        let (mut bias, mut sq, mut n) = (0.0, 0.0, 0.0);
+        for _ in 0..400 {
+            let x = Vector3::new(rng.next() * 20.0 - 10.0, rng.next() * 20.0 - 10.0, 0.0);
+            let cams: Vec<(Camera, Vector2<f64>)> = centers
+                .iter()
+                .map(|&c| {
+                    let (cm, px) = view(c, &x);
+                    (cm, px + Vector2::new(rng.gauss(), rng.gauss()) * 0.7)
+                })
+                .collect();
+            let (p, _) = stand_in::triangulate_robust_refined(&cams, 50.0, 0.0, refine)
+                .expect("triangulates");
+            let ez = p.z - x.z;
+            bias += ez;
+            sq += ez * ez;
+            n += 1.0;
+        }
+        (bias / n, (sq / n).sqrt())
+    }
+
+    #[test]
+    fn refined_triangulation_depth_error_not_worse_at_small_angle() {
+        let two = [Vector3::new(0.0, 0.0, 80.0), Vector3::new(4.0, 0.0, 80.0)];
+        let (b0, r0) = depth_stats(&two, 0, 7);
+        let (b1, r1) = depth_stats(&two, 4, 7);
+        eprintln!("two view: linear bias {b0:.3} rms {r0:.3} | refined bias {b1:.3} rms {r1:.3}");
+        // 두 시점에서는 두 추정이 거의 같다(깊이 오차 약 2 m, 차이 2% 이내).
+        assert!(r1 <= r0 * 1.02, "rms {r1} vs {r0}");
+
+        // 가까운 연속 프레임 5 장(기선 0.5 m) + 먼 카메라 한 대(가로 기선 15 m)
+        let mut multi: Vec<Vector3<f64>> = (0..5)
+            .map(|i| Vector3::new(i as f64 * 0.5, 0.0, 80.0))
+            .collect();
+        multi.push(Vector3::new(15.0, 3.0, 80.0));
+        let (bm0, rm0) = depth_stats(&multi, 0, 11);
+        let (bm1, rm1) = depth_stats(&multi, 4, 11);
+        eprintln!(
+            "multi view: linear bias {bm0:.3} rms {rm0:.3} | refined bias {bm1:.3} rms {rm1:.3}"
+        );
+        // 잡음만 있는 합성에서는 선형과 각도 정제가 같은 최적점에 가까워 차이가 없다: 나빠지지 않음만 단언한다.
+        assert!(rm1 <= rm0 * 1.02, "rms {rm1} vs {rm0}");
+        assert!(bm1.abs() <= bm0.abs() + 0.05, "bias {bm1} vs {bm0}");
+    }
+
+    #[test]
+    fn refined_triangulation_is_exact_without_noise() {
+        let x = Vector3::new(3.0, -2.0, 0.5);
+        let cams: Vec<_> = [
+            Vector3::new(0.0, 0.0, 60.0),
+            Vector3::new(1.0, 0.0, 60.0),
+            Vector3::new(14.0, 2.0, 60.0),
+        ]
+        .iter()
+        .map(|&c| view(c, &x))
+        .collect();
+        let (p, keep) = stand_in::triangulate_robust_refined(&cams, 0.5, 1.0, 4).unwrap();
+        assert!((p - x).norm() < 1e-6, "{p:?}");
+        assert!(keep.iter().all(|&k| k));
     }
 }
