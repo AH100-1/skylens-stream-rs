@@ -1006,10 +1006,6 @@ pub fn run_pipeline(
         st.secs_dense = t3.elapsed().as_secs_f64();
         st.preview_points = coarse.len();
         let ta = to_tracks(&init, &gids);
-        while let Ok(m) = rx.try_recv() {
-            in_flight -= 1;
-            handle(m, &mut recs, &mut events, &mut realigns, &mut latest_ref)?;
-        }
         let (mut sim, mut target) = (None, None);
         if let Some(m) = latest_ref {
             let win = overlap_window(r, &recs[m].region);
@@ -1058,6 +1054,11 @@ pub fn run_pipeline(
             centers: BTreeMap::new(),
             registered_prev,
         });
+        // 이 구역을 올린 뒤에 끝난 정밀 결과를 반영한다(방금 올린 초벌도 재정렬 대상이다).
+        while let Ok(m) = rx.try_recv() {
+            in_flight -= 1;
+            handle(m, &mut recs, &mut events, &mut realigns, &mut latest_ref)?;
+        }
     }
     while in_flight > 0 {
         let m = rx.recv().map_err(|e| e.to_string())?;
