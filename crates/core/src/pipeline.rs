@@ -534,306 +534,6 @@ fn triangulate_tracks(
     (points, obs, st)
 }
 
-#[cfg(test)]
-mod tri_tests {
-    use super::stand_in::{max_drops, triangulate_robust};
-    use super::*;
-
-    fn k() -> Intrinsics {
-        Intrinsics::from_hfov(960, 540, 65f64.to_radians())
-    }
-
-    /// 아래를 보는 카메라(동=x, 북=위 영상). 카메라 좌표 x=동, y=남, z=아래.
-    fn nadir(c: Vector3<f64>) -> Pose {
-        let r = Rotation3::from_matrix_unchecked(Matrix3::from_diagonal(&Vector3::new(
-            1.0, -1.0, -1.0,
-        )));
-        Pose::from_center(r, &Point3::from(c))
-    }
-
-    fn cam(c: Vector3<f64>) -> Camera {
-        Camera {
-            intrinsics: k(),
-            pose: nadir(c),
-        }
-    }
-
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> f64 {
-            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
-        }
-        fn gauss(&mut self) -> f64 {
-            let (a, b) = (self.next().max(1e-12), self.next());
-            (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
-        }
-    }
-
-    fn view(c: Vector3<f64>, x: &Vector3<f64>) -> (Camera, Vector2<f64>) {
-        let cm = cam(c);
-        let px = cm.project(&Point3::from(*x)).unwrap();
-        (cm, px)
-    }
-
-    /// 6 시점이 한 점을 본다(기선 10 m 간격, 고도 30 m).
-    fn six_views(x: &Vector3<f64>) -> Vec<(Camera, Vector2<f64>)> {
-        (0..6)
-            .map(|i| {
-                let c = Vector3::new(-25.0 + 10.0 * i as f64, (i % 2) as f64 * 6.0, 30.0);
-                view(c, x)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn degenerate_inputs_do_not_panic() {
-        let x = Vector3::new(3.0, 2.0, 0.0);
-        assert!(triangulate_robust(&[], 1.0, 1.5).is_none());
-        let v = six_views(&x);
-        assert!(triangulate_robust(&v[..1], 1.0, 1.5).is_none());
-        // 같은 중심, 같은 광선.
-        let same = vec![v[0], v[0], v[0]];
-        assert!(triangulate_robust(&same, 1.0, 1.5).is_none());
-        // 같은 중심, 다른 픽셀(순수 회전): 광선이 한 점에서 만나지 않는다.
-        let c0 = Vector3::new(0.0, 0.0, 30.0);
-        let (ca, pa) = view(c0, &x);
-        let pure = vec![(ca, pa), (ca, pa + Vector2::new(80.0, 0.0))];
-        assert!(triangulate_robust(&pure, 1.0, 1.5).is_none());
-        // 평행 광선(무한히 먼 점이나 같은 방향): 모든 시점이 같은 광선 방향.
-        let far = Vector3::new(0.0, 0.0, -1.0e9);
-        let par: Vec<_> = (0..3)
-            .map(|i| view(Vector3::new(10.0 * i as f64, 0.0, 30.0), &far))
-            .collect();
-        assert!(triangulate_robust(&par, 1.0, 1.5).is_none());
-        // NaN 픽셀: 그 관측만 빠지고 나머지로 풀린다. 전부 NaN 이면 None.
-        let mut nan = v.clone();
-        nan[2].1 = Vector2::new(f64::NAN, 10.0);
-        let (p, keep) = triangulate_robust(&nan, 1.0, 1.5).expect("nan skipped");
-        assert!(!keep[2] && keep.iter().filter(|&&k| k).count() == 5);
-        assert!((p - x).norm() < 1e-6);
-        let all_nan: Vec<_> = v
-            .iter()
-            .map(|&(c, _)| (c, Vector2::new(f64::NAN, f64::NAN)))
-            .collect();
-        assert!(triangulate_robust(&all_nan, 1.0, 1.5).is_none());
-        // 카메라 뒤: 한 시점이 점을 뒤에서 본다(위쪽에서 위를 향하는 점).
-        let mut behind = v.clone();
-        behind[3].0 = Camera {
-            intrinsics: k(),
-            pose: Pose::from_center(
-                Rotation3::from_matrix_unchecked(Matrix3::from_diagonal(&Vector3::new(
-                    1.0, -1.0, -1.0,
-                ))),
-                &Point3::new(5.0, 0.0, -40.0),
-            ),
-        };
-        let r = triangulate_robust(&behind, 1.0, 1.5);
-        if let Some((p, keep)) = r {
-            assert!(!keep[3]);
-            assert!((p - x).norm() < 0.05);
-        }
-        // 두 시점뿐이고 한쪽이 뒤: 풀 수 없다.
-        assert!(triangulate_robust(&behind[2..4], 1.0, 1.5).is_none());
-    }
-
-    #[test]
-    fn outliers_are_dropped_up_to_the_cap_only() {
-        assert_eq!(
-            (2..=9).map(max_drops).collect::<Vec<_>>(),
-            [0, 1, 1, 1, 2, 2, 2, 2]
-        );
-        let x = Vector3::new(1.0, -2.0, 1.0);
-        let mut rng = Rng(7);
-        let mut clean = six_views(&x);
-        for (_, px) in clean.iter_mut() {
-            *px += Vector2::new(0.3 * rng.gauss(), 0.3 * rng.gauss());
-        }
-        // 이상치 없음.
-        let (p0, keep0) = triangulate_robust(&clean, 2.0, 1.5).unwrap();
-        assert!(keep0.iter().all(|&k| k));
-        assert!((p0 - x).norm() < 0.1);
-        // 1 개, 2 개.
-        for outliers in [vec![1usize], vec![1, 4]] {
-            let mut v = clean.clone();
-            for &o in &outliers {
-                v[o].1 += Vector2::new(40.0, -25.0);
-            }
-            let (p, keep) = triangulate_robust(&v, 2.0, 1.5).expect("within cap");
-            for i in 0..6 {
-                assert_eq!(keep[i], !outliers.contains(&i), "{outliers:?} {keep:?}");
-            }
-            assert!((p - x).norm() < 0.1, "{}", (p - x).norm());
-        }
-        // 상한(2) 초과: 3 개가 이상치면 None.
-        let mut v = clean.clone();
-        for o in [0usize, 2, 4] {
-            v[o].1 += Vector2::new(35.0 + 10.0 * o as f64, 20.0);
-        }
-        assert!(triangulate_robust(&v, 2.0, 1.5).is_none());
-        // 3 시점은 하나까지: 이상치 하나는 버리고 남은 둘로 푼다.
-        let mut v3 = clean[..3].to_vec();
-        v3[1].1 += Vector2::new(50.0, 0.0);
-        let (_, keep) = triangulate_robust(&v3, 2.0, 1.5).unwrap();
-        assert_eq!(keep, [true, false, true]);
-    }
-
-    struct Scene {
-        truth: Vec<Vector3<f64>>,
-        poses: Vec<Pose>,
-        coarse: Vec<Option<Pose>>,
-        tracks: Vec<Vec<(usize, usize, Vector2<f64>)>>,
-        n_pts: usize,
-    }
-
-    /// 고도 30 m 6×5 격자, 점 2000 개(3 개 이상 시점), 픽셀 잡음 σ, 초벌 포즈 흔들기.
-    fn scene(px_sigma: f64, rot_sigma: f64, pos_sigma: f64) -> Scene {
-        let mut rng = Rng(42);
-        let mut centers = Vec::new();
-        for r in 0..5 {
-            for c in 0..6 {
-                centers.push(Vector3::new(c as f64 * 12.0, r as f64 * 8.0, 30.0));
-            }
-        }
-        let poses: Vec<Pose> = centers.iter().map(|&c| nadir(c)).collect();
-        let coarse: Vec<Option<Pose>> = poses
-            .iter()
-            .map(|p| {
-                let w = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * rot_sigma;
-                let dr = Rotation3::from_scaled_axis(w);
-                let dc = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * pos_sigma;
-                Some(Pose::from_center(
-                    dr * p.rotation,
-                    &Point3::from(p.center().coords + dc),
-                ))
-            })
-            .collect();
-        let intr = k();
-        let mut truth = Vec::new();
-        let mut tracks = Vec::new();
-        while truth.len() < 2000 {
-            let x = Vector3::new(
-                10.0 + 50.0 * rng.next(),
-                8.0 + 24.0 * rng.next(),
-                3.0 * rng.next(),
-            );
-            let o: Vec<_> = poses
-                .iter()
-                .enumerate()
-                .filter_map(|(i, p)| {
-                    let q = Camera {
-                        intrinsics: intr,
-                        pose: *p,
-                    }
-                    .project(&Point3::from(x))?;
-                    intr.contains(&q).then(|| {
-                        (
-                            i,
-                            tracks.len() * 100 + i,
-                            q + Vector2::new(px_sigma * rng.gauss(), px_sigma * rng.gauss()),
-                        )
-                    })
-                })
-                .collect();
-            if o.len() >= 3 {
-                truth.push(x);
-                tracks.push(o);
-            }
-        }
-        let n_pts = tracks.len();
-        Scene {
-            truth,
-            poses,
-            coarse,
-            tracks,
-            n_pts,
-        }
-    }
-
-    fn rms_over(
-        poses: &[Option<Pose>],
-        pts: &[Vector3<f64>],
-        obs: &[Vec<(usize, usize, Vector2<f64>)>],
-    ) -> f64 {
-        let (mut s, mut n) = (0.0, 0usize);
-        for (x, o) in pts.iter().zip(obs) {
-            for &(i, _, px) in o {
-                if let Some(q) = (Camera {
-                    intrinsics: k(),
-                    pose: poses[i].unwrap(),
-                })
-                .project(&Point3::from(*x))
-                {
-                    s += (q - px).norm_squared();
-                    n += 1;
-                }
-            }
-        }
-        (s / n as f64).sqrt()
-    }
-
-    #[test]
-    fn refined_ba_keeps_observations_at_realistic_coarse_error() {
-        let sc = scene(0.3, 0.0035, 0.08);
-        let (points, obs, st) = triangulate_tracks(&sc.coarse, &k(), &sc.tracks);
-        let coarse_rms = rms_over(&sc.coarse, &points, &obs);
-        eprintln!("coarse rms {coarse_rms:.2} px {st:?}");
-        assert!((3.0..=5.5).contains(&coarse_rms), "{coarse_rms}");
-        // 점 문턱이 고정 0.7 px 이 아니라 분포에서 정해진다.
-        assert!(st.thr_px > 2.0, "{st:?}");
-        assert!(st.obs_ba as f64 >= 0.9 * st.obs_all as f64, "{st:?}");
-        assert!(st.points as f64 >= 0.9 * sc.n_pts as f64, "{st:?}");
-        let mut s = Sparse {
-            poses: sc.coarse.clone(),
-            points,
-            obs,
-            rms: 0.0,
-        };
-        let before = s.obs.iter().map(Vec::len).sum::<usize>();
-        let mut rng = Rng(5);
-        let gps: Vec<Vector3<f64>> = sc
-            .poses
-            .iter()
-            .map(|p| p.center().coords + Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.5)
-            .collect();
-        s.rms = run_ba(&mut s, &k(), 15, Some(&gps));
-        let after = s.obs.iter().map(Vec::len).sum::<usize>();
-        assert_eq!(before, after);
-        // 거르지 않은 전체 관측(정답 점 기준 점별 목록)에 대한 정밀 재투영.
-        let all: Vec<Vec<_>> = {
-            // 점 번호가 어긋나지 않게 BA 점별 관측을 원래 트랙에서 다시 찾는다.
-            s.obs
-                .iter()
-                .map(|o| {
-                    let id = o[0].1 / 100;
-                    sc.tracks[id].clone()
-                })
-                .collect()
-        };
-        let all_rms = rms_over(&s.poses, &s.points, &all);
-        let mut errs: Vec<f64> = s
-            .poses
-            .iter()
-            .zip(&sc.poses)
-            .map(|(a, b)| (a.unwrap().center() - b.center()).norm())
-            .collect();
-        errs.sort_by(f64::total_cmp);
-        let med = errs[errs.len() / 2];
-        eprintln!(
-            "refined rms {:.3} over unfiltered {all_rms:.3}; center err median {med:.2} max {:.2}; obs {before}/{}",
-            s.rms,
-            errs[errs.len() - 1],
-            st.obs_all
-        );
-        assert!(s.rms < 0.7 && all_rms < 0.7, "{} {all_rms}", s.rms);
-        assert!(med < 1.5, "{med}");
-        let _ = &sc.truth;
-    }
-}
-
 /// 회전 평균 → 방향으로 좌표계 맞춤 → 위치 → 삼각측량. 초벌 희소 모델.
 fn sparse_init(
     imgs: &[&ImgData],
@@ -1359,4 +1059,304 @@ pub fn run_pipeline(
     );
     std::fs::write(out.join("report.json"), report).map_err(|e| e.to_string())?;
     Ok(res)
+}
+
+#[cfg(test)]
+mod tri_tests {
+    use super::stand_in::{max_drops, triangulate_robust};
+    use super::*;
+
+    fn k() -> Intrinsics {
+        Intrinsics::from_hfov(960, 540, 65f64.to_radians())
+    }
+
+    /// 아래를 보는 카메라(동=x, 북=위 영상). 카메라 좌표 x=동, y=남, z=아래.
+    fn nadir(c: Vector3<f64>) -> Pose {
+        let r = Rotation3::from_matrix_unchecked(Matrix3::from_diagonal(&Vector3::new(
+            1.0, -1.0, -1.0,
+        )));
+        Pose::from_center(r, &Point3::from(c))
+    }
+
+    fn cam(c: Vector3<f64>) -> Camera {
+        Camera {
+            intrinsics: k(),
+            pose: nadir(c),
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> f64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn gauss(&mut self) -> f64 {
+            let (a, b) = (self.next().max(1e-12), self.next());
+            (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+        }
+    }
+
+    fn view(c: Vector3<f64>, x: &Vector3<f64>) -> (Camera, Vector2<f64>) {
+        let cm = cam(c);
+        let px = cm.project(&Point3::from(*x)).unwrap();
+        (cm, px)
+    }
+
+    /// 6 시점이 한 점을 본다(기선 10 m 간격, 고도 30 m).
+    fn six_views(x: &Vector3<f64>) -> Vec<(Camera, Vector2<f64>)> {
+        (0..6)
+            .map(|i| {
+                let c = Vector3::new(-25.0 + 10.0 * i as f64, (i % 2) as f64 * 6.0, 30.0);
+                view(c, x)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn degenerate_inputs_do_not_panic() {
+        let x = Vector3::new(3.0, 2.0, 0.0);
+        assert!(triangulate_robust(&[], 1.0, 1.5).is_none());
+        let v = six_views(&x);
+        assert!(triangulate_robust(&v[..1], 1.0, 1.5).is_none());
+        // 같은 중심, 같은 광선.
+        let same = vec![v[0], v[0], v[0]];
+        assert!(triangulate_robust(&same, 1.0, 1.5).is_none());
+        // 같은 중심, 다른 픽셀(순수 회전): 광선이 한 점에서 만나지 않는다.
+        let c0 = Vector3::new(0.0, 0.0, 30.0);
+        let (ca, pa) = view(c0, &x);
+        let pure = vec![(ca, pa), (ca, pa + Vector2::new(80.0, 0.0))];
+        assert!(triangulate_robust(&pure, 1.0, 1.5).is_none());
+        // 평행 광선(무한히 먼 점이나 같은 방향): 모든 시점이 같은 광선 방향.
+        let far = Vector3::new(0.0, 0.0, -1.0e9);
+        let par: Vec<_> = (0..3)
+            .map(|i| view(Vector3::new(10.0 * i as f64, 0.0, 30.0), &far))
+            .collect();
+        assert!(triangulate_robust(&par, 1.0, 1.5).is_none());
+        // NaN 픽셀: 그 관측만 빠지고 나머지로 풀린다. 전부 NaN 이면 None.
+        let mut nan = v.clone();
+        nan[2].1 = Vector2::new(f64::NAN, 10.0);
+        let (p, keep) = triangulate_robust(&nan, 1.0, 1.5).expect("nan skipped");
+        assert!(!keep[2] && keep.iter().filter(|&&k| k).count() == 5);
+        assert!((p - x).norm() < 1e-6);
+        let all_nan: Vec<_> = v
+            .iter()
+            .map(|&(c, _)| (c, Vector2::new(f64::NAN, f64::NAN)))
+            .collect();
+        assert!(triangulate_robust(&all_nan, 1.0, 1.5).is_none());
+        // 카메라 뒤: 한 시점이 점을 뒤에서 본다(위쪽에서 위를 향하는 점).
+        let mut behind = v.clone();
+        behind[3].0 = Camera {
+            intrinsics: k(),
+            pose: Pose::from_center(
+                Rotation3::from_matrix_unchecked(Matrix3::from_diagonal(&Vector3::new(
+                    1.0, -1.0, -1.0,
+                ))),
+                &Point3::new(5.0, 0.0, -40.0),
+            ),
+        };
+        let r = triangulate_robust(&behind, 1.0, 1.5);
+        if let Some((p, keep)) = r {
+            assert!(!keep[3]);
+            assert!((p - x).norm() < 0.05);
+        }
+        // 두 시점뿐이고 한쪽이 뒤: 풀 수 없다.
+        assert!(triangulate_robust(&behind[2..4], 1.0, 1.5).is_none());
+    }
+
+    #[test]
+    fn outliers_are_dropped_up_to_the_cap_only() {
+        assert_eq!(
+            (2..=9).map(max_drops).collect::<Vec<_>>(),
+            [0, 1, 1, 1, 2, 2, 2, 2]
+        );
+        let x = Vector3::new(1.0, -2.0, 1.0);
+        let mut rng = Rng(7);
+        let mut clean = six_views(&x);
+        for (_, px) in clean.iter_mut() {
+            *px += Vector2::new(0.3 * rng.gauss(), 0.3 * rng.gauss());
+        }
+        // 이상치 없음.
+        let (p0, keep0) = triangulate_robust(&clean, 2.0, 1.5).unwrap();
+        assert!(keep0.iter().all(|&k| k));
+        assert!((p0 - x).norm() < 0.1);
+        // 1 개, 2 개.
+        for outliers in [vec![1usize], vec![1, 4]] {
+            let mut v = clean.clone();
+            for &o in &outliers {
+                v[o].1 += Vector2::new(40.0, -25.0);
+            }
+            let (p, keep) = triangulate_robust(&v, 2.0, 1.5).expect("within cap");
+            for i in 0..6 {
+                assert_eq!(keep[i], !outliers.contains(&i), "{outliers:?} {keep:?}");
+            }
+            assert!((p - x).norm() < 0.1, "{}", (p - x).norm());
+        }
+        // 상한(2) 초과: 3 개가 이상치면 None.
+        let mut v = clean.clone();
+        for o in [0usize, 2, 4] {
+            v[o].1 += Vector2::new(35.0 + 10.0 * o as f64, 20.0);
+        }
+        assert!(triangulate_robust(&v, 2.0, 1.5).is_none());
+        // 3 시점은 하나까지: 이상치 하나는 버리고 남은 둘로 푼다.
+        let mut v3 = clean[..3].to_vec();
+        v3[1].1 += Vector2::new(50.0, 0.0);
+        let (_, keep) = triangulate_robust(&v3, 2.0, 1.5).unwrap();
+        assert_eq!(keep, [true, false, true]);
+    }
+
+    struct Scene {
+        truth: Vec<Vector3<f64>>,
+        poses: Vec<Pose>,
+        coarse: Vec<Option<Pose>>,
+        tracks: Vec<Vec<(usize, usize, Vector2<f64>)>>,
+        n_pts: usize,
+    }
+
+    /// 고도 30 m 6×5 격자, 점 2000 개(3 개 이상 시점), 픽셀 잡음 σ, 초벌 포즈 흔들기.
+    fn scene(px_sigma: f64, rot_sigma: f64, pos_sigma: f64) -> Scene {
+        let mut rng = Rng(42);
+        let mut centers = Vec::new();
+        for r in 0..5 {
+            for c in 0..6 {
+                centers.push(Vector3::new(c as f64 * 12.0, r as f64 * 8.0, 30.0));
+            }
+        }
+        let poses: Vec<Pose> = centers.iter().map(|&c| nadir(c)).collect();
+        let coarse: Vec<Option<Pose>> = poses
+            .iter()
+            .map(|p| {
+                let w = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * rot_sigma;
+                let dr = Rotation3::from_scaled_axis(w);
+                let dc = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * pos_sigma;
+                Some(Pose::from_center(
+                    dr * p.rotation,
+                    &Point3::from(p.center().coords + dc),
+                ))
+            })
+            .collect();
+        let intr = k();
+        let mut truth = Vec::new();
+        let mut tracks = Vec::new();
+        while truth.len() < 2000 {
+            let x = Vector3::new(
+                10.0 + 50.0 * rng.next(),
+                8.0 + 24.0 * rng.next(),
+                3.0 * rng.next(),
+            );
+            let o: Vec<_> = poses
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| {
+                    let q = Camera {
+                        intrinsics: intr,
+                        pose: *p,
+                    }
+                    .project(&Point3::from(x))?;
+                    intr.contains(&q).then(|| {
+                        (
+                            i,
+                            tracks.len() * 100 + i,
+                            q + Vector2::new(px_sigma * rng.gauss(), px_sigma * rng.gauss()),
+                        )
+                    })
+                })
+                .collect();
+            if o.len() >= 3 {
+                truth.push(x);
+                tracks.push(o);
+            }
+        }
+        let n_pts = tracks.len();
+        Scene {
+            truth,
+            poses,
+            coarse,
+            tracks,
+            n_pts,
+        }
+    }
+
+    fn rms_over(
+        poses: &[Option<Pose>],
+        pts: &[Vector3<f64>],
+        obs: &[Vec<(usize, usize, Vector2<f64>)>],
+    ) -> f64 {
+        let (mut s, mut n) = (0.0, 0usize);
+        for (x, o) in pts.iter().zip(obs) {
+            for &(i, _, px) in o {
+                if let Some(q) = (Camera {
+                    intrinsics: k(),
+                    pose: poses[i].unwrap(),
+                })
+                .project(&Point3::from(*x))
+                {
+                    s += (q - px).norm_squared();
+                    n += 1;
+                }
+            }
+        }
+        (s / n as f64).sqrt()
+    }
+
+    #[test]
+    fn refined_ba_keeps_observations_at_realistic_coarse_error() {
+        let sc = scene(0.3, 0.0035, 0.08);
+        let (points, obs, st) = triangulate_tracks(&sc.coarse, &k(), &sc.tracks);
+        let coarse_rms = rms_over(&sc.coarse, &points, &obs);
+        eprintln!("coarse rms {coarse_rms:.2} px {st:?}");
+        assert!((3.0..=5.5).contains(&coarse_rms), "{coarse_rms}");
+        // 점 문턱이 고정 0.7 px 이 아니라 분포에서 정해진다.
+        assert!(st.thr_px > 2.0, "{st:?}");
+        assert!(st.obs_ba as f64 >= 0.9 * st.obs_all as f64, "{st:?}");
+        assert!(st.points as f64 >= 0.9 * sc.n_pts as f64, "{st:?}");
+        let mut s = Sparse {
+            poses: sc.coarse.clone(),
+            points,
+            obs,
+            rms: 0.0,
+        };
+        let before = s.obs.iter().map(Vec::len).sum::<usize>();
+        let mut rng = Rng(5);
+        let gps: Vec<Vector3<f64>> = sc
+            .poses
+            .iter()
+            .map(|p| p.center().coords + Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.5)
+            .collect();
+        s.rms = run_ba(&mut s, &k(), 15, Some(&gps));
+        let after = s.obs.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(before, after);
+        // 거르지 않은 전체 관측(정답 점 기준 점별 목록)에 대한 정밀 재투영.
+        let all: Vec<Vec<_>> = {
+            // 점 번호가 어긋나지 않게 BA 점별 관측을 원래 트랙에서 다시 찾는다.
+            s.obs
+                .iter()
+                .map(|o| {
+                    let id = o[0].1 / 100;
+                    sc.tracks[id].clone()
+                })
+                .collect()
+        };
+        let all_rms = rms_over(&s.poses, &s.points, &all);
+        let mut errs: Vec<f64> = s
+            .poses
+            .iter()
+            .zip(&sc.poses)
+            .map(|(a, b)| (a.unwrap().center() - b.center()).norm())
+            .collect();
+        errs.sort_by(f64::total_cmp);
+        let med = errs[errs.len() / 2];
+        eprintln!(
+            "refined rms {:.3} over unfiltered {all_rms:.3}; center err median {med:.2} max {:.2}; obs {before}/{}",
+            s.rms,
+            errs[errs.len() - 1],
+            st.obs_all
+        );
+        assert!(s.rms < 0.7 && all_rms < 0.7, "{} {all_rms}", s.rms);
+        assert!(med < 1.5, "{med}");
+        let _ = &sc.truth;
+    }
 }
