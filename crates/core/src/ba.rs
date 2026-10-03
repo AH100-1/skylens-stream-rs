@@ -7,6 +7,10 @@
 //! - 게이지: 지정한 카메라(기본: 첫 카메라)의 포즈를 고정한다(목록이 비거나 범위 밖이면 첫 카메라).
 //!   고정 카메라가 하나뿐이면 남는 축척 1자유도는 두 번째 기준 카메라의 평행이동 한 성분을
 //!   고정해 없앤다. 성분은 축척 방향 기울기 |R_k(C_k − C_0)|_i 가 가장 큰 것을 고른다.
+//! - 위치 사전항(선택, `BaOptions::position_prior`): 카메라 중심 c_i 와 사전 위치 g_i 사이
+//!   잔차 (c_i − g_i)/σ 를 Huber(huber_k, 단위 σ) 로 더한다. 사전항이 있으면 축척 게이지
+//!   고정을 끈다(사전항이 축척·위치를 정한다). 카메라 블록 6×6 대각 항으로만 더해지므로
+//!   슈어 구조와 희소성은 그대로다. `free_gauge` 이면 고정 카메라도 두지 않는다.
 //! - 입력 검증: 포즈·그룹 길이 불일치, 범위 밖 그룹 번호, 유한하지 않은 포즈·내부 파라미터는
 //!   아무것도 고치지 않고 `BaStop::InvalidInput` 으로 돌려준다. 범위 밖 점·카메라 번호,
 //!   유한하지 않은 픽셀·점 좌표의 관측은 제외하고 수를 보고한다(비유한 점은 그대로 둔다).
@@ -83,6 +87,52 @@ impl Loss {
 /// 내부 파라미터 순서: [fx, fy, cx, cy, k1, k2, p1, p2].
 pub const INTRINSIC_NAMES: [&str; 8] = ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2"];
 
+/// 카메라 중심 위치 사전항. 사전 위치는 문제의 모델 좌표계(예: GPS ENU 를 현재 모델에
+/// 닮음 변환한 것)로 준다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PositionPrior {
+    /// 카메라별 사전 위치. 길이는 카메라 수와 같아야 하며 `None`·비유한 값은 사전항 없음.
+    pub positions: Vec<Option<Point3<f64>>>,
+    /// 표준편차 σ(모델 단위, 기본 2.0).
+    pub sigma: f64,
+    /// 카메라별 σ(비면 모두 `sigma`; 길이가 있으면 카메라 수와 같아야 한다). 값이 양의
+    /// 유한수가 아니면 `sigma` 를 쓴다.
+    pub sigmas: Vec<f64>,
+    /// Huber 문턱(σ 단위, 기본 3.0).
+    pub huber_k: f64,
+    /// 참이면(기본) `fixed_cameras` 를 무시하고 포즈를 고정하지 않는다.
+    pub free_gauge: bool,
+}
+
+impl PositionPrior {
+    /// σ = 2, Huber 3σ, 게이지 자유.
+    pub fn new(positions: Vec<Option<Point3<f64>>>) -> Self {
+        Self {
+            positions,
+            sigma: 2.0,
+            sigmas: Vec::new(),
+            huber_k: 3.0,
+            free_gauge: true,
+        }
+    }
+
+    fn sigma_of(&self, c: usize) -> f64 {
+        self.sigmas
+            .get(c)
+            .copied()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(self.sigma)
+    }
+
+    fn target(&self, c: usize) -> Option<Point3<f64>> {
+        self.positions
+            .get(c)
+            .copied()
+            .flatten()
+            .filter(|g| g.iter().all(|v| v.is_finite()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BaOptions {
     /// 0 = 초벌(평가만), 1 이상 = 정밀.
@@ -98,6 +148,8 @@ pub struct BaOptions {
     pub initial_lambda: f64,
     /// 상대 비용 감소가 이보다 작으면 멈춘다.
     pub function_tolerance: f64,
+    /// 카메라 중심 위치 사전항. 기본 None(끔).
+    pub position_prior: Option<PositionPrior>,
 }
 
 impl Default for BaOptions {
@@ -111,6 +163,7 @@ impl Default for BaOptions {
             max_tracks: 100_000,
             initial_lambda: 1e-4,
             function_tolerance: 1e-10,
+            position_prior: None,
         }
     }
 }
@@ -241,6 +294,11 @@ struct Layout {
 /// 고정 카메라 목록(범위 밖 제거, 비면 첫 카메라)과 축척 고정 (카메라, 평행이동 성분).
 fn gauge(problem: &BaProblem, opts: &BaOptions) -> (Vec<usize>, Option<(usize, usize)>) {
     let n_cam = problem.poses.len();
+    if let Some(pr) = &opts.position_prior {
+        if pr.free_gauge {
+            return (Vec::new(), None);
+        }
+    }
     let mut fixed: Vec<usize> = opts
         .fixed_cameras
         .iter()
@@ -252,7 +310,7 @@ fn gauge(problem: &BaProblem, opts: &BaOptions) -> (Vec<usize>, Option<(usize, u
     if fixed.is_empty() && n_cam > 0 {
         fixed.push(0);
     }
-    if fixed.len() != 1 {
+    if fixed.len() != 1 || opts.position_prior.is_some() {
         return (fixed, None);
     }
     // 고정 카메라 C_0 를 중심으로 한 축척 s 에서 t_k = −R_k(C_0 + s(C_k − C_0)) 이므로
@@ -316,8 +374,13 @@ fn layout(problem: &BaProblem, opts: &BaOptions) -> Layout {
 }
 
 /// (가중 비용, 비가중 제곱합, 투영 실패 수).
-fn evaluate(problem: &BaProblem, obs: &[Observation], loss: Loss) -> (f64, f64, usize) {
-    let mut cost = 0.0;
+fn evaluate(
+    problem: &BaProblem,
+    obs: &[Observation],
+    loss: Loss,
+    prior: Option<&PositionPrior>,
+) -> (f64, f64, usize) {
+    let mut cost = prior_cost(problem, prior);
     let mut sq = 0.0;
     let mut bad = 0;
     for o in obs {
@@ -333,6 +396,65 @@ fn evaluate(problem: &BaProblem, obs: &[Observation], loss: Loss) -> (f64, f64, 
         sq += z;
     }
     (cost, sq, bad)
+}
+
+/// 위치 사전항 비용 Σ ½ρ_Huber(|c_i − g_i|²/σ²).
+fn prior_cost(problem: &BaProblem, prior: Option<&PositionPrior>) -> f64 {
+    let Some(pr) = prior else { return 0.0 };
+    let huber = Loss::Huber(pr.huber_k);
+    let mut cost = 0.0;
+    for (c, pose) in problem.poses.iter().enumerate() {
+        if let Some(g) = pr.target(c) {
+            cost += 0.5
+                * huber.rho((pose.center() - g).norm_squared() / (pr.sigma_of(c) * pr.sigma_of(c)));
+        }
+    }
+    cost
+}
+
+/// 사전항을 정규방정식의 카메라 블록 대각에 더한다. 잔차 r=(c−g)/σ, c=−Rᵀt 이고
+/// 왼쪽 섭동에서 ∂c/∂ω = −Rᵀ[t]×, ∂c/∂t = −Rᵀ.
+fn add_prior(
+    problem: &BaProblem,
+    lay: &Layout,
+    prior: &PositionPrior,
+    a: &mut DMatrix<f64>,
+    gc: &mut DVector<f64>,
+) {
+    let huber = Loss::Huber(prior.huber_k);
+    for (c, pose) in problem.poses.iter().enumerate() {
+        let Some(g) = prior.target(c) else { continue };
+        let inv = 1.0 / prior.sigma_of(c);
+        let r = (pose.center() - g) * inv;
+        let w = huber.weight(r.norm_squared());
+        let rt = pose.rotation.inverse();
+        let rm = rt.matrix();
+        let tx = Matrix3::new(
+            0.0,
+            -pose.translation.z,
+            pose.translation.y,
+            pose.translation.z,
+            0.0,
+            -pose.translation.x,
+            -pose.translation.y,
+            pose.translation.x,
+            0.0,
+        );
+        let mut j = SMatrix::<f64, 3, 6>::zeros();
+        j.fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&(-(rm * tx) * inv));
+        j.fixed_view_mut::<3, 3>(0, 3).copy_from(&(-rm * inv));
+        let idx = &lay.cam_idx[c];
+        for (ka, ia) in idx.iter().enumerate() {
+            let Some(ia) = *ia else { continue };
+            gc[ia] += w * j.column(ka).dot(&r);
+            for (kb, ib) in idx.iter().enumerate() {
+                if let Some(ib) = *ib {
+                    a[(ia, ib)] += w * j.column(ka).dot(&j.column(kb));
+                }
+            }
+        }
+    }
 }
 
 struct PointBlock {
@@ -355,9 +477,13 @@ fn linearize(
     by_point: &[Vec<usize>],
     obs: &[Observation],
     loss: Loss,
+    prior: Option<&PositionPrior>,
 ) -> Linearization {
     let mut a = DMatrix::<f64>::zeros(lay.n, lay.n);
     let mut gc = DVector::<f64>::zeros(lay.n);
+    if let Some(pr) = prior {
+        add_prior(problem, lay, pr, &mut a, &mut gc);
+    }
     let mut points = Vec::with_capacity(tracks.len());
     for &p in tracks {
         let mut blk = PointBlock {
@@ -524,6 +650,18 @@ fn input_is_consistent(problem: &BaProblem) -> bool {
             .all(|&g| g < problem.groups.len())
 }
 
+/// 사전항이 있으면 길이가 카메라 수와 같고 σ·문턱이 양의 유한수여야 한다.
+fn prior_is_valid(problem: &BaProblem, opts: &BaOptions) -> bool {
+    opts.position_prior.as_ref().is_none_or(|p| {
+        p.positions.len() == problem.poses.len()
+            && (p.sigmas.is_empty() || p.sigmas.len() == problem.poses.len())
+            && p.sigma.is_finite()
+            && p.sigma > 0.0
+            && p.huber_k.is_finite()
+            && p.huber_k > 0.0
+    })
+}
+
 /// 관측이 쓸 수 있는지(번호 범위·픽셀 유한성·점 좌표 유한성).
 /// 유한하지 않은 점은 고치지 않고 그 관측만 뺀다.
 fn observation_is_valid(problem: &BaProblem, o: &Observation) -> bool {
@@ -537,7 +675,22 @@ fn observation_is_valid(problem: &BaProblem, o: &Observation) -> bool {
 /// 번들 조정. `problem` 을 제자리에서 고친다. 선택되지 않은 점은 그대로 둔다.
 /// 입력이 맞지 않으면(`BaStop::InvalidInput`) 아무것도 고치지 않는다.
 pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
-    if !input_is_consistent(problem) {
+    // 유효한 사전 위치가 3개 미만이면 사전항을 쓰지 않고 일반 게이지로 푼다.
+    let mut plain;
+    let opts = match &opts.position_prior {
+        Some(p)
+            if (0..p.positions.len())
+                .filter(|&c| p.target(c).is_some())
+                .count()
+                < 3 =>
+        {
+            plain = opts.clone();
+            plain.position_prior = None;
+            &plain
+        }
+        _ => opts,
+    };
+    if !input_is_consistent(problem) || !prior_is_valid(problem, opts) {
         return BaReport {
             iterations: 0,
             refined: false,
@@ -574,6 +727,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
         by_point[o.point].push(i);
     }
     let lay = layout(problem, opts);
+    let prior = opts.position_prior.as_ref();
     let rms = |sq: f64, behind: usize| (sq / (obs.len() - behind).max(1) as f64).sqrt();
     // Cauchy 는 비볼록이라 먼 초기값에서 일부 점이 이상치 쪽 해에 걸린다. 같은 척도의
     // Huber 로 먼저 수렴시킨 뒤 Cauchy 로 바꾼다(단계 방식).
@@ -581,11 +735,11 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
         Loss::Cauchy(d) => Some(Loss::Huber(d)),
         _ => None,
     };
-    let (initial_cost, sq0, behind0) = evaluate(problem, &obs, opts.loss);
+    let (initial_cost, sq0, behind0) = evaluate(problem, &obs, opts.loss, prior);
     let initial_rms = rms(sq0, behind0);
     let mut loss = staged.unwrap_or(opts.loss);
     let mut cost = if staged.is_some() {
-        evaluate(problem, &obs, loss).0
+        evaluate(problem, &obs, loss, prior).0
     } else {
         initial_cost
     };
@@ -615,7 +769,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
             {
                 staged = None;
                 loss = opts.loss;
-                cost = evaluate(problem, &obs, loss).0;
+                cost = evaluate(problem, &obs, loss, prior).0;
                 lambda = opts.initial_lambda;
                 stop = BaStop::MaxIterations;
                 if iterations < opts.max_iterations {
@@ -625,14 +779,14 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
             break;
         }
         iterations += 1;
-        let lin = linearize(problem, &lay, &tracks, &by_point, &obs, loss);
-        let (_, _, bad0) = evaluate(problem, &obs, loss);
+        let lin = linearize(problem, &lay, &tracks, &by_point, &obs, loss, prior);
+        let (_, _, bad0) = evaluate(problem, &obs, loss, prior);
         let mut accepted = false;
         for _ in 0..12 {
             match solve(&lin, lambda) {
                 Some((dc, dp)) => {
                     let cand = apply(problem, &lay, &lin, &dc, &dp);
-                    let (c_new, sq_new, bad) = evaluate(&cand, &obs, loss);
+                    let (c_new, sq_new, bad) = evaluate(&cand, &obs, loss, prior);
                     if bad <= bad0 && c_new < cost {
                         let rel = (cost - c_new) / cost.max(1e-300);
                         *problem = cand;
@@ -665,7 +819,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
         initial_rms,
         final_rms: rms(final_sq, final_behind),
         initial_cost,
-        final_cost: evaluate(problem, &obs, opts.loss).0,
+        final_cost: evaluate(problem, &obs, opts.loss, prior).0,
         converged: stop == BaStop::Converged,
         stop,
         num_observations_rejected: rejected,
@@ -1503,6 +1657,137 @@ mod tests {
         }
     }
 
+    /// 편대 장면의 높이 방향 2차 휨(최대 6 m)과 잡음을 준 초기값에서 위치 사전항 켬/끔 비교.
+    fn bowed_formation(seed: u64) -> (BaProblem, Vec<Pose>, Vec<Option<Point3<f64>>>) {
+        let (mut p, mut rng) = scene_groups(seed, 30, 500, vec![true_intr()], 120.0);
+        let gt = p.poses.clone();
+        add_noise(&mut p, &mut rng, 0.5);
+        let gps: Vec<Option<Point3<f64>>> = gt
+            .iter()
+            .map(|q| {
+                let n = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 1.5;
+                Some(q.center() + n)
+            })
+            .collect();
+        // 높이 2차 휨 + 일정한 높이 치우침 + 축척 4 % 오차(사전항이 없으면 게이지가 못 고치는 모드).
+        let bow = |x: f64| 3.0 + 6.0 * (1.0 - (x / 60.0) * (x / 60.0));
+        let scale = 1.04;
+        for q in &mut p.poses {
+            let c = q.center();
+            let n = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.3;
+            let c2 = Point3::new(c.x, c.y, c.z + bow(c.x)) * scale + n;
+            let w = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.01;
+            *q = Pose::from_center(Rotation3::new(w) * q.rotation, &c2);
+        }
+        for x in &mut p.points {
+            let n = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.2;
+            *x = Point3::new(x.x, x.y, x.z + bow(x.x)) * scale + n;
+        }
+        (p, gt, gps)
+    }
+
+    fn center_errors(est: &[Pose], gt: &[Pose]) -> (f64, f64, f64) {
+        let med = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        let e: Vec<Vector3<f64>> = est
+            .iter()
+            .zip(gt)
+            .map(|(a, b)| a.center() - b.center())
+            .collect();
+        let d: Vec<f64> = e.iter().map(|v| v.norm()).collect();
+        let max = d.iter().cloned().fold(0.0, f64::max);
+        let h: Vec<f64> = e.iter().map(|v| v.z.abs()).collect();
+        (med(d), max, med(h))
+    }
+
+    #[test]
+    fn position_prior_pins_scale_and_bow() {
+        let mut worst_on = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for seed in [11u64, 12, 13] {
+            let (p0, gt, gps) = bowed_formation(seed);
+            let start = center_errors(&p0.poses, &gt);
+            let off_opts = BaOptions::default();
+            let on_opts = BaOptions {
+                position_prior: Some(PositionPrior::new(gps.clone())),
+                ..BaOptions::default()
+            };
+            let (mut off, mut on) = (p0.clone(), p0.clone());
+            let r_off = bundle_adjust(&mut off, &off_opts);
+            let r_on = bundle_adjust(&mut on, &on_opts);
+            let e_off = center_errors(&off.poses, &gt);
+            let e_on = center_errors(&on.poses, &gt);
+            println!(
+                "seed {seed}: start med/max/h {:.2}/{:.2}/{:.2} | off {:.2}/{:.2}/{:.2} rms {:.3} | on {:.2}/{:.2}/{:.2} rms {:.3} it {}",
+                start.0, start.1, start.2, e_off.0, e_off.1, e_off.2, r_off.final_rms,
+                e_on.0, e_on.1, e_on.2, r_on.final_rms, r_on.iterations
+            );
+            assert!(r_on.refined && r_off.refined);
+            assert!(
+                e_off.2 > 2.0 && e_on.2 < 0.5 * e_off.2,
+                "on height {} off {}",
+                e_on.2,
+                e_off.2
+            );
+            assert!(e_on.2 < 1.5, "on height median {}", e_on.2);
+            assert!(e_on.0 < 2.0 && e_on.1 < 5.0, "on {:?}", e_on);
+            assert!(r_on.final_rms <= 0.7, "rms {}", r_on.final_rms);
+            worst_on = (
+                worst_on.0.max(e_on.0),
+                worst_on.1.max(e_on.1),
+                worst_on.2.max(e_on.2),
+                worst_on.3.max(r_on.final_rms),
+            );
+        }
+        println!("worst on: {worst_on:?}");
+    }
+
+    #[test]
+    fn position_prior_is_off_by_default_and_validated() {
+        assert!(BaOptions::default().position_prior.is_none());
+        let (mut p, _, gps) = bowed_formation(5);
+        let before = p.poses.clone();
+        let mut bad = PositionPrior::new(gps.clone());
+        bad.sigma = 0.0;
+        let r = bundle_adjust(
+            &mut p,
+            &BaOptions {
+                position_prior: Some(bad),
+                ..BaOptions::default()
+            },
+        );
+        assert_eq!(r.stop, BaStop::InvalidInput);
+        let r = bundle_adjust(
+            &mut p,
+            &BaOptions {
+                position_prior: Some(PositionPrior::new(gps[..3].to_vec())),
+                ..BaOptions::default()
+            },
+        );
+        assert_eq!(r.stop, BaStop::InvalidInput);
+        assert_eq!(p.poses, before);
+        // 유효 사전 위치 2개뿐이면 사전항 없이 일반 게이지로 푼다.
+        let mut two = vec![None; p.poses.len()];
+        two[1] = gps[1];
+        two[2] = gps[2];
+        let mut a = p.clone();
+        let mut b = p.clone();
+        let o = BaOptions {
+            max_iterations: 3,
+            ..BaOptions::default()
+        };
+        bundle_adjust(&mut a, &o);
+        bundle_adjust(
+            &mut b,
+            &BaOptions {
+                position_prior: Some(PositionPrior::new(two)),
+                ..o
+            },
+        );
+        assert_eq!(a.poses, b.poses);
+    }
+
     /// 선형 탐색으로 누적하던 슈어 소거(이전 방식)와 결과가 비트 단위로 같다.
     #[test]
     fn schur_matches_linear_search_accumulation() {
@@ -1514,7 +1799,15 @@ mod tests {
             by_point[o.point].push(i);
         }
         let lay = layout(&p, &opts);
-        let lin = linearize(&p, &lay, &tracks, &by_point, &p.observations, opts.loss);
+        let lin = linearize(
+            &p,
+            &lay,
+            &tracks,
+            &by_point,
+            &p.observations,
+            opts.loss,
+            None,
+        );
         let lambda = 1e-3;
         let (s, rhs, _) = schur(&lin, lambda);
         let n = lin.a.nrows();
@@ -1574,7 +1867,15 @@ mod tests {
         }
         let lay = layout(&p, &opts);
         let t = Instant::now();
-        let lin = linearize(&p, &lay, &tracks, &by_point, &p.observations, opts.loss);
+        let lin = linearize(
+            &p,
+            &lay,
+            &tracks,
+            &by_point,
+            &p.observations,
+            opts.loss,
+            None,
+        );
         let t_lin = t.elapsed().as_secs_f64();
         let t = Instant::now();
         let (s, rhs, _) = schur(&lin, 1e-4);
@@ -1583,7 +1884,7 @@ mod tests {
         let ok = s.cholesky().map(|c| c.solve(&rhs)).is_some();
         let t_chol = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let (cost, _, _) = evaluate(&p, &p.observations, opts.loss);
+        let (cost, _, _) = evaluate(&p, &p.observations, opts.loss, None);
         let t_eval = t.elapsed().as_secs_f64();
         let t = Instant::now();
         let rep = bundle_adjust(
