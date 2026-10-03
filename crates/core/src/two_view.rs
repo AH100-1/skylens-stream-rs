@@ -2217,15 +2217,19 @@ mod tests {
 
     /// 실측 편대 합성 장면의 카메라 간 짝(F(p)–R(p+d), F(p)–L(p+d), d = 20..=40 간격 4)에서
     /// 검증된 정상 대응과 정답 상대 회전. 반환: (카메라, d, 정규화 대응 두 벌, 정답 회전).
-    type CrossPair = (
+    pub(super) type CrossPair = (
         crate::synth::CamId,
         usize,
         Vec<Vector2<f64>>,
         Vec<Vector2<f64>>,
         Rotation3<f64>,
         Matrix3<f64>,
+        (Vec<Vector2<f64>>, Vec<Vector2<f64>>, Vector3<f64>),
     );
-    fn cross_pairs(seed: u64, ds: &[usize]) -> Vec<CrossPair> {
+    pub(super) fn cross_pairs_for_same_camera(seed: u64, ds: &[usize]) -> Vec<CrossPair> {
+        cross_pairs(seed, ds, &[crate::synth::CamId::F])
+    }
+    fn cross_pairs(seed: u64, ds: &[usize], cams: &[crate::synth::CamId]) -> Vec<CrossPair> {
         use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
         use crate::matching::ratio_match;
         use crate::synth::{CamId, Scene, SceneConfig};
@@ -2251,7 +2255,7 @@ mod tests {
         let base = 8usize;
         let fa = feats(CamId::F, base);
         let mut out = vec![];
-        for cam in [CamId::R, CamId::L] {
+        for &cam in cams {
             for &d in ds {
                 let fb = feats(cam, base + d);
                 let (a, b) = (&view(CamId::F, base).camera, &view(cam, base + d).camera);
@@ -2281,10 +2285,54 @@ mod tests {
                 };
                 let s1: Vec<_> = (0..n1.len()).filter(|&i| inl[i]).map(|i| n1[i]).collect();
                 let s2: Vec<_> = (0..n1.len()).filter(|&i| inl[i]).map(|i| n2[i]).collect();
-                out.push((cam, d, s1, s2, truth, e));
+                let tt = b.pose.translation - truth * a.pose.translation;
+                out.push((cam, d, s1, s2, truth, e, (n1, n2, tt)));
             }
         }
         out
+    }
+
+    /// F-251: 남은 2° 초과 짝의 원인 확인. 검증 통과 정상 집합은 거의 모두 참 정상(정답 포즈의 Sampson 문턱 안)이고,
+    /// 정답 포즈에서 시작한 정밀화도 같은 회전 오차에 수렴한다. 곧 오차는 정상 집합 선택이나 국소 최소가 아니라
+    /// 좁은 겹침·평면 우세 장면에서 이 정상 대응이 회전을 묶는 정도의 한계다.
+    #[test]
+    fn cross_pair_error_is_estimator_limit() {
+        let (mut true_share, mut n_pairs) = (0.0, 0usize);
+        for seed in 1..=3u64 {
+            for (cam, d, s1, s2, truth, e, (_, _, tt)) in cross_pairs(
+                seed,
+                &[20, 28, 36],
+                &[crate::synth::CamId::R, crate::synth::CamId::L],
+            ) {
+                let et = essential_from_pose(&truth, &tt.normalize());
+                let th = 1.0 / 377.0;
+                let share = (0..s1.len())
+                    .filter(|&i| sampson_residual(&et, &s1[i], &s2[i]).abs() < th)
+                    .count() as f64
+                    / s1.len() as f64;
+                let er = |r: &Rotation3<f64>| rotation_angle_between(r, &truth).to_degrees();
+                let rf = refine_relative_pose(&e, &s1, &s2, 50).unwrap();
+                let (gr, _) = refine_pose(&truth, &tt.normalize(), &s1, &s2, 50);
+                eprintln!(
+                    "seed {seed} {cam:?} +{d} n={} 참 정상 {share:.3} 정제 {:.2}° 정답시작 정제 {:.2}°",
+                    s1.len(),
+                    er(&rf.rotation),
+                    er(&gr)
+                );
+                true_share += share;
+                n_pairs += 1;
+                // 정답에서 시작해도 정제 해보다 더 좋아지지 않거나 (오차가 큰 짝에서) 같은 값에 수렴.
+                if er(&rf.rotation) > 2.0 {
+                    assert!(
+                        (er(&gr) - er(&rf.rotation)).abs() < 0.3,
+                        "seed {seed} {cam:?} +{d}"
+                    );
+                }
+            }
+        }
+        let mean = true_share / n_pairs as f64;
+        eprintln!("정상 집합 중 참 정상 평균 {mean:.3} ({n_pairs} 짝)");
+        assert!(mean > 0.93, "참 정상 비율 {mean}");
     }
 
     /// F-251: 카메라 간 짝의 선형·정밀화 회전 오차 표(원인 조사용 기록).
@@ -2292,7 +2340,11 @@ mod tests {
     fn cross_pair_refine_table() {
         let mut errs = vec![];
         for seed in 1..=3u64 {
-            for (cam, d, s1, s2, truth, e) in cross_pairs(seed, &[20, 24, 28, 32, 36, 40]) {
+            for (cam, d, s1, s2, truth, e, _) in cross_pairs(
+                seed,
+                &[20, 24, 28, 32, 36, 40],
+                &[crate::synth::CamId::R, crate::synth::CamId::L],
+            ) {
                 let lin = recover_pose(&e, &s1, &s2).unwrap();
                 let (lr, lt) = refine_pose(&lin.rotation, &lin.translation, &s1, &s2, 50);
                 let rf = refine_relative_pose(&e, &s1, &s2, 50).unwrap();
@@ -2320,7 +2372,7 @@ mod tests {
             errs.len(),
             errs[errs.len() / 2]
         );
-        // 기준값은 수정 후 측정(36 짝: 중앙 0.772°, 2° 초과 3, 최대 5.86°) 에 여유를 둔 값. 수정 전에는 최대 32°.
+        // 기준값은 수정 후 측정(36 짝: 중앙 0.88°(정렬 36개의 index 18), 2° 초과 3, 최대 5.86°) 에 여유를 둔 값. 카메라 간 짝은 정상 대응이 50~100개로 같은 카메라 짝(125~460개, 중앙 0.076°)보다 적어 기준을 따로 둔다. 수정 전에는 최대 32°.
         assert!(errs.len() >= 30, "검증 통과 짝 {}", errs.len());
         assert!(errs[errs.len() / 2] < 1.0, "중앙 {}", errs[errs.len() / 2]);
         assert!(over2 as f64 <= 0.12 * errs.len() as f64, "2° 초과 {over2}");
@@ -2329,5 +2381,38 @@ mod tests {
             "최대 {}",
             errs.last().unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod same_camera_tests {
+    use super::*;
+
+    /// F-251: 같은 카메라 짝(F(8)–F(8+d), d = 4·8·12)의 정밀화 회전 오차. 카메라 간 짝과 따로 단언한다.
+    #[test]
+    fn same_camera_pair_refine_errors() {
+        let mut errs = vec![];
+        for seed in 1..=3u64 {
+            for (cam, d, s1, s2, truth, e, _) in
+                tests::cross_pairs_for_same_camera(seed, &[4, 8, 12])
+            {
+                let rf = refine_relative_pose(&e, &s1, &s2, 50).unwrap();
+                let er = rf.rotation.angle_to(&truth).to_degrees();
+                eprintln!("seed {seed} {cam:?} +{d} n={} 오차 {er:.3}°", s1.len());
+                errs.push(er);
+            }
+        }
+        errs.sort_by(f64::total_cmp);
+        let over2 = errs.iter().filter(|&&x| x > 2.0).count();
+        eprintln!(
+            "같은 카메라 n={} 중앙 {:.3}° 2° 초과 {over2} 최대 {:.3}°",
+            errs.len(),
+            errs[errs.len() / 2],
+            errs.last().unwrap()
+        );
+        assert!(errs.len() >= 8, "검증 통과 짝 {}", errs.len());
+        assert!(errs[errs.len() / 2] < 0.2, "중앙 {}", errs[errs.len() / 2]);
+        assert_eq!(over2, 0, "2° 초과");
+        assert!(*errs.last().unwrap() < 0.5, "최대 {}", errs.last().unwrap());
     }
 }
