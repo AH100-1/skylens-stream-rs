@@ -91,11 +91,14 @@ fn synthetic_scene_runs_end_to_end() {
             (z - scene.surface_height(x, y)).abs()
         })
         .collect();
+    let over1 = d.iter().filter(|&&v| v > 1.0).count() as f64 / d.len() as f64;
     let sm = median(d);
     eprintln!(
-        "cloud points {} surface distance median {sm:.3} m",
-        cloud.len()
+        "cloud points {} surface distance median {sm:.3} m, share over 1 m {:.1}%",
+        cloud.len(),
+        100.0 * over1
     );
-    assert!(sm < 3.5, "표면 거리 중앙 {sm}");
+    assert!(cloud.len() >= 5000, "점 수 {}", cloud.len());
+    assert!(sm <= 1.0, "표면 거리 중앙 {sm}");
     let _ = std::fs::remove_dir_all(&root);
 }

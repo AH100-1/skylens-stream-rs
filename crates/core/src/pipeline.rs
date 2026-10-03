@@ -803,8 +803,14 @@ fn dense_cloud(
         })
         .collect();
     let pts: Vec<[f64; 3]> = s.points.iter().map(|p| [p.x, p.y, p.z]).collect();
+    // 융합 문턱은 자세 정밀도에 맞춘다: 재투영 오차 상한 = 1 px + 4 × (BA 재투영 RMS 를 밀집 해상도로 환산),
+    // 상대 깊이 상한은 같은 배수. 느슨한 초벌 자세(RMS ≈ 2.5 px)에서도 이웃 동의가 남게 한다.
+    let rms_dense = s.rms * dw as f64 / k.width as f64;
+    let scale = (1.0 + 4.0 * rms_dense).clamp(1.0, 6.0);
     let cfg = DenseConfig {
         max_width: dw as u32,
+        reproj_px: DenseConfig::default().reproj_px * scale,
+        depth_rel: DenseConfig::default().depth_rel * scale,
         ..DenseConfig::default()
     };
     let mut cloud = region_cloud(&views, &pts, &cfg);
