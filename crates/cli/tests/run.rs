@@ -133,6 +133,14 @@ fn run_rejects_bad_options_and_missing_input() {
     assert_eq!(out.status.code(), Some(2));
     let out = run(&[t.0.to_str().unwrap(), o.to_str().unwrap(), "--stride", "0"]);
     assert_eq!(out.status.code(), Some(2));
+    for bad in [
+        ["--dense-method", "x"],
+        ["--position", "x"],
+        ["--gps-sigma-h", "0"],
+    ] {
+        let out = run(&[t.0.to_str().unwrap(), o.to_str().unwrap(), bad[0], bad[1]]);
+        assert_eq!(out.status.code(), Some(2), "{bad:?}");
+    }
     let out = run(&[t.0.join("nope").to_str().unwrap(), o.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
     assert!(!o.exists());

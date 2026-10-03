@@ -23,8 +23,17 @@ struct Case {
 }
 
 fn run_case(stride: usize, ba_iters: usize, method: DenseMethod) -> Case {
+    run_case_with(stride, ba_iters, method, PositionMethod::GpsLeastSquares)
+}
+
+fn run_case_with(
+    stride: usize,
+    ba_iters: usize,
+    method: DenseMethod,
+    position: PositionMethod,
+) -> Case {
     let root = std::env::temp_dir().join(format!(
-        "skylens_pipe_{}_{stride}_{ba_iters}_{method:?}",
+        "skylens_pipe_{}_{stride}_{ba_iters}_{method:?}_{position:?}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&root);
@@ -51,11 +60,7 @@ fn run_case(stride: usize, ba_iters: usize, method: DenseMethod) -> Case {
         dense_method: method,
         hfov_deg: 65.0,
         ba_iters,
-        position: if std::env::var("PIPE_POSITION").as_deref() == Ok("ta") {
-            PositionMethod::TranslationAveraging
-        } else {
-            PositionMethod::GpsLeastSquares
-        },
+        position,
         preview_ba_iters: 8,
         ..PipelineConfig::default()
     };
@@ -271,5 +276,21 @@ fn synthetic_two_region_end_to_end() {
         number_after(&pa.measured, "구역 간 스케일 차 ") <= 10.0,
         "{}",
         pa.measured
+    );
+}
+
+/// 위치 평균 경로(`--position translation-averaging` 과 같은 설정), 트랙은 `tracks::build_tracks`.
+#[test]
+fn synthetic_single_region_translation_averaging() {
+    let c = run_case_with(
+        2,
+        15,
+        DenseMethod::Sweep,
+        PositionMethod::TranslationAveraging,
+    );
+    print_case(&c);
+    eprintln!(
+        "TA registered {} of {} center med {:.3} max {:.3}",
+        c.registered, c.images, c.center_med, c.center_max
     );
 }

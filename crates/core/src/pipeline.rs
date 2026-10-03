@@ -3,7 +3,8 @@
 //!
 //! 밀집 단계는 `dense::region_cloud`(구역 사진별 깊이 + 융합)를 거친다. 밀집 점이 하나도 안 나오면
 //! [`stand_in::depth_from_sparse`](희소 점 역거리 보간 깊이)로 대신한다.
-//! 아직 합치지 않은 부품(트랙, 위치 평균·삼각측량)은 [`stand_in`] 의 단순 구현으로 잇는다.
+//! 트랙은 `tracks::build_tracks`, 위치 평균은 `translation_averaging` 을 쓴다. [`stand_in`] 에는
+//! 희소 점 깊이 보간·GPS 선형 위치 풀이·삼각측량의 단순 구현만 남아 있다.
 //! `sparse::reconstruct` 는 이 흐름에 연결되어 있지 않다(희소 단계는 이 파일의 `sparse_init` 등이 맡는다).
 
 use std::collections::{BTreeMap, HashMap};
@@ -159,61 +160,6 @@ type PairList = (usize, usize, Vec<(usize, usize)>);
 pub mod stand_in {
     //! 병합 전 부품의 단순 대체. 모양은 TASKS 인터페이스를 따른다.
     use super::*;
-
-    /// 트랙: 합집합-찾기, 같은 사진이 두 번 든 성분은 버린다. 반환은 성분별 (사진, 특징) 목록.
-    /// `feat_counts[i]` = 사진 i 의 특징 수, `matches` = (i, j, [(특징 i, 특징 j)]).
-    pub fn build_tracks(feat_counts: &[usize], matches: &[PairList]) -> Vec<Vec<(usize, usize)>> {
-        let mut off = vec![0usize; feat_counts.len() + 1];
-        for (i, c) in feat_counts.iter().enumerate() {
-            off[i + 1] = off[i] + c;
-        }
-        let mut parent: Vec<usize> = (0..off[feat_counts.len()]).collect();
-        fn find(p: &mut [usize], mut x: usize) -> usize {
-            while p[x] != x {
-                p[x] = p[p[x]];
-                x = p[x];
-            }
-            x
-        }
-        for (i, j, m) in matches {
-            for &(a, b) in m {
-                let (ra, rb) = (
-                    find(&mut parent, off[*i] + a),
-                    find(&mut parent, off[*j] + b),
-                );
-                if ra != rb {
-                    parent[ra] = rb;
-                }
-            }
-        }
-        let mut comps: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-        for (i, j, m) in matches {
-            for &(a, b) in m {
-                for (img, f) in [(*i, a), (*j, b)] {
-                    let r = find(&mut parent, off[img] + f);
-                    let e = comps.entry(r).or_default();
-                    if !e.contains(&(img, f)) {
-                        e.push((img, f));
-                    }
-                }
-            }
-        }
-        let mut out: Vec<Vec<(usize, usize)>> = comps
-            .into_values()
-            .filter(|c| {
-                let mut imgs: Vec<usize> = c.iter().map(|o| o.0).collect();
-                imgs.sort_unstable();
-                let n = imgs.len();
-                imgs.dedup();
-                n >= 2 && imgs.len() == n
-            })
-            .collect();
-        for c in &mut out {
-            c.sort_unstable();
-        }
-        out.sort();
-        out
-    }
 
     /// 위치: 방향 제약 (I − ddᵀ)(C_j − C_i) = 0 과 GPS 사전(가중 `prior`)의 선형 최소제곱.
     /// `dirs` = (i, j, 세계 좌표 단위 방향 C_i → C_j). 중심이 정해지지 않으면 None.
@@ -680,9 +626,8 @@ fn averaged_centers(
             })
         })
         .collect();
-    let counts: Vec<usize> = imgs.iter().map(|d| d.feats.len()).collect();
     let ms: Vec<_> = pm.iter().map(|p| (p.i, p.j, p.inl.clone())).collect();
-    let mut tracks: Vec<Vec<(usize, usize)>> = stand_in::build_tracks(&counts, &ms)
+    let mut tracks: Vec<Vec<(usize, usize)>> = multi_view_tracks(imgs, &ms)
         .into_iter()
         .filter(|t| t.iter().filter(|&&(i, _)| rots[i].is_some()).count() >= 3)
         .collect();
