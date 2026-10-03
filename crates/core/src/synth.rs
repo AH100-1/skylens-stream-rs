@@ -55,6 +55,8 @@ pub struct SceneConfig {
     pub offsets: [[f64; 3]; 3],
     /// GPS 잡음 표준편차(m, 축마다).
     pub gps_sigma: f64,
+    /// 기체(카메라)별 GPS 치우침 표준편차(m, 축마다). 기체마다 한 번 뽑아 모든 위치에 같은 값을 더한다(0 이면 없음).
+    pub gps_bias_sigma: f64,
     pub seed: u64,
 }
 
@@ -94,6 +96,7 @@ impl Default for SceneConfig {
             heading_deg: [-3.0, 125.0, -116.0],
             offsets: formation_offsets(),
             gps_sigma: 1.5,
+            gps_bias_sigma: 0.0,
             seed: 1,
         }
     }
@@ -291,7 +294,14 @@ impl Scene {
                     gauss(config.seed, 3 * i + 1),
                     gauss(config.seed, 3 * i + 2),
                 ) * config.gps_sigma;
-                gps_enu.push(center + noise);
+                // 기체별 고정 치우침: 난수 열 번호를 위치 잡음과 겹치지 않게 큰 값에서 시작.
+                let b = (1u64 << 40) + 3 * cam as u64;
+                let bias = Vector3::new(
+                    gauss(config.seed, b),
+                    gauss(config.seed, b + 1),
+                    gauss(config.seed, b + 2),
+                ) * config.gps_bias_sigma;
+                gps_enu.push(center + noise + bias);
                 views.push(View {
                     name: format!("cam{}_{:04}", cam.letter(), p),
                     cam,
