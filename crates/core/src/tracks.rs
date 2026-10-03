@@ -1504,6 +1504,62 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
     }
 
+    /// 참 점 중 관측이 둘 이상의 트랙으로 갈라진 점의 수와 (길이 하한 이상으로 이어지는) 점 수.
+    fn split_points(s: &Synthetic, tracks: &[Track]) -> (usize, usize) {
+        let mut spread: HashMap<usize, std::collections::HashSet<usize>> = HashMap::new();
+        for (ti, t) in tracks.iter().enumerate() {
+            for o in &t.observations {
+                spread
+                    .entry(s.gt[o.image][o.feature])
+                    .or_default()
+                    .insert(ti);
+            }
+        }
+        (
+            spread.values().filter(|v| v.len() > 1).count(),
+            spread.len(),
+        )
+    }
+
+    #[test]
+    fn formation_recall_table() {
+        // 편대 기본 장면(44 위치, 카메라 간 짝 포함), 재현율 30·40·50% x 오대응 0·5·10%.
+        // 오대응 수는 짝마다 참 대응 1000 개당 0·50·100 개. 시드 1~2 의 최저값을 단언.
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        let mut failures = Vec::new();
+        for keep in [30, 40, 50] {
+            for opm in [0, 50, 100] {
+                let (mut pmin, mut cmin) = (2.0f64, 2.0f64);
+                let (mut split, mut total) = (0, 0);
+                for seed in 1..=2 {
+                    let s = synthetic_scene(opm, keep, 0, seed, &opts);
+                    let (p, c, _, _) = run_policy(&s, ConflictPolicy::Split);
+                    let cfg = TrackConfig::default();
+                    let (t, _) = build_tracks(&s.pairs, &s.keypoints, &cfg);
+                    let (sp, n) = split_points(&s, &t);
+                    pmin = pmin.min(p);
+                    cmin = cmin.min(c);
+                    split += sp;
+                    total += n;
+                }
+                eprintln!(
+                    "formation keep {keep} outlier {opm}permil: min purity {pmin:.4} min completeness {cmin:.4} split points {split}/{total}"
+                );
+                if cmin < 0.95 {
+                    failures.push(format!("keep {keep} opm {opm}: completeness {cmin}"));
+                }
+                if opm <= 50 && pmin < 0.97 {
+                    failures.push(format!("keep {keep} opm {opm}: purity {pmin}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
     #[test]
     fn seeds_change_the_kept_matches() {
         // 시드가 해시 키 전체에 섞이는지: 시드 1·2 의 같은 짝(첫 짝; 영상 (0,1) 은 공통 점이 16 개
