@@ -511,6 +511,40 @@ pub fn average_translations_with_points(
             .collect();
         start[cam] = robust_ray_point(&obs, gate);
     }
+    // 카메라와 점을 번갈아 다듬는다(점 이상치가 있으면 1단계 중심 자체가 틀려 있을 수 있다). 카메라는 자기를
+    // 본 점들의 광선 교차 위치 가설 중 정상 광선이 더 많은 쪽으로 바꾸고, 점은 새 중심에서 다시 삼각측량한다.
+    // 문턱은 10° 에서 점차 줄인다.
+    for round in 0..4 {
+        let g = gate * [1.0, 0.6, 0.4, 0.3][round];
+        for cam in 0..n_cam {
+            let pts: Vec<(Vector3<f64>, Vector3<f64>)> = by_cam[cam]
+                .iter()
+                .filter_map(|&k| Some((start[n_cam + point_observations[k].point]?, rays[k]?)))
+                .collect();
+            let lines: Vec<(Vector3<f64>, Vector3<f64>)> =
+                pts.iter().map(|(x, r)| (*x, -*r)).collect();
+            let Some(cand) = robust_ray_point(&lines, g) else {
+                continue;
+            };
+            let support = |c: &Vector3<f64>| {
+                pts.iter()
+                    .filter(|(x, r)| angle_between(&(x - c), r) <= g)
+                    .count()
+            };
+            if start[cam].is_none_or(|cur| support(&cand) > support(&cur)) {
+                start[cam] = Some(cand);
+            }
+        }
+        for (p, ks) in by_point.iter().enumerate() {
+            let obs: Vec<(Vector3<f64>, Vector3<f64>)> = ks
+                .iter()
+                .filter_map(|&k| Some((start[point_observations[k].camera]?, rays[k]?)))
+                .collect();
+            if let Some(x) = robust_ray_point(&obs, g) {
+                start[n_cam + p] = Some(x);
+            }
+        }
+    }
     let refined = average_core(
         rotations,
         observations,
@@ -1883,10 +1917,16 @@ mod tests {
     const POINTS: (usize, usize, f64) = (200, 16, 0.05);
 
     fn run_with(seed: u64, case: &Case, point_outliers: f64) -> (usize, f64, f64) {
-        let (poses, rots, obs) = observations(seed, case);
+        // 실측 배치(`SceneConfig::default()`)·실측 짝 일정. 배치가 실측 값임은 `real_formation` 이 단언한다.
+        let (poses, _gps, rots, obs) = real_observations(seed, case, 1.5);
         let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, point_outliers);
-        let res =
-            average_translations_with_points(&rots, &obs, &pobs, &TranslationConfig::default());
+        let res = average_translations_robust(
+            &rots,
+            &obs,
+            &pobs,
+            &TranslationConfig::default(),
+            seed,
+        );
         let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
         let (rms, max) = stats(&similarity_aligned_errors(&res.centers, &truth));
         (res.registered(), rms, max)
@@ -2156,8 +2196,8 @@ mod tests {
                     println!(
                         "point {pfrac} pair {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m"
                     );
-                    if reg < 238 || rms > 0.3 {
-                        fails.push((pfrac, frac, seed, reg, rms));
+                    if reg < 238 || rms > 0.3 || max > 1.0 {
+                        fails.push((pfrac, frac, seed, reg, rms, max));
                     }
                 }
             }
