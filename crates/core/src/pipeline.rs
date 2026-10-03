@@ -12,7 +12,7 @@ use nalgebra::DMatrix;
 use rayon::prelude::*;
 
 use crate::align::Similarity;
-use crate::ba::{bundle_adjust, BaOptions, BaProblem, Observation};
+use crate::ba::{bundle_adjust, BaOptions, BaProblem, Observation, PositionPrior};
 use crate::camera::{Camera, Intrinsics, Pose};
 use crate::dataset::Dataset;
 use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
@@ -210,6 +210,59 @@ pub mod stand_in {
             }
         }
         Some(x)
+    }
+
+    /// 강건 다시점 삼각측량: 재투영이 가장 나쁜 관측을 하나씩 버리며(2개까지) 모든 관측이
+    /// `max_px` 안에 들고 광선 최대 각이 `min_deg` 이상일 때만 돌려준다. 반환: 점, 남긴 관측 표시.
+    pub fn triangulate_robust(
+        cams: &[(Camera, Vector2<f64>)],
+        max_px: f64,
+        min_deg: f64,
+    ) -> Option<(Vector3<f64>, Vec<bool>)> {
+        let mut keep = vec![true; cams.len()];
+        loop {
+            let idx: Vec<usize> = (0..cams.len()).filter(|&i| keep[i]).collect();
+            if idx.len() < 2 {
+                return None;
+            }
+            let sub: Vec<(Camera, Vector2<f64>)> = idx.iter().map(|&i| cams[i]).collect();
+            let mut a = Matrix3::zeros();
+            let mut b = Vector3::zeros();
+            for (cam, px) in &sub {
+                let n = cam.intrinsics.to_normalized(px);
+                let u = (cam.pose.rotation.inverse() * Vector3::new(n.x, n.y, 1.0)).normalize();
+                let m = Matrix3::identity() - u * u.transpose();
+                a += m;
+                b += m * cam.pose.center().coords;
+            }
+            let x = a.lu().solve(&b)?;
+            let errs: Vec<f64> = sub
+                .iter()
+                .map(|(cam, px)| {
+                    cam.project(&Point3::from(x))
+                        .map_or(f64::INFINITY, |q| (q - px).norm())
+                })
+                .collect();
+            let (worst, we) = errs
+                .iter()
+                .copied()
+                .enumerate()
+                .fold((0, 0.0), |m, (i, e)| if e > m.1 { (i, e) } else { m });
+            if we.partial_cmp(&max_px) == Some(std::cmp::Ordering::Less) {
+                let rays: Vec<Vector3<f64>> = sub
+                    .iter()
+                    .map(|(c, _)| (x - c.pose.center().coords).normalize())
+                    .collect();
+                let mut ang = 0.0f64;
+                for i in 0..rays.len() {
+                    for j in i + 1..rays.len() {
+                        ang = ang.max(rays[i].dot(&rays[j]).clamp(-1.0, 1.0).acos());
+                    }
+                }
+                return (ang.to_degrees() >= min_deg).then_some((x, keep));
+            }
+            keep[idx[worst]] = false;
+        }
     }
 
     /// 희소 점 보간 깊이 맵(역거리 가중, 반경 밖은 빈 화소). `cam` 은 깊이 맵 해상도의 카메라.
@@ -486,26 +539,33 @@ fn sparse_init(
                 (i, f, Vector2::new(kp.x as f64 + 0.5, kp.y as f64 + 0.5))
             })
             .collect();
+        let o: Vec<(usize, usize, Vector2<f64>)> = o
+            .into_iter()
+            .filter(|&(i, _, _)| poses[i].is_some())
+            .collect();
         let cams: Vec<(Camera, Vector2<f64>)> = o
             .iter()
-            .filter_map(|&(i, _, px)| {
-                poses[i].map(|pose| {
-                    (
-                        Camera {
-                            intrinsics: *k,
-                            pose,
-                        },
-                        px,
-                    )
-                })
+            .map(|&(i, _, px)| {
+                (
+                    Camera {
+                        intrinsics: *k,
+                        pose: poses[i].unwrap(),
+                    },
+                    px,
+                )
             })
             .collect();
         if cams.len() < 2 {
             continue;
         }
-        if let Some(x) = stand_in::triangulate_track(&cams, 6.0) {
+        if let Some((x, keep)) = stand_in::triangulate_robust(&cams, 0.7, 4.0) {
             points.push(x);
-            obs.push(o);
+            obs.push(
+                o.into_iter()
+                    .zip(keep)
+                    .filter_map(|(v, kp)| kp.then_some(v))
+                    .collect(),
+            );
         }
     }
     let mut s = Sparse {
@@ -514,7 +574,7 @@ fn sparse_init(
         obs,
         rms: 0.0,
     };
-    s.rms = run_ba(&mut s, k, 0);
+    s.rms = run_ba(&mut s, k, 0, None);
     Ok(s)
 }
 
@@ -545,7 +605,7 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
     Some(sim)
 }
 
-fn run_ba(s: &mut Sparse, k: &Intrinsics, iters: usize) -> f64 {
+fn run_ba(s: &mut Sparse, k: &Intrinsics, iters: usize, gps: Option<&[Vector3<f64>]>) -> f64 {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
         .collect();
@@ -572,6 +632,8 @@ fn run_ba(s: &mut Sparse, k: &Intrinsics, iters: usize) -> f64 {
     let opts = BaOptions {
         max_iterations: iters,
         default_free_intrinsics: [false; 8],
+        position_prior: gps
+            .map(|g| PositionPrior::new(ids.iter().map(|&i| Some(Point3::from(g[i]))).collect())),
         ..BaOptions::default()
     };
     let rep = bundle_adjust(&mut prob, &opts);
@@ -749,7 +811,7 @@ pub fn run_pipeline(
                 },
                 || {
                     let mut rs = init.clone();
-                    rs.rms = run_ba(&mut rs, &k, cfg.ba_iters);
+                    rs.rms = run_ba(&mut rs, &k, cfg.ba_iters, Some(&gps));
                     gps_align_refined(&mut rs, &gps);
                     let rc = dense_cloud(&rs, &imgs, &k, &in_region, cfg.dense_width);
                     (rs, rc)
