@@ -619,6 +619,7 @@ fn region_cloud_impl(
     take_nbrs: usize,
 ) -> PointCloud {
     // 1. 왜곡 보정·축소. 실패한 사진은 건너뛴다(빈 깊이 맵).
+    let t_depth = std::time::Instant::now();
     let prepared: Vec<Option<DepthView>> = views
         .par_iter()
         .map(|v| prepare(v, cfg.max_width))
@@ -676,7 +677,9 @@ fn region_cloud_impl(
         })
         .collect();
 
+    crate::timing::add("dense_depth", t_depth.elapsed().as_secs_f64());
     // 4. 융합.
+    let t_fuse = std::time::Instant::now();
     let fviews: Vec<FusionView> = preps
         .iter()
         .enumerate()
@@ -693,7 +696,9 @@ fn region_cloud_impl(
         min_views: cfg.min_views.max(1),
         ..FusionConfig::default()
     };
-    fusion::try_fuse(&fviews, &maps, fcfg).unwrap_or_default()
+    let cloud = fusion::try_fuse(&fviews, &maps, fcfg).unwrap_or_default();
+    crate::timing::add("fusion", t_fuse.elapsed().as_secs_f64());
+    cloud
 }
 
 #[cfg(test)]

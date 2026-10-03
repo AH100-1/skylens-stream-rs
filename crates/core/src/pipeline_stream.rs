@@ -73,10 +73,10 @@ impl LiveLog {
         region: usize,
         state: &[LiveRegion],
     ) -> Result<(), String> {
-        let cloud = compose(state);
+        let cloud = crate::timing::timed("align_ghost", || compose(state));
         let seq = self.events.len();
         let name = format!("snapshots/live/ev_{seq:03}_{kind}_r{region}.ply");
-        write_ply_file(self.out.join(&name), &cloud)
+        crate::timing::timed("write", || write_ply_file(self.out.join(&name), &cloud))
             .map_err(|e| format!("스냅샷 쓰기 실패: {e}"))?;
         self.events.push(LiveEvent {
             seq,
