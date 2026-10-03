@@ -215,7 +215,7 @@ fn synthetic_single_region_end_to_end() {
     ] {
         check_item(&c, n, true);
     }
-    // 기본 설정(초벌 BA 0회) CLI 실측: verify 6/7, 종료 코드 1.
+    // 기본 설정(초벌 BA 0회) 실측: verify 7/7.
     // preview_align 통과: 점쌍 2746, 잔차 중앙 최대 3.932 m (목표 < 6 m).
     check_item(&c, "preview_align", true);
     let pa = c.report.item("preview_align").unwrap();
@@ -227,15 +227,14 @@ fn synthetic_single_region_end_to_end() {
     // 구역 1개: 이웃 겹침은 해당 없음.
     let ov = c.report.item("refined_overlap").unwrap();
     assert!(ov.measured.contains("해당 없음"), "{}", ov.measured);
-    // 미달: 최근접 중앙 2.358 m (목표 < 3 m 통과), 높이 차 중앙 2.657 m (목표 < 2 m 미달).
-    check_item(&c, "preview_vs_refined", false);
+    // 통과: 최근접 중앙 1.416 m (< 3 m), 높이 차 중앙 1.553 m (< 2 m). 초벌 점 광선 각 20도 이상만 남김.
+    check_item(&c, "preview_vs_refined", true);
     let pr = c.report.item("preview_vs_refined").unwrap();
-    eprintln!(
-        "SPEC 목표 preview_vs_refined 높이 차 < 2 m, 현재: {}",
+    assert!(
+        number_after(&pr.measured, "높이 차 중앙 최대 ") < 2.0,
+        "{}",
         pr.measured
     );
-    let h = number_after(&pr.measured, "높이 차 중앙 최대 ");
-    assert!(h > 2.0 && h < 3.2, "높이 차 {}", pr.measured);
     assert!(
         number_after(&pr.measured, "최근접 중앙 최대 ") < 3.0,
         "{}",
