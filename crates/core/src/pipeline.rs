@@ -1353,9 +1353,9 @@ mod diag {
                 .collect();
             // 좌표계 무관 회전 오차: 전역 회전 Q = polar(Σ Rᵢᵀ Tᵢ) 로 맞춘 뒤.
             let mut m = Matrix3::zeros();
-            for i in 0..n {
-                if let Some(r) = st.rots[i] {
-                    m += r.matrix().transpose() * tp[i].rotation.matrix();
+            for (r, t) in st.rots.iter().zip(&tp) {
+                if let Some(r) = r {
+                    m += r.matrix().transpose() * t.rotation.matrix();
                 }
             }
             let sv = m.svd(true, true);
