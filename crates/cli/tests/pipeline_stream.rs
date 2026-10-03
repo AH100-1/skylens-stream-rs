@@ -50,6 +50,7 @@ fn snapshots_grow_without_nan_and_realign_residuals_small() {
         dense_width: 80,
         hfov_deg: 65.0,
         ba_iters: 8,
+        ..PipelineConfig::default()
     };
     let out = root.join("out");
     let res = run_pipeline(&ds, &cfg, &out).unwrap();

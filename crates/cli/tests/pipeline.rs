@@ -2,7 +2,7 @@
 
 use skylens_core::dataset::{load_dataset, DatasetConfig};
 use skylens_core::math::Point3;
-use skylens_core::pipeline::{run_pipeline, PipelineConfig};
+use skylens_core::pipeline::{run_pipeline, PipelineConfig, PositionMethod};
 use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
 use skylens_core::verify::verify_dir;
@@ -50,6 +50,11 @@ fn run_case(stride: usize, ba_iters: usize) -> Case {
         dense_width: 96,
         hfov_deg: 65.0,
         ba_iters,
+        position: if std::env::var("PIPE_POSITION").as_deref() == Ok("ta") {
+            PositionMethod::TranslationAveraging
+        } else {
+            PositionMethod::GpsLeastSquares
+        },
     };
     let t = std::time::Instant::now();
     let res = run_pipeline(&ds, &cfg, &output).unwrap();
