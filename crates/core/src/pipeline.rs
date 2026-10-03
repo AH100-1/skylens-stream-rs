@@ -907,6 +907,7 @@ fn sparse_init_with(
     };
     // 좌표계 맞춤(Kabsch): 모델 방향 b = Rᵢᵀ(−R_ijᵀ t) → GPS 방향.
     let mut h = Matrix3::zeros();
+    let mut n_kabsch = 0usize;
     let mut dirs_model = Vec::new();
     for (p, _) in pm.iter().zip(&keep_edge).filter(|(_, &k)| k) {
         let (Some(ri), Some(_), Some(t)) = (rots[p.i], rots[p.j], p.t) else {
@@ -917,9 +918,18 @@ fn sparse_init_with(
         let dg = gps[p.j] - gps[p.i];
         if dg.norm() > 3.0 {
             h += b * dg.normalize().transpose() * dg.norm();
+            n_kabsch += 1;
         }
     }
     let svd = h.svd(true, true);
+    // 짝이 3개 미만이거나 가장 큰 특이값이 0 이면 방향을 정할 수 없다(제자리 비행). 직선 비행은
+    // 특이값 하나만 크므로 허용하고 아래에서 비행 축 둘레 회전을 따로 정한다.
+    if n_kabsch < 3 || svd.singular_values.max() < 1e-9 {
+        return Err(format!(
+            "좌표계 맞춤 불가: GPS 3 m 초과 짝 {n_kabsch} 개, 최대 특이값 {:.3e}",
+            svd.singular_values.max()
+        ));
+    }
     let (u, vt) = (svd.u.ok_or("SVD")?, svd.v_t.ok_or("SVD")?);
     let d = (vt.transpose() * u.transpose()).determinant().signum();
     let mut g = vt.transpose() * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, d)) * u.transpose();
