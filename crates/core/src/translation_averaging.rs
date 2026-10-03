@@ -1951,7 +1951,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "80경우 전수(시드 1~20), 오래 걸림"]
+    #[ignore = "기준 미달(열린 문제 F-276)"]
     fn noisy_outliers_grid_seeds_1_to_20() {
         let fails = grid(1..=20);
         assert!(fails.is_empty(), "{} fails: {fails:?}", fails.len());
