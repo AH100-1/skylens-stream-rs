@@ -1028,7 +1028,46 @@ fn gp_uniform(state: &mut u64) -> f64 {
 /// 중심·점은 [−100, 100]³ 무작위(시드 고정)에서 시작하고 d = 1 에서 시작한다. c, X 가 고정이면 d 는 닫힌
 /// 해, d 가 고정이면 c, X 는 좌표별로 같은 희소 선형 연립이라 둘을 번갈아 푼다(IRLS 가중 포함).
 /// `active[k]` 가 거짓인 관측은 쓰지 않는다. 반환: (중심, 점, 관측별 d).
+/// 관측에 쓰인 점 번호만 모아 0.. 로 압축해 풀고(번호 크기·빈 번호가 비용에 영향을 주지 않는다) 원래 번호 배치로
+/// 되돌려 준다. 쓰이지 않은 번호의 점은 원점. 무작위 시작은 쓰인 번호의 오름차순으로 뽑는다.
 fn gp_solve(
+    n_cam: usize,
+    n_pts: usize,
+    obs: &[(usize, usize, Vector3<f64>, f64)],
+    active: &[bool],
+    init: Option<&[Vector3<f64>]>,
+    seed: u64,
+) -> Vec<Vector3<f64>> {
+    let mut used = vec![false; n_pts];
+    for o in obs {
+        used[o.1] = true;
+    }
+    let mut map = vec![usize::MAX; n_pts];
+    let mut ids = Vec::new();
+    for (p, &u) in used.iter().enumerate() {
+        if u {
+            map[p] = ids.len();
+            ids.push(p);
+        }
+    }
+    let cobs: Vec<(usize, usize, Vector3<f64>, f64)> =
+        obs.iter().map(|&(c, p, v, w)| (c, map[p], v, w)).collect();
+    let cinit: Option<Vec<Vector3<f64>>> = init.map(|s| {
+        let mut v = s[..n_cam].to_vec();
+        v.extend(ids.iter().map(|&p| s[n_cam + p]));
+        v
+    });
+    let xc = gp_solve_compact(n_cam, ids.len(), &cobs, active, cinit.as_deref(), seed);
+    let mut x = vec![Vector3::zeros(); n_cam + n_pts];
+    x[..n_cam].copy_from_slice(&xc[..n_cam]);
+    for (i, &p) in ids.iter().enumerate() {
+        x[n_cam + p] = xc[n_cam + i];
+    }
+    x
+}
+
+/// `gp_solve` 의 본체. 점 번호는 0..n_pts 가 모두 쓰인 압축 번호.
+fn gp_solve_compact(
     n_cam: usize,
     n_pts: usize,
     obs: &[(usize, usize, Vector3<f64>, f64)],
@@ -1663,6 +1702,117 @@ mod tests {
             });
         }
         (poses, rots, obs)
+    }
+
+    /// 규모 시험용 합성 장면: 카메라 n_cam 대(격자 위 지붕 높이), 점 n_pts 개(바닥 부근),
+    /// 카메라마다 per_cam 개 점을 무작위로 본다(무잡음, 회전은 무작위). 점 번호는 `shift` 만큼 민다.
+    fn scale_scene(
+        n_cam: usize,
+        n_pts: usize,
+        per_cam: usize,
+        shift: usize,
+    ) -> (
+        Vec<Option<Rotation3<f64>>>,
+        Vec<PointObservation>,
+        Vec<Point3<f64>>,
+    ) {
+        let mut rng = Rng(0xC0FFEE ^ n_pts as u64);
+        let side = (n_cam as f64).sqrt().ceil() as usize;
+        let centers: Vec<Point3<f64>> = (0..n_cam)
+            .map(|i| {
+                Point3::new(
+                    (i % side) as f64 * 6.0 + rng.unit(),
+                    (i / side) as f64 * 6.0 + rng.unit(),
+                    40.0 + 2.0 * rng.unit(),
+                )
+            })
+            .collect();
+        let extent = side as f64 * 6.0;
+        let pts: Vec<Vector3<f64>> = (0..n_pts)
+            .map(|_| Vector3::new(rng.unit() * extent, rng.unit() * extent, 4.0 * rng.unit()))
+            .collect();
+        let rots: Vec<Rotation3<f64>> = (0..n_cam)
+            .map(|_| {
+                Rotation3::from_euler_angles(0.2 * rng.gauss(), 0.2 * rng.gauss(), 6.0 * rng.unit())
+            })
+            .collect();
+        let mut obs = Vec::with_capacity(n_cam * per_cam);
+        for (i, c) in centers.iter().enumerate() {
+            for _ in 0..per_cam {
+                let p = (rng.next() % n_pts as u64) as usize;
+                obs.push(PointObservation {
+                    camera: i,
+                    point: p + shift,
+                    bearing: rots[i] * (pts[p] - c.coords),
+                    weight: 1.0,
+                });
+            }
+        }
+        (rots.into_iter().map(Some).collect(), obs, centers)
+    }
+
+    fn scale_run(
+        n_cam: usize,
+        n_pts: usize,
+        per_cam: usize,
+        shift: usize,
+    ) -> (usize, f64, f64, f64) {
+        let (rots, pobs, truth) = scale_scene(n_cam, n_pts, per_cam, shift);
+        let t0 = std::time::Instant::now();
+        let res =
+            average_translations_with_points(&rots, &[], &pobs, &TranslationConfig::default());
+        let dt = t0.elapsed().as_secs_f64();
+        let (rms, max) = stats(&similarity_aligned_errors(&res.centers, &truth));
+        println!(
+            "scale cams {n_cam} pts {n_pts} obs/cam {per_cam} shift {shift}: reg {} rms {rms:.4} max {max:.4} {dt:.2} s",
+            res.registered()
+        );
+        (res.registered(), rms, max, dt)
+    }
+
+    #[test]
+    fn point_ids_are_compressed() {
+        // 같은 장면의 점 번호를 크게 밀어도 결과가 같고, 시간이 번호 크기에 매이지 않는다.
+        let (a_reg, a_rms, a_max, _) = scale_run(24, 300, 80, 0);
+        let (b_reg, b_rms, b_max, _) = scale_run(24, 300, 80, 1_000_000);
+        assert_eq!(a_reg, b_reg);
+        assert!((a_rms - b_rms).abs() < 1e-6 && (a_max - b_max).abs() < 1e-6);
+        assert!(a_reg == 24 && a_max < 1e-3, "reg {a_reg} max {a_max}");
+    }
+
+    #[test]
+    #[ignore = "규모 시험: 240장·점 1000·장당 관측 400, 릴리스 수 초"]
+    fn scale_240_cams_1000_points() {
+        let (reg, _, max, _) = scale_run(240, 1000, 400, 0);
+        assert!(reg >= 238 && max < 1e-2, "reg {reg} max {max}");
+    }
+
+    #[test]
+    #[ignore = "규모 시험: 240장·점 2만·장당 관측 4000, 릴리스 수십 초, 메모리 1 GB 이하 확인용"]
+    fn scale_240_cams_20000_points() {
+        let (reg, _, max, dt) = scale_run(240, 20_000, 4000, 0);
+        assert!(
+            reg >= 238 && max < 1e-2 && dt < 60.0,
+            "reg {reg} max {max} dt {dt}"
+        );
+    }
+
+    #[test]
+    #[ignore = "규모 시험: 240장·점 8만·장당 관측 4000, 릴리스 수십 초, 메모리 1 GB 이하 확인용"]
+    fn scale_240_cams_80000_points() {
+        let (reg, _, max, dt) = scale_run(240, 80_000, 4000, 0);
+        assert!(
+            reg >= 238 && max < 1e-2 && dt < 90.0,
+            "reg {reg} max {max} dt {dt}"
+        );
+    }
+
+    #[test]
+    #[ignore = "규모 시험: 점 번호를 1e6 밀어 비교, 릴리스 수십 초"]
+    fn scale_shifted_ids_same_time() {
+        let (_, _, _, t0) = scale_run(240, 20_000, 4000, 0);
+        let (_, _, _, t1) = scale_run(240, 20_000, 4000, 1_000_000);
+        assert!((t1 - t0).abs() <= 0.1 * t0, "t0 {t0} t1 {t1}");
     }
 
     fn stats(e: &[f64]) -> (f64, f64) {
