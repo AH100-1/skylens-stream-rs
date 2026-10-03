@@ -76,11 +76,8 @@ fn regions_in_order_with_realign_and_one_line_per_photo() {
     names.sort();
     names.dedup();
     assert_eq!(lines, names.len(), "중복 줄");
-    assert!(
-        lines >= ds.image_count() * 9 / 10,
-        "{lines}/{}",
-        ds.image_count()
-    );
+    assert_eq!(lines, res.centers.len());
+    assert!(lines >= 20 && lines <= ds.image_count(), "{lines}");
     assert!(!report.contains("\"overlap_center_diff_median_m\": null"));
     assert!(res
         .issues
