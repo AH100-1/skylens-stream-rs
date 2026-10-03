@@ -172,9 +172,9 @@ impl Default for Config {
         Self {
             radius: 4,
             step: 2,
-            iterations: 5,
+            iterations: 4,
             refine_iterations: 1,
-            coarse_width: 240,
+            coarse_width: 120,
             sigma_color: 0.1,
             sigma_spatial: 3.0,
             top_k: 2,
@@ -664,7 +664,7 @@ impl Ctx<'_> {
 
     /// 모든 화소의 현재 가설 비용과, 이웃을 `keep` 장으로 줄인 마스크(현재 가설에서
     /// 이웃별 비용이 낮은 순). `keep` 이 0 이거나 이웃 수 이상이면 전부.
-    fn eval_all(&self, hyps: &[Hyp], keep: usize) -> (Vec<f32>, Vec<u32>) {
+    fn eval_all(&self, hyps: &[Hyp], keep: usize, prior: Option<&[u32]>) -> (Vec<f32>, Vec<u32>) {
         let m = self.neighbors.len();
         let all = if m >= 32 { u32::MAX } else { (1u32 << m) - 1 };
         (0..self.w * self.h)
@@ -678,12 +678,21 @@ impl Ctx<'_> {
                 if keep == 0 || keep >= m {
                     return (self.cost(x, y, &rp, &p, &hyps[i]), all);
                 }
+                let allowed = prior.map_or(all, |pm| pm[i] & all);
                 let mut per = [(MAX_COST, 0usize); MAX_NEIGHBORS];
-                for (j, slot) in per.iter_mut().enumerate().take(m) {
-                    *slot = (self.cost_masked(x, y, &rp, &p, &hyps[i], 1 << j), j);
+                let mut np = 0;
+                for j in 0..m {
+                    if allowed & (1 << j) != 0 {
+                        per[np] = (self.cost_masked(x, y, &rp, &p, &hyps[i], 1 << j), j);
+                        np += 1;
+                    }
                 }
-                let per = &mut per[..m];
+                if np == 0 {
+                    return (self.cost(x, y, &rp, &p, &hyps[i]), all);
+                }
+                let per = &mut per[..np];
                 per.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                let keep = keep.min(np);
                 let mask = per[..keep].iter().fold(0u32, |a, &(_, j)| a | (1 << j));
                 let k = self.cfg.top_k.clamp(1, keep);
                 let c = per[..k].iter().map(|v| v.0).sum::<f32>() / k as f32;
@@ -694,7 +703,7 @@ impl Ctx<'_> {
 }
 
 /// 한 층의 결과: 가설, 비용, K⁻¹, 너비.
-type LevelState = (Vec<Hyp>, Vec<f32>, Matrix3<f32>, usize);
+type LevelState = (Vec<Hyp>, Vec<f32>, Matrix3<f32>, usize, Vec<u32>);
 
 /// 피라미드 한 층: 시점별 (K, 영상).
 struct Level {
@@ -753,7 +762,10 @@ pub fn estimate_profiled(
             .map(|v| v.image.normalized())
             .collect(),
     }];
-    while cfg.coarse_width > 0 && levels.last().unwrap().img[0].width >= 2 * cfg.coarse_width {
+    while cfg.coarse_width > 0
+        && w >= 4 * cfg.coarse_width
+        && levels.last().unwrap().img[0].width >= 2 * cfg.coarse_width
+    {
         let prev = levels.last().unwrap();
         let half = Matrix3::new(0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0);
         let next = Level {
@@ -810,6 +822,15 @@ pub fn estimate_profiled(
             },
         };
         let n = ctx.w * ctx.h;
+        let prior_masks: Option<Vec<u32>> = state.as_ref().map(|(_, _, _, cw, cm)| {
+            let chh = cm.len() / cw;
+            (0..n)
+                .map(|i| {
+                    let (x, y) = (i % ctx.w, i / ctx.w);
+                    cm[((y / 2).min(chh - 1)) * cw + (x / 2).min(cw - 1)]
+                })
+                .collect()
+        });
         let mut hyps: Vec<Hyp> = match state.take() {
             None => (0..n)
                 .into_par_iter()
@@ -822,7 +843,7 @@ pub fn estimate_profiled(
                     }
                 })
                 .collect(),
-            Some((ch, _, ckinv, cw)) => {
+            Some((ch, _, ckinv, cw, _)) => {
                 let chh = ch.len() / cw;
                 (0..n)
                     .into_par_iter()
@@ -842,7 +863,11 @@ pub fn estimate_profiled(
         };
         let coarsest = li == top;
         let t0 = std::time::Instant::now();
-        let (mut costs, masks) = ctx.eval_all(&hyps, if coarsest { 0 } else { cfg.fine_neighbors });
+        let (mut costs, masks) = ctx.eval_all(
+            &hyps,
+            if coarsest { 0 } else { cfg.fine_neighbors },
+            prior_masks.as_deref(),
+        );
         let t1 = std::time::Instant::now();
         let (iters, perts) = if coarsest {
             (cfg.iterations, cfg.perturbations)
@@ -864,7 +889,7 @@ pub fn estimate_profiled(
         let mut masks = masks;
         ctx.run(&mut hyps, &mut costs, &masks, sched);
         if split {
-            (costs, masks) = ctx.eval_all(&hyps, cfg.coarse_neighbors);
+            (costs, masks) = ctx.eval_all(&hyps, cfg.coarse_neighbors, None);
             sched.first = 1;
             sched.iterations = iters - 1;
             ctx.run(&mut hyps, &mut costs, &masks, sched);
@@ -876,10 +901,10 @@ pub fn estimate_profiled(
                 run_s: t1.elapsed().as_secs_f64(),
             });
         }
-        state = Some((hyps, costs, ctx.kinv, ctx.w));
+        state = Some((hyps, costs, ctx.kinv, ctx.w, masks));
     }
 
-    let (hyps, costs, _, _) = state.expect("층이 하나 이상");
+    let (hyps, costs, _, _, _) = state.expect("층이 하나 이상");
     let mut dm = DepthMap::invalid(w, h);
     for i in 0..w * h {
         let c = costs[i];
