@@ -125,12 +125,12 @@ fn detected_scales_follow_octave_count() {
 
 /// E RANSAC 의 최소 반복 수. 축소 실행에서 E RANSAC 이 짝당 가장 비싼 구간이고(짝당 수십 ms),
 /// 정상 비율이 높아 적응 반복 수가 바닥으로 내려가는 짝이 대부분이라 이 값이 그 구간 시간을 거의 그대로 정한다.
-/// 300 은 `two_view::ransac_essential` 이 쌍둥이 해도 표본에 나오도록 둔 바닥값이다(적응 반복 수
+/// 100 은 `two_view::ransac_essential` 이 쌍둥이 해도 표본에 나오도록 둔 바닥값이다(조기 포기 계수와 함께 정했다. 적응 반복 수
 /// ⌈ln(1−p)/ln(1−w⁵)⌉ 은 w=0.8·p=0.999 에서 18 이라 바닥이 없으면 대부분의 짝이 20 회 안팎에서 끝난다).
 /// 이 값을 바꾸면 E RANSAC 시간이 비례해 바뀌므로 시간 측정 노트와 함께 고친다.
 #[test]
 fn essential_ransac_min_iterations_fixed() {
-    assert_eq!(ESSENTIAL_MIN_ITERS, 300);
+    assert_eq!(ESSENTIAL_MIN_ITERS, 100);
 }
 
 fn argv(s: &str) -> Vec<String> {
