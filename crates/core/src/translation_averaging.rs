@@ -1892,6 +1892,72 @@ mod tests {
         (res.registered(), rms, max)
     }
 
+    /// 실측 배치에서 점 제약을 더한 풀이. 반환: (등록 수, RMS, 최대, 짝 그래프 최대 성분 크기, 1단계 등록 수·RMS).
+    fn real_run_with(
+        seed: u64,
+        case: &Case,
+        point_outliers: f64,
+    ) -> (usize, f64, f64, usize, usize, f64) {
+        let (poses, _gps, rots, obs) = real_observations(seed, case, 1.5);
+        let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+        let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, point_outliers);
+        let cfg = TranslationConfig::default();
+        let edges: Vec<(usize, usize)> = obs.iter().map(|o| (o.i, o.j)).collect();
+        let (comp, best) = components(poses.len(), &edges);
+        let comp_size = comp.iter().filter(|c| **c == best && c.is_some()).count();
+        let stage = average_core(&rots, &obs, &[], &cfg, None);
+        let (rs, _) = stats(&similarity_aligned_errors(&stage.centers, &truth));
+        let res = average_translations_with_points(&rots, &obs, &pobs, &cfg);
+        let (rms, max) = stats(&similarity_aligned_errors(&res.centers, &truth));
+        (
+            res.registered(),
+            rms,
+            max,
+            comp_size,
+            stage.registered(),
+            rs,
+        )
+    }
+
+    /// 진단: 실측 배치 × 짝 이상치 × 점 이상치 × 시드 표. 환경 변수 DIAG_SEEDS(기본 1~20),
+    /// DIAG_FRACS(기본 0.10,0.20), DIAG_PFRACS(기본 0,0.05). 기준 미달 경우는 FAIL 로 표시한다.
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_real_points_table() {
+        let list = |name: &str, def: Vec<f64>| -> Vec<f64> {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+                .unwrap_or(def)
+        };
+        let seeds = list("DIAG_SEEDS", (1..=20).map(|s| s as f64).collect());
+        let fracs = list("DIAG_FRACS", vec![0.10, 0.20]);
+        let pfracs = list("DIAG_PFRACS", vec![0.0, 0.05]);
+        let mut bad = 0;
+        let mut total = 0;
+        for &pf in &pfracs {
+            for &frac in &fracs {
+                for &seed in &seeds {
+                    let case = Case {
+                        noise_deg: 1.0,
+                        outlier_frac: frac,
+                        unobservable_frac: 0.05,
+                    };
+                    let seed = seed as u64;
+                    let (reg, rms, max, comp, sreg, srms) = real_run_with(seed, &case, pf);
+                    let fail = reg < 238 || rms > 0.3;
+                    total += 1;
+                    bad += fail as usize;
+                    println!(
+                        "REALPTS point {pf} pair {frac} seed {seed}: reg {reg} rms {rms:.3} max {max:.3} | comp {comp} stage reg {sreg} rms {srms:.3} {}",
+                        if fail { "FAIL" } else { "" }
+                    );
+                }
+            }
+        }
+        println!("REALPTS summary: {bad} fail of {total}");
+    }
+
     /// 진단: 점 제약 유무별 등록 수·RMS (잡음 1°, 이상치 10·20%, 시드 1~5).
     #[test]
     #[ignore = "진단 출력용"]
