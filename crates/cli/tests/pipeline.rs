@@ -55,6 +55,7 @@ fn run_case(stride: usize, ba_iters: usize) -> Case {
         } else {
             PositionMethod::GpsLeastSquares
         },
+        preview_ba_iters: 8,
         ..PipelineConfig::default()
     };
     let t = std::time::Instant::now();
@@ -180,31 +181,23 @@ fn synthetic_single_region_end_to_end() {
     ] {
         check_item(&c, n, true);
     }
-    // 알려진 미달: 초벌 정렬 잔차 중앙 6.97 m (목표 < 6 m). 상한 8 m 만 단언한다.
-    check_item(&c, "preview_align", false);
+    // 초벌 전 GPS 사전항 BA 8회: 정렬 잔차 중앙 0.046 m (목표 < 6 m).
+    check_item(&c, "preview_align", true);
     let pa = c.report.item("preview_align").unwrap();
     assert!(
-        number_after(&pa.measured, "잔차 중앙 최대 ") < 8.0,
+        number_after(&pa.measured, "잔차 중앙 최대 ") < 0.5,
         "{}",
         pa.measured
     );
     // 구역 1개: 이웃 겹침은 해당 없음.
     let ov = c.report.item("refined_overlap").unwrap();
     assert!(ov.measured.contains("해당 없음"), "{}", ov.measured);
-    // 알려진 미달: SPEC 목표는 같은 위치 높이 차 중앙 < 2 m. 측정 4.62 m, 상한 5.5 m 만 단언한다(이전 상한 3.5 m 에서 느슨하게 바꿈).
+    // 초벌 전 BA 8회: 같은 위치 높이 차 중앙 0.107 m (목표 < 2 m), 최근접 0.413 m.
+    check_item(&c, "preview_vs_refined", true);
     let pr = c.report.item("preview_vs_refined").unwrap();
-    eprintln!(
-        "SPEC 목표 preview_vs_refined 높이 차 < 2 m, 현재: {}",
-        pr.measured
-    );
     assert!(
-        !pr.pass,
-        "목표 달성: 이 단언을 pass 로 바꾼다 ({})",
-        pr.measured
-    );
-    assert!(
-        number_after(&pr.measured, "높이 차 중앙 최대 ") < 5.5,
-        "높이 차 상한 {}",
+        number_after(&pr.measured, "높이 차 중앙 최대 ") < 0.5,
+        "높이 차 {}",
         pr.measured
     );
 }

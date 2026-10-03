@@ -55,6 +55,8 @@ pub struct PipelineConfig {
     pub gps_sigma_h: f64,
     /// 정밀 BA GPS 사전항 σ, 수직(m).
     pub gps_sigma_v: f64,
+    /// 초벌 점군을 만들기 전 GPS 사전항 BA 반복 수. 0 이면 BA 없이(SPEC §초벌) 닮음 정렬 포즈 그대로.
+    pub preview_ba_iters: usize,
 }
 
 impl PipelineConfig {
@@ -87,6 +89,7 @@ impl Default for PipelineConfig {
             tri_min_px: 0.7,
             gps_sigma_h: 2.0,
             gps_sigma_v: 2.0,
+            preview_ba_iters: 0,
         }
     }
 }
@@ -857,10 +860,22 @@ fn sparse_init(
     k: &Intrinsics,
     method: PositionMethod,
     tri: &TriConfig,
+    pre_ba: (usize, f64),
 ) -> Result<Sparse, String> {
-    sparse_init_with(imgs, pm, gps, k, method, tri, &PreviewOpts::default()).map(|r| r.0)
+    sparse_init_with(
+        imgs,
+        pm,
+        gps,
+        k,
+        method,
+        tri,
+        pre_ba,
+        &PreviewOpts::default(),
+    )
+    .map(|r| r.0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sparse_init_with(
     imgs: &[&ImgData],
     pm: &[PairMatch],
@@ -868,6 +883,7 @@ fn sparse_init_with(
     k: &Intrinsics,
     method: PositionMethod,
     tri: &TriConfig,
+    pre_ba: (usize, f64),
     opts: &PreviewOpts,
 ) -> Result<(Sparse, PreviewStages), String> {
     let n = imgs.len();
@@ -1015,6 +1031,14 @@ fn sparse_init_with(
         rms: 0.0,
     };
     s.rms = run_ba(&mut s, k, 0, None, 2.0, &[]);
+    if pre_ba.0 > 0 {
+        // 짧은 GPS 사전항 BA: 초벌 포즈·점의 스케일·기울기·깊이를 정밀 쪽으로 당긴다.
+        let after = run_ba(&mut s, k, pre_ba.0, Some(gps), pre_ba.1, &[]);
+        if std::env::var("PIPE_DEBUG").is_ok() {
+            eprintln!("debug preview ba rms {:.3} -> {after:.3}", s.rms);
+        }
+        s.rms = after;
+    }
     Ok((s, stages))
 }
 
@@ -1653,9 +1677,17 @@ pub fn run_pipeline(
         st.secs_matching = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
         let pair_ids: Vec<(usize, usize)> = pm.iter().map(|p| (p.i, p.j)).collect();
-        let init = match check_motion(&gps, &views, &pair_ids)
-            .and_then(|_| sparse_init(&imgs, &pm, &gps, &k, cfg.position, &tri))
-        {
+        let init = match check_motion(&gps, &views, &pair_ids).and_then(|_| {
+            sparse_init(
+                &imgs,
+                &pm,
+                &gps,
+                &k,
+                cfg.position,
+                &tri,
+                (cfg.preview_ba_iters, cfg.prior_sigma()),
+            )
+        }) {
             Ok(s) => s,
             Err(e) => {
                 skipped.push(format!("구역 {} 건너뜀: {e}", r.index));
@@ -2025,6 +2057,7 @@ mod diag {
                 &k,
                 PipelineConfig::default().position,
                 &TriConfig::from_config(&PipelineConfig::default()),
+                (0, 2.0),
                 opts,
             )
             .unwrap();
@@ -2220,6 +2253,7 @@ mod diag {
             &k,
             PipelineConfig::default().position,
             &TriConfig::from_config(&PipelineConfig::default()),
+            (0, 2.0),
         )
         .unwrap();
         let mut rs = init.clone();
