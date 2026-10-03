@@ -64,11 +64,13 @@ skylens-stream verify <출력 폴더>
 # 합성 장면으로 끝까지 돌려 보기(synth → run → verify). 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(--span 48)으로 잡는다
 skylens-stream synth scene 320 180
 skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
-# 이 장면에서 verify 는 5/7 통과(preview_align·preview_vs_refined 미달)라 종료 코드 1 이다. run 은 4코어 측정 기계에서 약 2~3분
+# 기본 설정(초벌은 BA 없음)에서 verify 는 6/7 통과, 종료 코드 1: preview_vs_refined 만 미달(최근접 중앙 2.358 m 는 통과, 높이 차 중앙 2.657 m > 2 m). 초벌 재투영 3.026 px → 정밀 0.300 px.
+# run 은 4코어 측정 기계에서 약 2~4분
 skylens-stream verify out
 # 구역 2개 이상(40위치 x 2 구역 이상, 이웃 구역 겹침 항목 판정): --stride 1 로 80위치 전부 사용
 skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
 skylens-stream verify out2
+# 이 장면(구역 2개)에서 verify 는 5/7 통과, 종료 코드 1: preview_align(점쌍 최소 324 < 1000; 스케일 차 8.26%·잔차 5.130 m 는 기준 안)·preview_vs_refined(높이 차 6.278 m, 최근접 5.946 m) 미달, refined_overlap 0.257 m 통과
 
 # 판 번호 출력 ("skylens-stream 0.1.0")
 skylens-stream --version

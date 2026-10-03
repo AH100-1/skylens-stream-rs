@@ -1693,23 +1693,31 @@ pub fn run_pipeline(
         st.secs_matching = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
         let pair_ids: Vec<(usize, usize)> = pm.iter().map(|p| (p.i, p.j)).collect();
-        let init = match check_motion(&gps, &views, &pair_ids).and_then(|_| {
-            sparse_init(
-                &imgs,
-                &pm,
-                &gps,
-                &k,
-                cfg.position,
-                &tri,
-                (cfg.preview_ba_iters, cfg.prior_sigma()),
-            )
-        }) {
+        // 정밀 BA 시작점(`start`)은 초벌 BA 옵션과 무관하게 BA 전 모델이다.
+        // 초벌 BA(선택, 기본 0회)는 그 사본(`init`)에만 적용한다.
+        let start = match check_motion(&gps, &views, &pair_ids)
+            .and_then(|_| sparse_init(&imgs, &pm, &gps, &k, cfg.position, &tri, (0, 2.0)))
+        {
             Ok(s) => s,
             Err(e) => {
                 skipped.push(format!("구역 {} 건너뜀: {e}", r.index));
                 events.push(format!("{:.1}s skip region {}", t_now(), r.index));
                 continue;
             }
+        };
+        let init = if cfg.preview_ba_iters > 0 {
+            let mut p = start.clone();
+            p.rms = run_ba(
+                &mut p,
+                &k,
+                cfg.preview_ba_iters,
+                Some(&gps),
+                cfg.prior_sigma(),
+                &[],
+            );
+            p
+        } else {
+            start.clone()
         };
         st.secs_sparse = t2.elapsed().as_secs_f64();
         st.registered = init.poses[n_help..].iter().filter(|p| p.is_some()).count();
@@ -1802,7 +1810,7 @@ pub fn run_pipeline(
         // 정밀(BA)은 다른 스레드에서: 직전 구역의 정밀 모델이 나오면 그 좌표계·포즈를 기준으로 시작한다.
         let (anchor_tx, anchor_rx) = mpsc::channel::<Option<Anchor>>();
         {
-            let (tx, init, arcs) = (tx.clone(), init.clone(), arcs.clone());
+            let (tx, init, arcs) = (tx.clone(), start, arcs.clone());
             let (gps, dw, iters, dmethod) =
                 (gps.clone(), cfg.dense_width, cfg.ba_iters, cfg.dense_method);
             let psig = cfg.prior_sigma();

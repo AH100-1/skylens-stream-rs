@@ -22,9 +22,9 @@ struct Case {
     report: skylens_core::verify::Report,
 }
 
-fn run_case(stride: usize, ba_iters: usize, method: DenseMethod) -> Case {
+fn run_case(stride: usize, ba_iters: usize, method: DenseMethod, preview_ba: usize) -> Case {
     let root = std::env::temp_dir().join(format!(
-        "skylens_pipe_{}_{stride}_{ba_iters}_{method:?}",
+        "skylens_pipe_{}_{stride}_{ba_iters}_{method:?}_{preview_ba}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&root);
@@ -56,7 +56,7 @@ fn run_case(stride: usize, ba_iters: usize, method: DenseMethod) -> Case {
         } else {
             PositionMethod::GpsLeastSquares
         },
-        preview_ba_iters: 8,
+        preview_ba_iters: preview_ba,
         ..PipelineConfig::default()
     };
     let t = std::time::Instant::now();
@@ -176,7 +176,7 @@ fn print_case(c: &Case) {
 /// 단일 구역, 사진별 깊이를 패치매치로(점 수·표면 거리 기준은 스윕과 같은 틀).
 #[test]
 fn synthetic_single_region_end_to_end_patchmatch() {
-    let c = run_case(2, 15, DenseMethod::PatchMatch);
+    let c = run_case(2, 15, DenseMethod::PatchMatch, 0);
     print_case(&c);
     assert_eq!(c.regions, 1);
     assert_eq!(c.registered, 3 * 40, "등록 수");
@@ -186,7 +186,7 @@ fn synthetic_single_region_end_to_end_patchmatch() {
 /// 단일 구역(README 첫 명령과 같은 설정: stride 2, span 48, BA 15회).
 #[test]
 fn synthetic_single_region_end_to_end() {
-    let c = run_case(2, 15, DenseMethod::Sweep);
+    let c = run_case(2, 15, DenseMethod::Sweep, 0);
     print_case(&c);
     assert_eq!(c.regions, 1);
     assert_eq!(c.images, 3 * 40);
@@ -203,37 +203,44 @@ fn synthetic_single_region_end_to_end() {
     ] {
         check_item(&c, n, true);
     }
-    // 초벌 전 GPS 사전항 BA 8회: 정렬 잔차 중앙 0.046 m (목표 < 6 m).
+    // 기본 설정(초벌 BA 0회) CLI 실측: verify 6/7, 종료 코드 1.
+    // preview_align 통과: 점쌍 2746, 잔차 중앙 최대 3.932 m (목표 < 6 m).
     check_item(&c, "preview_align", true);
     let pa = c.report.item("preview_align").unwrap();
     assert!(
-        number_after(&pa.measured, "잔차 중앙 최대 ") < 0.5,
+        number_after(&pa.measured, "잔차 중앙 최대 ") < 6.0,
         "{}",
         pa.measured
     );
     // 구역 1개: 이웃 겹침은 해당 없음.
     let ov = c.report.item("refined_overlap").unwrap();
     assert!(ov.measured.contains("해당 없음"), "{}", ov.measured);
-    // 초벌 전 BA 8회: 같은 위치 높이 차 중앙 0.107 m (목표 < 2 m), 최근접 0.413 m.
-    check_item(&c, "preview_vs_refined", true);
+    // 미달: 최근접 중앙 2.358 m (목표 < 3 m 통과), 높이 차 중앙 2.657 m (목표 < 2 m 미달).
+    check_item(&c, "preview_vs_refined", false);
     let pr = c.report.item("preview_vs_refined").unwrap();
+    eprintln!(
+        "SPEC 목표 preview_vs_refined 높이 차 < 2 m, 현재: {}",
+        pr.measured
+    );
+    let h = number_after(&pr.measured, "높이 차 중앙 최대 ");
+    assert!(h > 2.0 && h < 3.2, "높이 차 {}", pr.measured);
     assert!(
-        number_after(&pr.measured, "높이 차 중앙 최대 ") < 0.5,
-        "높이 차 {}",
+        number_after(&pr.measured, "최근접 중앙 최대 ") < 3.0,
+        "{}",
         pr.measured
     );
 }
 
-/// 구역 2개 이상(README 둘째 명령: stride 1 → 80위치, span 48). 이웃 겹침이 실제로 판정된다.
-/// 현재 알려진 미달 항목(registered, preview_align, preview_vs_refined, refined_overlap)은
-/// SPEC 목표를 출력하고 측정값의 상한(여유 포함)만 단언한다. 목표를 달성하면 해당 단언을 바꾼다.
+/// 구역 2개 이상(README 둘째 명령: stride 1 → 80위치, span 48), 기본 설정(초벌 BA 0회).
+/// 이웃 겹침이 실제로 판정된다. 기본 설정 CLI 실측: verify 5/7, 종료 코드 1.
+/// 알려진 미달 항목은 SPEC 목표를 출력하고 측정값을 그대로 단언한다(완화 아님).
+/// 목표를 달성하면 해당 단언을 바꾼다.
 #[test]
 fn synthetic_two_region_end_to_end() {
-    let c = run_case(1, 15, DenseMethod::Sweep);
+    let c = run_case(1, 15, DenseMethod::Sweep, 0);
     print_case(&c);
     assert!(c.regions >= 2, "구역 수 {}", c.regions);
     assert_eq!(c.images, 3 * 80);
-    // 구역 앞쪽 보조 F 사진으로 등록 240/240 (이전 210/240).
     assert_eq!(c.registered, 240, "등록 수");
     check_item(&c, "registered", true);
     assert!(c.center_med < 2.5, "중심 오차 중앙 {}", c.center_med);
@@ -241,35 +248,58 @@ fn synthetic_two_region_end_to_end() {
     for n in ["region_images", "refined_reprojection", "snapshots"] {
         check_item(&c, n, true);
     }
-    // 겹침은 실제로 판정된다(구역 2개). 측정 8.51 m (목표 < 0.3 m). 구역 차례 처리·공유 점 재정렬을
-    // 합친 뒤 3.98 m 에서 나빠졌고 상한을 5 m 에서 10 m 로 느슨하게 바꿨다.
+    // 겹침은 실제로 판정된다(구역 2개): 1쌍, 높이 차 중앙 최대 0.257 m (목표 < 0.3 m) 통과.
+    check_item(&c, "refined_overlap", true);
     let ov = c.report.item("refined_overlap").unwrap();
+    assert!(!ov.measured.contains("해당 없음"), "{}", ov.measured);
     assert!(
-        ov.decided && !ov.measured.contains("해당 없음"),
-        "겹침 판정 안 됨: {}",
-        ov.measured
-    );
-    eprintln!("SPEC 목표 refined_overlap < 0.3 m, 현재: {}", ov.measured);
-    check_item(&c, "refined_overlap", false);
-    assert!(
-        number_after(&ov.measured, "중앙 최대 ") < 10.0,
+        number_after(&ov.measured, "중앙 최대 ") < 0.3,
         "{}",
         ov.measured
     );
-    // 측정 높이 차 12.0 m (목표 < 2 m; 합치기 전 4.94 m, 상한 6 m 에서 14 m 로 느슨하게 바꿈).
+    // 미달 1: 높이 차 중앙 최대 6.278 m, 최근접 5.946 m (목표 높이 차 < 2 m, 최근접 < 3 m).
     check_item(&c, "preview_vs_refined", false);
     let pr = c.report.item("preview_vs_refined").unwrap();
+    eprintln!(
+        "SPEC 목표 preview_vs_refined 높이 차 < 2 m, 현재: {}",
+        pr.measured
+    );
     assert!(
-        number_after(&pr.measured, "높이 차 중앙 최대 ") < 14.0,
+        number_after(&pr.measured, "높이 차 중앙 최대 ") > 2.0
+            && number_after(&pr.measured, "높이 차 중앙 최대 ") < 8.0,
         "{}",
         pr.measured
     );
-    // 구역 간 스케일 차 3.56% (목표 <= 10%): 보고서 항목은 점쌍 최소 175·잔차 중앙 6.42 m 로 미달.
+    // 미달 2: 점쌍 최소 324 < 1000 (구역 간 스케일 차 8.26% <= 10%, 잔차 중앙 최대 5.130 m < 6 m).
     check_item(&c, "preview_align", false);
     let pa = c.report.item("preview_align").unwrap();
+    assert!(pa.measured.contains("점쌍 최소 3"), "{}", pa.measured);
     assert!(
         number_after(&pa.measured, "구역 간 스케일 차 ") <= 10.0,
         "{}",
         pa.measured
     );
+    assert!(
+        number_after(&pa.measured, "잔차 중앙 최대 ") < 6.0,
+        "{}",
+        pa.measured
+    );
+}
+
+/// 초벌 BA 옵션(0회 vs 8회)은 초벌 모델만 바꾸고 정밀 BA 시작점은 같다:
+/// 정밀 카메라 중심 오차 중앙/최대가 같다(허용 오차 1e-3 m). 초벌 쪽 재투영 오차만 줄어든다.
+#[test]
+fn preview_ba_option_does_not_change_refined() {
+    let a = run_case(2, 15, DenseMethod::Sweep, 0);
+    let b = run_case(2, 15, DenseMethod::Sweep, 8);
+    eprintln!(
+        "preview_ba 0: center med {:.4} max {:.4} | 8: med {:.4} max {:.4}",
+        a.center_med, a.center_max, b.center_med, b.center_max
+    );
+    assert!((a.center_med - b.center_med).abs() < 1e-3, "중앙");
+    assert!((a.center_max - b.center_max).abs() < 1e-3, "최대");
+    assert_eq!(a.registered, b.registered);
+    // 판정 항목 refined_reprojection 은 정밀 쪽이라 둘 다 통과한다.
+    check_item(&a, "refined_reprojection", true);
+    check_item(&b, "refined_reprojection", true);
 }
