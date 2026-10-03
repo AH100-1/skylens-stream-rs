@@ -413,6 +413,48 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
         .collect()
 }
 
+/// 검증된 짝 대응을 `tracks::build_tracks` 로 다시점 트랙으로 묶는다. 반환은 성분별 (사진, 특징) 목록.
+fn multi_view_tracks(imgs: &[&ImgData], ms: &[PairList]) -> Vec<Vec<(usize, usize)>> {
+    let keypoints: Vec<Vec<Vector2<f64>>> = imgs
+        .iter()
+        .map(|d| {
+            d.feats
+                .iter()
+                .map(|f| Vector2::new(f.kp.x as f64 + 0.5, f.kp.y as f64 + 0.5))
+                .collect()
+        })
+        .collect();
+    let pairs: Vec<crate::tracks::PairMatches> = ms
+        .iter()
+        .map(|(i, j, m)| crate::tracks::PairMatches {
+            image_a: *i,
+            image_b: *j,
+            matches: m.clone(),
+        })
+        .collect();
+    let cfg = crate::tracks::TrackConfig {
+        min_length: 2,
+        ..Default::default()
+    };
+    let (tracks, st) = crate::tracks::build_tracks(&pairs, &keypoints, &cfg);
+    if std::env::var("PIPE_DEBUG").is_ok() {
+        let mut h = [0usize; 8];
+        for t in &tracks {
+            h[t.len().min(7)] += 1;
+        }
+        eprintln!("debug tracks {} len-hist(0..7+) {h:?} {st:?}", tracks.len());
+    }
+    tracks
+        .iter()
+        .map(|t| {
+            t.observations
+                .iter()
+                .map(|o| (o.image, o.feature))
+                .collect()
+        })
+        .collect()
+}
+
 /// 삼각측량 거름 설정. 해상도에 비례하는 느슨한 문턱과, 초벌 재투영 분포(중앙값 × 배수)에서
 /// 정하는 점 문턱을 함께 쓴다.
 #[derive(Clone, Copy, Debug)]
@@ -661,13 +703,12 @@ fn sparse_init(
             g.determinant()
         );
     }
-    let counts: Vec<usize> = imgs.iter().map(|d| d.feats.len()).collect();
     let ms: Vec<_> = pm
         .iter()
         .filter(|p| poses[p.i].is_some() && poses[p.j].is_some())
         .map(|p| (p.i, p.j, p.inl.clone()))
         .collect();
-    let tracks = stand_in::build_tracks(&counts, &ms);
+    let tracks = multi_view_tracks(imgs, &ms);
     let track_obs: Vec<Vec<(usize, usize, Vector2<f64>)>> = tracks
         .iter()
         .map(|tr| {
