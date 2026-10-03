@@ -11,7 +11,7 @@
 새 구역이 들어올 때마다 빠른 초벌 점군을 먼저 보여 주고, 정밀 계산이 끝난 구역은 정밀본으로 바꿔 끼운다.
 화면에는 단계마다 "이전 구역은 정밀본 + 최신 구역은 초벌" 점군이 나간다.
 
-> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth`·`verify` 만 있고, 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정 → GPS 정렬 → 구역 분할 → 밀집 준비·융합 → 초벌 정렬·스냅샷 = 점진 스트림)를 묶어 만들어 가는 중이다.
+> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth`·`run`·`verify` 가 있고, `run` 이 아래 단계를 묶어 초벌·정밀·스냅샷을 낸다. 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정 → GPS 정렬 → 구역 분할 → 밀집 준비·융합 → 초벌 정렬·스냅샷 = 점진 스트림)를 묶어 만들어 가는 중이다.
 
 ### 설치
 
@@ -64,6 +64,7 @@ skylens-stream verify <출력 폴더>
 # 합성 장면으로 끝까지 돌려 보기(synth → run → verify). 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(--span 48)으로 잡는다
 skylens-stream synth scene 320 180
 skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
+# 이 장면에서 verify 는 5/7 통과(preview_align·preview_vs_refined 미달)라 종료 코드 1 이다. run 은 4코어 측정 기계에서 약 2~3분
 skylens-stream verify out
 # 구역 2개 이상(40위치 x 2 구역 이상, 이웃 구역 겹침 항목 판정): --stride 1 로 80위치 전부 사용
 skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
@@ -249,7 +250,7 @@ A Rust tool that builds a **progressively refined 3D point cloud** from the vide
 Each time a new region arrives, a fast preview cloud is shown first; once the accurate solve for a region finishes, its preview is swapped for the refined cloud.
 At every step the output is "refined clouds for earlier regions + preview for the newest region".
 
-> Work in progress. The command-line tool currently has only `ply-info`, `synth` and `verify`; the progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment → GPS alignment → region split → dense preparation and fusion → preview alignment and snapshots = progressive stream).
+> Work in progress. The command-line tool currently has `ply-info`, `synth`, `run` and `verify`; `run` chains the stages below into preview, refined and snapshot outputs. The progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment → GPS alignment → region split → dense preparation and fusion → preview alignment and snapshots = progressive stream).
 
 ### Build
 
