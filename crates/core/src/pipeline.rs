@@ -1794,7 +1794,7 @@ pub fn run_pipeline_with(
         let t3 = Instant::now();
         let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
         let coarse = dense_cloud(
-            &well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200),
+            &well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 50),
             &imgs,
             &k,
             &in_region,
