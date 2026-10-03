@@ -1,8 +1,10 @@
 //! 끝까지 잇는 흐름: 이미지 폴더(+GPS) → 특징 → 매칭 → 회전 평균 → 위치 → 삼각측량 → 번들 조정
 //! → 구역별 초벌/정밀 → 밀집 깊이 → 융합 → 정렬·스냅샷·manifest.
 //!
-//! 아직 합치지 않은 부품(트랙, 위치 평균·삼각측량, PatchMatch)은 [`stand_in`] 의 단순 구현으로 잇는다.
-//! 해당 브랜치가 병합되면 `run_region` 안의 호출 한 줄씩만 바꾸면 된다.
+//! 밀집 단계는 `dense::region_cloud`(구역 사진별 깊이 + 융합)를 거친다. 밀집 점이 하나도 안 나오면
+//! [`stand_in::depth_from_sparse`](희소 점 역거리 보간 깊이)로 대신한다.
+//! 아직 합치지 않은 부품(트랙, 위치 평균·삼각측량)은 [`stand_in`] 의 단순 구현으로 잇는다.
+//! `sparse::reconstruct` 는 이 흐름에 연결되어 있지 않다(희소 단계는 이 파일의 `sparse_init` 등이 맡는다).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -15,9 +17,10 @@ use crate::align::Similarity;
 use crate::ba::{bundle_adjust, BaOptions, BaProblem, Observation, PositionPrior};
 use crate::camera::{Camera, Intrinsics, Pose};
 use crate::dataset::Dataset;
+use crate::dense::{region_cloud, DenseConfig, DenseView};
 use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use crate::fusion::{fuse, FusionConfig, FusionView};
-use crate::matching::{ratio_match, RansacConfig, PAIR_TEMPORAL};
+use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig};
 use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::ply::{PointCloud, PointRecord};
 use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
@@ -336,43 +339,8 @@ struct PairMatch {
     t: Option<Vector3<f64>>,
 }
 
-/// 편대 겹침(FEEDBACK F-197)에 맞춘 짝 목록. `views[k] = (카메라 번호 F=0 R=1 L=2, 위치 번호)`.
-/// 같은 카메라는 위치 차 1..=PAIR_TEMPORAL, 같은 위치 근처(차 <= 2)의 다른 카메라,
-/// 카메라 사이는 F(p)–R(p+12..=p+40), F(p)–L(p+16..=p+40) 을 `CROSS_STEP` 간격으로 표본한다.
-/// 결과 (i, j) 는 i < j, 중복 없음, 정렬됨.
-pub fn formation_pairs(views: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    const CROSS_STEP: i64 = 4;
-    let mut out = Vec::new();
-    for i in 0..views.len() {
-        for j in 0..views.len() {
-            if i == j {
-                continue;
-            }
-            let ((ca, pa), (cb, pb)) = (views[i], views[j]);
-            let dist = pa.abs_diff(pb);
-            let ok = if ca == cb {
-                j > i && (1..=PAIR_TEMPORAL).contains(&dist)
-            } else if dist <= 2 {
-                j > i
-            } else if ca == 0 {
-                let d = pb as i64 - pa as i64;
-                let lo = if cb == 1 { 12 } else { 16 };
-                (lo..=40).contains(&d) && (d - lo) % CROSS_STEP == 0
-            } else {
-                false
-            };
-            if ok {
-                out.push((i.min(j), i.max(j)));
-            }
-        }
-    }
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
 fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> Vec<PairMatch> {
-    let pairs = formation_pairs(views);
+    let pairs = scheduled_pairs(views, &PairSchedule::default());
     pairs
         .par_iter()
         .filter_map(|&(i, j)| {
@@ -650,12 +618,53 @@ fn run_ba(s: &mut Sparse, k: &Intrinsics, iters: usize, gps: Option<&[Vector3<f6
     }
 }
 
-/// 밀집: 깊이 맵(stand_in) → 융합. 희소 점도 함께 담는다.
+/// 밀집: 구역 사진을 `dense::region_cloud`(보정·이웃·사진별 깊이·융합)에 넘긴다. 희소 점도 함께 담는다.
+/// `dw` 는 보정 뒤 긴 변 화소 수다. 밀집 점이 하나도 안 나오면 희소 점 보간 깊이로 대신한다.
 fn dense_cloud(
     s: &Sparse,
     imgs: &[&ImgData],
     k: &Intrinsics,
     in_region: &[bool],
+    dw: usize,
+) -> PointCloud {
+    let ids: Vec<usize> = (0..s.poses.len())
+        .filter(|&i| s.poses[i].is_some() && in_region[i])
+        .collect();
+    let views: Vec<DenseView> = ids
+        .iter()
+        .map(|&i| DenseView {
+            camera: Camera {
+                intrinsics: *k,
+                pose: s.poses[i].unwrap(),
+            },
+            image: imgs[i].rgb.clone(),
+        })
+        .collect();
+    let pts: Vec<[f64; 3]> = s.points.iter().map(|p| [p.x, p.y, p.z]).collect();
+    let cfg = DenseConfig {
+        max_width: dw as u32,
+        ..DenseConfig::default()
+    };
+    let mut cloud = region_cloud(&views, &pts, &cfg);
+    if cloud.is_empty() {
+        cloud = interpolated_cloud(s, &ids, imgs, k, dw);
+    }
+    for p in &s.points {
+        cloud.points.push(PointRecord {
+            xyz: [p.x as f32, p.y as f32, p.z as f32],
+            normal: [0.0; 3],
+            rgb: [128; 3],
+        });
+    }
+    cloud
+}
+
+/// 대체 경로: 희소 점 역거리 보간 깊이 맵 → 융합.
+fn interpolated_cloud(
+    s: &Sparse,
+    ids: &[usize],
+    imgs: &[&ImgData],
+    k: &Intrinsics,
     dw: usize,
 ) -> PointCloud {
     let dh = ((k.height as f64 * dw as f64 / k.width as f64).round() as usize).max(8);
@@ -669,9 +678,6 @@ fn dense_cloud(
         height: dh as u32,
         dist: k.dist,
     };
-    let ids: Vec<usize> = (0..s.poses.len())
-        .filter(|&i| s.poses[i].is_some() && in_region[i])
-        .collect();
     let views: Vec<FusionView> = ids
         .iter()
         .map(|&i| {
@@ -705,15 +711,7 @@ fn dense_cloud(
         min_groups: 1,
         same_group_views: None,
     };
-    let mut cloud = fuse(&views, &maps, cfg);
-    for p in &s.points {
-        cloud.points.push(PointRecord {
-            xyz: [p.x as f32, p.y as f32, p.z as f32],
-            normal: [0.0; 3],
-            rgb: [128; 3],
-        });
-    }
-    cloud
+    fuse(&views, &maps, cfg)
 }
 
 fn to_tracks(s: &Sparse, gid: &[usize]) -> Vec<Track> {

@@ -14,7 +14,7 @@ use crate::ba::{bundle_adjust, BaOptions, BaProblem, Observation};
 use crate::camera::{Camera, Intrinsics, Pose};
 use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use crate::matching::{
-    ratio_match, RansacConfig, MIN_VERIFIED_INLIERS, PAIR_POW2_MAX, PAIR_TEMPORAL,
+    ratio_match, scheduled_pairs, PairSchedule, RansacConfig, MIN_VERIFIED_INLIERS,
 };
 use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
 use crate::two_view::{ransac_essential, refine_relative_pose};
@@ -32,81 +32,6 @@ pub struct SparseInput {
     pub image: image::RgbImage,
     /// 동-북-위 GPS(m).
     pub gps_enu: Option<[f64; 3]>,
-}
-
-/// 카메라 간 짝 규칙: 카메라 `a` 의 위치 p 와 카메라 `b` 의 위치 p+d (d 는 `min_d..=max_d`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CrossRule {
-    pub a: usize,
-    pub b: usize,
-    pub min_d: isize,
-    pub max_d: isize,
-}
-
-/// 영상 짝 일정. 같은 카메라는 시간 이웃과 2의 거듭제곱 간격, 다른 카메라는 `cross` 규칙.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PairSchedule {
-    pub temporal: usize,
-    pub pow2_max: usize,
-    pub cross: Vec<CrossRule>,
-}
-
-impl Default for PairSchedule {
-    /// 실측 겹침(FEEDBACK F-197): F(p)–R(p+12..+40), F(p)–L(p+16..+40). R↔L 은 직접 잇지 않고 F 를 거친다.
-    fn default() -> Self {
-        Self {
-            temporal: PAIR_TEMPORAL,
-            pow2_max: PAIR_POW2_MAX,
-            cross: vec![
-                CrossRule {
-                    a: 0,
-                    b: 1,
-                    min_d: 12,
-                    max_d: 40,
-                },
-                CrossRule {
-                    a: 0,
-                    b: 2,
-                    min_d: 16,
-                    max_d: 40,
-                },
-            ],
-        }
-    }
-}
-
-impl PairSchedule {
-    /// 입력 (그룹, 위치) 목록에서 i < j 짝을 정렬해 돌려준다.
-    pub fn pairs(&self, views: &[(usize, usize)]) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
-        for i in 0..views.len() {
-            for j in i + 1..views.len() {
-                let ((ca, pa), (cb, pb)) = (views[i], views[j]);
-                let ok = if ca == cb {
-                    let d = pa.abs_diff(pb);
-                    d >= 1 && (d <= self.temporal || (d.is_power_of_two() && d <= self.pow2_max))
-                } else {
-                    self.cross.iter().any(|r| {
-                        let ((pa_, pb_), hit) = if (ca, cb) == (r.a, r.b) {
-                            ((pa, pb), true)
-                        } else if (cb, ca) == (r.a, r.b) {
-                            ((pb, pa), true)
-                        } else {
-                            ((0, 0), false)
-                        };
-                        hit && {
-                            let d = pb_ as isize - pa_ as isize;
-                            d >= r.min_d && d <= r.max_d
-                        }
-                    })
-                };
-                if ok {
-                    out.push((i, j));
-                }
-            }
-        }
-        out
-    }
 }
 
 /// 짝 그래프가 하나의 연결 성분인지(영상 번호 0..n).
@@ -261,7 +186,7 @@ pub fn reconstruct(
 
     // 2. 짝 일정·매칭·기하 검증.
     let views: Vec<(usize, usize)> = inputs.iter().map(|x| (x.group, x.position)).collect();
-    let pairs = cfg.pair_schedule.pairs(&views);
+    let pairs = scheduled_pairs(&views, &cfg.pair_schedule);
     let results: Vec<PairResult> = pairs
         .par_iter()
         .enumerate()
@@ -1084,7 +1009,7 @@ mod tests {
     fn default_schedule_is_connected() {
         let views: Vec<(usize, usize)> =
             (0..44).flat_map(|p| (0..3).map(move |g| (g, p))).collect();
-        let pairs = PairSchedule::default().pairs(&views);
+        let pairs = scheduled_pairs(&views, &PairSchedule::default());
         assert!(is_connected(views.len(), &pairs));
         // R↔L 직접 짝 없음, F–R·F–L 은 있음.
         let has = |a: usize, b: usize| {
@@ -1094,11 +1019,18 @@ mod tests {
         };
         assert!(has(0, 1) && has(0, 2) && !has(1, 2));
         // 시간 일정만 쓰면 세 덩어리다.
-        let t = PairSchedule {
-            cross: vec![],
-            ..PairSchedule::default()
-        }
-        .pairs(&views);
+        let t = scheduled_pairs(
+            &views,
+            &PairSchedule {
+                cross: crate::matching::CrossSchedule::Formation {
+                    right_min: 1,
+                    left_min: 1,
+                    max: 0,
+                    step: 1,
+                },
+                ..PairSchedule::default()
+            },
+        );
         assert!(!is_connected(views.len(), &t));
     }
 
