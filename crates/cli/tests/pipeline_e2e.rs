@@ -278,11 +278,10 @@ fn single_region_end_to_end() {
 }
 
 /// 구역 2개(README 둘째 명령, stride 1 → 80위치 × 3대 = 240장): refined_overlap 이 실제로 판정된다.
-/// 실측(4코어, 부하 22): run 332 초, verify 5/7 종료 코드 1, 중심 오차 중앙 0.290/최대 3.115 m,
+/// 시험 전체 약 3 분(부하 낮을 때 179 초, 부하 22 에서는 run 만 332 초). 실측: verify 5/7 종료 코드 1, 중심 오차 중앙 0.290/최대 3.115 m,
 /// 정밀 점 표면 거리 중앙 0.494/95% 3.022 m (점 19855개). 상한은 실측 x 1.2.
 /// 실패 항목: preview_align (점쌍 최소 324 < 1000), preview_vs_refined (높이 차 중앙 최대 6.278 m, 최근접 5.946 m).
 #[test]
-#[ignore = "구역 2개, 약 5.5 분"]
 fn two_region_end_to_end() {
     let o = pipeline("two", "1");
     assert_eq!(o.m.registered, 240, "등록 수");
