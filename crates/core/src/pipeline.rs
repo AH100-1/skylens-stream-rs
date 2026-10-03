@@ -723,7 +723,7 @@ fn sparse_init(
         ba_only,
         rms: 0.0,
     };
-    s.rms = run_ba(&mut s, k, 0, None);
+    s.rms = run_ba(&mut s, k, 0, None, &[]);
     Ok(s)
 }
 
@@ -740,21 +740,54 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
         .collect();
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
     let (sim, _, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
-    for &i in &ids {
-        let p = s.poses[i].unwrap();
+    apply_sparse_sim(s, &sim);
+    Some(sim)
+}
+
+/// 희소 모델 전체(포즈·점·BA 전용 점)에 닮음 변환을 적용한다.
+fn apply_sparse_sim(s: &mut Sparse, sim: &Similarity) {
+    for p in s.poses.iter_mut().flatten() {
         let c = sim.apply_point(&p.center().coords);
-        s.poses[i] = Some(Pose::from_center(
-            p.rotation * sim.r.inverse(),
-            &Point3::from(c),
-        ));
+        *p = Pose::from_center(p.rotation * sim.r.inverse(), &Point3::from(c));
     }
     for p in s.points.iter_mut() {
         *p = sim.apply_point(p);
     }
-    Some(sim)
+    for e in s.ba_only.iter_mut() {
+        e.0 = sim.apply_point(&e.0);
+    }
 }
 
-fn run_ba(s: &mut Sparse, k: &Intrinsics, iters: usize, gps: Option<&[Vector3<f64>]>) -> f64 {
+/// 직전 정밀 모델에 맞춘 시작: 닮음 변환으로 같은 좌표계로 옮기고 공유 사진 포즈를 직전 값으로 고정.
+struct Anchor {
+    sim: Similarity,
+    /// (구역 안 사진 번호, 직전 정밀 포즈)
+    fixed: Vec<(usize, Pose)>,
+}
+
+/// 새 구역 `rec` 의 초벌 희소 모델을 직전 정밀 구역 `prev` 에 맞출 기준을 만든다.
+/// 반환: 기준(닮음 변환 + 고정 포즈), 점 쌍 수, 잔차 중앙값. 겹침이 모자라면 `None`.
+fn make_anchor(rec: &RegionRec, prev: &RegionRec) -> Option<(Anchor, usize, f64)> {
+    let tb = &prev.refined.as_ref()?.0;
+    let win = crate::progressive::overlap_window(&rec.region, &prev.region);
+    let (sim, n, med) = crate::progressive::cross_align(&rec.ta, tb, win)?;
+    let fixed: Vec<(usize, Pose)> = rec
+        .gids
+        .iter()
+        .enumerate()
+        .filter(|&(a, _)| rec.reg_flags[a])
+        .filter_map(|(a, g)| prev.rposes.get(g).map(|p| (a, *p)))
+        .collect();
+    Some((Anchor { sim, fixed }, n, med))
+}
+
+fn run_ba(
+    s: &mut Sparse,
+    k: &Intrinsics,
+    iters: usize,
+    gps: Option<&[Vector3<f64>]>,
+    fixed: &[usize],
+) -> f64 {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
         .collect();
@@ -790,6 +823,11 @@ fn run_ba(s: &mut Sparse, k: &Intrinsics, iters: usize, gps: Option<&[Vector3<f6
     let opts = BaOptions {
         max_iterations: iters,
         default_free_intrinsics: [false; 8],
+        fixed_cameras: if fixed.is_empty() {
+            vec![0]
+        } else {
+            fixed.iter().filter_map(|i| loc.get(i).copied()).collect()
+        },
         position_prior: gps
             .map(|g| PositionPrior::new(ids.iter().map(|&i| Some(Point3::from(g[i]))).collect())),
         ..BaOptions::default()
@@ -910,6 +948,14 @@ struct RegionRec {
     registered_prev: Vec<usize>,
     /// gids 앞쪽 보조 사진 수(출력·점수 제외).
     n_help: usize,
+    /// 정밀 모델의 사진별 포즈(다음 구역의 고정 기준).
+    rposes: HashMap<usize, Pose>,
+    /// 이 구역 정밀 작업이 직전 구역 정밀 결과를 기다리는 통로.
+    anchor_tx: Option<std::sync::mpsc::Sender<Option<Anchor>>>,
+    /// 기준 구역과의 정렬 기록: (직전 구역 번호, 점 쌍 수, 잔차 중앙 m, 스케일).
+    anchored: Option<(usize, usize, f64, f64)>,
+    /// 등록된 사진 표시(gids 순서).
+    reg_flags: Vec<bool>,
 }
 
 /// 정밀(BA) 작업 결과.
@@ -918,6 +964,36 @@ struct RefinedMsg {
     sparse: Sparse,
     cloud: PointCloud,
     secs: f64,
+}
+
+/// 기준을 정밀 작업 스레드에 보내고 기록한다(`None` 이면 기준 없이 시작).
+fn send_anchor(
+    rec: &mut RegionRec,
+    tx: &std::sync::mpsc::Sender<Option<Anchor>>,
+    a: Option<(Anchor, usize, f64)>,
+    prev: usize,
+    secs: f64,
+    events: &mut Vec<String>,
+) {
+    match a {
+        Some((an, n, med)) => {
+            events.push(format!(
+                "{secs:.1}s anchor region {} on refined {prev} pairs {n} median {med:.3} m scale {:.4} fixed {}",
+                rec.region.index,
+                an.sim.s,
+                an.fixed.len()
+            ));
+            rec.anchored = Some((prev, n, med, an.sim.s));
+            let _ = tx.send(Some(an));
+        }
+        None => {
+            events.push(format!(
+                "{secs:.1}s anchor region {} none (overlap too small)",
+                rec.region.index
+            ));
+            let _ = tx.send(None);
+        }
+    }
 }
 
 fn write_decimated(out: &Path, name: &str, cloud: &PointCloud) -> Result<(), String> {
@@ -929,8 +1005,9 @@ fn write_decimated(out: &Path, name: &str, cloud: &PointCloud) -> Result<(), Str
 }
 
 /// 구역 앞쪽 보조 F 사진 범위: 위치 [lo-HELPER_SPAN, lo-HELPER_MIN].
+/// 짝 규칙상 R(p)·L(p) 는 F(p-40..=p-12) 와 겹치므로 구역 첫 12 위치의 R·L 은 구역 바로 앞 F 까지 필요하다.
 const HELPER_SPAN: usize = 40;
-const HELPER_MIN: usize = 20;
+const HELPER_MIN: usize = 1;
 
 /// 끝까지 돌린다. 출력 폴더에 preview·refined·snapshots·manifest.json·report.json·poses.txt 를 쓴다.
 ///
@@ -985,6 +1062,11 @@ pub fn run_pipeline(
                 rec.centers.insert(*g, [c.x, c.y, c.z]);
             }
         }
+        for (a, g) in rec.gids.iter().enumerate() {
+            if let Some(p) = m.sparse.poses[a] {
+                rec.rposes.insert(*g, p);
+            }
+        }
         rec.stats.refined_rms = m.sparse.rms;
         rec.stats.refined_points = m.cloud.len();
         rec.stats.secs_ba = m.secs;
@@ -1018,6 +1100,13 @@ pub fn run_pipeline(
         rec.own = Some((sim, ar));
         rec.refined = Some((tb, m.cloud));
         *latest_ref = Some(k);
+        // 다음 구역의 정밀 작업이 이 모델을 기다리고 있으면 기준을 보낸다.
+        if k + 1 < recs.len() {
+            if let Some(tx) = recs[k + 1].anchor_tx.take() {
+                let a = make_anchor(&recs[k + 1], &recs[k]);
+                send_anchor(&mut recs[k + 1], &tx, a, k, t_now(), events);
+            }
+        }
         events.push(format!(
             "{:.1}s refined region {} rms {:.3} done",
             t_now(),
@@ -1201,27 +1290,6 @@ pub fn run_pipeline(
             ));
         }
         let slot = recs.len();
-        // 정밀(BA)은 다른 스레드에서: 끝나면 메시지로 돌아온다.
-        {
-            let (tx, init, arcs) = (tx.clone(), init.clone(), arcs.clone());
-            let (gps, dw, iters) = (gps.clone(), cfg.dense_width, cfg.ba_iters);
-            let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
-            in_flight += 1;
-            std::thread::spawn(move || {
-                let t = Instant::now();
-                let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
-                let mut rs = init;
-                rs.rms = run_ba(&mut rs, &k, iters, Some(&gps));
-                gps_align_refined(&mut rs, &gps);
-                let cloud = dense_cloud(&rs, &imgs, &k, &in_region, dw);
-                let _ = tx.send(RefinedMsg {
-                    slot,
-                    sparse: rs,
-                    cloud,
-                    secs: t.elapsed().as_secs_f64(),
-                });
-            });
-        }
         // 초벌 점군: 곧바로 만들어 최신 정밀 좌표계로 정렬해 내보낸다.
         let t3 = Instant::now();
         let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
@@ -1278,7 +1346,60 @@ pub fn run_pipeline(
             centers: BTreeMap::new(),
             registered_prev,
             n_help,
+            rposes: HashMap::new(),
+            anchor_tx: None,
+            anchored: None,
+            reg_flags: init.poses.iter().map(|p| p.is_some()).collect(),
         });
+        // 정밀(BA)은 다른 스레드에서: 직전 구역의 정밀 모델이 나오면 그 좌표계·포즈를 기준으로 시작한다.
+        let (anchor_tx, anchor_rx) = mpsc::channel::<Option<Anchor>>();
+        {
+            let (tx, init, arcs) = (tx.clone(), init.clone(), arcs.clone());
+            let (gps, dw, iters) = (gps.clone(), cfg.dense_width, cfg.ba_iters);
+            let gids_t = recs[slot].gids.clone();
+            let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
+            in_flight += 1;
+            std::thread::spawn(move || {
+                let anchor = anchor_rx.recv().ok().flatten();
+                let t = Instant::now();
+                let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
+                let mut rs = init;
+                let mut fixed: Vec<usize> = Vec::new();
+                if let Some(an) = &anchor {
+                    apply_sparse_sim(&mut rs, &an.sim);
+                    for (i, p) in &an.fixed {
+                        rs.poses[*i] = Some(*p);
+                        fixed.push(*i);
+                    }
+                }
+                rs.rms = run_ba(&mut rs, &k, iters, Some(&gps), &fixed);
+                if anchor.is_none() {
+                    gps_align_refined(&mut rs, &gps);
+                }
+                let cloud = dense_cloud(&rs, &imgs, &k, &in_region, dw);
+                let _ = tx.send(RefinedMsg {
+                    slot,
+                    sparse: rs,
+                    cloud,
+                    secs: t.elapsed().as_secs_f64(),
+                });
+            });
+        }
+        if slot == 0 {
+            let _ = anchor_tx.send(None);
+        } else if recs[slot - 1].refined.is_some() {
+            let a = make_anchor(&recs[slot], &recs[slot - 1]);
+            send_anchor(
+                &mut recs[slot],
+                &anchor_tx,
+                a,
+                slot - 1,
+                t_now(),
+                &mut events,
+            );
+        } else {
+            recs[slot].anchor_tx = Some(anchor_tx);
+        }
         // 이 구역을 올린 뒤에 끝난 정밀 결과를 반영한다(방금 올린 초벌도 재정렬 대상이다).
         while let Ok(m) = rx.try_recv() {
             in_flight -= 1;
@@ -1699,7 +1820,7 @@ mod tri_tests {
             .iter()
             .map(|p| p.center().coords + Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.5)
             .collect();
-        s.rms = run_ba(&mut s, &k(), 15, Some(&gps));
+        s.rms = run_ba(&mut s, &k(), 15, Some(&gps), &[]);
         let after = count(&s);
         assert_eq!(before, after);
         // 거르지 않은 전체 관측(정답 점 기준 점별 목록)에 대한 정밀 재투영.
