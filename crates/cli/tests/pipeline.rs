@@ -200,15 +200,15 @@ fn synthetic_two_region_end_to_end() {
     print_case(&c);
     assert!(c.regions >= 2, "구역 수 {}", c.regions);
     assert_eq!(c.images, 3 * 80);
-    // 측정: 210/240 (SPEC 목표 240/240).
-    assert!(c.registered >= 195, "등록 수 {} (목표 240)", c.registered);
-    check_item(&c, "registered", false);
-    assert!(c.center_med < 2.8, "중심 오차 중앙 {}", c.center_med);
-    assert!(c.surface_med < 6.5, "표면 거리 중앙 {}", c.surface_med);
+    // 구역 앞쪽 보조 F 사진으로 등록 240/240 (이전 210/240).
+    assert_eq!(c.registered, 240, "등록 수");
+    check_item(&c, "registered", true);
+    assert!(c.center_med < 2.5, "중심 오차 중앙 {}", c.center_med);
+    assert!(c.surface_med < 4.5, "표면 거리 중앙 {}", c.surface_med);
     for n in ["region_images", "refined_reprojection", "snapshots"] {
         check_item(&c, n, true);
     }
-    // 겹침은 실제로 판정된다(구역 2개). 측정 14.4 m (목표 < 0.3 m).
+    // 겹침은 실제로 판정된다(구역 2개). 측정 3.98 m (이전 14.4 m, 목표 < 0.3 m).
     let ov = c.report.item("refined_overlap").unwrap();
     assert!(
         ov.decided && !ov.measured.contains("해당 없음"),
@@ -218,7 +218,7 @@ fn synthetic_two_region_end_to_end() {
     eprintln!("SPEC 목표 refined_overlap < 0.3 m, 현재: {}", ov.measured);
     check_item(&c, "refined_overlap", false);
     assert!(
-        number_after(&ov.measured, "중앙 최대 ") < 18.0,
+        number_after(&ov.measured, "중앙 최대 ") < 5.0,
         "{}",
         ov.measured
     );
@@ -230,6 +230,11 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         pr.measured
     );
-    // 측정: 구역 간 스케일 차 13.08% (목표 <= 10%).
-    check_item(&c, "preview_align", false);
+    // 구역 간 스케일 차 1.06% (이전 13.08%, 목표 <= 10%): 보고서 항목은 잔차 중앙 4.1 m 로 아직 미달.
+    let pa = c.report.item("preview_align").unwrap();
+    assert!(
+        number_after(&pa.measured, "구역 간 스케일 차 ") <= 10.0,
+        "{}",
+        pa.measured
+    );
 }

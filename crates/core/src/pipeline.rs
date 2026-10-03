@@ -730,6 +730,10 @@ fn to_tracks(s: &Sparse, gid: &[usize]) -> Vec<Track> {
         .collect()
 }
 
+/// 구역 앞쪽 보조 F 사진 범위: 위치 [lo-HELPER_SPAN, lo-HELPER_MIN].
+const HELPER_SPAN: usize = 40;
+const HELPER_MIN: usize = 20;
+
 /// 끝까지 돌린다. 출력 폴더에 preview·refined·snapshots·manifest.json·report.json·poses.txt 를 쓴다.
 pub fn run_pipeline(
     ds: &Dataset,
@@ -758,8 +762,21 @@ pub fn run_pipeline(
             images: 3 * (r.hi - r.lo),
             ..Default::default()
         };
-        let gids: Vec<usize> = (r.lo..r.hi)
-            .flat_map(|p| (0..3).map(move |c| 3 * p + c))
+        // 구역 시작 쪽 R·L 은 F(p-40..=p-20) 와만 겹친다(F-197). 구역 밖 앞쪽 F 사진을 보조로 넣어
+        // 구역 첫 위치들의 카메라 간 짝이 끊기지 않게 한다. 보조 사진은 출력·점수에 넣지 않는다.
+        let helper_lo = r.lo.saturating_sub(HELPER_SPAN);
+        let helper_hi = if r.lo >= HELPER_MIN {
+            r.lo - HELPER_MIN + 1
+        } else {
+            0
+        };
+        let helpers: Vec<usize> = (helper_lo..helper_hi.max(helper_lo))
+            .map(|p| 3 * p)
+            .collect();
+        let n_help = helpers.len();
+        let gids: Vec<usize> = helpers
+            .into_iter()
+            .chain((r.lo..r.hi).flat_map(|p| (0..3).map(move |c| 3 * p + c)))
             .collect();
         let t0 = Instant::now();
         let need: Vec<usize> = gids
@@ -821,13 +838,13 @@ pub fn run_pipeline(
         };
         st.secs_ba = t3.elapsed().as_secs_f64();
         st.secs_dense = secs_dense_pre;
-        st.registered = init.poses.iter().filter(|p| p.is_some()).count();
+        st.registered = init.poses[n_help..].iter().filter(|p| p.is_some()).count();
         st.tracks = init.points.len();
         st.preview_rms = init.rms;
         st.refined_rms = ref_s.rms;
         st.preview_points = pre_cloud.len();
         st.refined_points = ref_cloud.len();
-        for (a, g) in gids.iter().enumerate() {
+        for (a, g) in gids.iter().enumerate().skip(n_help) {
             if init.poses[a].is_some() {
                 reg_prev.insert(*g);
             }
