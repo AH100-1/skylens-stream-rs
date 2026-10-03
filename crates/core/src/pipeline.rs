@@ -39,6 +39,27 @@ pub struct PipelineConfig {
     /// 수평 화각(도). 데이터셋에 내부 파라미터가 없으므로 받는다.
     pub hfov_deg: f64,
     pub ba_iters: usize,
+    /// 초벌 삼각측량의 느슨한 문턱(영상 폭 비율). 점 후보 선별과 BA 관측 목록의 바깥 한계.
+    pub tri_loose_frac: f64,
+    /// 점 문턱 = 이 배수 × 후보 관측 재투영 중앙값.
+    pub tri_median_k: f64,
+    /// 점 문턱의 하한(px).
+    pub tri_min_px: f64,
+    /// 정밀 BA GPS 사전항 σ, 수평(m). BA 사전항이 등방(카메라별 스칼라 σ)이라
+    /// 실제로는 수평 2 : 수직 1 가중 제곱평균 √((2σh²+σv²)/3) 한 값을 쓴다.
+    pub gps_sigma_h: f64,
+    /// 정밀 BA GPS 사전항 σ, 수직(m).
+    pub gps_sigma_v: f64,
+    /// 초벌 점군을 만들기 전 GPS 사전항 BA 반복 수. 0 이면 BA 없이(SPEC §초벌) 닮음 정렬 포즈 그대로.
+    pub preview_ba_iters: usize,
+}
+
+impl PipelineConfig {
+    /// BA 사전항에 넘기는 등방 σ.
+    pub fn prior_sigma(&self) -> f64 {
+        let (h, v) = (self.gps_sigma_h, self.gps_sigma_v);
+        ((2.0 * h * h + v * v) / 3.0).sqrt()
+    }
 }
 
 impl Default for PipelineConfig {
@@ -48,6 +69,12 @@ impl Default for PipelineConfig {
             dense_width: 160,
             hfov_deg: 65.0,
             ba_iters: 15,
+            tri_loose_frac: 0.02,
+            tri_median_k: 3.0,
+            tri_min_px: 0.7,
+            gps_sigma_h: 2.0,
+            gps_sigma_v: 2.0,
+            preview_ba_iters: 0,
         }
     }
 }
@@ -426,12 +453,16 @@ struct TriConfig {
     min_deg: f64,
 }
 
-const TRI: TriConfig = TriConfig {
-    loose_frac: 0.02,
-    median_k: 3.0,
-    min_px: 0.7,
-    min_deg: 4.0,
-};
+impl TriConfig {
+    fn from_config(c: &PipelineConfig) -> Self {
+        Self {
+            loose_frac: c.tri_loose_frac,
+            median_k: c.tri_median_k,
+            min_px: c.tri_min_px,
+            min_deg: 4.0,
+        }
+    }
+}
 
 /// 삼각측량 집계(관측 수는 초벌 점 문턱 전·후, BA 에 넘기는 수).
 #[allow(dead_code)]
@@ -456,13 +487,14 @@ fn triangulate_tracks(
     poses: &[Option<Pose>],
     k: &Intrinsics,
     tracks: &[Vec<(usize, usize, Vector2<f64>)>],
+    tri: &TriConfig,
 ) -> (
     Vec<Vector3<f64>>,
     Vec<Vec<(usize, usize, Vector2<f64>)>>,
     Vec<(Vector3<f64>, Vec<(usize, usize, Vector2<f64>)>)>,
     TriStats,
 ) {
-    let loose = (TRI.loose_frac * k.width as f64).max(6.0);
+    let loose = (tri.loose_frac * k.width as f64).max(6.0);
     let cams_of = |o: &[(usize, usize, Vector2<f64>)]| -> Vec<(Camera, Vector2<f64>)> {
         o.iter()
             .filter_map(|&(i, _, px)| {
@@ -485,7 +517,7 @@ fn triangulate_tracks(
             if cams.len() != o.len() {
                 return None;
             }
-            let (x, keep) = stand_in::triangulate_robust(&cams, loose, TRI.min_deg)?;
+            let (x, keep) = stand_in::triangulate_robust(&cams, loose, tri.min_deg)?;
             let e = cams
                 .iter()
                 .zip(keep)
@@ -502,7 +534,7 @@ fn triangulate_tracks(
         .collect();
     errs.sort_by(f64::total_cmp);
     let median = errs.get(errs.len() / 2).copied().unwrap_or(0.0);
-    let thr = (TRI.median_k * median).clamp(TRI.min_px, loose);
+    let thr = (tri.median_k * median).clamp(tri.min_px, loose);
     // 느슨한 문턱 안의 관측 모두.
     let loose_obs = |o: &[(usize, usize, Vector2<f64>)], x: &Vector3<f64>| -> Vec<_> {
         o.iter()
@@ -522,7 +554,7 @@ fn triangulate_tracks(
         .map(|(o, c)| {
             let (x0, _) = c.as_ref()?;
             let cams = cams_of(o);
-            match stand_in::triangulate_robust(&cams, thr, TRI.min_deg) {
+            match stand_in::triangulate_robust(&cams, thr, tri.min_deg) {
                 Some((x, keep)) => {
                     let nk = keep.iter().filter(|&&kp| kp).count();
                     Some((true, x, loose_obs(o, &x), nk))
@@ -561,6 +593,8 @@ fn sparse_init(
     pm: &[PairMatch],
     gps: &[Vector3<f64>],
     k: &Intrinsics,
+    tri: &TriConfig,
+    pre_ba: (usize, f64),
 ) -> Result<Sparse, String> {
     let n = imgs.len();
     let edges: Vec<RelativeRotation> = pm
@@ -680,7 +714,7 @@ fn sparse_init(
                 .collect()
         })
         .collect();
-    let (points, obs, ba_only, stats) = triangulate_tracks(&poses, k, &track_obs);
+    let (points, obs, ba_only, stats) = triangulate_tracks(&poses, k, &track_obs, tri);
     if std::env::var("PIPE_DEBUG").is_ok() {
         eprintln!("debug triangulation {stats:?}");
     }
@@ -691,7 +725,15 @@ fn sparse_init(
         ba_only,
         rms: 0.0,
     };
-    s.rms = run_ba(&mut s, k, 0, None, &[]);
+    s.rms = run_ba(&mut s, k, 0, None, 2.0, &[]);
+    if pre_ba.0 > 0 {
+        // 짧은 GPS 사전항 BA: 초벌 포즈·점의 스케일·기울기·깊이를 정밀 쪽으로 당긴다.
+        let after = run_ba(&mut s, k, pre_ba.0, Some(gps), pre_ba.1, &[]);
+        if std::env::var("PIPE_DEBUG").is_ok() {
+            eprintln!("debug preview ba rms {:.3} -> {after:.3}", s.rms);
+        }
+        s.rms = after;
+    }
     Ok(s)
 }
 
@@ -754,6 +796,7 @@ fn run_ba(
     k: &Intrinsics,
     iters: usize,
     gps: Option<&[Vector3<f64>]>,
+    prior_sigma: f64,
     fixed: &[usize],
 ) -> f64 {
     let ids: Vec<usize> = (0..s.poses.len())
@@ -796,8 +839,12 @@ fn run_ba(
         } else {
             fixed.iter().filter_map(|i| loc.get(i).copied()).collect()
         },
-        position_prior: gps
-            .map(|g| PositionPrior::new(ids.iter().map(|&i| Some(Point3::from(g[i]))).collect())),
+        position_prior: gps.map(|g| {
+            let mut pr =
+                PositionPrior::new(ids.iter().map(|&i| Some(Point3::from(g[i]))).collect());
+            pr.sigma = prior_sigma;
+            pr
+        }),
         ..BaOptions::default()
     };
     let rep = bundle_adjust(&mut prob, &opts);
@@ -1252,6 +1299,7 @@ pub fn run_pipeline(
             Intrinsics::from_hfov(d.width(), d.height(), cfg.hfov_deg.to_radians())
         });
         st.secs_features = t0.elapsed().as_secs_f64();
+        let tri = TriConfig::from_config(cfg);
         let arcs: Vec<Arc<ImgData>> = gids.iter().map(|g| cache[g].clone()).collect();
         let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
         let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
@@ -1264,9 +1312,16 @@ pub fn run_pipeline(
         st.secs_matching = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
         let pair_ids: Vec<(usize, usize)> = pm.iter().map(|p| (p.i, p.j)).collect();
-        let init = match check_motion(&gps, &views, &pair_ids)
-            .and_then(|_| sparse_init(&imgs, &pm, &gps, &k))
-        {
+        let init = match check_motion(&gps, &views, &pair_ids).and_then(|_| {
+            sparse_init(
+                &imgs,
+                &pm,
+                &gps,
+                &k,
+                &tri,
+                (cfg.preview_ba_iters, cfg.prior_sigma()),
+            )
+        }) {
             Ok(s) => s,
             Err(e) => {
                 skipped.push(format!("구역 {} 건너뜀: {e}", r.index));
@@ -1360,6 +1415,7 @@ pub fn run_pipeline(
         {
             let (tx, init, arcs) = (tx.clone(), init.clone(), arcs.clone());
             let (gps, dw, iters) = (gps.clone(), cfg.dense_width, cfg.ba_iters);
+            let psig = cfg.prior_sigma();
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
             in_flight += 1;
@@ -1376,7 +1432,7 @@ pub fn run_pipeline(
                         fixed.push(*i);
                     }
                 }
-                rs.rms = run_ba(&mut rs, &k, iters, Some(&gps), &fixed);
+                rs.rms = run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed);
                 if anchor.is_none() {
                     gps_align_refined(&mut rs, &gps);
                 }
@@ -1792,10 +1848,101 @@ mod tri_tests {
         (s / n as f64).sqrt()
     }
 
+    fn tri() -> TriConfig {
+        TriConfig::from_config(&PipelineConfig::default())
+    }
+
+    /// 기체(i % 3)별 GPS 치우침 2 m(축마다 σ) + 잡음 0.5 m. 사전항 끔/켬(σ 2·0.7)에서 정밀 중심 오차(정답 대비, 닮음 정렬 뒤)와
+    /// 거르기 전 관측 대비 정밀 재투영을 잰다.
+    #[test]
+    fn refined_ba_with_per_vehicle_gps_bias() {
+        let sc = scene(0.3, 0.0035, 0.08);
+        let mut rng = Rng(9);
+        let bias: Vec<Vector3<f64>> = (0..3)
+            .map(|_| Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 2.0)
+            .collect();
+        let gps: Vec<Vector3<f64>> = sc
+            .poses
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                p.center().coords
+                    + bias[i % 3]
+                    + Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.5
+            })
+            .collect();
+        let mut res = Vec::new();
+        for (tag, prior) in [
+            ("off", None),
+            ("sigma2", Some(2.0)),
+            ("sigma0.7", Some(0.7)),
+        ] {
+            let (points, obs, ba_only, _) =
+                triangulate_tracks(&sc.coarse, &k(), &sc.tracks, &tri());
+            let mut s = Sparse {
+                poses: sc.coarse.clone(),
+                points,
+                obs,
+                ba_only,
+                rms: 0.0,
+            };
+            s.rms = run_ba(
+                &mut s,
+                &k(),
+                15,
+                prior.map(|_| &gps[..]),
+                prior.unwrap_or(2.0),
+                &[],
+            );
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            };
+            let src: Vec<Vector3<f64>> =
+                s.poses.iter().map(|p| p.unwrap().center().coords).collect();
+            let tru: Vec<Vector3<f64>> = sc.poses.iter().map(|p| p.center().coords).collect();
+            let mut raw: Vec<f64> = src.iter().zip(&tru).map(|(a, b)| (a - b).norm()).collect();
+            let sim = crate::align::robust_similarity(&src, &tru, 3, 3.0)
+                .unwrap()
+                .0;
+            let mut al: Vec<f64> = src
+                .iter()
+                .zip(&tru)
+                .map(|(a, b)| (sim.apply_point(a) - b).norm())
+                .collect();
+            let (m_raw, m_al) = (med(&mut raw), med(&mut al));
+            eprintln!(
+                "bias2 {tag}: rms {:.3} center median raw {m_raw:.2} aligned {m_al:.2}",
+                s.rms
+            );
+            res.push((m_raw, m_al, s.rms));
+        }
+        // 치우침 2 m 장면: 사전항을 켜면 중심이 치우침 쪽으로 끌려 끔보다 커지고(σ 가 작을수록 더), 닮음 정렬 뒤에는
+        // 모두 0.1 m 안이다(편대 전체의 쏠림은 닮음 변환이 흡수). σ 2 m(기본)는 정답에서 1.5 m 안.
+        assert!(
+            res[0].0 < 1.0 && res[1].0 < 1.5 && res[1].0 > res[0].0,
+            "{res:?}"
+        );
+        assert!(res[2].0 > res[1].0, "{res:?}");
+        assert!(res.iter().all(|r| r.1 < 0.1), "{res:?}");
+        assert!(res.iter().all(|r| r.2 < 0.7), "{res:?}");
+    }
+
+    #[test]
+    fn prior_sigma_combines_horizontal_and_vertical() {
+        let c = PipelineConfig {
+            gps_sigma_h: 1.0,
+            gps_sigma_v: 4.0,
+            ..PipelineConfig::default()
+        };
+        assert!((c.prior_sigma() - 6f64.sqrt()).abs() < 1e-12);
+        assert!((PipelineConfig::default().prior_sigma() - 2.0).abs() < 1e-12);
+    }
+
     #[test]
     fn refined_ba_keeps_observations_at_realistic_coarse_error() {
         let sc = scene(0.3, 0.0035, 0.08);
-        let (points, obs, ba_only, st) = triangulate_tracks(&sc.coarse, &k(), &sc.tracks);
+        let (points, obs, ba_only, st) = triangulate_tracks(&sc.coarse, &k(), &sc.tracks, &tri());
         let coarse_rms = rms_over(&sc.coarse, &points, &obs);
         eprintln!("coarse rms {coarse_rms:.2} px {st:?}");
         assert!((3.0..=6.0).contains(&coarse_rms), "{coarse_rms}");
@@ -1824,7 +1971,7 @@ mod tri_tests {
             .iter()
             .map(|p| p.center().coords + Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.5)
             .collect();
-        s.rms = run_ba(&mut s, &k(), 15, Some(&gps), &[]);
+        s.rms = run_ba(&mut s, &k(), 15, Some(&gps), 2.0, &[]);
         let after = count(&s);
         assert_eq!(before, after);
         // 거르지 않은 전체 관측(정답 점 기준 점별 목록)에 대한 정밀 재투영.
