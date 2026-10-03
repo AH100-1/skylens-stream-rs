@@ -161,6 +161,8 @@ pub struct Config {
     pub seed: u64,
     /// `estimate_fast` 의 가장 거친 층 반복 횟수.
     pub fast_iterations: usize,
+    /// `estimate_fast` 의 원 해상도 층 전파 후보 수(4 면 가까운 4 만).
+    pub fine_prop: usize,
 }
 
 impl Default for Config {
@@ -181,6 +183,7 @@ impl Default for Config {
             normal_steps: 5,
             seed: 0x5eed,
             fast_iterations: 6,
+            fine_prop: 4,
         }
     }
 }
@@ -994,6 +997,8 @@ struct FCtx<'a> {
     mean: Vec<f32>,
     istd: Vec<f32>,
     range: (f32, f32),
+    /// 화소별 쓸 이웃 비트마스크(비트 j = 이웃 j). 거친 층 첫 반복 뒤 비용이 낮은 쪽만 남긴다.
+    mask: Vec<u8>,
 }
 
 /// 창 안 표본값(기준 영상). 가장자리는 가장 가까운 화소로 대치.
@@ -1105,15 +1110,24 @@ impl FCtx<'_> {
         p: &FPatch,
         mean: f32,
         istd: f32,
+        msk: u8,
     ) -> f32 {
         let den = n.dot(m);
         if den >= -1e-3 {
             return MAX_COST;
         }
         let nv = self.kinv.transpose() * (n / (d * den));
-        let k = FAST_TOP_K.min(self.nbrs.len());
+        let used = if self.nbrs.len() >= 8 {
+            msk.count_ones() as usize
+        } else {
+            self.nbrs.len()
+        };
+        let k = FAST_TOP_K.min(used.max(1));
         let mut best = [MAX_COST; FAST_TOP_K];
         for j in 0..self.nbrs.len() {
+            if j < 8 && msk >> j & 1 == 0 {
+                continue;
+            }
             let mut c = self.ncc(j, q, &nv, p, mean, istd);
             for b in best.iter_mut().take(k) {
                 if c < *b {
@@ -1147,6 +1161,40 @@ impl FCtx<'_> {
         -rn
     }
 
+    /// 현재 가설로 화소마다 이웃별 비용을 재어 낮은 `keep` 장의 비트마스크를 만든다(이웃 8장 이하).
+    fn pixel_masks(&self, hyps: &[FHyp], keep: usize) -> Vec<u8> {
+        let w = self.w;
+        let nn = self.nbrs.len().min(8);
+        let mut out = vec![0xFFu8; w * self.h];
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let mut p = FPatch {
+                v: [0.0; MAX_SAMPLES],
+            };
+            for (x, o) in row.iter_mut().enumerate() {
+                let i = y * w + x;
+                let hy = &hyps[i];
+                if self.istd[i] == 0.0 {
+                    continue;
+                }
+                let m = self.ray(x, y);
+                let den = hy.n.dot(&m);
+                if den >= -1e-3 {
+                    continue;
+                }
+                self.gather(x, y, &mut p);
+                let q = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, 1.0);
+                let nv = self.kinv.transpose() * (hy.n / (hy.d * den));
+                let mut cs = [(MAX_COST, 0usize); 8];
+                for (j, c) in cs.iter_mut().enumerate().take(nn) {
+                    *c = (self.ncc(j, &q, &nv, &p, self.mean[i], self.istd[i]), j);
+                }
+                cs[..nn].sort_by(|a, b| a.0.total_cmp(&b.0));
+                *o = cs[..keep.min(nn)].iter().fold(0u8, |m, c| m | 1 << c.1);
+            }
+        });
+        out
+    }
+
     /// 층 안 모든 화소 비용을 현재 가설로 다시 잰다.
     fn eval_all(&self, hyps: &mut [FHyp]) {
         let w = self.w;
@@ -1163,7 +1211,16 @@ impl FCtx<'_> {
                 self.gather(x, y, &mut p);
                 let m = self.ray(x, y);
                 let q = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, 1.0);
-                hy.c = self.agg(&q, &m, hy.d, &hy.n, &p, self.mean[i], self.istd[i]);
+                hy.c = self.agg(
+                    &q,
+                    &m,
+                    hy.d,
+                    &hy.n,
+                    &p,
+                    self.mean[i],
+                    self.istd[i],
+                    self.mask[i],
+                );
             }
         });
     }
@@ -1208,7 +1265,7 @@ impl FCtx<'_> {
             (3, 0),
         ];
         let i = y * self.w + x;
-        let (mean, istd) = (self.mean[i], self.istd[i]);
+        let (mean, istd, msk) = (self.mean[i], self.istd[i], self.mask[i]);
         self.gather(x, y, p);
         let m = self.ray(x, y);
         let q = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, 1.0);
@@ -1247,7 +1304,7 @@ impl FCtx<'_> {
             }
             tried[nt] = (d, c.n);
             nt += 1;
-            let cost = self.agg(&q, &m, d, &c.n, p, mean, istd);
+            let cost = self.agg(&q, &m, d, &c.n, p, mean, istd, msk);
             if cost < best.c {
                 best = FHyp { d, n: c.n, c: cost };
             }
@@ -1272,7 +1329,7 @@ impl FCtx<'_> {
                 cand[2] = (dd, b0.n);
             }
             for (d, n) in cand {
-                let cost = self.agg(&q, &m, d, &n, p, mean, istd);
+                let cost = self.agg(&q, &m, d, &n, p, mean, istd, msk);
                 if cost < best.c {
                     best = FHyp { d, n, c: cost };
                 }
@@ -1284,7 +1341,7 @@ impl FCtx<'_> {
             let (a, b) = (1.0 / self.range.0, 1.0 / self.range.1);
             let d = 1.0 / (a + (b - a) * rng.f());
             let n = self.random_normal(&mut rng, &m);
-            let cost = self.agg(&q, &m, d, &n, p, mean, istd);
+            let cost = self.agg(&q, &m, d, &n, p, mean, istd, msk);
             if cost < best.c {
                 best = FHyp { d, n, c: cost };
             }
@@ -1391,7 +1448,8 @@ pub fn estimate_fast_profiled(
     let range32 = (range.0 as f32, range.1 as f32);
     let offs = fast_offsets(cfg.radius, cfg.step);
 
-    let mut state: Option<(Vec<FHyp>, usize, usize, Matrix3<f32>)> = None;
+    let mut state: Option<(Vec<FHyp>, usize, usize, Matrix3<f32>, Vec<u8>)> = None;
+    let use_masks = nb.len() <= 8 && cfg.fine_neighbors > 0 && cfg.fine_neighbors < nb.len();
     let top = levels.len() - 1;
     for li in (0..levels.len()).rev() {
         let lv = &levels[li];
@@ -1420,6 +1478,7 @@ pub fn estimate_fast_profiled(
             mean: vec![0.0; lw * lh],
             istd: vec![0.0; lw * lh],
             range: range32,
+            mask: vec![0xFF; lw * lh],
         };
         // 기준 창 평균·표준편차 역수 캐시.
         {
@@ -1434,6 +1493,7 @@ pub fn estimate_fast_profiled(
                 mean: Vec::new(),
                 istd: Vec::new(),
                 range: range32,
+                mask: Vec::new(),
             };
             mean.par_chunks_mut(lw)
                 .zip(istd.par_chunks_mut(lw))
@@ -1471,7 +1531,17 @@ pub fn estimate_fast_profiled(
                     }
                 });
             }
-            Some((prev, pw, ph, pkinv)) => {
+            Some((prev, pw, ph, pkinv, pmask)) => {
+                if use_masks {
+                    ctx.mask
+                        .par_chunks_mut(lw)
+                        .enumerate()
+                        .for_each(|(y, row)| {
+                            for (x, o) in row.iter_mut().enumerate() {
+                                *o = pmask[(y / 2).min(ph - 1) * pw + (x / 2).min(pw - 1)];
+                            }
+                        });
+                }
                 hyps.par_chunks_mut(lw).enumerate().for_each(|(y, row)| {
                     for (x, hy) in row.iter_mut().enumerate() {
                         let (px, py) = ((x / 2).min(pw - 1), (y / 2).min(ph - 1));
@@ -1497,7 +1567,7 @@ pub fn estimate_fast_profiled(
                 } else {
                     cfg.fine_neighbors.min(ctx.nbrs.len())
                 };
-                if keep < ctx.nbrs.len() {
+                if !use_masks && keep < ctx.nbrs.len() {
                     ctx.nbrs = fast_select_neighbors(&ctx, &hyps, keep);
                 }
             }
@@ -1527,7 +1597,11 @@ pub fn estimate_fast_profiled(
                 amp_n: 0.5 * halve * 0.5f32.powi(lvl_up),
                 steps,
                 fresh: coarsest,
-                n_prop: 8,
+                n_prop: if li == 0 && cfg.fine_prop < 8 {
+                    cfg.fine_prop
+                } else {
+                    8
+                },
                 skip_below: if coarsest { 0.0 } else { FAST_SKIP_COST },
             };
             for color in 0..2usize {
@@ -1536,12 +1610,15 @@ pub fn estimate_fast_profiled(
                 ctx.phase(&hyps, &mut other, color, tag, &sc);
                 std::mem::swap(&mut hyps, &mut other);
             }
+            if coarsest && use_masks && it == 0 {
+                ctx.mask = ctx.pixel_masks(&hyps, cfg.fine_neighbors);
+            }
         }
         mark(format!("L{li} iterations"), &mut stages);
-        state = Some((hyps, lw, lh, ctx.kinv));
+        state = Some((hyps, lw, lh, ctx.kinv, std::mem::take(&mut ctx.mask)));
     }
 
-    let (hyps, lw, lh, _) = state.unwrap();
+    let (hyps, lw, lh, _, _) = state.unwrap();
     let _ = t_all;
     debug_assert_eq!((lw, lh), (w, h));
     let mut dm = DepthMap::invalid(w, h);
