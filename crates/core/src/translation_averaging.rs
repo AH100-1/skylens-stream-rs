@@ -1890,9 +1890,87 @@ mod tests {
                     errs[c]
                 );
             }
+            // 최대 오차 카메라의 짝 직선: 정답 방향 대비 각 오차(도)와 이웃 정답 방향 분포.
+            let c = idx[0];
+            let mut ang = Vec::new();
+            for o in obs.iter().filter(|o| o.i == c || o.j == c) {
+                let rj = poses[o.j].rotation;
+                let dir = rj.inverse() * o.direction;
+                let t = poses[o.i].center() - poses[o.j].center();
+                ang.push(angle_between(&dir, &t).to_degrees());
+            }
+            ang.sort_by(|a, b| a.total_cmp(b));
+            println!(
+                "  worst cam {c} pair-line angle err deg: {:?}",
+                ang.iter()
+                    .map(|a| (a * 10.0).round() / 10.0)
+                    .collect::<Vec<_>>()
+            );
+            let mut dirs = Vec::new();
+            for o in obs.iter().filter(|o| o.i == c || o.j == c) {
+                let other = if o.i == c { o.j } else { o.i };
+                let t = (poses[other].center() - poses[c].center()).normalize();
+                dirs.push((t.x, t.y, t.z));
+            }
+            let m = dirs.iter().fold(Matrix3::<f64>::zeros(), |a, d| {
+                let v = Vector3::new(d.0, d.1, d.2);
+                a + v * v.transpose()
+            });
+            let e = m.symmetric_eigen().eigenvalues;
+            println!(
+                "  worst cam {c} neighbour-direction scatter eigenvalues {:?}",
+                e.as_slice()
+            );
             let mean_pt = pobs.len() as f64 / 240.0;
             println!("  mean point obs per camera {mean_pt:.1}");
         }
+    }
+
+    /// 80경우(시드 범위 × 짝 이상치 10·20% × 점 이상치 0·5%) 표. 시드 범위는 환경변수 TA_SEEDS="처음:끝".
+    fn grid(seeds: std::ops::RangeInclusive<u64>) -> Vec<(f64, f64, u64, usize, f64, f64)> {
+        let mut fails = Vec::new();
+        for pfrac in [0.0, 0.05] {
+            for frac in [0.10, 0.20] {
+                for seed in seeds.clone() {
+                    let case = Case {
+                        noise_deg: 1.0,
+                        outlier_frac: frac,
+                        unobservable_frac: 0.05,
+                    };
+                    let (reg, rms, max) = run_with(seed, &case, pfrac);
+                    println!(
+                        "GRID point {pfrac} pair {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m"
+                    );
+                    if reg < 238 || rms > 0.3 || max > 1.0 {
+                        fails.push((pfrac, frac, seed, reg, rms, max));
+                    }
+                }
+            }
+        }
+        fails
+    }
+
+    #[test]
+    #[ignore = "80경우 전수(시드 1~20), 오래 걸림"]
+    fn noisy_outliers_grid_seeds_1_to_20() {
+        let fails = grid(1..=20);
+        assert!(fails.is_empty(), "{} fails: {fails:?}", fails.len());
+    }
+
+    #[test]
+    #[ignore = "기준 미달(시드 22 점 이상치 5% RMS 0.36 m)로 열린 문제, 조정에 쓰지 않은 시드 21~25"]
+    fn noisy_outliers_unseen_seeds_21_to_25() {
+        let fails = grid(21..=25);
+        assert!(fails.is_empty(), "{} fails: {fails:?}", fails.len());
+    }
+
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_grid_env() {
+        let r = std::env::var("TA_SEEDS").unwrap_or_else(|_| "1:20".into());
+        let (a, b) = r.split_once(':').unwrap();
+        let fails = grid(a.parse().unwrap()..=b.parse().unwrap());
+        println!("GRID fails {}: {fails:?}", fails.len());
     }
 
     #[test]
