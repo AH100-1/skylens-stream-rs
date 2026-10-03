@@ -2,7 +2,7 @@
 
 use skylens_core::dataset::{load_dataset, DatasetConfig};
 use skylens_core::math::Point3;
-use skylens_core::pipeline::{run_pipeline, PipelineConfig, PositionMethod};
+use skylens_core::pipeline::{run_pipeline, DenseMethod, PipelineConfig, PositionMethod};
 use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
 use skylens_core::verify::verify_dir;
@@ -22,9 +22,9 @@ struct Case {
     report: skylens_core::verify::Report,
 }
 
-fn run_case(stride: usize, ba_iters: usize) -> Case {
+fn run_case(stride: usize, ba_iters: usize, method: DenseMethod) -> Case {
     let root = std::env::temp_dir().join(format!(
-        "skylens_pipe_{}_{stride}_{ba_iters}",
+        "skylens_pipe_{}_{stride}_{ba_iters}_{method:?}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&root);
@@ -48,6 +48,7 @@ fn run_case(stride: usize, ba_iters: usize) -> Case {
     let cfg = PipelineConfig {
         max_features: 800,
         dense_width: 96,
+        dense_method: method,
         hfov_deg: 65.0,
         ba_iters,
         position: if std::env::var("PIPE_POSITION").as_deref() == Ok("ta") {
@@ -60,7 +61,11 @@ fn run_case(stride: usize, ba_iters: usize) -> Case {
     };
     let t = std::time::Instant::now();
     let res = run_pipeline(&ds, &cfg, &output).unwrap();
-    eprintln!("secs {:.1}", t.elapsed().as_secs_f64());
+    eprintln!("{method:?} secs {:.1}", t.elapsed().as_secs_f64());
+    eprintln!(
+        "{method:?} dense secs {:.2}",
+        res.regions.iter().map(|r| r.secs_dense).sum::<f64>()
+    );
     for r in &res.regions {
         eprintln!("{r:?}");
     }
@@ -109,7 +114,14 @@ fn run_case(stride: usize, ba_iters: usize) -> Case {
         })
         .collect();
     let over1 = d.iter().filter(|&&v| v > 1.0).count() as f64 / d.len() as f64;
+    let mut sorted = d.clone();
+    sorted.sort_by(f64::total_cmp);
+    let p95 = sorted[(sorted.len() as f64 * 0.95) as usize];
     let sm = median(d);
+    eprintln!(
+        "{method:?} verify pass {passed}/{} p95 {p95:.3} m",
+        report.items.len()
+    );
     eprintln!(
         "cloud points {} surface distance median {sm:.3} m, share over 1 m {:.1}%",
         cloud.len(),
@@ -161,10 +173,20 @@ fn print_case(c: &Case) {
     }
 }
 
+/// 단일 구역, 사진별 깊이를 패치매치로(점 수·표면 거리 기준은 스윕과 같은 틀).
+#[test]
+fn synthetic_single_region_end_to_end_patchmatch() {
+    let c = run_case(2, 15, DenseMethod::PatchMatch);
+    print_case(&c);
+    assert_eq!(c.regions, 1);
+    assert_eq!(c.registered, 3 * 40, "등록 수");
+    assert!(c.surface_med <= 1.0, "표면 거리 중앙 {}", c.surface_med);
+}
+
 /// 단일 구역(README 첫 명령과 같은 설정: stride 2, span 48, BA 15회).
 #[test]
 fn synthetic_single_region_end_to_end() {
-    let c = run_case(2, 15);
+    let c = run_case(2, 15, DenseMethod::Sweep);
     print_case(&c);
     assert_eq!(c.regions, 1);
     assert_eq!(c.images, 3 * 40);
@@ -207,7 +229,7 @@ fn synthetic_single_region_end_to_end() {
 /// SPEC 목표를 출력하고 측정값의 상한(여유 포함)만 단언한다. 목표를 달성하면 해당 단언을 바꾼다.
 #[test]
 fn synthetic_two_region_end_to_end() {
-    let c = run_case(1, 15);
+    let c = run_case(1, 15, DenseMethod::Sweep);
     print_case(&c);
     assert!(c.regions >= 2, "구역 수 {}", c.regions);
     assert_eq!(c.images, 3 * 80);

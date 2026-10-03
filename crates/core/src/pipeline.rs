@@ -17,7 +17,7 @@ use crate::align::Similarity;
 use crate::ba::{bundle_adjust, BaOptions, BaProblem, Observation, PositionPrior};
 use crate::camera::{Camera, Intrinsics, Pose};
 use crate::dataset::Dataset;
-use crate::dense::{region_cloud, DenseConfig, DenseView};
+use crate::dense::{region_cloud, region_cloud_patchmatch, DenseConfig, DenseView};
 use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use crate::fusion::{fuse, FusionConfig, FusionView};
 use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig};
@@ -33,12 +33,23 @@ use crate::translation_averaging::{
 };
 use crate::two_view::{ransac_essential, recover_pose};
 
+/// 밀집 단계 사진별 깊이 방식.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseMethod {
+    /// 평면 스윕(기존).
+    Sweep,
+    /// 패치매치(이웃 8장).
+    PatchMatch,
+}
+
 /// 실행 설정.
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
     pub max_features: usize,
     /// 밀집 깊이 맵 폭(px).
     pub dense_width: usize,
+    /// 밀집 깊이 방식.
+    pub dense_method: DenseMethod,
     /// 수평 화각(도). 데이터셋에 내부 파라미터가 없으므로 받는다.
     pub hfov_deg: f64,
     pub ba_iters: usize,
@@ -81,6 +92,7 @@ impl Default for PipelineConfig {
         Self {
             max_features: 1500,
             dense_width: 160,
+            dense_method: DenseMethod::Sweep,
             hfov_deg: 65.0,
             ba_iters: 15,
             position: PositionMethod::GpsLeastSquares,
@@ -1227,6 +1239,7 @@ fn dense_cloud(
     k: &Intrinsics,
     in_region: &[bool],
     dw: usize,
+    method: DenseMethod,
 ) -> PointCloud {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some() && in_region[i])
@@ -1252,7 +1265,10 @@ fn dense_cloud(
         depth_rel: DenseConfig::default().depth_rel * scale,
         ..DenseConfig::default()
     };
-    let mut cloud = region_cloud(&views, &pts, &cfg);
+    let mut cloud = match method {
+        DenseMethod::Sweep => region_cloud(&views, &pts, &cfg),
+        DenseMethod::PatchMatch => region_cloud_patchmatch(&views, &pts, &cfg),
+    };
     if cloud.is_empty() {
         cloud = interpolated_cloud(s, &ids, imgs, k, dw);
     }
@@ -1724,6 +1740,7 @@ pub fn run_pipeline(
             &k,
             &in_region,
             cfg.dense_width,
+            cfg.dense_method,
         );
         st.secs_dense = t3.elapsed().as_secs_f64();
         st.preview_points = coarse.len();
@@ -1786,7 +1803,8 @@ pub fn run_pipeline(
         let (anchor_tx, anchor_rx) = mpsc::channel::<Option<Anchor>>();
         {
             let (tx, init, arcs) = (tx.clone(), init.clone(), arcs.clone());
-            let (gps, dw, iters) = (gps.clone(), cfg.dense_width, cfg.ba_iters);
+            let (gps, dw, iters, dmethod) =
+                (gps.clone(), cfg.dense_width, cfg.ba_iters, cfg.dense_method);
             let psig = cfg.prior_sigma();
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
@@ -1808,7 +1826,7 @@ pub fn run_pipeline(
                 if anchor.is_none() {
                     gps_align_refined(&mut rs, &gps);
                 }
-                let cloud = dense_cloud(&rs, &imgs, &k, &in_region, dw);
+                let cloud = dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod);
                 let _ = tx.send(RefinedMsg {
                     slot,
                     sparse: rs,
@@ -2131,8 +2149,8 @@ mod diag {
                 let (sim, rec) = align_region(&region, &pairs);
                 align_m = rec.fit_median_m;
                 let inr = vec![true; n];
-                let rc = dense_cloud(&rs, &imgs, &k, &inr, 96);
-                let pc = dense_cloud(&good, &imgs, &k, &inr, 96);
+                let rc = dense_cloud(&rs, &imgs, &k, &inr, 96, DenseMethod::Sweep);
+                let pc = dense_cloud(&good, &imgs, &k, &inr, 96, DenseMethod::Sweep);
                 let xyz = |c: &PointCloud| -> Vec<[f64; 3]> {
                     c.points
                         .iter()
@@ -2354,7 +2372,7 @@ mod diag {
         );
         // (d) 높이 차 비교: 밀집 점군(초벌 전체 / 초벌 광선 각 필터) vs 정밀, 정답 표면 대비.
         let inr = vec![true; n];
-        let ref_cloud = dense_cloud(&rs, &imgs, &k, &inr, 96);
+        let ref_cloud = dense_cloud(&rs, &imgs, &k, &inr, 96, DenseMethod::Sweep);
         let xyz = |c: &PointCloud| -> Vec<[f64; 3]> {
             c.points
                 .iter()
@@ -2371,7 +2389,7 @@ mod diag {
                 .collect())
         );
         for (label, s, sim) in [("all", &init, &sim_all), ("angle>=2", &good, &sim_good)] {
-            let c = dense_cloud(s, &imgs, &k, &inr, 96);
+            let c = dense_cloud(s, &imgs, &k, &inr, 96, DenseMethod::Sweep);
             let raw = xyz(&c);
             let al = sim.as_ref().map(|m| xyz(&apply_cloud(m, &c)));
             eprintln!(
