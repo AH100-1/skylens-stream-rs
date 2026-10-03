@@ -23,6 +23,9 @@ use crate::fusion::{fuse, FusionConfig, FusionView};
 use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig};
 use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::ply::{PointCloud, PointRecord};
+use crate::translation_averaging::{
+    average_translations_with_points, PointObservation, RelativeTranslation, TranslationConfig,
+};
 use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
 use crate::stream::{
     align_region, align_window, apply_alignments, point_pairs, split_regions, write_outputs,
@@ -39,6 +42,17 @@ pub struct PipelineConfig {
     /// 수평 화각(도). 데이터셋에 내부 파라미터가 없으므로 받는다.
     pub hfov_deg: f64,
     pub ba_iters: usize,
+    /// 초벌 위치 추정 방식.
+    pub position: PositionMethod,
+}
+
+/// 초벌 위치 추정 방식.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionMethod {
+    /// 짝 방향 + GPS 사전의 선형 최소제곱(`stand_in::solve_centers`).
+    GpsLeastSquares,
+    /// 짝 방향 + 점 방향 제약 위치 평균(`average_translations_with_points`), 축척·원점은 GPS 로.
+    TranslationAveraging,
 }
 
 impl Default for PipelineConfig {
@@ -48,6 +62,7 @@ impl Default for PipelineConfig {
             dense_width: 160,
             hfov_deg: 65.0,
             ba_iters: 15,
+            position: PositionMethod::GpsLeastSquares,
         }
     }
 }
@@ -597,12 +612,105 @@ fn triangulate_tracks(
     (points, obs, ba_only, st)
 }
 
+/// 위치 평균: 짝 방향 + 트랙 점 방향 제약으로 중심을 구하고, 방향은 `g`(모델 → ENU)로 돌린 뒤
+/// 축척·원점만 GPS 에 맞춘다(강건 재가중). 쓸 수 없으면 None.
+fn averaged_centers(
+    imgs: &[&ImgData],
+    pm: &[PairMatch],
+    gps: &[Vector3<f64>],
+    k: &Intrinsics,
+    rots: &[Option<Rotation3<f64>>],
+    g: &Matrix3<f64>,
+) -> Option<Vec<Option<Vector3<f64>>>> {
+    let n = imgs.len();
+    let rel: Vec<RelativeTranslation> = pm
+        .iter()
+        .filter_map(|p| {
+            let t = p.t?;
+            (t.norm() > 0.0).then_some(RelativeTranslation {
+                i: p.i,
+                j: p.j,
+                direction: t,
+                rotation: Some(p.rot),
+                weight: p.inl.len() as f64,
+            })
+        })
+        .collect();
+    let counts: Vec<usize> = imgs.iter().map(|d| d.feats.len()).collect();
+    let ms: Vec<_> = pm.iter().map(|p| (p.i, p.j, p.inl.clone())).collect();
+    let mut tracks: Vec<Vec<(usize, usize)>> = stand_in::build_tracks(&counts, &ms)
+        .into_iter()
+        .filter(|t| t.iter().filter(|&&(i, _)| rots[i].is_some()).count() >= 3)
+        .collect();
+    tracks.sort_by_key(|t| std::cmp::Reverse(t.len()));
+    tracks.truncate(3000);
+    let mut pts = Vec::new();
+    for (pi, tr) in tracks.iter().enumerate() {
+        for &(i, f) in tr {
+            if rots[i].is_none() {
+                continue;
+            }
+            let b = norm(k, &imgs[i].feats[f]);
+            pts.push(PointObservation {
+                camera: i,
+                point: pi,
+                bearing: Vector3::new(b.x, b.y, 1.0),
+                weight: 1.0,
+            });
+        }
+    }
+    let res = average_translations_with_points(rots, &rel, &pts, &TranslationConfig::default());
+    if res.registered() < 2 {
+        return None;
+    }
+    // 방향을 ENU 로 돌린 중심에 축척 s·원점 t 만 맞춘다: gps ≈ s·(g c) + t.
+    let idx: Vec<usize> = (0..n).filter(|&i| res.centers[i].is_some()).collect();
+    let src: Vec<Vector3<f64>> = idx
+        .iter()
+        .map(|&i| g * res.centers[i].unwrap().coords)
+        .collect();
+    let dst: Vec<Vector3<f64>> = idx.iter().map(|&i| gps[i]).collect();
+    let mut keep = vec![true; idx.len()];
+    let (mut s, mut t) = (1.0, Vector3::zeros());
+    for _ in 0..6 {
+        let w: Vec<usize> = (0..idx.len()).filter(|&a| keep[a]).collect();
+        if w.len() < 3 {
+            return None;
+        }
+        let m = w.len() as f64;
+        let ms = w.iter().map(|&a| src[a]).sum::<Vector3<f64>>() / m;
+        let md = w.iter().map(|&a| dst[a]).sum::<Vector3<f64>>() / m;
+        let num: f64 = w.iter().map(|&a| (src[a] - ms).dot(&(dst[a] - md))).sum();
+        let den: f64 = w.iter().map(|&a| (src[a] - ms).norm_squared()).sum();
+        if !(den > 1e-18 && num > 0.0) {
+            return None;
+        }
+        s = num / den;
+        t = md - s * ms;
+        let mut r: Vec<f64> = (0..idx.len())
+            .map(|a| (s * src[a] + t - dst[a]).norm())
+            .collect();
+        let mut sorted = r.clone();
+        sorted.sort_by(f64::total_cmp);
+        let thr = (3.0 * sorted[sorted.len() / 2]).max(3.0);
+        for (a, v) in r.drain(..).enumerate() {
+            keep[a] = v <= thr;
+        }
+    }
+    let mut out = vec![None; n];
+    for (a, &i) in idx.iter().enumerate() {
+        out[i] = Some(s * src[a] + t);
+    }
+    Some(out)
+}
+
 /// 회전 평균 → 방향으로 좌표계 맞춤 → 위치 → 삼각측량. 초벌 희소 모델.
 fn sparse_init(
     imgs: &[&ImgData],
     pm: &[PairMatch],
     gps: &[Vector3<f64>],
     k: &Intrinsics,
+    method: PositionMethod,
 ) -> Result<Sparse, String> {
     let n = imgs.len();
     let edges: Vec<RelativeRotation> = pm
@@ -673,11 +781,29 @@ fn sparse_init(
         .map(|&(i, j, b)| (loc[&i], loc[&j], (g * b).normalize()))
         .collect();
     let gl: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
-    let centers = stand_in::solve_centers(&gl, &dirs, 0.2).ok_or("위치 풀이 실패")?;
+    let mut placed: Option<Vec<Option<Vector3<f64>>>> = None;
+    if method == PositionMethod::TranslationAveraging {
+        placed = averaged_centers(imgs, pm, gps, k, &rots, &g);
+        if placed.is_none() && std::env::var("PIPE_DEBUG").is_ok() {
+            eprintln!("debug translation averaging failed, GPS least squares instead");
+        }
+    }
+    let placed: Vec<Option<Vector3<f64>>> = match placed {
+        Some(c) => c,
+        None => {
+            let c = stand_in::solve_centers(&gl, &dirs, 0.2).ok_or("위치 풀이 실패")?;
+            let mut v = vec![None; n];
+            for (a, &i) in ids.iter().enumerate() {
+                v[i] = Some(c[a]);
+            }
+            v
+        }
+    };
     let mut poses: Vec<Option<Pose>> = vec![None; n];
-    for (a, &i) in ids.iter().enumerate() {
+    for &i in &ids {
+        let Some(c) = placed[i] else { continue };
         let r = Rotation3::from_matrix_unchecked(rots[i].unwrap().matrix() * g.transpose());
-        poses[i] = Some(Pose::from_center(r, &Point3::from(centers[a])));
+        poses[i] = Some(Pose::from_center(r, &Point3::from(c)));
     }
     if std::env::var("PIPE_DEBUG").is_ok() {
         let mut ang: Vec<f64> = pm
@@ -1323,7 +1449,7 @@ pub fn run_pipeline(
         let t2 = Instant::now();
         let pair_ids: Vec<(usize, usize)> = pm.iter().map(|p| (p.i, p.j)).collect();
         let init = match check_motion(&gps, &views, &pair_ids)
-            .and_then(|_| sparse_init(&imgs, &pm, &gps, &k))
+            .and_then(|_| sparse_init(&imgs, &pm, &gps, &k, cfg.position))
         {
             Ok(s) => s,
             Err(e) => {
