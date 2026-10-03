@@ -11,6 +11,7 @@ pub mod fusion;
 pub mod geo;
 pub mod matching;
 pub mod math;
+pub mod patchmatch;
 pub mod pipeline;
 pub mod ply;
 pub mod rotation_averaging;
