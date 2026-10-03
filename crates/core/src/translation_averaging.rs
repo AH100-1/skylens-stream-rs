@@ -562,6 +562,205 @@ pub fn average_translations_with_points(
     refined
 }
 
+/// 후보 해의 짝 간선 비용: Σ min(각 잔차, 문턱)² (등록되지 않은 끝점이 있으면 문턱). 작을수록 낫다.
+fn truncated_pair_cost(
+    rotations: &[Option<Rotation3<f64>>],
+    observations: &[RelativeTranslation],
+    centers: &[Option<Point3<f64>>],
+    cap: f64,
+) -> f64 {
+    let mut cost = 0.0;
+    for o in observations {
+        let r = (|| {
+            let (ci, cj) = (centers.get(o.i)?.as_ref()?, centers.get(o.j)?.as_ref()?);
+            let rj = rotations.get(o.j).copied().flatten()?;
+            let d = rj.inverse() * o.direction;
+            let v = ci - cj;
+            (v.norm() > 1e-12 && d.norm() > 1e-12).then(|| angle_between(&v, &d))
+        })()
+        .unwrap_or(cap)
+        .min(cap);
+        cost += r * r;
+    }
+    cost
+}
+
+/// 1차원 투영 순서 일관성 거르기(Wilson & Snavely 2014). 회전 평균 결과로 세계 좌표로 돌린 상대 방향 d_ij
+/// (c_i − c_j 방향)를 무작위 축 h 에 투영한 x = ⟨d_ij, h⟩ 가 양이면 "i 가 j 뒤", 음이면 "i 가 j 앞" 이라는
+/// 순서 제약이다. 카메라 순서는 간선 부호의 보르다 점수로 구하고(최소 되먹임 호 집합의 근사), 순서를
+/// 거스르는 간선(|x| > 허용치)을 센다. 축 `axes` 개에서 어긋난 비율이 `max_frac` 를 넘는 간선을 버린다.
+/// 반환: 입력 관측별 유지 여부.
+fn projection_filter(
+    rotations: &[Option<Rotation3<f64>>],
+    observations: &[RelativeTranslation],
+    axes: usize,
+    tol: f64,
+    max_frac: f64,
+    seed: u64,
+) -> Vec<bool> {
+    let n = rotations.len();
+    let mut world: Vec<Option<Vector3<f64>>> = Vec::with_capacity(observations.len());
+    for o in observations {
+        let d = (o.i < n && o.j < n && o.i != o.j && o.direction.iter().all(|x| x.is_finite()))
+            .then(|| rotations[o.j].map(|r| r.inverse() * o.direction))
+            .flatten()
+            .filter(|d| d.norm() > 1e-12)
+            .map(|d| d.normalize());
+        world.push(d);
+    }
+    let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let gauss = move |n: &mut dyn FnMut() -> u64| {
+        let u1 = ((n() >> 11) as f64 / (1u64 << 53) as f64).max(1e-300);
+        let u2 = (n() >> 11) as f64 / (1u64 << 53) as f64;
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    };
+    let mut bad = vec![0usize; observations.len()];
+    let mut used = vec![0usize; observations.len()];
+    for _ in 0..axes {
+        let h = Vector3::new(gauss(&mut next), gauss(&mut next), gauss(&mut next));
+        if h.norm() < 1e-9 {
+            continue;
+        }
+        let h = h.normalize();
+        // 순서 점수: 각 간선이 말하는 방향으로 두 끝점에 ±부호를 준다.
+        let mut score = vec![0f64; n];
+        let x: Vec<f64> = world.iter().map(|d| d.map_or(0.0, |d| d.dot(&h))).collect();
+        for (k, o) in observations.iter().enumerate() {
+            if world[k].is_some() {
+                let s = x[k].signum();
+                score[o.i] += s;
+                score[o.j] -= s;
+            }
+        }
+        for (k, o) in observations.iter().enumerate() {
+            if world[k].is_none() || x[k].abs() < tol {
+                continue; // 축에 거의 수직인 간선은 순서를 말하지 못한다.
+            }
+            used[k] += 1;
+            // i 가 j 뒤(x > 0)여야 점수 순서도 i 가 높아야 한다.
+            if (score[o.i] - score[o.j]) * x[k] < 0.0 {
+                bad[k] += 1;
+            }
+        }
+    }
+    (0..observations.len())
+        .map(|k| used[k] == 0 || (bad[k] as f64) <= max_frac * used[k] as f64)
+        .collect()
+}
+
+/// 여러 후보 중 짝 간선 비용이 가장 작은 해를 고르는 위치 평균.
+///
+/// 후보: (1) 점 포함 2단계 해(`average_translations_with_points`), (2) 짝만 푼 1단계 해, (3) 1차원 투영 순서
+/// 일관성으로 이상치 간선을 거른 뒤 짝만 푼 해, (4) 무작위 시작값 3개에서 시작해 코시 척도를 각 잔차
+/// 중앙값(1.4826 배, 2°~10° 로 제한)으로 정하고 반복 재가중한 해. 비용은 min(각 잔차, 6°)² 의 합이다.
+pub fn average_translations_robust(
+    rotations: &[Option<Rotation3<f64>>],
+    observations: &[RelativeTranslation],
+    point_observations: &[PointObservation],
+    cfg: &TranslationConfig,
+    seed: u64,
+) -> TranslationResult {
+    let n_cam = rotations.len();
+    let rots = finite_rotations(rotations);
+    let cap = cfg.outlier_threshold_rad;
+    let mut cands: Vec<TranslationResult> = Vec::new();
+    cands.push(average_translations_with_points(
+        rotations,
+        observations,
+        point_observations,
+        cfg,
+    ));
+    let stage = average_core(rotations, observations, &[], cfg, None);
+    // (3) 투영 순서 거르기 뒤 다시 푼다.
+    let keep = projection_filter(&rots, observations, 50, 0.1, 0.25, seed);
+    let sub: Vec<RelativeTranslation> = observations
+        .iter()
+        .zip(&keep)
+        .filter(|(_, &k)| k)
+        .map(|(o, _)| o.clone())
+        .collect();
+    let mut filtered = average_core(rotations, &sub, &[], cfg, None);
+    {
+        // 입력 간선 번호로 되돌린다.
+        let mut res = vec![f64::NAN; observations.len()];
+        let mut inl = vec![false; observations.len()];
+        let kept_idx: Vec<usize> = (0..observations.len()).filter(|&k| keep[k]).collect();
+        for (s, &k) in kept_idx.iter().enumerate() {
+            res[k] = filtered.residuals_rad.get(s).copied().unwrap_or(f64::NAN);
+            inl[k] = filtered.inliers.get(s).copied().unwrap_or(false);
+        }
+        filtered.residuals_rad = res;
+        filtered.inliers = inl;
+    }
+    filtered.rejected[1] += keep.iter().filter(|k| !**k).count();
+    cands.push(filtered);
+    // (4) 무작위 시작 + 중앙값 척도.
+    let mut rng = seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1;
+    let mut unit = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut base = stage.clone();
+    for _ in 0..3 {
+        let st: Vec<Option<Vector3<f64>>> = (0..n_cam)
+            .map(|_| {
+                Some(Vector3::new(
+                    unit() * 200.0 - 100.0,
+                    unit() * 200.0 - 100.0,
+                    unit() * 200.0 - 100.0,
+                ))
+            })
+            .collect();
+        // 척도: 현재 최선 해의 잔차 중앙값.
+        let mut r: Vec<f64> = base
+            .residuals_rad
+            .iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .collect();
+        let sigma = if r.is_empty() {
+            cfg.robust_sigma_rad
+        } else {
+            let k = r.len() / 2;
+            (1.4826 * *r.select_nth_unstable_by(k, f64::total_cmp).1)
+                .clamp(2f64.to_radians(), 10f64.to_radians())
+        };
+        let c2 = TranslationConfig {
+            robust_sigma_rad: sigma,
+            ..cfg.clone()
+        };
+        let cand = average_core(rotations, observations, &[], &c2, Some(&st));
+        if cand.registered() > 0 {
+            base = cand.clone();
+        }
+        cands.push(cand);
+    }
+    cands.push(stage);
+    let mut best: Option<(f64, usize)> = None;
+    let max_reg = cands.iter().map(|c| c.registered()).max().unwrap_or(0);
+    for (k, c) in cands.iter().enumerate() {
+        // 등록 수가 최대의 99% 보다 적은 후보는 비용이 작아도 고르지 않는다.
+        if (c.registered() as f64) < 0.99 * max_reg as f64 {
+            continue;
+        }
+        let cost = truncated_pair_cost(&rots, observations, &c.centers, cap);
+        if best.is_none_or(|(b, _)| cost < b) {
+            best = Some((cost, k));
+        }
+    }
+    let k = best.map_or(0, |(_, k)| k);
+    cands.swap_remove(k)
+}
+
 /// 광선 교차 위치로 카메라를 바꿀 때 요구하는 점 광선 지지 수 차이.
 const RAY_SWAP_MARGIN: usize = 3;
 
@@ -1812,6 +2011,48 @@ mod tests {
         let (rms, _) = stats(&similarity_aligned_errors(&res.centers, &truth));
         assert!(res.registered() >= 225, "registered {}", res.registered());
         assert!(rms < 6.0, "rms {rms}");
+    }
+
+    #[test]
+    fn robust_selection_registers_all_seeds_and_outlier_rates() {
+        // 옛 배치, 방향 잡음 1°, 관측 불가 5%, 점 200개(이상치 5%). 시드 1~10 × 짝 이상치 0·10·20%.
+        // 기준: 등록 ≥ 99%(238/240), 닮음 정렬 후 중심 RMS ≤ 1.0 m. 기존 경로(점 포함)와 함께 표로 낸다.
+        // 기본은 F-214 실패 시드 6·9·10 × 20%. 전체 표는 ROBUST_SEEDS=1,2,..,10 ROBUST_FRACS=0,0.1,0.2 (부하 없이도 수 분).
+        let list = |k: &str, d: Vec<f64>| -> Vec<f64> {
+            std::env::var(k)
+                .ok()
+                .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+                .unwrap_or(d)
+        };
+        let seeds = list("ROBUST_SEEDS", vec![6.0, 9.0, 10.0]);
+        let fracs = list("ROBUST_FRACS", vec![0.20]);
+        let mut fails = Vec::new();
+        for &frac in &fracs {
+            for &seed in &seeds {
+                let seed = seed as u64;
+                let case = Case {
+                    noise_deg: 1.0,
+                    outlier_frac: frac,
+                    unobservable_frac: 0.05,
+                };
+                let (poses, rots, obs) = observations(seed, &case);
+                let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, POINTS.2);
+                let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+                let cfg = TranslationConfig::default();
+                let old = average_translations_with_points(&rots, &obs, &pobs, &cfg);
+                let (ro, _) = stats(&similarity_aligned_errors(&old.centers, &truth));
+                let new = average_translations_robust(&rots, &obs, &pobs, &cfg, seed);
+                let (rn, mx) = stats(&similarity_aligned_errors(&new.centers, &truth));
+                println!(
+                    "ROBUST pair {frac} seed {seed}: old reg {} rms {ro:.3} | robust reg {} rms {rn:.3} max {mx:.3}",
+                    old.registered(), new.registered()
+                );
+                if new.registered() < 238 || rn > 1.0 {
+                    fails.push((frac, seed, new.registered(), rn));
+                }
+            }
+        }
+        assert!(fails.is_empty(), "{fails:?}");
     }
 
     #[test]
