@@ -82,7 +82,6 @@ fn run_case(stride: usize, ba_iters: usize) -> Case {
     eprintln!("registered {} of {}", errs.len(), ds.image_count());
     eprintln!("center error median {med:.3} m max {max:.3} m");
     let registered = errs.len();
-    let passed = report.items.iter().filter(|i| i.pass).count();
 
     // 점군 → 정답 표면(수직 거리 근사).
     let origin = scene.to_first_gps_frame(&Point3::new(0.0, 0.0, 0.0)).coords;

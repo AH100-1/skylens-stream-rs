@@ -758,6 +758,10 @@ fn apply_sparse_sim(s: &mut Sparse, sim: &Similarity) {
     }
 }
 
+/// 다음 구역의 정밀 BA 를 직전 정밀 모델 기준으로 시작할지. 3구역 측정(재투영 RMS 0.81/0.51 px 대 0.28/0.32 px)에서
+/// 초벌 기반 닮음 변환의 잔차(1.7~3.1 m)가 커서 오히려 나빠져 기본은 끈다.
+const ANCHOR_NEXT_REGION: bool = false;
+
 /// 직전 정밀 모델에 맞춘 시작: 닮음 변환으로 같은 좌표계로 옮기고 공유 사진 포즈를 직전 값으로 고정.
 struct Anchor {
     sim: Similarity,
@@ -768,6 +772,9 @@ struct Anchor {
 /// 새 구역 `rec` 의 초벌 희소 모델을 직전 정밀 구역 `prev` 에 맞출 기준을 만든다.
 /// 반환: 기준(닮음 변환 + 고정 포즈), 점 쌍 수, 잔차 중앙값. 겹침이 모자라면 `None`.
 fn make_anchor(rec: &RegionRec, prev: &RegionRec) -> Option<(Anchor, usize, f64)> {
+    if !ANCHOR_NEXT_REGION {
+        return None;
+    }
     let tb = &prev.refined.as_ref()?.0;
     let win = crate::progressive::overlap_window(&rec.region, &prev.region);
     let (sim, n, med) = crate::progressive::cross_align(&rec.ta, tb, win)?;
