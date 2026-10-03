@@ -728,7 +728,6 @@ fn sparse_init(
     Ok(s)
 }
 
-/// 번들 조정(`iters == 0` 이면 재투영 오차만 잰다). 반환: 재투영 RMS(px).
 /// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
 /// BA 는 자유 좌표계에서 움직이므로 정밀 모델을 다시 GPS 좌표계로 돌려놓는다.
 fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity> {
@@ -755,6 +754,7 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
     Some(sim)
 }
 
+/// 번들 조정(`iters == 0` 이면 재투영 오차만 잰다). 반환: 재투영 RMS(px).
 fn run_ba(s: &mut Sparse, k: &Intrinsics, iters: usize, gps: Option<&[Vector3<f64>]>) -> f64 {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
