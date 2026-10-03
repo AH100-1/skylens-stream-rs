@@ -10,6 +10,7 @@ pub mod fusion;
 pub mod geo;
 pub mod matching;
 pub mod math;
+pub mod patchmatch;
 pub mod ply;
 pub mod rotation_averaging;
 pub mod stream;
