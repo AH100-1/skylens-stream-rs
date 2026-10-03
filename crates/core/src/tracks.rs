@@ -103,7 +103,7 @@ pub enum ConflictPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrackConfig {
     pub policy: ConflictPolicy,
-    /// 최소 관측 수(2 미만은 2 로 본다).
+    /// 최소 관측 수(2 미만은 2 로 본다). 기본 3: 두 뷰 트랙은 위치 추정에서 간격 비를 정하지 못한다.
     pub min_length: usize,
     /// 트랙 수 상한([`select_tracks`]).
     pub max_tracks: usize,
@@ -113,7 +113,7 @@ impl Default for TrackConfig {
     fn default() -> Self {
         Self {
             policy: ConflictPolicy::Split,
-            min_length: 2,
+            min_length: 3,
             max_tracks: MAX_TRACKS,
         }
     }
@@ -612,6 +612,17 @@ mod tests {
     /// `swap_percent`: 정답 점 중 이 비율(%)을 1.5 m 옆 격자 점과 모든 짝에서 일관되게 바꿔
     /// 대응시킨다(반복 무늬형 오대응).
     fn synthetic(outlier_per_mille: u64, keep_percent: u64, swap_percent: u64) -> Synthetic {
+        synthetic_seeded(outlier_per_mille, keep_percent, swap_percent, 0)
+    }
+
+    /// `seed`: 대응 유지·오대응 선택의 시드(0 이면 시드 없는 기본 선택과 같다).
+    fn synthetic_seeded(
+        outlier_per_mille: u64,
+        keep_percent: u64,
+        swap_percent: u64,
+        seed: u64,
+    ) -> Synthetic {
+        let sd = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let scene = Scene::new(SceneConfig {
             positions: 12,
             ..SceneConfig::default()
@@ -668,13 +679,13 @@ mod tests {
             }
             let mut m = Vec::new();
             for &(fa, fb, p) in &common {
-                if hash((a as u64) << 44 | (b as u64) << 24 | p as u64 | 1 << 63) % 100
+                if hash((a as u64) << 44 | (b as u64) << 24 | p as u64 | 1 << 63 ^ sd) % 100
                     >= keep_percent
                 {
                     continue;
                 }
                 // 바뀐 점: 같은 짝 b 에서 옆 격자 점(번호 + 1)의 특징과 대응시킨다.
-                if hash(p as u64 ^ 0x5A5A_0000_0000) % 100 < swap_percent {
+                if hash(p as u64 ^ 0x5A5A_0000_0000 ^ sd) % 100 < swap_percent {
                     if let Some(&fq) = feat_of[b].get(&(p + 1)) {
                         m.push((fa, fq));
                         outliers += 1;
@@ -686,7 +697,7 @@ mod tests {
             inliers += m.len();
             let k = (m.len() as u64 * outlier_per_mille).div_ceil(1000);
             for t in 0..k {
-                let s = hash((a as u64) << 40 | (b as u64) << 20 | t);
+                let s = hash((a as u64) << 40 | (b as u64) << 20 | t ^ sd);
                 let fa = (s % keypoints[a].len() as u64) as usize;
                 let fb = ((s >> 32) % keypoints[b].len() as u64) as usize;
                 if gt[a][fa] != gt[b][fb] {
@@ -785,6 +796,8 @@ mod tests {
             }
         }
         let mut sum = 0.0;
+        // 길이 하한(기본 3) 미만으로만 이어지는 점은 어떤 방법으로도 트랙이 되지 않으므로 뺀다.
+        reach.retain(|_, n| *n >= TrackConfig::default().min_length);
         for (p, &n) in &reach {
             let m = best
                 .get(p)
@@ -964,6 +977,60 @@ mod tests {
     }
 
     #[test]
+    fn sparse_recall_over_seeds() {
+        // 시드 1~10, 재현율 30·40·50% × 오대응 0·1·5%: 완전도 >= 0.95 이고, 오대응 1% 이하에서는
+        // 순도 >= 0.99. 5% 오대응은 순도 >= 0.97 만 단언한다(0.99 미달 경우가 남아 있다, 노트 참고).
+        let mut failures = Vec::new();
+        for keep in [30, 40, 50] {
+            for opm in [0, 10, 50] {
+                let (mut pmin, mut cmin) = (2.0f64, 2.0f64);
+                for seed in 1..=10 {
+                    let s = synthetic_seeded(opm, keep, 0, seed);
+                    let (p, c, _, _) = run_policy(&s, ConflictPolicy::Split);
+                    pmin = pmin.min(p);
+                    cmin = cmin.min(c);
+                }
+                eprintln!("keep {keep} opm {opm}: seeds 1..10 min purity {pmin:.4} min completeness {cmin:.4}");
+                let pure_min = if opm <= 10 { 0.99 } else { 0.97 };
+                if pmin < pure_min || cmin < 0.95 {
+                    failures.push(format!("keep {keep} opm {opm}: {pmin} {cmin}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    #[ignore = "원인 조사용 측정표"]
+    fn recall_table() {
+        for keep in [30, 40, 50] {
+            for (opm, swap) in [(0, 0), (10, 0), (50, 0), (0, 1)] {
+                let (mut ps, mut cs, mut pd, mut cd) = (vec![], vec![], vec![], vec![]);
+                for seed in 1..=5 {
+                    let s = synthetic_seeded(opm, keep, swap, seed);
+                    let (p, c, _, _) = run_policy(&s, ConflictPolicy::Split);
+                    ps.push(p);
+                    cs.push(c);
+                    let (p, c, _, _) = run_policy(&s, ConflictPolicy::Drop);
+                    pd.push(p);
+                    cd.push(c);
+                }
+                let f = |v: &Vec<f64>| {
+                    format!(
+                        "{:.4}/{:.4}",
+                        v.iter().cloned().fold(2.0, f64::min),
+                        v.iter().sum::<f64>() / v.len() as f64
+                    )
+                };
+                eprintln!(
+                    "keep {keep} opm {opm} swap {swap}: Split purity(min/mean) {} compl {} | Drop purity {} compl {}",
+                    f(&ps), f(&cs), f(&pd), f(&cd)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn consistent_swaps_stay_pure() {
         // 정답 점 1% 를 옆 격자 점과 모든 짝에서 일관되게 바꾼다(반복 무늬형 오대응).
         let s = synthetic(0, 100, 1);
@@ -1031,7 +1098,11 @@ mod tests {
         }
         // Split: 세 간선 모두 지지도 0 이라 노드 번호 순((0,0)-(1,0), (0,1)-(2,0), (1,0)-(2,0))으로
         // 처리하고, 마지막 간선은 영상 0 이 겹쳐 건너뛴다. 충돌 성분이 두 트랙으로 나뉜다.
-        let (t, st) = build_tracks(&pairs, &kp, &TrackConfig::default());
+        let two = TrackConfig {
+            min_length: 2,
+            ..TrackConfig::default()
+        };
+        let (t, st) = build_tracks(&pairs, &kp, &two);
         assert_eq!(st.conflicts, 1);
         let all: Vec<Vec<_>> = t
             .iter()
@@ -1075,9 +1146,15 @@ mod tests {
         assert_eq!(st.invalid_matches, 2);
         assert_eq!(st.too_short, 1);
         assert!(t.is_empty());
-        let (t, _) = build_tracks(&pairs, &kp, &TrackConfig::default());
+        let two = TrackConfig {
+            min_length: 2,
+            ..TrackConfig::default()
+        };
+        let (t, _) = build_tracks(&pairs, &kp, &two);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].len(), 2);
+        // 기본 최소 관측 수는 3 이다.
+        assert_eq!(TrackConfig::default().min_length, 3);
     }
 
     #[test]
