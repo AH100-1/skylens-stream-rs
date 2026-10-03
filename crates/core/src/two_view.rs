@@ -675,9 +675,18 @@ fn planar_inliers(
             .map(|i| inl[i] && homography_transfer(h, &n1[i], &n2[i]) < th)
             .collect()
     };
-    let count = |v: &[bool]| v.iter().filter(|&&b| b).count();
+    let count_h = |h: &Matrix3<f64>| -> usize {
+        idx.iter()
+            .filter(|&&i| homography_transfer(h, &n1[i], &n2[i]) < th)
+            .count()
+    };
     let mut best: Option<Vec<bool>> = None;
-    for _ in 0..PLANAR_RANSAC_ITERS {
+    let mut best_cnt = 0usize;
+    // 적응형 종료(Hartley & Zisserman): 정상 비율 w 로 N = ln(1−p)/ln(1−w⁴), 최소 PLANAR_MIN_ITERS.
+    let mut iters = PLANAR_RANSAC_ITERS;
+    let mut it = 0;
+    while it < iters {
+        it += 1;
         let mut pick = [0usize; 4];
         let mut k = 0;
         while k < 4 {
@@ -692,9 +701,17 @@ fn planar_inliers(
         let Some(h) = homography_dlt(&a, &b) else {
             continue;
         };
-        let m = mark(&h);
-        if best.as_ref().is_none_or(|bm| count(&m) > count(bm)) {
-            best = Some(m);
+        let c = count_h(&h);
+        if best.is_none() || c > best_cnt {
+            best = Some(mark(&h));
+            best_cnt = c;
+            iters = crate::matching::adaptive_iterations(
+                c as f64 / idx.len() as f64,
+                4,
+                PLANAR_CONFIDENCE,
+                PLANAR_RANSAC_ITERS,
+            )
+            .max(PLANAR_MIN_ITERS);
         }
     }
     // 최소 표본 해를 정상 짝 전체로 다시 맞추고, 다시 맞춘 H 로는 모든 대응을 판정한다
@@ -743,10 +760,15 @@ pub struct RansacStats {
     pub best_ratio: f64,
     /// 사전 검사로 정상 수 세기를 건너뛴 후보 수.
     pub skipped: usize,
+    /// 정밀화 전에 포기했는가.
+    pub abandoned: bool,
     /// 표본 단계·정밀화 단계 시간(초).
     pub secs_sample: f64,
     pub secs_refine: f64,
 }
+
+/// 후보 목록(본질 행렬, 정상 표시).
+pub type EssentialCandidates = Vec<(Matrix3<f64>, Vec<bool>)>;
 
 /// [`ransac_essential_candidates`] 와 같고 실행 통계도 돌려준다.
 pub fn ransac_essential_candidates_stats(
@@ -754,7 +776,7 @@ pub fn ransac_essential_candidates_stats(
     n2: &[Vector2<f64>],
     focal_px: f64,
     cfg: &RansacConfig,
-) -> (Vec<(Matrix3<f64>, Vec<bool>)>, RansacStats) {
+) -> (EssentialCandidates, RansacStats) {
     let mut stats = RansacStats::default();
     let r = ransac_essential_inner(n1, n2, focal_px, cfg, &mut stats);
     (r, stats)
@@ -785,6 +807,18 @@ fn ransac_essential_inner(
             .collect()
     };
     let count = |v: &[bool]| v.iter().filter(|&&b| b).count();
+    // 정상 수가 `need` 이상이면 그 수를, 남은 대응을 모두 정상으로 쳐도 못 미치면 None.
+    let count_at_least = |e: &Matrix3<f64>, need: usize| -> Option<usize> {
+        let mut c = 0usize;
+        for i in 0..n {
+            if sampson_residual(e, &n1[i], &n2[i]).abs() < th {
+                c += 1;
+            } else if c + (n - 1 - i) < need {
+                return None;
+            }
+        }
+        (c >= need).then_some(c)
+    };
     let distinct = |a: &Matrix3<f64>, b: &Matrix3<f64>| {
         let (a, b) = (a / a.norm(), b / b.norm());
         (a - b).norm().min((a + b).norm()) > 0.1
@@ -814,11 +848,13 @@ fn ransac_essential_inner(
         let s1: Vec<_> = idx.iter().map(|&i| n1[i]).collect();
         let s2: Vec<_> = idx.iter().map(|&i| n2[i]).collect();
         for e in essential_5pt(&s1, &s2) {
-            let cnt = count(&inliers_of(&e));
             let best = pool.first().map_or(0, |p| p.1);
-            if cnt < 5 || 10 * cnt < 7 * best {
+            // 보관 조건(정상 수 ≥ 5 이고 10·cnt ≥ 7·best)을 못 채울 것이 확정되면 세기를 멈춘다(결과 동일).
+            let need = 5.max((7 * best).div_ceil(10));
+            let Some(cnt) = count_at_least(&e, need) else {
+                stats.skipped += 1;
                 continue;
-            }
+            };
             match pool.iter().position(|(p, _)| !distinct(p, &e)) {
                 Some(j) if pool[j].1 >= cnt => {}
                 Some(j) => pool[j] = (e, cnt),
@@ -837,6 +873,25 @@ fn ransac_essential_inner(
     stats.iters = it;
     stats.best_ratio = pool.first().map_or(0, |p| p.1) as f64 / n as f64;
     stats.secs_sample = t_sample.elapsed().as_secs_f64();
+    // 겹침 없는 짝의 조기 포기: 표본 단계 최선 정상 수가 유의 기준의 절반에도 못 미치면 정밀화로
+    // 기준을 넘길 수 없으므로 정밀화 없이 끝낸다.
+    {
+        let (mut lo, mut hi) = (n2[0], n2[0]);
+        for x in n2 {
+            lo = lo.inf(x);
+            hi = hi.sup(x);
+        }
+        let (w, h) = ((hi.x - lo.x).max(th), (hi.y - lo.y).max(th));
+        let p_hit = (2.0 * th * (w * w + h * h).sqrt() / (w * h)).min(1.0);
+        let lambda = (n - 5) as f64 * p_hit;
+        let needed =
+            ((5.0 + lambda + 6.0 * lambda.sqrt() + 2.0).ceil() as usize).max(MIN_ESSENTIAL_INLIERS);
+        let best = pool.first().map_or(0, |p| p.1);
+        if 2 * best < needed || (best as f64) < 0.5 * cfg.min_inlier_ratio * n as f64 {
+            stats.abandoned = true;
+            return vec![];
+        }
+    }
     let t_refine = std::time::Instant::now();
     let cost = |e: &Matrix3<f64>, inl: &[bool]| -> f64 {
         (0..n)
@@ -1117,6 +1172,10 @@ pub const MIN_ESSENTIAL_INLIERS: usize = 15;
 /// 평면 판정용 호모그래피 4점 RANSAC 반복 수.
 pub const PLANAR_RANSAC_ITERS: usize = 200;
 
+/// 평면 판정 4점 RANSAC 의 최소 반복 수와 적응형 종료 신뢰도.
+pub const PLANAR_MIN_ITERS: usize = 40;
+pub const PLANAR_CONFIDENCE: f64 = 0.999;
+
 /// 호모그래피 전달 오차 문턱 = 이 배수 × 에피폴라 문턱. 전달 오차는 두 영상 잡음이 2차원으로 더해져
 /// 에피폴라 거리보다 크다. 띠를 넓혀도 무작위 이상치가 한 점 둘레 원에 들 확률은 매우 작다(1920×1080 에서
 /// 반지름 3.75 px 원 ≈ 2e-5)이므로 정상 짝을 놓치지 않는 쪽으로 넉넉히 둔다.
@@ -1130,7 +1189,7 @@ pub const PLANAR_MIN_SHARE: f64 = 0.8;
 pub const PLANAR_STRUCTURE_SHARE: f64 = 1.05;
 
 /// 5점 RANSAC 의 최소 반복 수.
-pub const ESSENTIAL_MIN_ITERS: usize = 300;
+pub const ESSENTIAL_MIN_ITERS: usize = 100;
 
 #[cfg(test)]
 mod tests {
@@ -1862,6 +1921,35 @@ mod tests {
         }
         // 측정값 0.430°. 이 값보다 작은 회전 오차 기준은 평면 σ0.5px 에서 달성할 수 없다.
         assert!(floor0 > 0.3 && floor0 < 0.5, "평면 하한 {floor0}°");
+    }
+
+    /// 깨끗한 대응(잡음 0.3 px, 이상치 없음)에서는 적응형 종료가 최소 반복 수에서 멈추고,
+    /// 같은 시드로 두 번 돌리면 결과가 같으며, 첫 후보 회전이 정답에 0.2° 안으로 든다.
+    #[test]
+    fn ransac_essential_adaptive_stop_is_deterministic_and_accurate() {
+        let mut worst = 0.0f64;
+        for seed in 1..=8 {
+            let s = scene_with_baseline(150, 0.3, seed, 6.0);
+            let k = s.c1.intrinsics;
+            let cfg = RansacConfig {
+                max_iters: 500,
+                ..RansacConfig::default()
+            };
+            let (c1, st1) = ransac_essential_candidates_stats(&s.x1, &s.x2, k.fx, &cfg);
+            let (c2, st2) = ransac_essential_candidates_stats(&s.x1, &s.x2, k.fx, &cfg);
+            assert_eq!(st1.iters, ESSENTIAL_MIN_ITERS, "시드 {seed}");
+            assert_eq!(st1.iters, st2.iters);
+            assert_eq!(c1.len(), c2.len());
+            assert!(st1.best_ratio > 0.9, "시드 {seed}: 비율 {}", st1.best_ratio);
+            assert!(st1.skipped > 0, "시드 {seed}: 조기 중단 없음");
+            let (e, inl) = &c1[0];
+            assert_eq!(e, &c2[0].0);
+            assert_eq!(inl, &c2[0].1);
+            let (r, _) = s.rel();
+            let p = recover_pose(e, &s.x1, &s.x2).expect("자세");
+            worst = worst.max(rotation_angle_between(&p.rotation, &r).to_degrees());
+        }
+        assert!(worst < 0.2, "최악 회전 오차 {worst}°");
     }
 
     #[test]

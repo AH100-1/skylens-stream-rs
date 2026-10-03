@@ -398,13 +398,14 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
             crate::timing::add("matching_ransac_cpu", t_ransac.elapsed().as_secs_f64());
             if ransac_stats_enabled() {
                 eprintln!(
-                    "ransac_stat pair {i} {j} n {} iters {} best_ratio {:.4} skipped {} sample_s {:.5} refine_s {:.5} ok {}",
+                    "ransac_stat pair {i} {j} n {} iters {} best_ratio {:.4} skipped {} sample_s {:.5} refine_s {:.5} abandoned {} ok {}",
                     rs.n,
                     rs.iters,
                     rs.best_ratio,
                     rs.skipped,
                     rs.secs_sample,
                     rs.secs_refine,
+                    rs.abandoned,
                     ransac.is_some()
                 );
             }
@@ -2027,9 +2028,8 @@ pub fn run_pipeline_with(
         let (mut sim, mut target) = (None, None);
         if let Some(m) = latest_ref {
             let tbm = &recs[m].refined.as_ref().unwrap().0;
-            let ca = crate::timing::timed("align_ghost", || {
-                region_align(&ta, tbm, r, &recs[m].region)
-            });
+            let ca =
+                crate::timing::timed("align_ghost", || region_align(&ta, tbm, r, &recs[m].region));
             if let Some((s, n, med)) = ca {
                 realigns.push(ReAlign {
                     secs: t_now(),
