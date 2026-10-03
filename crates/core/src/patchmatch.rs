@@ -182,7 +182,7 @@ impl Default for Config {
             fine_neighbors: 4,
             normal_steps: 5,
             seed: 0x5eed,
-            fast_iterations: 6,
+            fast_iterations: 4,
             fine_prop: 4,
         }
     }
