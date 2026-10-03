@@ -277,6 +277,8 @@ pub struct WarpField {
 
 /// 보정장 칸 수 상한 방향의 기본 칸 수(긴 변 기준).
 const WARP_GRID: f64 = 12.0;
+/// 칸 누적값: (x 합, y 합, 짝 수, 잔차 합).
+type CellAcc = (f64, f64, f64, Vector3<f64>);
 
 impl WarpField {
     /// 전체 닮음 변환 `sim` 과 3D 점 짝에서 만든다. 잔차가 `max(3·med, TRIM_FLOOR_M)` 를 넘는 짝은 뺀다.
@@ -308,7 +310,7 @@ impl WarpField {
             return None;
         }
         let cs = ext / WARP_GRID;
-        let mut acc: HashMap<(i64, i64), (f64, f64, f64, Vector3<f64>)> = HashMap::new();
+        let mut acc: HashMap<(i64, i64), CellAcc> = HashMap::new();
         for (x, b) in &good {
             let key = (
                 ((x.x - lo[0]) / cs).floor() as i64,
