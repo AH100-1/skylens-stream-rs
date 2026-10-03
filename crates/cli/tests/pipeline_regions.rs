@@ -3,7 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use skylens_core::dataset::{load_dataset, DatasetConfig};
-use skylens_core::pipeline::{run_pipeline, PipelineConfig};
+use skylens_core::math::Point3;
+use skylens_core::pipeline::{run_pipeline, PipelineConfig, RegionLink};
 use skylens_core::synth::{Scene, SceneConfig};
 
 const POSITIONS: usize = 26;
@@ -14,6 +15,7 @@ fn cfg() -> PipelineConfig {
         dense_width: 80,
         hfov_deg: 65.0,
         ba_iters: 8,
+        ..PipelineConfig::default()
     }
 }
 
@@ -131,4 +133,95 @@ fn stationary_segment_is_error_or_issue() {
         ),
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+fn number_after(s: &str, prefix: &str) -> f64 {
+    let at = s
+        .find(prefix)
+        .unwrap_or_else(|| panic!("{prefix} 없음: {s}"))
+        + prefix.len();
+    let t = &s[at..];
+    let end = t
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(t.len());
+    t[..end].parse().unwrap()
+}
+
+struct Link {
+    registered: usize,
+    overlap_m: f64,
+    scale_pct: f64,
+    center_med: f64,
+    verify_pass: usize,
+    verify_total: usize,
+}
+
+fn run_link(mode: RegionLink, tag: &str) -> Link {
+    let (root, scene) = scene_dir(tag);
+    let ds = dataset(&root);
+    let c = PipelineConfig {
+        region_link: mode,
+        ..cfg()
+    };
+    let out = root.join("out");
+    let res = run_pipeline(&ds, &c, &out).unwrap();
+    let report = skylens_core::verify::verify_dir(&out);
+    let ov = report.item("refined_overlap").unwrap();
+    let pa = report.item("preview_align").unwrap();
+    eprintln!(
+        "LINK {mode:?} overlap: {} | align: {}",
+        ov.measured, pa.measured
+    );
+    let mut errs: Vec<f64> = res
+        .centers
+        .iter()
+        .map(|(name, c)| {
+            let v = scene.views.iter().find(|v| &v.name == name).unwrap();
+            let t = scene.to_first_gps_frame(&v.camera.pose.center());
+            (Point3::new(c[0], c[1], c[2]) - t).norm()
+        })
+        .collect();
+    errs.sort_by(f64::total_cmp);
+    let overlap_m = res
+        .issues
+        .iter()
+        .find(|i| i.contains("겹침 구간 사진 중심 차이"))
+        .map_or(f64::NAN, |i| number_after(i, "중앙 "));
+    let l = Link {
+        registered: res.centers.len(),
+        overlap_m,
+        scale_pct: number_after(&pa.measured, "구역 간 스케일 차 "),
+        center_med: errs[errs.len() / 2],
+        verify_pass: report.items.iter().filter(|i| i.pass).count(),
+        verify_total: report.items.len(),
+    };
+    eprintln!(
+        "LINKROW {mode:?} reg {}/{} overlap {:.3} m scale {:.2}% center_med {:.3} m verify {}/{}",
+        l.registered,
+        ds.image_count(),
+        l.overlap_m,
+        l.scale_pct,
+        l.center_med,
+        l.verify_pass,
+        l.verify_total
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    l
+}
+
+/// 구역 경계 묶는 방식별 비교(구역 3개). 기본 방식의 상한을 단언한다.
+#[test]
+fn region_link_modes_compared() {
+    let off = run_link(RegionLink::Off, "link_off");
+    let pts = run_link(RegionLink::Points, "link_pts");
+    let ctr = run_link(RegionLink::Centers, "link_ctr");
+    // 측정(3구역, 26 위치): 세 방식 모두 등록 62/78, 묶기는 아직 이득이 없다. 기본(Off)의 상한만 단언한다.
+    assert_eq!(off.registered, 62, "등록 수");
+    assert!(pts.registered >= 60 && ctr.registered >= 60);
+    assert!(off.overlap_m < 6.0, "겹침 차 {}", off.overlap_m);
+    assert!(off.scale_pct < 250.0, "스케일 차 {}", off.scale_pct);
+    assert!(off.center_med < 3.0, "중심 오차 {}", off.center_med);
+    assert!(off.verify_pass >= 3 && off.verify_pass <= off.verify_total);
+    // 묶는 방식이 기본보다 나빠지는 정도의 상한(점 고정은 스케일 차가 커진다).
+    assert!(ctr.center_med < 3.5 && pts.center_med < 6.0);
 }

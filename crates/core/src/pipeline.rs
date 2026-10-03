@@ -36,6 +36,20 @@ pub struct PipelineConfig {
     /// 수평 화각(도). 데이터셋에 내부 파라미터가 없으므로 받는다.
     pub hfov_deg: f64,
     pub ba_iters: usize,
+    /// 새 구역 정밀 BA 를 앞 구역 정밀 모델에 묶는 방식.
+    pub region_link: RegionLink,
+}
+
+/// 구역 경계를 묶는 방식(정밀 BA 시작·고정).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RegionLink {
+    /// 묶지 않고 구역마다 따로 풀어 GPS 로 맞춘다. 3구역 측정에서 세 방식 중 가장 나은 결과라 기본.
+    #[default]
+    Off,
+    /// 공유 3D 점(초벌 대 앞 정밀) 닮음 변환으로 옮기고 겹치는 사진 포즈를 앞 정밀 값으로 고정.
+    Points,
+    /// 겹치는 사진 중심(초벌 대 앞 정밀)의 닮음 변환으로 옮기고 같은 사진 포즈를 고정.
+    Centers,
 }
 
 impl Default for PipelineConfig {
@@ -45,6 +59,7 @@ impl Default for PipelineConfig {
             dense_width: 160,
             hfov_deg: 65.0,
             ba_iters: 15,
+            region_link: RegionLink::default(),
         }
     }
 }
@@ -758,10 +773,6 @@ fn apply_sparse_sim(s: &mut Sparse, sim: &Similarity) {
     }
 }
 
-/// 다음 구역의 정밀 BA 를 직전 정밀 모델 기준으로 시작할지. 3구역 측정(재투영 RMS 0.81/0.51 px 대 0.28/0.32 px)에서
-/// 초벌 기반 닮음 변환의 잔차(1.7~3.1 m)가 커서 오히려 나빠져 기본은 끈다.
-const ANCHOR_NEXT_REGION: bool = false;
-
 /// 직전 정밀 모델에 맞춘 시작: 닮음 변환으로 같은 좌표계로 옮기고 공유 사진 포즈를 직전 값으로 고정.
 struct Anchor {
     sim: Similarity,
@@ -771,13 +782,40 @@ struct Anchor {
 
 /// 새 구역 `rec` 의 초벌 희소 모델을 직전 정밀 구역 `prev` 에 맞출 기준을 만든다.
 /// 반환: 기준(닮음 변환 + 고정 포즈), 점 쌍 수, 잔차 중앙값. 겹침이 모자라면 `None`.
-fn make_anchor(rec: &RegionRec, prev: &RegionRec) -> Option<(Anchor, usize, f64)> {
-    if !ANCHOR_NEXT_REGION {
-        return None;
-    }
-    let tb = &prev.refined.as_ref()?.0;
-    let win = crate::progressive::overlap_window(&rec.region, &prev.region);
-    let (sim, n, med) = crate::progressive::cross_align(&rec.ta, tb, win)?;
+fn make_anchor(
+    rec: &RegionRec,
+    prev: &RegionRec,
+    mode: RegionLink,
+) -> Option<(Anchor, usize, f64)> {
+    let (sim, n, med) = match mode {
+        RegionLink::Off => return None,
+        RegionLink::Points => {
+            let tb = &prev.refined.as_ref()?.0;
+            let win = crate::progressive::overlap_window(&rec.region, &prev.region);
+            crate::progressive::cross_align(&rec.ta, tb, win)?
+        }
+        RegionLink::Centers => {
+            let (mut src, mut dst) = (Vec::new(), Vec::new());
+            for (a, g) in rec.gids.iter().enumerate() {
+                if let (Some(c), Some(p)) = (rec.init_centers[a], prev.rposes.get(g)) {
+                    src.push(c);
+                    dst.push(p.center().coords);
+                }
+            }
+            if src.len() < 4 {
+                return None;
+            }
+            let (sim, _, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+            let mut res: Vec<f64> = src
+                .iter()
+                .zip(&dst)
+                .map(|(a, b)| (sim.apply_point(a) - b).norm())
+                .collect();
+            res.sort_by(f64::total_cmp);
+            let med = res[res.len() / 2];
+            (sim, src.len(), med)
+        }
+    };
     let fixed: Vec<(usize, Pose)> = rec
         .gids
         .iter()
@@ -963,6 +1001,8 @@ struct RegionRec {
     anchored: Option<(usize, usize, f64, f64)>,
     /// 등록된 사진 표시(gids 순서).
     reg_flags: Vec<bool>,
+    /// 초벌 카메라 중심(gids 순서).
+    init_centers: Vec<Option<Vector3<f64>>>,
 }
 
 /// 정밀(BA) 작업 결과.
@@ -1034,6 +1074,7 @@ pub fn run_pipeline(
     use crate::stream::{preview_name, refined_name};
     use std::sync::{mpsc, Arc};
 
+    let link = cfg.region_link;
     let n_pos = ds.positions.len();
     let regions = split_regions(n_pos, ds.config.span, ds.config.ovl);
     let owns = own_ranges(&regions, n_pos);
@@ -1110,7 +1151,7 @@ pub fn run_pipeline(
         // 다음 구역의 정밀 작업이 이 모델을 기다리고 있으면 기준을 보낸다.
         if k + 1 < recs.len() {
             if let Some(tx) = recs[k + 1].anchor_tx.take() {
-                let a = make_anchor(&recs[k + 1], &recs[k]);
+                let a = make_anchor(&recs[k + 1], &recs[k], link);
                 send_anchor(&mut recs[k + 1], &tx, a, k, t_now(), events);
             }
         }
@@ -1367,6 +1408,11 @@ pub fn run_pipeline(
             anchor_tx: None,
             anchored: None,
             reg_flags: init.poses.iter().map(|p| p.is_some()).collect(),
+            init_centers: init
+                .poses
+                .iter()
+                .map(|p| p.map(|p| p.center().coords))
+                .collect(),
         });
         // 정밀(BA)은 다른 스레드에서: 직전 구역의 정밀 모델이 나오면 그 좌표계·포즈를 기준으로 시작한다.
         let (anchor_tx, anchor_rx) = mpsc::channel::<Option<Anchor>>();
@@ -1405,7 +1451,7 @@ pub fn run_pipeline(
         if slot == 0 {
             let _ = anchor_tx.send(None);
         } else if recs[slot - 1].refined.is_some() {
-            let a = make_anchor(&recs[slot], &recs[slot - 1]);
+            let a = make_anchor(&recs[slot], &recs[slot - 1], link);
             send_anchor(
                 &mut recs[slot],
                 &anchor_tx,
