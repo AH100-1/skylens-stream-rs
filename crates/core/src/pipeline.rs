@@ -644,12 +644,10 @@ pub struct PreviewStages {
     pub pruned: (usize, usize),
 }
 
+type RotsAndKeep = (Vec<Option<Rotation3<f64>>>, Vec<bool>);
+
 /// 회전 평균 + 상대 회전과 어긋나는 간선 제거 뒤 재평균. 반환: 회전, 간선 유지 표시.
-fn average_pruned(
-    n: usize,
-    pm: &[PairMatch],
-    opts: &PreviewOpts,
-) -> Result<(Vec<Option<Rotation3<f64>>>, Vec<bool>), String> {
+fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<RotsAndKeep, String> {
     let mk = |keep: &[bool]| -> Vec<RelativeRotation> {
         pm.iter()
             .zip(keep)
