@@ -1149,30 +1149,7 @@ fn refine_center(
     }
     a += Matrix3::identity() * (1e-9 * a.trace().max(1e-12));
     let sol = a.cholesky()?.solve(&rhs);
-    if !sol.iter().all(|v| v.is_finite()) {
-        return None;
-    }
-    // 채택 조건(비엄격): 문턱 안 제약 수가 줄지 않고 각 잔차 제곱합이 늘지 않을 때만 받아들인다.
-    let (n_old, sse_old) = center_fit(cur, cons);
-    let (n_new, sse_new) = center_fit(&sol, cons);
-    (n_new >= n_old && sse_new <= sse_old * (1.0 + 1e-9) + 1e-12).then_some(sol)
-}
-
-/// 중심 `c` 에서 문턱 안 제약 수와 그 각 잔차 제곱합.
-fn center_fit(c: &Vector3<f64>, cons: &[(Vector3<f64>, Vector3<f64>, f64, f64)]) -> (usize, f64) {
-    let (mut n, mut sse) = (0usize, 0.0);
-    for (o, u, _, gate) in cons {
-        let dx = c - o;
-        if dx.dot(u) <= 0.0 {
-            continue;
-        }
-        let a = angle_between(&dx, u);
-        if a <= *gate {
-            n += 1;
-            sse += a * a;
-        }
-    }
-    (n, sse)
+    sol.iter().all(|v| v.is_finite()).then_some(sol)
 }
 
 fn global_positioning(
