@@ -1361,12 +1361,11 @@ fn region_sim3_mode() -> u8 {
     }
 }
 
+/// (원 점, 대상 점, 대응마다 공유 이미지 목록).
+type SharedPairs = (Vec<Vector3<f64>>, Vec<Vector3<f64>>, Vec<Vec<u32>>);
+
 /// 두 트랙 모음의 3D 점 대응과 대응마다 공유 이미지 목록(같은 이미지·같은 특징 번호). 이미지 위치가 `window` 안인 것만.
-fn shared_pairs(
-    a: &[Track],
-    b: &[Track],
-    window: (usize, usize),
-) -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>, Vec<Vec<u32>>) {
+fn shared_pairs(a: &[Track], b: &[Track], window: (usize, usize)) -> SharedPairs {
     let in_win = |img: u32| {
         let p = (img / 3) as usize;
         p >= window.0 && p < window.1
