@@ -248,7 +248,9 @@ pub fn fuse(views: &[FusionView], depth_maps: &[DepthMap], cfg: FusionConfig) ->
 
 /// [`fuse`] 와 같고, 입력·설정 검사 실패를 오류로 돌려준다.
 ///
-/// 기준 사진은 번호 순서로 처리한다. 한 기준 사진 안에서는 화소 행을 나눠
+/// 기준 사진은 유효 깊이 화소가 많은 순서로(같으면 번호 순서로) 처리한다. 먼저
+/// 처리되는 사진이 쓰인 화소 표시를 먼저 차지하므로 품질 좋은 깊이 지도가 점의
+/// 기준이 된다. 한 기준 사진 안에서는 화소 행을 나눠
 /// 동시에 후보를 만들고(앞 사진들이 쓴 화소 표시는 읽기만), 화소 순서대로
 /// 확정하면서 이미 쓰인 이웃 화소를 빼고 동의 수를 다시 센다. 결과는 직렬
 /// 처리와 같다.
@@ -1762,8 +1764,125 @@ mod tests {
             &firsts[..1]
         );
         assert!(cloud.len() > 1000);
-        assert_eq!(firsts[0], 1, "first reference view {}", firsts[0]);
-        let pos0 = firsts.iter().position(|&r| r == 0);
-        assert!(pos0.is_none_or(|p| p > 0));
+        // 기준 사진이 처음 나타나는 순서: 유효 화소 수 내림차순, 같으면 번호순.
+        let mut seen: Vec<usize> = Vec::new();
+        for &r in &firsts {
+            if !seen.contains(&r) {
+                seen.push(r);
+            }
+        }
+        let valid: Vec<usize> = maps
+            .iter()
+            .map(|m| m.depth.iter().filter(|d| **d > 0.0).count())
+            .collect();
+        let mut expect: Vec<usize> = (0..maps.len()).collect();
+        expect.sort_by_key(|&i| (std::cmp::Reverse(valid[i]), i));
+        expect.retain(|i| seen.contains(i));
+        println!("order: seen {seen:?} expect {expect:?}");
+        assert_eq!(seen[0], 1, "first reference view {}", seen[0]);
+        assert_eq!(seen, expect);
+        assert_eq!(*seen.last().unwrap(), 0, "view 0 (half invalid) is last");
+    }
+
+    /// 잡음 0.5 %·이상치 10 % 깊이 지도: 거리 분위수, 이상치 잔존율, min_views 별 표.
+    #[test]
+    fn consistency_table_noise_half_percent() {
+        let cams = small_cameras();
+        let truth: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        let mut rng = Rng(0x0bad_cafe_1234_5678);
+        let mut maps = truth.clone();
+        let bad: Vec<Vec<bool>> = maps
+            .iter_mut()
+            .map(|m| corrupt(m, &mut rng, 0.005, 0.10))
+            .collect();
+        let mut rows = Vec::new();
+        for mv in 1..=4usize {
+            let cfg = FusionConfig {
+                min_views: mv,
+                ..FusionConfig::default()
+            };
+            TRACE.with(|t| t.borrow_mut().clear());
+            let cloud = fuse(&views(&cams), &maps, cfg);
+            let trace: Trace = TRACE.with(|t| t.borrow().clone());
+            assert!(!cloud.has_nan());
+            assert_eq!(trace.len(), cloud.len());
+            // 기준 또는 동의 화소가 이상치인 점의 비율.
+            let tainted = trace
+                .iter()
+                .filter(|(r, i, ag)| bad[*r][*i] || ag.iter().any(|&(j, k)| bad[j][k]))
+                .count();
+            let ref_bad = trace.iter().filter(|(r, i, _)| bad[*r][*i]).count();
+            let mut e: Vec<f64> = cloud
+                .points
+                .iter()
+                .map(|p| surface_dist(&SMALL, &pt(p)))
+                .collect();
+            e.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = e[e.len() / 2];
+            let p95 = e[(e.len() * 95 / 100).min(e.len() - 1)];
+            println!(
+                "min_views={mv}: points {} median {med:.5} p95 {p95:.5} tainted {tainted} ({:.3}%) ref_bad {ref_bad}",
+                cloud.len(),
+                100.0 * tainted as f64 / cloud.len() as f64
+            );
+            rows.push((cloud.len(), med, p95, tainted, ref_bad));
+        }
+        // min_views 가 오르면 점이 줄거나 같다(중복 제거 때문에 완전한 단조는 아니라 여유 5 %).
+        for w in rows.windows(2) {
+            assert!(w[1].0 as f64 <= 1.05 * w[0].0 as f64, "{rows:?}");
+        }
+        // 기본(3)과 4: 이상치가 점에 섞이는 비율 < 1 %, 기준 이상치 점은 더 드물다.
+        for &(n, med, p95, tainted, _) in &rows[2..] {
+            assert!(n > 1500, "points {n}");
+            assert!(tainted * 100 < n, "tainted {tainted} of {n}");
+            // 단일 화소 σ = 0.5 % × 깊이 ≈ 0.035 → 평균 후 중앙은 그 안.
+            assert!(med < 0.03, "median {med}");
+            assert!(p95 < 0.08, "p95 {p95}");
+        }
+        // 깊이 허용(1 %)이 최대 오차를 막는다: 3 이상에서 최대 0.1 m 이하.
+        let cfg = FusionConfig::default();
+        let cloud = fuse(&views(&cams), &maps, cfg);
+        let (_, max, far) = errors(&SMALL, &cloud);
+        assert!(max < 0.1 && far == 0, "max {max} far {far}");
+    }
+
+    /// 화면 밖 투영·깊이 0/NaN/무한대/음수·카메라 뒤 점: 패닉 없이 유한한 점만 낸다.
+    #[test]
+    fn boundary_cases_do_not_panic() {
+        let cams = small_cameras();
+        let mut maps: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        for (v, m) in maps.iter_mut().enumerate() {
+            for (i, d) in m.depth.iter_mut().enumerate() {
+                match (i + v) % 13 {
+                    0 => *d = 0.0,
+                    1 => *d = f32::NAN,
+                    2 => *d = f32::INFINITY,
+                    3 => *d = -5.0,
+                    4 => *d = 1e-12,
+                    5 => *d = 1e9,
+                    _ => {}
+                }
+            }
+        }
+        let cloud = fuse(&views(&cams), &maps, FusionConfig::default());
+        assert!(!cloud.has_nan());
+        // 한 장만 카메라 앞뒤가 뒤섞인 깊이, 다른 장은 전부 NaN.
+        let mut maps2: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        for d in maps2[1].depth.iter_mut() {
+            *d = f32::NAN;
+        }
+        for d in maps2[2].depth.iter_mut() {
+            *d = -1.0;
+        }
+        let cloud = fuse(&views(&cams), &maps2, FusionConfig::default());
+        assert!(!cloud.has_nan());
+        // 모든 깊이가 극단값이어도 패닉하지 않는다.
+        for m in maps2.iter_mut() {
+            for d in m.depth.iter_mut() {
+                *d = 1e7;
+            }
+        }
+        let cloud = fuse(&views(&cams), &maps2, FusionConfig::default());
+        assert!(!cloud.has_nan());
     }
 }

@@ -23,6 +23,7 @@
 
 use crate::ba::Observation;
 use crate::math::{Matrix3, Vector2, Vector3};
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// 국소 변위 일관성 기준 문턱(화소): 960x540 영상 기준. 영상 크기에 비례해 늘린다.
@@ -455,82 +456,101 @@ fn displacement_outliers(
         .collect();
     idx.sort_unstable();
     let k = DISPLACEMENT_NEIGHBORS;
-    let mut cand: Vec<(f64, usize)> = Vec::new();
-    // 이웃 하나: (u / cell, 변위)
-    let mut nb: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(k);
-    let mut res: Vec<f64> = Vec::with_capacity(k);
-    let mut keep: Vec<bool> = Vec::with_capacity(k);
-    for (i, q) in pos.iter().enumerate() {
-        let (cx, cy) = key(&q.0);
-        cand.clear();
-        for ring in 1..=3i64 {
-            cand.clear();
-            for gx in cx - ring..=cx + ring {
-                for gy in cy - ring..=cy + ring {
-                    let lo = idx.partition_point(|e| e.0 < (gx, gy));
-                    for e in idx[lo..].iter().take_while(|e| e.0 == (gx, gy)) {
-                        if e.1 != i {
-                            let d = pos[e.1].0 - q.0;
-                            cand.push((d.x * d.x + d.y * d.y, e.1));
+    // 점마다 독립이므로 병렬로 계산한다(결과는 순서·스레드 수와 무관). 버퍼는 스레드마다 한 벌.
+    type Scratch = (
+        Vec<(f64, usize)>,
+        Vec<(f64, f64, f64, f64)>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<bool>,
+    );
+    let flags: Vec<bool> = pos
+        .par_iter()
+        .enumerate()
+        .map_init(
+            || -> Scratch {
+                (
+                    Vec::new(),
+                    Vec::with_capacity(k),
+                    Vec::with_capacity(k),
+                    Vec::with_capacity(k),
+                    Vec::with_capacity(k),
+                )
+            },
+            |(cand, nb, res, sorted, keep), (i, q)| {
+                let (cx, cy) = key(&q.0);
+                for ring in 1..=3i64 {
+                    cand.clear();
+                    for gx in cx - ring..=cx + ring {
+                        for gy in cy - ring..=cy + ring {
+                            let lo = idx.partition_point(|e| e.0 < (gx, gy));
+                            for e in idx[lo..].iter().take_while(|e| e.0 == (gx, gy)) {
+                                if e.1 != i {
+                                    let d = pos[e.1].0 - q.0;
+                                    cand.push((d.x * d.x + d.y * d.y, e.1));
+                                }
+                            }
                         }
                     }
+                    if cand.len() >= k {
+                        break;
+                    }
                 }
-            }
-            if cand.len() >= k {
-                break;
-            }
-        }
-        if cand.len() < 8 {
-            continue;
-        }
-        if cand.len() > k {
-            cand.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
-            cand.truncate(k);
-        }
-        nb.clear();
-        for &(_, j) in &cand {
-            let u = (pos[j].0 - q.0) / cell;
-            nb.push((u.x, u.y, pos[j].1.x - q.1.x, pos[j].1.y - q.1.y));
-        }
-        // 변위는 대상 점 변위를 뺀 값으로 둔다: 맞춘 상수항 t 가 곧 (예측 − 실제) 의 반대 부호 잔차다.
-        keep.clear();
-        keep.resize(nb.len(), true);
-        let mut fit = None;
-        let mut s = 0.0;
-        for round in 0..3 {
-            let Some(f) = fit_affine(&nb, &keep) else {
-                break;
-            };
-            res.clear();
-            for e in &nb {
-                let rx = e.2 - (f[0] + f[1] * e.0 + f[2] * e.1);
-                let ry = e.3 - (f[3] + f[4] * e.0 + f[5] * e.1);
-                res.push((rx * rx + ry * ry).sqrt());
-            }
-            let mut sorted = res.clone();
-            sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-            s = 1.4826 * sorted[sorted.len() / 2];
-            fit = Some(f);
-            if round == 2 {
-                break;
-            }
-            let cut = (3.0 * s).max(tol * 0.25);
-            let mut n = 0;
-            for (kp, r) in keep.iter_mut().zip(&res) {
-                *kp = *r <= cut;
-                n += *kp as usize;
-            }
-            if n < 6 {
-                break;
-            }
-        }
-        let Some(f) = fit else {
-            continue;
-        };
-        // 대상 점은 u = 0, 변위 0(뺀 값)이므로 예측 (f[0], f[3]) 가 곧 어긋남이다.
-        let r = (f[0] * f[0] + f[3] * f[3]).sqrt();
-        out[i] = r > (4.0 * s).clamp(tol, 3.0 * tol);
-    }
+                if cand.len() < 8 {
+                    return false;
+                }
+                if cand.len() > k {
+                    cand.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
+                    cand.truncate(k);
+                }
+                nb.clear();
+                for &(_, j) in cand.iter() {
+                    let u = (pos[j].0 - q.0) / cell;
+                    nb.push((u.x, u.y, pos[j].1.x - q.1.x, pos[j].1.y - q.1.y));
+                }
+                // 변위는 대상 점 변위를 뺀 값으로 둔다: 맞춘 상수항 t 가 곧 (예측 − 실제) 의 반대 부호 잔차다.
+                keep.clear();
+                keep.resize(nb.len(), true);
+                let mut fit = None;
+                let mut s = 0.0;
+                for round in 0..3 {
+                    let Some(f) = fit_affine(nb, keep) else {
+                        break;
+                    };
+                    res.clear();
+                    for e in nb.iter() {
+                        let rx = e.2 - (f[0] + f[1] * e.0 + f[2] * e.1);
+                        let ry = e.3 - (f[3] + f[4] * e.0 + f[5] * e.1);
+                        res.push((rx * rx + ry * ry).sqrt());
+                    }
+                    sorted.clear();
+                    sorted.extend_from_slice(res);
+                    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+                    s = 1.4826 * sorted[sorted.len() / 2];
+                    fit = Some(f);
+                    if round == 2 {
+                        break;
+                    }
+                    let cut = (3.0 * s).max(tol * 0.25);
+                    let mut n = 0;
+                    for (kp, r) in keep.iter_mut().zip(res.iter()) {
+                        *kp = *r <= cut;
+                        n += *kp as usize;
+                    }
+                    if n < 6 {
+                        break;
+                    }
+                }
+                let Some(f) = fit else {
+                    return false;
+                };
+                // 대상 점은 u = 0, 변위 0(뺀 값)이므로 예측 (f[0], f[3]) 가 곧 어긋남이다.
+                let r = (f[0] * f[0] + f[3] * f[3]).sqrt();
+                r > (4.0 * s).clamp(tol, 3.0 * tol)
+            },
+        )
+        .collect();
+    out.copy_from_slice(&flags);
     out
 }
 
@@ -1499,6 +1519,72 @@ mod tests {
             assert!(cross > 0);
             if ps < 0.99 || cs < 0.97 {
                 failures.push(format!("keep {keep} opm {opm}: {ps} {cs}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// 참 점 중 관측이 둘 이상의 트랙으로 갈라진 점의 수와 (길이 하한 이상으로 이어지는) 점 수.
+    fn split_points(s: &Synthetic, tracks: &[Track]) -> (usize, usize) {
+        let mut spread: HashMap<usize, std::collections::HashSet<usize>> = HashMap::new();
+        for (ti, t) in tracks.iter().enumerate() {
+            for o in &t.observations {
+                spread
+                    .entry(s.gt[o.image][o.feature])
+                    .or_default()
+                    .insert(ti);
+            }
+        }
+        (
+            spread.values().filter(|v| v.len() > 1).count(),
+            spread.len(),
+        )
+    }
+
+    #[test]
+    fn formation_recall_table() {
+        // 편대 기본 장면(44 위치, 카메라 간 짝 포함), 재현율 30·40·50% x 오대응 0·5·10%.
+        // 오대응 수는 짝마다 참 대응 1000 개당 0·50·100 개. 시드 1~2 의 최저값을 단언.
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        let mut failures = Vec::new();
+        for keep in [30, 40, 50] {
+            for opm in [0, 50, 100] {
+                let (mut pmin, mut cmin) = (2.0f64, 2.0f64);
+                let (mut split, mut total) = (0, 0);
+                for seed in 1..=2 {
+                    let s = synthetic_scene(opm, keep, 0, seed, &opts);
+                    let (p, c, _, _) = run_policy(&s, ConflictPolicy::Split);
+                    let cfg = TrackConfig::default();
+                    let (t, _) = build_tracks(&s.pairs, &s.keypoints, &cfg);
+                    let (sp, n) = split_points(&s, &t);
+                    pmin = pmin.min(p);
+                    cmin = cmin.min(c);
+                    split += sp;
+                    total += n;
+                }
+                eprintln!(
+                    "formation keep {keep} outlier {opm}permil: min purity {pmin:.4} min completeness {cmin:.4} split points {split}/{total}"
+                );
+                // 실측 최저(완전도 0.9937, 순도 0.9962(오대응 5% 이하))보다 0.01 쯤 아래.
+                if cmin < 0.985 {
+                    failures.push(format!("keep {keep} opm {opm}: completeness {cmin}"));
+                }
+                if opm <= 50 && pmin < 0.99 {
+                    failures.push(format!("keep {keep} opm {opm}: purity {pmin}"));
+                }
+                // 갈라진 점 비율 상한(실측 최대 30% 3.1%, 40% 0.3%, 50% 0.07%).
+                let max_split = match keep {
+                    30 => 0.04,
+                    _ => 0.01,
+                };
+                let ratio = split as f64 / total as f64;
+                if ratio > max_split {
+                    failures.push(format!("keep {keep} opm {opm}: split ratio {ratio:.4}"));
+                }
             }
         }
         assert!(failures.is_empty(), "{failures:?}");
