@@ -61,17 +61,6 @@ skylens-stream synth <출력 폴더> [폭 높이]
 # 등록 사진 수·구역 사진 수·재투영 오차는 출력 폴더의 report.json 이 있을 때만 판정한다
 skylens-stream verify <출력 폴더>
 
-# 합성 장면으로 끝까지 돌려 보기(synth → run → verify). 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(--span 48)으로 잡는다
-skylens-stream synth scene 320 180
-skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
-# 기본 설정(초벌은 BA 없음)에서 verify 는 6/7 통과, 종료 코드 1: preview_vs_refined 만 미달(최근접 중앙 2.358 m 는 통과, 높이 차 중앙 2.657 m > 2 m). 초벌 재투영 3.026 px → 정밀 0.300 px.
-# run 은 4코어 측정 기계에서 약 2~4분
-skylens-stream verify out
-# 구역 2개 이상(40위치 x 2 구역 이상, 이웃 구역 겹침 항목 판정): --stride 1 로 80위치 전부 사용
-skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
-skylens-stream verify out2
-# 이 장면(구역 2개)에서 verify 는 5/7 통과, 종료 코드 1: preview_align(점쌍 최소 324 < 1000; 스케일 차 8.26%·잔차 5.130 m 는 기준 안)·preview_vs_refined(높이 차 6.278 m, 최근접 5.946 m) 미달, refined_overlap 0.257 m 통과
-
 # 판 번호 출력 ("skylens-stream 0.1.0")
 skylens-stream --version
 
@@ -80,6 +69,34 @@ skylens-stream --help
 ```
 
 인자 없이 실행하거나 모르는 명령이면 사용법을 표준 오류로 내고 종료 코드 2 로 끝난다.
+
+### 합성 장면으로 한 번 돌려 보기
+
+`synth` → `run` → `verify` 를 끝까지 잇는다. 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(`--span 48`)으로 잡는다.
+같은 명령을 `crates/cli/tests/pipeline_e2e.rs` 가 프로세스로 돌려 아래 수치에 상한을 건다(구역 2개 시험은 `cargo test --release -p skylens-stream --test pipeline_e2e -- --ignored`).
+
+```bash
+skylens-stream synth scene 320 180
+skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
+skylens-stream verify out
+# 구역 2개(80위치 전부, 이웃 구역 겹침 항목 판정)
+skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
+skylens-stream verify out2
+```
+
+출력 폴더에는 `preview/`·`refined/`·`snapshots/`(와 `snapshots/manifest.json`)·`poses.txt`·`report.json` 이 생긴다. 4코어 기계(부하 약 20)에서 실측:
+
+| | 단구역 (`out`, 120장) | 구역 2개 (`out2`, 240장) |
+|---|---|---|
+| run 시간 | 약 2 분 (92~122 초) | 332 초 |
+| verify | 6/7, 종료 코드 1 | 5/7, 종료 코드 1 |
+| 미달 항목 | preview_vs_refined (최근접 중앙 2.358 m 통과, 높이 차 중앙 2.657 m ≥ 2 m) | preview_align (점쌍 최소 324 < 1000; 스케일 차 8.26%, 잔차 5.130 m 는 기준 안), preview_vs_refined (최근접 5.946 m, 높이 차 6.278 m) |
+| refined_overlap | 해당 없음 (구역 1개) | PASS, 1쌍 겹침 차 중앙 최대 0.257 m |
+| 재투영 (초벌 → 정밀) | 3.026 → 0.300 px | 3.232 → 0.282 px |
+| 카메라 중심 오차 중앙 / 최대 | 0.329 / 2.912 m | 0.290 / 3.115 m |
+| 정밀 점 → 정답 표면 중앙 / 95% | 0.475 / 1.465 m (점 11054) | 0.494 / 3.022 m (점 19855) |
+
+오차는 정답 카메라 `truth/cameras.txt`·정답 표면(`Scene::surface_height`, 수직 거리)과 `poses.txt`·`refined/*.ply` 를 비교한 값이다(정답 원점과 첫 GPS 원점 차를 옮겨서). 회전 오차는 `poses.txt` 에 카메라 중심만 있어 재지 못한다.
 
 ### 라이브러리: 특징점
 
