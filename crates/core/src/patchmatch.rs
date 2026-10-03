@@ -161,6 +161,8 @@ pub struct Config {
     pub fine_step: usize,
     /// 가장 거친 층이 아닌 층에서 쓰는 전파 이웃 수(8 이면 전부, 4 는 거리 1 의 네 곳).
     pub fine_propagation: usize,
+    /// 가장 거친 층에서 첫 반복 뒤 비용이 낮은 이웃 이 장수만 남긴다. 0 이면 줄이지 않는다.
+    pub coarse_neighbors: usize,
     /// 난수 씨앗.
     pub seed: u64,
 }
@@ -183,6 +185,7 @@ impl Default for Config {
             normal_steps: 0,
             fine_step: 4,
             fine_propagation: 4,
+            coarse_neighbors: 4,
             seed: 0x5eed,
         }
     }
@@ -329,6 +332,9 @@ impl Tables {
 /// 한 층의 반복 계획. `level` 은 난수 분리용.
 #[derive(Clone, Copy)]
 struct Sched {
+    /// 이 호출이 시작하는 반복 번호(난수·섭동 척도 연속용)와 층 전체 반복 수.
+    first: usize,
+    total: usize,
     iterations: usize,
     perturbations: usize,
     normal_steps: usize,
@@ -515,6 +521,8 @@ impl Ctx<'_> {
     /// 한 층에서 전파·정련을 `iterations` 회. `level` 은 난수 분리용.
     fn run(&self, hyps: &mut [Hyp], costs: &mut [f32], masks: &[u32], sched: Sched) {
         let Sched {
+            first,
+            total,
             iterations,
             perturbations,
             normal_steps,
@@ -535,7 +543,7 @@ impl Ctx<'_> {
         let cfg = self.cfg;
         let log_span = (self.range.1 / self.range.0).ln();
         let offs = &OFFS[..self.nprop.min(OFFS.len())];
-        for it in 0..iterations {
+        for it in first..first + iterations {
             for color in 0..2usize {
                 let updates: Vec<(usize, Hyp, f32)> = (0..h)
                     .into_par_iter()
@@ -595,7 +603,7 @@ impl Ctx<'_> {
                             }
                             // 무작위 섭동 정련: 척도를 줄여 가며.
                             let frac = if coarsest {
-                                (1.0 - it as f32 / iterations.max(1) as f32).max(0.05)
+                                (1.0 - it as f32 / total.max(1) as f32).max(0.05)
                             } else {
                                 0.1
                             };
@@ -626,7 +634,7 @@ impl Ctx<'_> {
                                 );
                                 try_hyp(Hyp { depth: d, n: nn }, &mut best, &mut best_c);
                             }
-                            if it + 1 == iterations {
+                            if it + 1 == total {
                                 let mut s = 0.04;
                                 for _ in 0..normal_steps {
                                     let nn = self.perturb_normal(&mut rng, &best.n, s, &rp);
@@ -842,14 +850,25 @@ pub fn estimate_profiled(
             (cfg.refine_iterations, cfg.refine_perturbations)
         };
         let nsteps = if li == 0 { cfg.normal_steps } else { 0 };
-        let sched = Sched {
-            iterations: iters,
+        let split =
+            coarsest && cfg.coarse_neighbors > 0 && cfg.coarse_neighbors < nb.len() && iters > 1;
+        let mut sched = Sched {
+            first: 0,
+            total: iters,
+            iterations: if split { 1 } else { iters },
             perturbations: perts,
             normal_steps: nsteps,
             level: li,
             coarsest,
         };
+        let mut masks = masks;
         ctx.run(&mut hyps, &mut costs, &masks, sched);
+        if split {
+            (costs, masks) = ctx.eval_all(&hyps, cfg.coarse_neighbors);
+            sched.first = 1;
+            sched.iterations = iters - 1;
+            ctx.run(&mut hyps, &mut costs, &masks, sched);
+        }
         if let Some(p) = profile.as_deref_mut() {
             p.push(LevelTime {
                 width: ctx.w,
