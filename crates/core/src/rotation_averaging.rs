@@ -140,6 +140,13 @@ pub fn project_to_rotation(m: &Matrix3<f64>) -> Option<Rotation3<f64>> {
     Some(Rotation3::from_matrix_unchecked(u * d * vt))
 }
 
+/// 유한하고 직교(‖RᵀR − I‖ < 1e-6)이며 행렬식이 양수인지. 회전이 아닌 행렬 간선은 쓰지 않는다.
+fn is_rotation(m: &Matrix3<f64>) -> bool {
+    m.iter().all(|v| v.is_finite())
+        && (m.transpose() * m - Matrix3::identity()).norm() < 1e-6
+        && m.determinant() > 0.0
+}
+
 fn angle(a: &Rotation3<f64>) -> f64 {
     // trace 로 재면 작은 각에서 정밀도가 떨어지므로 사원수 각을 쓴다.
     crate::math::UnitQuaternion::from_rotation_matrix(a).angle()
@@ -215,6 +222,7 @@ fn greedy_init(
                 best = (support, m);
             }
         }
+        // 간선은 `is_rotation` 을 통과한 것만 오므로 preds[0] 도 회전이다(가중합 사영이 실패할 때만 쓴다).
         rot[v] = project_to_rotation(&best.1).or(Some(preds[0].0));
         for &k in &incident[v] {
             placed_links[other_end(&edges[k], v)] += 1;
@@ -559,10 +567,7 @@ pub fn average_rotations(
     let usable: Vec<bool> = edges
         .iter()
         .map(|e| {
-            e.i != e.j
-                && e.weight.is_finite()
-                && e.weight > 0.0
-                && e.rotation.matrix().iter().all(|v| v.is_finite())
+            e.i != e.j && e.weight.is_finite() && e.weight > 0.0 && is_rotation(e.rotation.matrix())
         })
         .collect();
     let ids: Vec<usize> = (0..edges.len()).filter(|&k| usable[k]).collect();
@@ -863,6 +868,8 @@ mod tests {
         caught: usize,
         missed: usize,
         missed_strict: usize,
+        /// 문턱만 정의로 놓친 간선: (번호, 정답 잔차°, 추정 잔차°, 두 끝 오차 합°).
+        missed_list: Vec<(usize, f64, f64, f64)>,
         false_rej: usize,
         thr_deg: f64,
         diff: f64,
@@ -900,10 +907,13 @@ mod tests {
             caught: count(&|k| is_outlier[k] && !res.inliers[k]),
             // 놓침: 오염 간선 중 정답 잔차가 문턱을 넘는데도 정상으로 남은 것.
             // 추정 회전으로 잰 잔차와 정답으로 잰 잔차는 두 끝 정점 오차 합까지 다를 수 있어,
-            // 정답 잔차가 문턱 + 두 끝 오차를 넘는 것만 센다(문턱 바로 위 간선은 추정으로 판별 불가).
+            // 정답 잔차가 문턱 + 여유를 넘는 것만 센다(문턱 바로 위 간선은 추정으로 판별 불가).
+            // 여유 = min(두 끝 오차 합, 문턱): 끝 정점이 크게 틀리면 그 오차가 여유를 키워 놓침이
+            // 0 으로 보이므로 잡음 모형에 묶인 문턱(≈ σ̂ 의 6배)에서 자른다. 해를 믿을 수 없으면
+            // (reliable=false) 정점 오차가 잡음 모형을 따르지 않으므로 여유 0(문턱만 정의)으로 센다.
             missed: count(&|k| {
-                let slack = if all_some {
-                    err[edges[k].i] + err[edges[k].j]
+                let slack = if all_some && res.reliable {
+                    (err[edges[k].i] + err[edges[k].j]).min(thr)
                 } else {
                     0.0
                 };
@@ -912,6 +922,24 @@ mod tests {
             missed_strict: count(&|k| {
                 is_outlier[k] && res.inliers[k] && edge_residual(&edges[k], truth) >= thr
             }),
+            missed_list: (0..edges.len())
+                .filter(|&k| {
+                    is_outlier[k] && res.inliers[k] && edge_residual(&edges[k], truth) >= thr
+                })
+                .map(|k| {
+                    let sum = if all_some {
+                        err[edges[k].i] + err[edges[k].j]
+                    } else {
+                        f64::NAN
+                    };
+                    (
+                        k,
+                        edge_residual(&edges[k], truth).to_degrees(),
+                        res.residuals_rad[k].to_degrees(),
+                        sum.to_degrees(),
+                    )
+                })
+                .collect(),
             false_rej: count(&|k| !is_outlier[k] && !res.inliers[k]),
             thr_deg: thr.to_degrees(),
             diff,
@@ -1076,7 +1104,17 @@ mod tests {
             );
         }
         let (m_med, m_max) = med_max(rows.iter().map(|(_, c)| c.mean));
-        println!("σ 1°+이상치 10% 시드 30개: 평균 오차 중앙 {m_med:.3}° 최악 {m_max:.3}°");
+        let strict: usize = rows.iter().map(|(_, c)| c.missed_strict).sum();
+        let slack: usize = rows.iter().map(|(_, c)| c.missed).sum();
+        println!("σ 1°+이상치 10% 시드 30개: 평균 오차 중앙 {m_med:.3}° 최악 {m_max:.3}°, 놓침 합 {slack} (문턱만 {strict})");
+        for (seed, c) in &rows {
+            for (k, truth_res, est_res, sum) in &c.missed_list {
+                println!(
+                    "σ 1°+이상치 시드 {seed}: 간선 {k} {:?} 정답 잔차 {truth_res:.2}° 추정 잔차 {est_res:.2}° 문턱 {:.2}° 끝 오차 합 {sum:.2}°",
+                    pairs[*k], c.thr_deg
+                );
+            }
+        }
         for (seed, c) in &rows {
             assert!(c.reliable, "시드 {seed}");
             assert!(c.diff < 1e-6, "시드 {seed}: 기준 해와 차 {}", c.diff);
@@ -1101,6 +1139,18 @@ mod tests {
         println!(
             "σ 2°+이상치 10% 시드 30개: 평균 오차 중앙 {m_med:.3}° 최악 {m_max:.3}°, 최대 오차 중앙 {x_med:.3}° 최악 {x_max:.3}°"
         );
+        // 놓침 원인: 문턱만 정의로 놓친 간선의 정답 잔차·추정 잔차·두 끝 오차 합.
+        for (seed, c) in &rows {
+            for (k, truth_res, est_res, sum) in &c.missed_list {
+                println!(
+                    "σ 2°+이상치 시드 {seed}: 간선 {k} {:?} 정답 잔차 {truth_res:.2}° 추정 잔차 {est_res:.2}° 문턱 {:.2}° 끝 오차 합 {sum:.2}°",
+                    pairs[*k], c.thr_deg
+                );
+            }
+        }
+        let strict: usize = rows.iter().map(|(_, c)| c.missed_strict).sum();
+        let slack: usize = rows.iter().map(|(_, c)| c.missed).sum();
+        println!("σ 2°+이상치 10% 시드 30개: 놓침 합 {slack} (문턱만 {strict})");
         for (seed, c) in &rows {
             assert!(c.max < 10.0, "시드 {seed}: 최대 {}°", c.max);
             assert_eq!(c.missed, 0, "시드 {seed}");
@@ -1165,14 +1215,25 @@ mod tests {
     fn heavy_contamination_is_flagged() {
         let (truth, pairs) = scene_graph();
         let cap = AveragingConfig::default().outlier_cap_rad.to_degrees();
-        for (label, every) in [("절반", 2usize), ("전부", 1)] {
-            let c = run_case(&truth, &pairs, 0.6, every, 41, false);
+        // 놓침 하한: 두 끝 오차를 여유로 쓰던 정의에서 0 으로 보이던 세 경우. 문턱만 정의 측정값
+        // (4/4/265)과 정답 잔차 > 30° 인 정상 남은 오염 간선 수(3/≥4/258) 중 작은 쪽을 하한으로 둔다.
+        for (label, every, seed, min_missed) in [
+            ("절반", 2usize, 41u64, 3usize),
+            ("절반", 2, 42, 4),
+            ("전부", 1, 41, 258),
+        ] {
+            let c = run_case(&truth, &pairs, 0.6, every, seed, false);
             println!(
-                "{label} 오염: 이상치 {} 문턱 {:.2}° 놓침 {} 평균 {:.2}° 최대 {:.2}° 믿음 {}",
-                c.outliers, c.thr_deg, c.missed, c.mean, c.max, c.reliable
+                "{label} 오염 시드 {seed}: 이상치 {} 문턱 {:.2}° 놓침 {} (문턱만 {}) 평균 {:.2}° 최대 {:.2}° 믿음 {}",
+                c.outliers, c.thr_deg, c.missed, c.missed_strict, c.mean, c.max, c.reliable
             );
             assert!(c.thr_deg <= cap + 1e-9, "{label}: 문턱 {}°", c.thr_deg);
             assert!(!c.reliable, "{label}");
+            assert!(
+                c.missed >= min_missed,
+                "{label} 시드 {seed}: 놓침 {} < {min_missed}",
+                c.missed
+            );
         }
     }
 
@@ -1367,11 +1428,64 @@ mod tests {
             // 시간 상한: 단독 측정 2000 정점 전체 0.46~0.70 s. 4 코어를 여러 작업이 나눠 쓰는 부하에서
             // 7배 이상 느려진 적이 없어 5 s 를 상한으로 둔다.
             assert!(total < 5.0, "정점 {n}: {total:.3}s");
-            // 사슬은 오차가 길이를 따라 쌓인다(측정 평균 240/1000 정점 1.4/4.9°). 판별력 있는 정확도 단언은
-            // 선형화 공분산 예측 대비로 바꿔야 하나 2000 정점 역행렬이 무거워 아직 느슨한 상한만 둔다.
+            // 사슬은 오차가 길이를 따라 쌓인다(측정 평균 240/1000 정점 1.4/4.9°) — 전역 정렬 오차는 소수 자유도
+            // 랜덤 워크라 판별력이 없으므로 이웃 정점 사이 상대 회전 오차를 선형화 공분산 예측과 비교한다.
             assert!(mean < 20.0, "평균 {mean}°");
+            for k in [1usize, 4] {
+                let ratio =
+                    chain_relative_error_ratio(&res.rotations, &truth, k, 1f64.to_radians());
+                println!("정점 {n}: 간격 {k} 상대 오차² 평균 / 선형화 예측 = {ratio:.3}");
+                // 240 정점은 안쪽 표본이 40개뿐이라(측정 1.14·1.23) 기록만 한다. 1000·2000 정점은 표본 약
+                // 800·1800 개로 측정 0.96~1.01. 기준 ±25%: 강건 무게의 효율 손실과 표본 흔들림을 덮되,
+                // 정상 간선 일부를 버리거나 무게를 잘못 줘 오차가 예측의 1.25배를 넘게 커지는 결함은 잡는다.
+                if n >= 1000 {
+                    assert!(
+                        (0.8..1.25).contains(&ratio),
+                        "정점 {n} 간격 {k}: 비 {ratio}"
+                    );
+                }
+            }
             assert!(res.inliers.iter().filter(|&&b| !b).count() <= edges.len() / 100);
         }
+    }
+
+    /// 거리 1..4 간선 사슬(단위 무게)에서 두 정점 사이 유효 저항 R(k).
+    /// 무한 사슬 라플라시안의 기호 λ(θ) = Σ_d 2(1 − cos dθ) 로 R(k) = (1/π) ∫_0^π 2(1 − cos kθ)/λ(θ) dθ.
+    /// 등방 잡음 σ(축마다) 최소제곱 해의 선형화 공분산은 L⁺ ⊗ σ²I₃ 이므로 두 정점 상대 회전 오차 각도²의
+    /// 기댓값은 3σ²·R(k)(사슬 양 끝 100 정점을 빼면 무한 사슬 값과 같다고 본다).
+    fn chain_resistance(k: usize) -> f64 {
+        let steps = 200_000;
+        let h = std::f64::consts::PI / steps as f64;
+        (0..steps)
+            .map(|s| {
+                let th = (s as f64 + 0.5) * h;
+                let lam: f64 = (1..=4).map(|d| 2.0 * (1.0 - (d as f64 * th).cos())).sum();
+                2.0 * (1.0 - (k as f64 * th).cos()) / lam
+            })
+            .sum::<f64>()
+            * h
+            / std::f64::consts::PI
+    }
+
+    /// 사슬 안쪽(양 끝 100 정점 제외) 정점 v, v+k 상대 회전 오차 각도² 평균 / 선형화 예측 3σ²R(k).
+    fn chain_relative_error_ratio(
+        est: &[Option<Rotation3<f64>>],
+        truth: &[Rotation3<f64>],
+        k: usize,
+        sigma: f64,
+    ) -> f64 {
+        let n = truth.len();
+        let range = 100..n - 100 - k;
+        let count = range.len() as f64;
+        let mean_sq = range
+            .map(|v| {
+                let d_est = est[v + k].unwrap() * est[v].unwrap().inverse();
+                let d_true = truth[v + k] * truth[v].inverse();
+                angle(&(d_est * d_true.inverse())).powi(2)
+            })
+            .sum::<f64>()
+            / count;
+        mean_sq / (3.0 * sigma * sigma * chain_resistance(k))
     }
 
     /// 띠 촐레스키가 밀집 촐레스키와 같은 해를 내는지(2000 정점 비교의 근거).
@@ -1478,6 +1592,81 @@ mod tests {
         }
     }
 
+    /// 성긴 최악 사례 그래프: 같은 카메라 1~3칸 + 같은 위치 다른 카메라(240대에서 942 간선).
+    /// SPEC 짝 일정보다 간선이 4배 적어 정상 집합 재선정이 실제로 일어난다.
+    fn sparse_graph() -> (Vec<Rotation3<f64>>, Vec<(usize, usize)>) {
+        let scene = Scene::new(SceneConfig::default());
+        let truth: Vec<_> = scene.views.iter().map(|v| v.camera.pose.rotation).collect();
+        let views: Vec<(usize, usize)> = scene
+            .views
+            .iter()
+            .map(|v| (v.cam as usize, v.position))
+            .collect();
+        let mut pairs = Vec::new();
+        for a in 0..views.len() {
+            for b in a + 1..views.len() {
+                let (ca, pa) = views[a];
+                let (cb, pb) = views[b];
+                if (ca == cb && pa.abs_diff(pb) <= 3) || (ca != cb && pa == pb) {
+                    pairs.push((a, b));
+                }
+            }
+        }
+        (truth, pairs)
+    }
+
+    /// 재선정 상한·미수렴 경로: 성긴 그래프 σ 2° 시드 115·7 은 상한 8 에서 재선정 1회 이상 뒤 수렴,
+    /// 상한 1 이면 집합이 바뀐 채 멈춰 미수렴으로 표시되지만 해는 마지막 집합의 최소제곱 해다.
+    #[test]
+    fn active_set_cap_path() {
+        let (truth, pairs) = sparse_graph();
+        println!("성긴 그래프 간선 {}", pairs.len());
+        assert_eq!(pairs.len(), 942);
+        let nodes: Vec<usize> = (0..truth.len()).collect();
+        for seed in [115u64, 7] {
+            for rounds in [8usize, 1] {
+                let cfg = AveragingConfig {
+                    active_set_rounds: rounds,
+                    ..AveragingConfig::default()
+                };
+                let mut rng = Rng(seed);
+                let (edges, _) = make_edges(&truth, &pairs, 2f64.to_radians(), 0, &mut rng);
+                let res = average_rotations(truth.len(), &edges, &cfg).unwrap();
+                let rot: Vec<_> = res.rotations.iter().map(|r| r.unwrap()).collect();
+                let active: Vec<usize> = (0..edges.len()).filter(|&k| res.inliers[k]).collect();
+                let mut more = rot.clone();
+                refine_global(&mut more, &edges, &active, &nodes, 0, 50, Solver::Pcg);
+                let moved = rot
+                    .iter()
+                    .zip(&more)
+                    .map(|(x, y)| angle(&(x * y.inverse())))
+                    .fold(0.0, f64::max);
+                let mut oracle: Vec<_> = truth.iter().map(|t| t * truth[0].inverse()).collect();
+                refine_global(&mut oracle, &edges, &active, &nodes, 0, 100, Solver::Dense);
+                let diff = rot
+                    .iter()
+                    .zip(&oracle)
+                    .map(|(x, y)| angle(&(x * y.inverse())))
+                    .fold(0.0, f64::max);
+                println!(
+                    "성긴 그래프 σ 2° 시드 {seed} 상한 {rounds}: 재선정 {} 수렴 {} 50단계 이동 {moved:.1e} rad 기준 해 차 {diff:.1e} rad",
+                    res.reselections, res.active_set_converged
+                );
+                if rounds == 8 {
+                    assert!(res.reselections >= 1, "시드 {seed}: 재선정 없음");
+                    assert!(res.active_set_converged, "시드 {seed}: 상한 8 미수렴");
+                } else {
+                    assert!(
+                        !res.active_set_converged,
+                        "시드 {seed}: 상한 1 에서 수렴 표시"
+                    );
+                }
+                assert!(moved < 1e-9, "시드 {seed} 상한 {rounds}: 이동 {moved}");
+                assert!(diff < 1e-6, "시드 {seed} 상한 {rounds}: 기준 해 차 {diff}");
+            }
+        }
+    }
+
     #[test]
     fn disconnected_and_invalid_inputs() {
         let r = Rotation3::from_euler_angles(0.1, 0.2, 0.3);
@@ -1496,6 +1685,22 @@ mod tests {
         assert!(res.rotations[0].is_none() && res.rotations[1].is_none());
         assert!((2..5).all(|v| res.rotations[v].is_some()));
         assert!(res.residuals_rad[0].is_nan() && !res.inliers[0]);
+        // 회전이 아닌 행렬(0 행렬·반사·축척)은 거부: 간선이 없으니 성분도 없다.
+        for bad in [
+            Matrix3::zeros(),
+            Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, -1.0)),
+            Matrix3::identity() * 1.001,
+        ] {
+            let mut b = e(0, 1);
+            b.rotation = Rotation3::from_matrix_unchecked(bad);
+            assert!(average_rotations(2, &[b], &cfg).is_none());
+            // 정상 간선과 함께 오면 그 간선만 빠지고 정점 2 는 놓이지 않는다.
+            let mut b2 = e(1, 2);
+            b2.rotation = Rotation3::from_matrix_unchecked(bad);
+            let res = average_rotations(3, &[e(0, 1), b2], &cfg).unwrap();
+            assert!(res.rotations[2].is_none() && !res.inliers[1]);
+            assert!(res.rotations[..2].iter().all(|r| r.is_some()));
+        }
         // NaN 회전·0 가중치·자기 간선은 무시.
         let mut nan = e(1, 2);
         nan.rotation = Rotation3::from_matrix_unchecked(Matrix3::from_element(f64::NAN));
