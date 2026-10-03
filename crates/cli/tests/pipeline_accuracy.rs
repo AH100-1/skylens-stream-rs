@@ -1,11 +1,12 @@
 //! 끝까지 흐름(synth → run → verify)의 정답 대비 정확도: 구역 1·2개 × 시드 2개.
 //! poses.txt·정밀/초벌 PLY 를 합성 정답 카메라·표면과 비교해 표로 출력하고 상한을 단언한다.
-//! 회전 오차: 출력(poses.txt)에 회전이 없어 비교하지 못한다(중심만 기록됨).
+//! 회전 오차: poses.txt 의 행 우선 회전(세계→카메라) 9개를 정답과 비교한다.
+//! 환경변수 PACC_PBA(초벌 전 BA 반복), PACC_SH/PACC_SV(GPS σ 수평/수직)로 설정을 바꿔 표를 뽑을 수 있다.
 
 use std::path::Path;
 
 use skylens_core::dataset::{load_dataset, DatasetConfig};
-use skylens_core::math::Point3;
+use skylens_core::math::{rotation_angle_between, Point3, Rotation3};
 use skylens_core::pipeline::{run_pipeline, PipelineConfig};
 use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
@@ -59,10 +60,19 @@ struct Acc {
     c_med: f64,
     c_p95: f64,
     c_max: f64,
+    r_med: f64,
+    r_max: f64,
     s_med: f64,
     s_p95: f64,
     height_diff: f64,
     report: Report,
+}
+
+fn env_or(k: &str, d: f64) -> f64 {
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn run_case(positions: usize, seed: u64) -> Acc {
@@ -93,6 +103,10 @@ fn run_case(positions: usize, seed: u64) -> Acc {
         dense_width: 96,
         hfov_deg: 65.0,
         ba_iters: 15,
+        preview_ba_iters: env_or("PACC_PBA", 0.0) as usize,
+        gps_sigma_h: env_or("PACC_SH", 2.0),
+        gps_sigma_v: env_or("PACC_SV", 2.0),
+        ..PipelineConfig::default()
     };
     let res = run_pipeline(&ds, &cfg, &out).unwrap();
     let report = verify_dir(&out);
@@ -104,6 +118,7 @@ fn run_case(positions: usize, seed: u64) -> Acc {
     // poses.txt 의 중심 → 정답 중심.
     let poses = std::fs::read_to_string(out.join("poses.txt")).unwrap();
     let mut errs = Vec::new();
+    let mut rerrs = Vec::new();
     let mut per_region_err: Vec<Vec<f64>> = vec![Vec::new(); res.regions.len().max(1)];
     for line in poses.lines() {
         let f: Vec<&str> = line.split(' ').collect();
@@ -112,6 +127,12 @@ fn run_case(positions: usize, seed: u64) -> Acc {
         let truth = scene.to_first_gps_frame(&v.camera.pose.center());
         let e = (Point3::new(c[0], c[1], c[2]) - truth).norm();
         errs.push(e);
+        if f.len() >= 13 {
+            let m: Vec<f64> = f[4..13].iter().map(|s| s.parse().unwrap()).collect();
+            let r =
+                Rotation3::from_matrix_unchecked(skylens_core::math::Matrix3::from_row_slice(&m));
+            rerrs.push(rotation_angle_between(&r, &v.camera.pose.rotation).to_degrees());
+        }
         // 위치 번호 → 구역: 구역 경계는 report 위치 수 누적으로 근사.
         let pos: usize = f[0][f[0].len() - 4..].parse().unwrap();
         let mut acc = 0usize;
@@ -161,6 +182,8 @@ fn run_case(positions: usize, seed: u64) -> Acc {
         c_med: quant(&errs, 0.5),
         c_p95: quant(&errs, 0.95),
         c_max: quant(&errs, 1.0),
+        r_med: quant(&rerrs, 0.5),
+        r_max: quant(&rerrs, 1.0),
         s_med: quant(&abs, 0.5),
         s_p95: quant(&abs, 0.95),
         height_diff: hd,
@@ -173,8 +196,8 @@ fn run_case(positions: usize, seed: u64) -> Acc {
 
 fn print_row(tag: &str, a: &Acc) {
     eprintln!(
-        "ACC [{tag}] regions {} registered {}/{} center med {:.3} p95 {:.3} max {:.3} m | rotation n/a | surface med {:.3} p95 {:.3} m | height diff {:.3} m | points-in-final-cloud see REGION",
-        a.regions, a.registered, a.images, a.c_med, a.c_p95, a.c_max, a.s_med, a.s_p95, a.height_diff
+        "ACC [{tag}] regions {} registered {}/{} center med {:.3} p95 {:.3} max {:.3} m | rotation med {:.3} max {:.3} deg | surface med {:.3} p95 {:.3} m | height diff {:.3} m | points-in-final-cloud see REGION",
+        a.regions, a.registered, a.images, a.c_med, a.c_p95, a.c_max, a.r_med, a.r_max, a.s_med, a.s_p95, a.height_diff
     );
     for i in &a.report.items {
         eprintln!(

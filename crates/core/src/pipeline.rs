@@ -996,6 +996,8 @@ struct RegionRec {
     /// 정밀 구역 → 가장 최근 정밀 모델 좌표계 닮음 변환(공유 3D 점 대응).
     rsim: Option<Similarity>,
     centers: BTreeMap<usize, [f64; 3]>,
+    /// 사진별 회전(세계→카메라, 행 우선 9개). poses.txt 출력용.
+    rots: BTreeMap<usize, [f64; 9]>,
     registered_prev: Vec<usize>,
     /// gids 앞쪽 보조 사진 수(출력·점수 제외).
     n_help: usize,
@@ -1111,6 +1113,12 @@ pub fn run_pipeline(
             if let Some(p) = m.sparse.poses[a] {
                 let c = p.center();
                 rec.centers.insert(*g, [c.x, c.y, c.z]);
+                let m = p.rotation.matrix();
+                let mut r = [0.0; 9];
+                for (i, v) in r.iter_mut().enumerate() {
+                    *v = m[(i / 3, i % 3)];
+                }
+                rec.rots.insert(*g, r);
             }
         }
         for (a, g) in rec.gids.iter().enumerate() {
@@ -1403,6 +1411,7 @@ pub fn run_pipeline(
             refined: None,
             rsim: None,
             centers: BTreeMap::new(),
+            rots: BTreeMap::new(),
             registered_prev,
             n_help,
             rposes: HashMap::new(),
@@ -1510,15 +1519,23 @@ pub fn run_pipeline(
             .unwrap_or_default()
     };
     let mut centers: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
+    let mut rots: BTreeMap<usize, [f64; 9]> = BTreeMap::new();
     let mut diffs: Vec<f64> = Vec::new();
     for rec in &recs {
         let (olo, ohi) = owns[rec.region.index];
         for (&g, c) in &rec.centers {
             let own = g / 3 >= olo && g / 3 < ohi;
+            let r = rec.rots.get(&g).copied();
             if own {
                 centers.insert(g, *c);
-            } else {
-                centers.entry(g).or_insert(*c);
+                if let Some(r) = r {
+                    rots.insert(g, r);
+                }
+            } else if !centers.contains_key(&g) {
+                centers.insert(g, *c);
+                if let Some(r) = r {
+                    rots.insert(g, r);
+                }
             }
         }
     }
@@ -1543,7 +1560,13 @@ pub fn run_pipeline(
     }
     let mut poses_txt = String::new();
     for (g, c) in &centers {
-        poses_txt += &format!("{} {} {} {}\n", name(*g), c[0], c[1], c[2]);
+        poses_txt += &format!("{} {} {} {}", name(*g), c[0], c[1], c[2]);
+        if let Some(r) = rots.get(g) {
+            for v in r {
+                poses_txt += &format!(" {v}");
+            }
+        }
+        poses_txt += "\n";
         res.centers.push((name(*g), *c));
     }
     std::fs::write(out.join("poses.txt"), poses_txt).map_err(|e| e.to_string())?;
