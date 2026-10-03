@@ -25,8 +25,8 @@ use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::ply::{PointCloud, PointRecord};
 use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
 use crate::stream::{
-    align_region, align_window, apply_alignments, point_pairs, split_regions, write_outputs,
-    AlignRecord, Region, Track,
+    align_region, apply_alignments, point_pairs, split_regions, write_outputs, AlignRecord, Region,
+    Track,
 };
 use crate::translation_averaging::{
     average_translations_with_points, PointObservation, RelativeTranslation, TranslationConfig,
@@ -1351,6 +1351,122 @@ fn to_tracks(s: &Sparse, gid: &[usize]) -> Vec<Track> {
         .collect()
 }
 
+/// 구역 정렬 방식. 환경 변수 `SKYLENS_REGION_SIM3`: 없음/0 = 기존 트리밍, 1 = 공유 이미지 양방향 합의,
+/// 2 = 1 + 점 대응 수집 범위를 겹침 양쪽으로 넓힘.
+fn region_sim3_mode() -> u8 {
+    match std::env::var("SKYLENS_REGION_SIM3").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    }
+}
+
+/// 두 트랙 모음의 3D 점 대응과 대응마다 공유 이미지 목록(같은 이미지·같은 특징 번호). 이미지 위치가 `window` 안인 것만.
+fn shared_pairs(
+    a: &[Track],
+    b: &[Track],
+    window: (usize, usize),
+) -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>, Vec<Vec<u32>>) {
+    let in_win = |img: u32| {
+        let p = (img / 3) as usize;
+        p >= window.0 && p < window.1
+    };
+    let mut by_obs: HashMap<(u32, u32), usize> = HashMap::new();
+    for (j, t) in b.iter().enumerate() {
+        for &o in &t.obs {
+            if in_win(o.0) {
+                by_obs.entry(o).or_insert(j);
+            }
+        }
+    }
+    let mut idx: HashMap<(usize, usize), usize> = HashMap::new();
+    let (mut s, mut d, mut im) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, t) in a.iter().enumerate() {
+        for &o in &t.obs {
+            if let Some(&j) = by_obs.get(&o).filter(|_| in_win(o.0)) {
+                let k = *idx.entry((i, j)).or_insert_with(|| {
+                    s.push(t.xyz);
+                    d.push(b[j].xyz);
+                    im.push(Vec::new());
+                    s.len() - 1
+                });
+                im[k].push(o.0);
+            }
+        }
+    }
+    (s, d, im)
+}
+
+/// 구역 정렬(초벌→정밀, 정밀→정밀 공통): 변환, 점쌍 수, 잔차 중앙값(m).
+fn region_align(
+    a: &[Track],
+    b: &[Track],
+    ra: &Region,
+    rb: &Region,
+) -> Option<(Similarity, usize, f64)> {
+    let win = crate::progressive::overlap_window(ra, rb);
+    let mode = region_sim3_mode();
+    if mode == 0 {
+        return crate::progressive::cross_align(a, b, win);
+    }
+    let win = if mode == 2 && win.0 < win.1 {
+        (win.0.saturating_sub(HELPER_SPAN), win.1 + HELPER_SPAN)
+    } else {
+        win
+    };
+    if win.0 >= win.1 {
+        return None;
+    }
+    let (s, d, im) = shared_pairs(a, b, win);
+    let r = crate::align::image_consensus_similarity(&s, &d, &im, 3.0, 0.3, 0.2)?;
+    Some((r.sim, s.len(), r.median))
+}
+
+/// 자기 구역 초벌 → 정밀 정렬(SPEC §3.7). 기본은 기존 `align_region`(트리밍).
+/// 모드 1 은 같은 점쌍에 공유 이미지 양방향 합의를, 모드 2 는 점쌍 수집 범위도 양쪽으로 넓힌다.
+fn own_align(
+    ta: &[Track],
+    tb: &[Track],
+    r: &Region,
+    ovl: usize,
+    n_pos: usize,
+) -> (Option<Similarity>, AlignRecord) {
+    let mode = region_sim3_mode();
+    let base = crate::stream::align_window(r, ovl, n_pos);
+    let pos = |i: u32| (i / 3) as usize;
+    if mode == 0 {
+        let mut pairs = point_pairs(ta, tb, pos, base);
+        let (mut sim, mut ar) = align_region(r, &pairs);
+        if sim.is_none() {
+            pairs = point_pairs(ta, tb, pos, (r.lo, r.hi));
+            (sim, ar) = align_region(r, &pairs);
+        }
+        return (sim, ar);
+    }
+    let win = if mode == 2 {
+        (
+            base.0.saturating_sub(HELPER_SPAN),
+            (base.1 + HELPER_SPAN).min(n_pos),
+        )
+    } else {
+        base
+    };
+    for w in [win, (r.lo, r.hi)] {
+        let (s, d, im) = shared_pairs(ta, tb, w);
+        if let Some(c) = crate::align::image_consensus_similarity(&s, &d, &im, 3.0, 0.3, 0.2) {
+            let ar = AlignRecord {
+                region: r.index,
+                pairs: s.len(),
+                fit_median_m: Some(c.median),
+                scale: Some(c.sim.s),
+            };
+            return (Some(c.sim), ar);
+        }
+    }
+    let pairs = point_pairs(ta, tb, pos, base);
+    align_region(r, &pairs)
+}
+
 /// 구역 하나의 진행 기록(메인 스레드 소유).
 struct RegionRec {
     region: Region,
@@ -1443,9 +1559,7 @@ pub fn run_pipeline(
     cfg: &PipelineConfig,
     out: &Path,
 ) -> Result<PipelineResult, String> {
-    use crate::progressive::{
-        check_motion, cross_align, median, overlap_window, own_ranges, ReAlign,
-    };
+    use crate::progressive::{check_motion, median, own_ranges, ReAlign};
     use crate::stream::{preview_name, refined_name};
     use std::sync::{mpsc, Arc};
 
@@ -1495,13 +1609,7 @@ pub fn run_pipeline(
         write_decimated(out, &refined_name(&rec.region), &m.cloud)?;
         // 자기 구역 초벌 → 정밀 정렬(SPEC §3.7).
         let r = rec.region;
-        let pos = |i: u32| (i / 3) as usize;
-        let mut pairs = point_pairs(&rec.ta, &tb, pos, align_window(&r, ds.config.ovl, n_pos));
-        let (mut sim, mut ar) = align_region(&r, &pairs);
-        if sim.is_none() {
-            pairs = point_pairs(&rec.ta, &tb, pos, (r.lo, r.hi));
-            (sim, ar) = align_region(&r, &pairs);
-        }
+        let (sim, ar) = own_align(&rec.ta, &tb, &r, ds.config.ovl, n_pos);
         if let Some(s) = &sim {
             realigns.push(ReAlign {
                 secs: t_now(),
@@ -1540,9 +1648,10 @@ pub fn run_pipeline(
             if j == k || recs[j].refined.is_some() {
                 continue;
             }
-            let win = overlap_window(&recs[j].region, &recs[k].region);
             let tbk = &recs[k].refined.as_ref().unwrap().0;
-            if let Some((s, n, med)) = cross_align(&recs[j].ta, tbk, win) {
+            if let Some((s, n, med)) =
+                region_align(&recs[j].ta, tbk, &recs[j].region, &recs[k].region)
+            {
                 realigns.push(ReAlign {
                     secs: t_now(),
                     region: j,
@@ -1579,10 +1688,8 @@ pub fn run_pipeline(
                 }
                 let tm = &recs[m].refined.as_ref().unwrap().0;
                 let tj = &recs[j].refined.as_ref().unwrap().0;
-                let Some((s, n, med)) = crate::pipeline_stream::realign_refined(
-                    (&recs[j].region, tj),
-                    (&recs[m].region, tm),
-                ) else {
+                let Some((s, n, med)) = region_align(tj, tm, &recs[j].region, &recs[m].region)
+                else {
                     continue;
                 };
                 let acc = total[m].as_ref().unwrap().compose(&s);
@@ -1747,9 +1854,8 @@ pub fn run_pipeline(
         let ta = to_tracks(&init, &gids);
         let (mut sim, mut target) = (None, None);
         if let Some(m) = latest_ref {
-            let win = overlap_window(r, &recs[m].region);
             let tbm = &recs[m].refined.as_ref().unwrap().0;
-            if let Some((s, n, med)) = cross_align(&ta, tbm, win) {
+            if let Some((s, n, med)) = region_align(&ta, tbm, r, &recs[m].region) {
                 realigns.push(ReAlign {
                     secs: t_now(),
                     region: slot,
