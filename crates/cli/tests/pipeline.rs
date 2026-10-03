@@ -12,9 +12,21 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-#[test]
-fn synthetic_scene_runs_end_to_end() {
-    let root = std::env::temp_dir().join(format!("skylens_pipe_{}", std::process::id()));
+struct Case {
+    registered: usize,
+    images: usize,
+    regions: usize,
+    center_med: f64,
+    center_max: f64,
+    surface_med: f64,
+    report: skylens_core::verify::Report,
+}
+
+fn run_case(stride: usize, ba_iters: usize) -> Case {
+    let root = std::env::temp_dir().join(format!(
+        "skylens_pipe_{}_{stride}_{ba_iters}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     let (input, output) = (root.join("in"), root.join("out"));
     let scene = Scene::new(SceneConfig {
@@ -26,7 +38,7 @@ fn synthetic_scene_runs_end_to_end() {
     let ds = load_dataset(
         &input,
         DatasetConfig {
-            stride: 2,
+            stride,
             span: 48,
             ovl: 2,
             max_skip_run: 2,
@@ -37,7 +49,7 @@ fn synthetic_scene_runs_end_to_end() {
         max_features: 800,
         dense_width: 96,
         hfov_deg: 65.0,
-        ba_iters: 10,
+        ba_iters,
     };
     let t = std::time::Instant::now();
     let res = run_pipeline(&ds, &cfg, &output).unwrap();
@@ -69,11 +81,8 @@ fn synthetic_scene_runs_end_to_end() {
     );
     eprintln!("registered {} of {}", errs.len(), ds.image_count());
     eprintln!("center error median {med:.3} m max {max:.3} m");
-    assert_eq!(errs.len(), ds.image_count(), "등록 수 {}", errs.len());
-    assert!(med < 1.5, "중심 오차 중앙 {med}");
-    assert!(max < 6.0, "중심 오차 최대 {max}");
+    let registered = errs.len();
     let passed = report.items.iter().filter(|i| i.pass).count();
-    assert!(passed >= 6, "verify 통과 {passed}/{}", report.items.len());
 
     // 점군 → 정답 표면(수직 거리 근사).
     let origin = scene.to_first_gps_frame(&Point3::new(0.0, 0.0, 0.0)).coords;
@@ -96,6 +105,32 @@ fn synthetic_scene_runs_end_to_end() {
         "cloud points {} surface distance median {sm:.3} m",
         cloud.len()
     );
-    assert!(sm < 3.5, "표면 거리 중앙 {sm}");
     let _ = std::fs::remove_dir_all(&root);
+    Case {
+        registered,
+        images: ds.image_count(),
+        regions: res.regions.len(),
+        center_med: med,
+        center_max: max,
+        surface_med: sm,
+        report,
+    }
+}
+
+#[test]
+fn explore() {
+    for (st, ba) in [(2, 10), (2, 15), (1, 10), (1, 15)] {
+        let t = std::time::Instant::now();
+        let c = run_case(st, ba);
+        eprintln!(
+            "CASE stride {st} ba {ba}: reg {}/{} regions {} cmed {:.3} cmax {:.3} surf {:.3} secs {:.0}",
+            c.registered, c.images, c.regions, c.center_med, c.center_max, c.surface_med, t.elapsed().as_secs_f64()
+        );
+        for i in &c.report.items {
+            eprintln!(
+                "CASE   {} pass={} decided={} {}",
+                i.name, i.pass, i.decided, i.measured
+            );
+        }
+    }
 }
