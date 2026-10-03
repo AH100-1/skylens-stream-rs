@@ -353,6 +353,7 @@ pub fn reconstruct(
             inputs,
             intrinsics,
             cfg.max_ba_tracks,
+            &gps,
         );
         prune(&mut pts, &cams, &keypoints, MAX_REPROJ_PX);
     }
@@ -854,6 +855,7 @@ fn run_ba(
     inputs: &[SparseInput],
     intrinsics: &[Intrinsics],
     max_tracks: usize,
+    gps: &[Option<Vector3<f64>>],
 ) {
     let reg: Vec<usize> = (0..cams.len()).filter(|&k| cams[k].is_some()).collect();
     let mut map = vec![usize::MAX; cams.len()];
@@ -884,6 +886,10 @@ fn run_ba(
         max_tracks,
         default_free_intrinsics: [false; 8],
         fixed_cameras: vec![0],
+        // 모델은 위치 단계에서 이미 GPS 좌표계(m)다. GPS 사전항으로 게이지를 묶어 회전 이탈을 막는다.
+        position_prior: (gps.iter().flatten().count() >= 3).then(|| {
+            crate::ba::PositionPrior::new(reg.iter().map(|&k| gps[k].map(Point3::from)).collect())
+        }),
         ..Default::default()
     };
     bundle_adjust(&mut prob, &opts);
@@ -1036,6 +1042,15 @@ mod tests {
 
     #[test]
     fn formation_scene_registers_all_and_meets_floors() {
+        run_formation(true);
+    }
+
+    #[test]
+    fn formation_scene_default_schedule_meets_floors() {
+        run_formation(false);
+    }
+
+    fn run_formation(fixed_schedule: bool) {
         let positions: usize = std::env::var("SP_POS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1049,14 +1064,18 @@ mod tests {
                 max_features: 1200,
                 record_stages: true,
                 // 이 시험의 바닥값은 겹침 12·16 칸부터 매 칸 짝을 쓰는 일정으로 쟀다(기본 일정은 +20 부터 4칸 간격).
-                pair_schedule: PairSchedule {
-                    cross: crate::matching::CrossSchedule::Formation {
-                        right_min: 12,
-                        left_min: 16,
-                        max: 40,
-                        step: 1,
-                    },
-                    ..PairSchedule::default()
+                pair_schedule: if fixed_schedule {
+                    PairSchedule {
+                        cross: crate::matching::CrossSchedule::Formation {
+                            right_min: 12,
+                            left_min: 16,
+                            max: 40,
+                            step: 1,
+                        },
+                        ..PairSchedule::default()
+                    }
+                } else {
+                    PairSchedule::default()
                 },
                 ..SparseConfig::default()
             },
@@ -1102,6 +1121,7 @@ mod tests {
         assert!(m.reproj_rms_px < 1.0);
         // 목표(중앙 1 m·최대 3 m·점 0.5 m)에는 못 미친다: 실제로 닿은 값을 바닥으로 단언한다.
         assert!(e.0 <= 1.5 && e.1 <= 3.5, "중심 {:?}", e);
+        assert!(e.4 < 1.0, "BA 뒤 회전 중앙 {}", e.4);
         assert!(pm <= 1.1, "점 {pm}");
         assert!(pv.points.len() > 100);
     }
