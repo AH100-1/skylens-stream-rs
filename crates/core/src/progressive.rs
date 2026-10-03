@@ -97,6 +97,20 @@ pub struct ChainStep {
 /// 같은 사진·같은 특징의 공유 3D 점으로 겹치는 이웃끼리 닮음 변환을 구하고, 최신 구역과 겹치지 않는
 /// 구역은 겹치는 이웃을 거쳐 변환을 연쇄 합성한다(너비 우선). 최신 구역 자신은 결과에 없다.
 pub fn chain_realign(items: &[Option<(Region, &[Track])>], k: usize) -> Vec<ChainStep> {
+    chain_realign_with(items, k, |tj, tm, rj, rm| {
+        cross_align(tj, tm, overlap_window(rj, rm))
+    })
+}
+
+/// `chain_realign` 과 같되 이웃 쌍의 닮음 변환(변환, 점쌍 수, 잔차 중앙값)을 `align(원, 대상, 원 구역, 대상 구역)` 로 구한다.
+pub fn chain_realign_with<F>(
+    items: &[Option<(Region, &[Track])>],
+    k: usize,
+    align: F,
+) -> Vec<ChainStep>
+where
+    F: Fn(&[Track], &[Track], &Region, &Region) -> Option<(Similarity, usize, f64)>,
+{
     let mut total: Vec<Option<Similarity>> = vec![None; items.len()];
     total[k] = Some(Similarity::identity());
     let mut out = Vec::new();
@@ -108,7 +122,7 @@ pub fn chain_realign(items: &[Option<(Region, &[Track])>], k: usize) -> Vec<Chai
             if total[j].is_some() {
                 continue;
             }
-            let Some((s, n, med)) = cross_align(tj, tm, overlap_window(&rj, &rm)) else {
+            let Some((s, n, med)) = align(tj, tm, &rj, &rm) else {
                 continue;
             };
             let acc = total[m].as_ref().unwrap().compose(&s);

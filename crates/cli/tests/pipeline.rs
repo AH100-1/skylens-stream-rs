@@ -244,7 +244,7 @@ fn synthetic_single_region_end_to_end() {
 }
 
 /// 구역 2개 이상(README 둘째 명령: stride 1 → 80위치, span 48), 기본 설정(초벌 BA 0회).
-/// 이웃 겹침이 실제로 판정된다. 기본 설정 CLI 실측: verify 5/7, 종료 코드 1.
+/// 이웃 겹침이 실제로 판정된다. 기본 설정 CLI 실측: verify 6/7, 종료 코드 1.
 /// 알려진 미달 항목은 SPEC 목표를 출력하고 측정값을 그대로 단언한다(완화 아님).
 /// 목표를 달성하면 해당 단언을 바꾼다.
 #[test]
@@ -269,7 +269,7 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         ov.measured
     );
-    // 미달 1: 높이 차 중앙 최대 6.278 m, 최근접 5.946 m (목표 높이 차 < 2 m, 최근접 < 3 m).
+    // 미달: 높이 차 중앙 최대 5.829 m, 최근접 4.923 m (목표 높이 차 < 2 m, 최근접 < 3 m).
     check_item(&c, "preview_vs_refined", false);
     let pr = c.report.item("preview_vs_refined").unwrap();
     eprintln!(
@@ -282,12 +282,17 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         pr.measured
     );
-    // 미달 2: 점쌍 최소 324 < 1000 (구역 간 스케일 차 8.26% <= 10%, 잔차 중앙 최대 5.130 m < 6 m).
-    check_item(&c, "preview_align", false);
+    // 통과: 구역 간 대응을 구역의 모든 이미지 관측으로 만들어 점쌍 최소 1221 (창 안 12장만 쓰면 324),
+    // 구역 간 스케일 차 0.05%, 잔차 중앙 최대 5.130 m (< 6 m).
+    check_item(&c, "preview_align", true);
     let pa = c.report.item("preview_align").unwrap();
-    assert!(pa.measured.contains("점쌍 최소 3"), "{}", pa.measured);
     assert!(
-        number_after(&pa.measured, "구역 간 스케일 차 ") <= 10.0,
+        number_after(&pa.measured, "점쌍 최소 ") >= 1200.0,
+        "{}",
+        pa.measured
+    );
+    assert!(
+        number_after(&pa.measured, "구역 간 스케일 차 ") <= 1.0,
         "{}",
         pa.measured
     );
