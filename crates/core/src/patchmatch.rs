@@ -179,7 +179,7 @@ impl Default for Config {
             perturbations: 3,
             refine_perturbations: 1,
             max_neighbors: 8,
-            fine_neighbors: 3,
+            fine_neighbors: 2,
             normal_steps: 0,
             fine_step: 4,
             fine_propagation: 4,
@@ -1389,7 +1389,17 @@ mod tests {
         let hwm0 = peak_rss_kb();
         let mut prof = Vec::new();
         let t = std::time::Instant::now();
-        let dm = estimate_profiled(&refv, &ns, (5.0, 20.0), &Config::default(), Some(&mut prof));
+        let mut cfg = Config::default();
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        cfg.coarse_width = env("PM_CW", cfg.coarse_width);
+        cfg.iterations = env("PM_IT", cfg.iterations);
+        cfg.refine_iterations = env("PM_RI", cfg.refine_iterations);
+        let dm = estimate_profiled(&refv, &ns, (5.0, 20.0), &cfg, Some(&mut prof));
         let el = t.elapsed().as_secs_f64();
         let hwm1 = peak_rss_kb();
         for p in &prof {
@@ -1441,18 +1451,18 @@ mod tests {
             fine_step: 2,
             fine_propagation: 8,
             coarse_width: 240,
-            iterations: 5,
+            iterations: 4,
             normal_steps: 0,
             ..d.clone()
         };
         let b = Config {
             coarse_width: 240,
-            iterations: 5,
+            iterations: 4,
             normal_steps: 0,
             ..d.clone()
         };
         let c = Config {
-            iterations: 5,
+            iterations: 4,
             normal_steps: 0,
             ..d.clone()
         };
@@ -1462,8 +1472,8 @@ mod tests {
         };
         let f = Config {
             normal_steps: 0,
-            iterations: 5,
-            fine_neighbors: 3,
+            iterations: 4,
+            fine_neighbors: 2,
             ..d.clone()
         };
         let cfgs = [("이전", old), ("B", b), ("C", c), ("기본", e), ("F", f)];
