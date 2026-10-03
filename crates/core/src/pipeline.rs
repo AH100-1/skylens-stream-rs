@@ -809,6 +809,45 @@ fn snap_poses_to_gps(poses: &mut [Option<Pose>], gps: &[Vector3<f64>]) {
     }
 }
 
+/// 비행 축 `axis` 둘레 회전각(닫힌 식): 카메라 광축 z 성분의 분산이 최소가 되는 각.
+/// 같은 기울기로 장착된 카메라들은 롤이 맞을 때 광축 높이가 같아지므로 평균 방향의 편향을 받지 않는다.
+/// z = cosθ·P + sinθ·Q 꼴이라 (P, Q) 공분산의 최소 고유 방향이 해이고, 부호는 평균이 더 아래인 쪽.
+fn roll_by_level_spread(
+    axis: &nalgebra::Unit<Vector3<f64>>,
+    g: &Matrix3<f64>,
+    valid: &[Rotation3<f64>],
+) -> Option<f64> {
+    let pq: Vec<(f64, f64)> = valid
+        .iter()
+        .map(|r| {
+            let v = g * (r.inverse() * Vector3::z());
+            let vp = v - **axis * v.dot(axis);
+            (vp.z, axis.cross(&vp).z)
+        })
+        .collect();
+    let n = pq.len() as f64;
+    let (mp, mq) = (
+        pq.iter().map(|x| x.0).sum::<f64>() / n,
+        pq.iter().map(|x| x.1).sum::<f64>() / n,
+    );
+    let (mut spp, mut sqq, mut spq) = (0.0, 0.0, 0.0);
+    for &(p, q) in &pq {
+        spp += (p - mp) * (p - mp);
+        sqq += (q - mq) * (q - mq);
+        spq += (p - mp) * (q - mq);
+    }
+    // 최소 고유 방향 w = (cosθ, sinθ): 각 2θ' = atan2(2 spq, spp - sqq) 가 최대 분산 방향.
+    let th = 0.5 * (2.0 * spq).atan2(spp - sqq) + std::f64::consts::FRAC_PI_2;
+    let (c, s) = (th.cos(), th.sin());
+    // 평균 z 가 더 작은 부호를 고른다(아래를 봄).
+    let mean_z = |c: f64, s: f64| c * mp + s * mq;
+    Some(if mean_z(c, s) <= mean_z(-c, -s) {
+        th
+    } else {
+        th + std::f64::consts::PI
+    })
+}
+
 /// 회전 평균 → 방향으로 좌표계 맞춤 → 위치 → 삼각측량. 초벌 희소 모델.
 fn sparse_init(
     imgs: &[&ImgData],
@@ -875,11 +914,14 @@ fn sparse_init_with(
             svd.singular_values.max()
         ));
     }
+    if std::env::var("PIPE_DEBUG").is_ok() {
+        eprintln!("debug kabsch singular values {:?}", svd.singular_values);
+    }
     let (u, vt) = (svd.u.ok_or("SVD")?, svd.v_t.ok_or("SVD")?);
     let d = (vt.transpose() * u.transpose()).determinant().signum();
     let mut g = vt.transpose() * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, d)) * u.transpose();
     // 편대가 거의 한 직선으로 날면 Kabsch 는 직선 둘레 회전을 못 정한다: 비행 축 둘레 회전을
-    // 카메라가 아래를 보는 쪽(보는 방향의 평균 z 가 가장 작은 쪽)으로 고른다.
+    // 광축 높이 분산이 최소인 각(닫힌 식)으로 고른다.
     let valid: Vec<Rotation3<f64>> = rots.iter().flatten().copied().collect();
     let mut axis = Vector3::zeros();
     let mut first: Option<Vector3<f64>> = None;
@@ -893,20 +935,9 @@ fn sparse_init_with(
     }
     if axis.norm() > 1e-9 && !valid.is_empty() {
         let axis = nalgebra::Unit::new_normalize(axis);
-        let mut best = (f64::INFINITY, g);
-        for step in 0..180 {
-            let gm =
-                *Rotation3::from_axis_angle(&axis, step as f64 * 2f64.to_radians()).matrix() * g;
-            let down: f64 = valid
-                .iter()
-                .map(|r| (gm * (r.inverse() * Vector3::z())).z)
-                .sum::<f64>()
-                / valid.len() as f64;
-            if down < best.0 {
-                best = (down, gm);
-            }
+        if let Some(theta) = roll_by_level_spread(&axis, &g, &valid) {
+            g = *Rotation3::from_axis_angle(&axis, theta).matrix() * g;
         }
-        g = best.1;
     }
     let ids: Vec<usize> = (0..n).filter(|&i| rots[i].is_some()).collect();
     let loc: HashMap<usize, usize> = ids.iter().enumerate().map(|(a, &i)| (i, a)).collect();
