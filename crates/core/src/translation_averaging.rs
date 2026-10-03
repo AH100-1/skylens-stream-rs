@@ -1920,13 +1920,8 @@ mod tests {
         // 실측 배치(`SceneConfig::default()`)·실측 짝 일정. 배치가 실측 값임은 `real_formation` 이 단언한다.
         let (poses, _gps, rots, obs) = real_observations(seed, case, 1.5);
         let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, point_outliers);
-        let res = average_translations_robust(
-            &rots,
-            &obs,
-            &pobs,
-            &TranslationConfig::default(),
-            seed,
-        );
+        let res =
+            average_translations_robust(&rots, &obs, &pobs, &TranslationConfig::default(), seed);
         let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
         let (rms, max) = stats(&similarity_aligned_errors(&res.centers, &truth));
         (res.registered(), rms, max)
