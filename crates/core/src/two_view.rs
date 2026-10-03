@@ -544,6 +544,12 @@ pub fn refine_pose(
     (r, t)
 }
 
+/// 다중 시작 해를 받는 최대 비용 비율(선형 해에서 시작한 정밀화 해 대비).
+const MULTI_START_COST_GAIN: f64 = 0.5;
+
+/// 다중 시작 해가 선형 해 정밀화 해와 이 각(10°)보다 가까우면 같은 골짜기로 보고 그대로 받는다.
+const MULTI_START_JUMP_RAD: f64 = 10.0 * std::f64::consts::PI / 180.0;
+
 /// 본질 행렬 E 에서 시작해 상대 자세를 Sampson 비용 최소화로 구한다.
 ///
 /// 선형 E 의 분해 해 하나만 다듬으면 잡음 큰 짝에서 정답과 다른 골짜기(비용이 정답보다 10배 큰
@@ -578,6 +584,22 @@ pub fn refine_relative_pose(
         .chain(axes.into_iter().map(|t| (procrustes, t)))
         .map(|(r, t)| refine_pose(&r, &t, n1, n2, iters))
         .min_by(|a, b| cost(&a.0, &a.1).total_cmp(&cost(&b.0, &b.1)))?;
+    // F-251: 겹침이 좁은 카메라 간 짝(정상 대응이 영상 한쪽에 몰림)에서는 회전–이동이 섞인 틀린 골짜기가
+    // 정답 골짜기보다 비용이 10~15% 낮게 나올 수 있다(회전 25~32° 틀림, 선형 해는 1~2°).
+    // 다중 시작은 선형 해가 비용 10배 이상인 틀린 골짜기에 있을 때를 위한 것이므로, 선형 해에서 시작한
+    // 정밀화 해보다 비용이 절반 아래로 내려갈 때만 받는다.
+    let (r, t) = if linear.translation_observable {
+        let local = refine_pose(&linear.rotation, &linear.translation, n1, n2, iters);
+        if r.angle_to(&local.0) < MULTI_START_JUMP_RAD
+            || cost(&r, &t) < MULTI_START_COST_GAIN * cost(&local.0, &local.1)
+        {
+            (r, t)
+        } else {
+            local
+        }
+    } else {
+        (r, t)
+    };
     // 관측 가능 여부도 정밀화된 E 로 다시 판정한다. 선형 E 가 틀린 골짜기에 있으면 에피폴라 잔차가
     // 부풀어 관측 가능한 짝을 순수 회전으로 오판하기 때문이다(기선/깊이 0.1, σ1 px 시드 5·6·10).
     recover_pose(&essential_from_pose(&r, &t), n1, n2)
@@ -2191,5 +2213,121 @@ mod tests {
         }
         eprintln!("편대 평면 실패 {} {fails:.3?}", fails.len());
         assert!(fails.is_empty(), "하한 + 0.2° 초과(쌍둥이) {fails:.3?}");
+    }
+
+    /// 실측 편대 합성 장면의 카메라 간 짝(F(p)–R(p+d), F(p)–L(p+d), d = 20..=40 간격 4)에서
+    /// 검증된 정상 대응과 정답 상대 회전. 반환: (카메라, d, 정규화 대응 두 벌, 정답 회전).
+    type CrossPair = (
+        crate::synth::CamId,
+        usize,
+        Vec<Vector2<f64>>,
+        Vec<Vector2<f64>>,
+        Rotation3<f64>,
+        Matrix3<f64>,
+    );
+    fn cross_pairs(seed: u64, ds: &[usize]) -> Vec<CrossPair> {
+        use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
+        use crate::matching::ratio_match;
+        use crate::synth::{CamId, Scene, SceneConfig};
+        let (w, h) = (480usize, 270usize);
+        let scene = Scene::new(SceneConfig {
+            width: w as u32,
+            height: h as u32,
+            seed,
+            ..SceneConfig::default()
+        });
+        let cfg = DetectorConfig::default();
+        let view = |cam: CamId, pos: usize| {
+            scene
+                .views
+                .iter()
+                .find(|v| v.cam == cam && v.position == pos)
+                .unwrap()
+        };
+        let feats = |cam: CamId, pos: usize| {
+            let (img, _) = scene.render(view(cam, pos));
+            detect_and_describe(&GrayImage::from_rgb(w, h, &img.data), &cfg)
+        };
+        let base = 8usize;
+        let fa = feats(CamId::F, base);
+        let mut out = vec![];
+        for cam in [CamId::R, CamId::L] {
+            for &d in ds {
+                let fb = feats(cam, base + d);
+                let (a, b) = (&view(CamId::F, base).camera, &view(cam, base + d).camera);
+                let m = ratio_match(&fa, &fb, 0.8, true);
+                let n1: Vec<_> = m
+                    .iter()
+                    .map(|&(i, _)| {
+                        a.intrinsics.index_to_normalized(&Vector2::new(
+                            fa[i].kp.x as f64,
+                            fa[i].kp.y as f64,
+                        ))
+                    })
+                    .collect();
+                let n2: Vec<_> = m
+                    .iter()
+                    .map(|&(_, j)| {
+                        b.intrinsics.index_to_normalized(&Vector2::new(
+                            fb[j].kp.x as f64,
+                            fb[j].kp.y as f64,
+                        ))
+                    })
+                    .collect();
+                let truth = b.pose.rotation * a.pose.rotation.inverse();
+                let rcfg = RansacConfig::default();
+                let Some((e, inl)) = ransac_essential(&n1, &n2, a.intrinsics.fx, &rcfg) else {
+                    continue;
+                };
+                let s1: Vec<_> = (0..n1.len()).filter(|&i| inl[i]).map(|i| n1[i]).collect();
+                let s2: Vec<_> = (0..n1.len()).filter(|&i| inl[i]).map(|i| n2[i]).collect();
+                out.push((cam, d, s1, s2, truth, e));
+            }
+        }
+        out
+    }
+
+    /// F-251: 카메라 간 짝의 선형·정밀화 회전 오차 표(원인 조사용 기록).
+    #[test]
+    fn cross_pair_refine_table() {
+        let mut errs = vec![];
+        for seed in 1..=3u64 {
+            for (cam, d, s1, s2, truth, e) in cross_pairs(seed, &[20, 24, 28, 32, 36, 40]) {
+                let lin = recover_pose(&e, &s1, &s2).unwrap();
+                let (lr, lt) = refine_pose(&lin.rotation, &lin.translation, &s1, &s2, 50);
+                let rf = refine_relative_pose(&e, &s1, &s2, 50).unwrap();
+                let cost = |r: &Rotation3<f64>, t: &Vector3<f64>| -> f64 {
+                    let e = essential_from_pose(r, &t.normalize());
+                    s1.iter()
+                        .zip(&s2)
+                        .map(|(a, b)| sampson_residual(&e, a, b).powi(2))
+                        .sum()
+                };
+                let er = |r: &Rotation3<f64>| rotation_angle_between(r, &truth).to_degrees();
+                eprintln!(
+                    "seed {seed} {cam:?} +{d} n={} lin {:.3} c={:.3e} | local {:.3} c={:.3e} | multi {:.3} c={:.3e} | truthcost {:.3e}",
+                    s1.len(), er(&lin.rotation), cost(&lin.rotation, &lin.translation),
+                    er(&lr), cost(&lr, &lt), er(&rf.rotation), cost(&rf.rotation, &rf.translation),
+                    cost(&truth, &lin.translation)
+                );
+                errs.push(er(&rf.rotation));
+            }
+        }
+        errs.sort_by(f64::total_cmp);
+        let over2 = errs.iter().filter(|&&x| x > 2.0).count();
+        eprintln!(
+            "정밀화 회전 오차 n={} 중앙 {:.3}° 2° 초과 {over2}",
+            errs.len(),
+            errs[errs.len() / 2]
+        );
+        // 기준값은 수정 후 측정(36 짝: 중앙 0.772°, 2° 초과 3, 최대 5.86°) 에 여유를 둔 값. 수정 전에는 최대 32°.
+        assert!(errs.len() >= 30, "검증 통과 짝 {}", errs.len());
+        assert!(errs[errs.len() / 2] < 1.0, "중앙 {}", errs[errs.len() / 2]);
+        assert!(over2 as f64 <= 0.12 * errs.len() as f64, "2° 초과 {over2}");
+        assert!(
+            *errs.last().unwrap() < 10.0,
+            "최대 {}",
+            errs.last().unwrap()
+        );
     }
 }
