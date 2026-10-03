@@ -1526,12 +1526,7 @@ pub fn run_pipeline(
         for (&g, c) in &rec.centers {
             let own = g / 3 >= olo && g / 3 < ohi;
             let r = rec.rots.get(&g).copied();
-            if own {
-                centers.insert(g, *c);
-                if let Some(r) = r {
-                    rots.insert(g, r);
-                }
-            } else if !centers.contains_key(&g) {
+            if own || !centers.contains_key(&g) {
                 centers.insert(g, *c);
                 if let Some(r) = r {
                     rots.insert(g, r);
