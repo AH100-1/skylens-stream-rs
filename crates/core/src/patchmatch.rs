@@ -171,14 +171,14 @@ impl Default for Config {
             iterations: 6,
             refine_iterations: 1,
             coarse_width: 240,
-            sigma_color: 0.1,
+            sigma_color: 100.0,
             sigma_spatial: 3.0,
-            top_k: 2,
+            top_k: 3,
             perturbations: 3,
             refine_perturbations: 1,
             max_neighbors: 8,
             fine_neighbors: 4,
-            normal_steps: 3,
+            normal_steps: 5,
             seed: 0x5eed,
             fast_iterations: 6,
         }
@@ -621,8 +621,8 @@ impl Ctx<'_> {
                                 );
                                 try_hyp(Hyp { depth: d, n: nn }, &mut best, &mut best_c);
                             }
-                            if it + 1 == iterations {
-                                let mut s = 0.04;
+                            if !coarsest || it + 1 == iterations {
+                                let mut s = if coarsest { 0.08 } else { 0.04 };
                                 for _ in 0..normal_steps {
                                     let nn = self.perturb_normal(&mut rng, &best.n, s, &rp);
                                     let b = best;
@@ -1886,7 +1886,6 @@ mod tests {
     // 깊이 1% 는 시차 0.14 px 에 해당하므로 부분 화소 정합이 되어야 넘는 기준이다.
 
     #[test]
-    #[ignore = "창 25 표본(반지름 4·간격 2)으로 법선 중앙값 7.4° > 5°, 깊이 기준은 통과(노트 참조)"]
     fn slanted_plane_depth_and_normal() {
         let s = slanted_stats(1.0, &Config::default());
         report("경사 평면", &s);
@@ -1919,7 +1918,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "창 25 표본(반지름 4·간격 2)으로 법선 중앙값 6.9° > 5°, 깊이 기준은 통과(노트 참조)"]
     fn steps_depth() {
         // 기준 시점 정규 x 범위 [-0.6,-0.2), [-0.2,0.2), [0.2,0.6) 에 깊이 8, 10, 12 계단.
         let zs = [(8.0, -0.6, -0.2), (10.0, -0.2, 0.2), (12.0, 0.2, 0.6)];
