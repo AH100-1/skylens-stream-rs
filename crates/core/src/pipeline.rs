@@ -1392,7 +1392,13 @@ fn own_align(
         pair_debug(ta, tb, r.index, base);
     }
     if mode == 0 {
-        let mut pairs = point_pairs(ta, tb, pos, base);
+        // 대응 범위: 기본은 구역의 모든 이미지(공유 관측 전부). `SKYLENS_PAIR_SCOPE=window` 면 정렬 창만.
+        let scope = if std::env::var("SKYLENS_PAIR_SCOPE").as_deref() == Ok("window") {
+            base
+        } else {
+            (r.lo, r.hi)
+        };
+        let mut pairs = point_pairs(ta, tb, pos, scope);
         let (mut sim, mut ar) = align_region(r, &pairs);
         if sim.is_none() {
             pairs = point_pairs(ta, tb, pos, (r.lo, r.hi));
@@ -1459,6 +1465,14 @@ fn pair_debug(ta: &[Track], tb: &[Track], region: usize, w: (usize, usize)) {
         .filter(|o| bo.contains(o))
         .count();
     let pairs = point_pairs(ta, tb, |i| (i / 3) as usize, w).len();
+    let all = point_pairs(ta, tb, |i| (i / 3) as usize, (0, usize::MAX));
+    let (src, dst): (Vec<_>, Vec<_>) = all.iter().copied().unzip();
+    let inl =
+        crate::stream::robust_fit(&src, &dst).map_or(0, |f| f.1.iter().filter(|&&b| b).count());
+    eprintln!(
+        "PAIRDBG region {region} all-images distinct point pairs {} robust inliers {inl}",
+        all.len()
+    );
     eprintln!(
         "PAIRDBG region {region} win {w:?} positions {} imgs_a {} imgs_b {} | coarse tracks {ta_t} obs {ta_o} | refined tracks {tb_t} obs {tb_o} | obs matched {matched} ({:.1}% of coarse obs) | distinct point pairs {pairs} | total tracks a {} b {}",
         w.1 - w.0,

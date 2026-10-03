@@ -70,7 +70,7 @@ skylens-stream verify out
 # 구역 2개 이상(40위치 x 2 구역 이상, 이웃 구역 겹침 항목 판정): --stride 1 로 80위치 전부 사용
 skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
 skylens-stream verify out2
-# 이 장면(구역 2개)에서 verify 는 5/7 통과, 종료 코드 1: preview_align(점쌍 최소 324 < 1000; 스케일 차 8.26%·잔차 5.130 m 는 기준 안)·preview_vs_refined(높이 차 6.278 m, 최근접 5.946 m) 미달, refined_overlap 0.257 m 통과
+# 이 장면(구역 2개)에서 verify 는 6/7 통과, 종료 코드 1: preview_vs_refined(높이 차 5.829 m, 최근접 4.923 m) 만 미달, preview_align(점쌍 최소 1221, 스케일 차 0.05%, 잔차 5.130 m)·refined_overlap 0.257 m 통과
 
 # 판 번호 출력 ("skylens-stream 0.1.0")
 skylens-stream --version
