@@ -1324,9 +1324,25 @@ pub fn run_pipeline_with(
         st.secs_matching = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
         let pair_ids: Vec<(usize, usize)> = pm.iter().map(|p| (p.i, p.j)).collect();
-        let init = match check_motion(&gps, &views, &pair_ids)
+        // 정지 검사는 구역 자기 위치끼리의 짝만 본다(앞 구역에서 온 도우미 사진의 움직임은 세지 않는다).
+        let own_pairs: Vec<(usize, usize)> = pair_ids
+            .iter()
+            .copied()
+            .filter(|&(i, j)| gids[i] / 3 >= r.lo && gids[j] / 3 >= r.lo)
+            .collect();
+        let own_registered = |s: &Sparse| s.poses[n_help..].iter().filter(|p| p.is_some()).count();
+        let init = match check_motion(&gps, &views, &own_pairs)
             .and_then(|_| sparse_init(&imgs, &pm, &gps, &k))
-        {
+            .and_then(|s| {
+                if own_registered(&s) < 3 {
+                    Err(format!(
+                        "구역 안 사진 등록 {} 장 < 3: 특징이 없어 등록할 수 없음",
+                        own_registered(&s)
+                    ))
+                } else {
+                    Ok(s)
+                }
+            }) {
             Ok(s) => s,
             Err(e) => {
                 skipped.push(format!("구역 {} 건너뜀: {e}", r.index));
