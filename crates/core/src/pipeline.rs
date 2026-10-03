@@ -95,7 +95,6 @@ struct Sparse {
 
 /// (사진 i, 사진 j, 특징 짝 목록).
 type PairList = (usize, usize, Vec<(usize, usize)>);
-type RegionTracks = (Region, Vec<Track>, Vec<Track>);
 
 pub mod stand_in {
     //! 병합 전 부품의 단순 대체. 모양은 TASKS 인터페이스를 따른다.
@@ -730,34 +729,185 @@ fn to_tracks(s: &Sparse, gid: &[usize]) -> Vec<Track> {
         .collect()
 }
 
+/// 구역 하나의 진행 기록(메인 스레드 소유).
+struct RegionRec {
+    region: Region,
+    stats: RegionStats,
+    gids: Vec<usize>,
+    ta: Vec<Track>,
+    coarse: PointCloud,
+    /// 지금 쓰는 초벌 → 기준 정밀 좌표 변환과 그 기준 구역.
+    sim: Option<Similarity>,
+    target: Option<usize>,
+    /// 자기 정밀 모델과의 정렬 기록(최종 manifest 용).
+    own: Option<(Option<Similarity>, AlignRecord)>,
+    refined: Option<(Vec<Track>, PointCloud)>,
+    centers: BTreeMap<usize, [f64; 3]>,
+    registered_prev: Vec<usize>,
+}
+
+/// 정밀(BA) 작업 결과.
+struct RefinedMsg {
+    slot: usize,
+    sparse: Sparse,
+    cloud: PointCloud,
+    secs: f64,
+}
+
+fn write_decimated(out: &Path, name: &str, cloud: &PointCloud) -> Result<(), String> {
+    crate::ply::write_ply_file(
+        out.join(name),
+        &crate::stream::decimate(cloud, crate::stream::DECIMATE_EVERY),
+    )
+    .map_err(|e| format!("출력 쓰기 실패: {e}"))
+}
+
 /// 끝까지 돌린다. 출력 폴더에 preview·refined·snapshots·manifest.json·report.json·poses.txt 를 쓴다.
+///
+/// 구역은 위치 순서로 하나씩 도착한다: 사진 읽기 → 짝 맞춤 → 등록(초벌 희소 모델) → 초벌 점군을 곧바로
+/// 출력(가장 최근에 나온 정밀 모델 좌표계로 정렬) → 정밀(BA) 은 다른 스레드에서 돌고, 끝나면
+/// 초벌을 대신해 내보내고 아직 정밀이 없는 초벌 구역을 새 정밀 모델 좌표로 다시 맞춘다.
+/// 다음 구역의 등록 전에 끝난 정밀 결과를 먼저 반영한다. 등록·희소 초기화에 실패한 구역은
+/// issues 에 적고 건너뛴다.
 pub fn run_pipeline(
     ds: &Dataset,
     cfg: &PipelineConfig,
     out: &Path,
 ) -> Result<PipelineResult, String> {
+    use crate::progressive::{
+        check_motion, cross_align, median, overlap_window, own_ranges, ReAlign,
+    };
+    use crate::stream::{preview_name, refined_name};
+    use std::sync::{mpsc, Arc};
+
     let n_pos = ds.positions.len();
     let regions = split_regions(n_pos, ds.config.span, ds.config.ovl);
-    let mut cache: HashMap<usize, ImgData> = HashMap::new();
+    let owns = own_ranges(&regions, n_pos);
+    for sub in ["preview", "refined", "snapshots"] {
+        std::fs::create_dir_all(out.join(sub)).map_err(|e| e.to_string())?;
+    }
+    let t_start = Instant::now();
+    let mut cache: HashMap<usize, Arc<ImgData>> = HashMap::new();
     let mut k_opt: Option<Intrinsics> = None;
     let mut res = PipelineResult::default();
-    let (mut prelim, mut refined, mut tr_pairs): (
-        Vec<PointCloud>,
-        Vec<PointCloud>,
-        Vec<RegionTracks>,
-    ) = (Vec::new(), Vec::new(), Vec::new());
-    let mut centers: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
-    let (mut reg_prev, mut reg_ref) = (
-        std::collections::BTreeSet::new(),
-        std::collections::BTreeSet::new(),
-    );
+    let mut recs: Vec<RegionRec> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut events: Vec<String> = Vec::new();
+    let mut realigns: Vec<ReAlign> = Vec::new();
+    let mut latest_ref: Option<usize> = None; // recs 번호
+    let mut in_flight = 0usize;
+    let (tx, rx) = mpsc::channel::<RefinedMsg>();
+    let t_now = || t_start.elapsed().as_secs_f64();
+
+    // 정밀 결과 하나를 반영: 파일 쓰기, 자기 정렬, 대기 중인 초벌 재정렬.
+    let handle = |m: RefinedMsg,
+                  recs: &mut Vec<RegionRec>,
+                  events: &mut Vec<String>,
+                  realigns: &mut Vec<ReAlign>,
+                  latest_ref: &mut Option<usize>|
+     -> Result<(), String> {
+        let k = m.slot;
+        let rec = &mut recs[k];
+        let tb = to_tracks(&m.sparse, &rec.gids);
+        for (a, g) in rec.gids.iter().enumerate() {
+            if let Some(p) = m.sparse.poses[a] {
+                let c = p.center();
+                rec.centers.insert(*g, [c.x, c.y, c.z]);
+            }
+        }
+        rec.stats.refined_rms = m.sparse.rms;
+        rec.stats.refined_points = m.cloud.len();
+        rec.stats.secs_ba = m.secs;
+        write_decimated(out, &refined_name(&rec.region), &m.cloud)?;
+        // 자기 구역 초벌 → 정밀 정렬(SPEC §3.7).
+        let r = rec.region;
+        let pos = |i: u32| (i / 3) as usize;
+        let mut pairs = point_pairs(&rec.ta, &tb, pos, align_window(&r, ds.config.ovl, n_pos));
+        let (mut sim, mut ar) = align_region(&r, &pairs);
+        if sim.is_none() {
+            pairs = point_pairs(&rec.ta, &tb, pos, (r.lo, r.hi));
+            (sim, ar) = align_region(&r, &pairs);
+        }
+        if let Some(s) = &sim {
+            realigns.push(ReAlign {
+                secs: t_now(),
+                region: k,
+                target: k,
+                pairs: ar.pairs,
+                median_m: ar.fit_median_m.unwrap_or(f64::NAN),
+                scale: s.s,
+            });
+            rec.sim = sim.clone();
+            rec.target = Some(k);
+            write_decimated(
+                out,
+                &preview_name(&r),
+                &crate::stream::apply_cloud(s, &rec.coarse),
+            )?;
+        }
+        rec.own = Some((sim, ar));
+        rec.refined = Some((tb, m.cloud));
+        *latest_ref = Some(k);
+        events.push(format!(
+            "{:.1}s refined region {} rms {:.3} done",
+            t_now(),
+            r.index,
+            m.sparse.rms
+        ));
+        // 이미 내보낸, 아직 정밀이 없는 초벌 구역을 새 정밀 모델 좌표로 다시 맞춘다.
+        for j in 0..recs.len() {
+            if j == k || recs[j].refined.is_some() {
+                continue;
+            }
+            let win = overlap_window(&recs[j].region, &recs[k].region);
+            let tbk = &recs[k].refined.as_ref().unwrap().0;
+            if let Some((s, n, med)) = cross_align(&recs[j].ta, tbk, win) {
+                realigns.push(ReAlign {
+                    secs: t_now(),
+                    region: j,
+                    target: k,
+                    pairs: n,
+                    median_m: med,
+                    scale: s.s,
+                });
+                let jr = recs[j].region;
+                write_decimated(
+                    out,
+                    &preview_name(&jr),
+                    &crate::stream::apply_cloud(&s, &recs[j].coarse),
+                )?;
+                recs[j].sim = Some(s);
+                recs[j].target = Some(k);
+                events.push(format!(
+                    "{:.1}s realign coarse {} to refined {} pairs {n} median {med:.3} m",
+                    t_now(),
+                    jr.index,
+                    recs[k].region.index
+                ));
+            }
+        }
+        Ok(())
+    };
+
     for r in &regions {
+        // 끝난 정밀 결과를 먼저 반영해 이번 등록·정렬이 최신 모델을 기준으로 삼게 한다.
+        while let Ok(m) = rx.try_recv() {
+            in_flight -= 1;
+            handle(m, &mut recs, &mut events, &mut realigns, &mut latest_ref)?;
+        }
+        // 정밀 작업이 둘 넘게 밀리면 하나가 끝나길 기다린다(코어 과다 경쟁 방지).
+        while in_flight >= 2 {
+            let m = rx.recv().map_err(|e| e.to_string())?;
+            in_flight -= 1;
+            handle(m, &mut recs, &mut events, &mut realigns, &mut latest_ref)?;
+        }
         let mut st = RegionStats {
             region: r.index,
             positions: r.hi - r.lo,
             images: 3 * (r.hi - r.lo),
             ..Default::default()
         };
+        events.push(format!("{:.1}s arrive region {}", t_now(), r.index));
         let gids: Vec<usize> = (r.lo..r.hi)
             .flat_map(|p| (0..3).map(move |c| 3 * p + c))
             .collect();
@@ -776,16 +926,26 @@ pub fn run_pipeline(
                 ))
             })
             .collect();
+        let mut load_err = None;
         for l in loaded {
-            let (g, d) = l?;
-            cache.insert(g, d);
+            match l {
+                Ok((g, d)) => {
+                    cache.insert(g, Arc::new(d));
+                }
+                Err(e) => load_err = Some(e),
+            }
+        }
+        if let Some(e) = load_err {
+            skipped.push(format!("구역 {} 건너뜀: 사진 읽기 실패: {e}", r.index));
+            continue;
         }
         let k = *k_opt.get_or_insert_with(|| {
             let d = &cache[&gids[0]].rgb;
             Intrinsics::from_hfov(d.width(), d.height(), cfg.hfov_deg.to_radians())
         });
         st.secs_features = t0.elapsed().as_secs_f64();
-        let imgs: Vec<&ImgData> = gids.iter().map(|g| &cache[g]).collect();
+        let arcs: Vec<Arc<ImgData>> = gids.iter().map(|g| cache[g].clone()).collect();
+        let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
         let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
         let gps: Vec<Vector3<f64>> = gids
             .iter()
@@ -795,129 +955,212 @@ pub fn run_pipeline(
         let pm = match_pairs(&imgs, &views, &k);
         st.secs_matching = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
-        let init =
-            sparse_init(&imgs, &pm, &gps, &k).map_err(|e| format!("구역 {}: {e}", r.index))?;
-        st.secs_sparse = t2.elapsed().as_secs_f64();
-        let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
-        let t3 = Instant::now();
-        let ((pre_cloud, ref_s, ref_cloud), secs_dense_pre) = {
-            let ((pc, dt), (rs, rc)) = rayon::join(
-                || {
-                    let t = Instant::now();
-                    (
-                        dense_cloud(&init, &imgs, &k, &in_region, cfg.dense_width),
-                        t.elapsed().as_secs_f64(),
-                    )
-                },
-                || {
-                    let mut rs = init.clone();
-                    rs.rms = run_ba(&mut rs, &k, cfg.ba_iters, Some(&gps));
-                    gps_align_refined(&mut rs, &gps);
-                    let rc = dense_cloud(&rs, &imgs, &k, &in_region, cfg.dense_width);
-                    (rs, rc)
-                },
-            );
-            ((pc, rs, rc), dt)
+        let pair_ids: Vec<(usize, usize)> = pm.iter().map(|p| (p.i, p.j)).collect();
+        let init = match check_motion(&gps, &views, &pair_ids)
+            .and_then(|_| sparse_init(&imgs, &pm, &gps, &k))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                skipped.push(format!("구역 {} 건너뜀: {e}", r.index));
+                events.push(format!("{:.1}s skip region {}", t_now(), r.index));
+                continue;
+            }
         };
-        st.secs_ba = t3.elapsed().as_secs_f64();
-        st.secs_dense = secs_dense_pre;
+        st.secs_sparse = t2.elapsed().as_secs_f64();
         st.registered = init.poses.iter().filter(|p| p.is_some()).count();
         st.tracks = init.points.len();
         st.preview_rms = init.rms;
-        st.refined_rms = ref_s.rms;
-        st.preview_points = pre_cloud.len();
-        st.refined_points = ref_cloud.len();
-        for (a, g) in gids.iter().enumerate() {
-            if init.poses[a].is_some() {
-                reg_prev.insert(*g);
+        events.push(format!(
+            "{:.1}s registered region {} ({}/{})",
+            t_now(),
+            r.index,
+            st.registered,
+            st.images
+        ));
+        let slot = recs.len();
+        // 정밀(BA)은 다른 스레드에서: 끝나면 메시지로 돌아온다.
+        {
+            let (tx, init, arcs) = (tx.clone(), init.clone(), arcs.clone());
+            let (gps, dw, iters) = (gps.clone(), cfg.dense_width, cfg.ba_iters);
+            let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
+            in_flight += 1;
+            std::thread::spawn(move || {
+                let t = Instant::now();
+                let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
+                let mut rs = init;
+                rs.rms = run_ba(&mut rs, &k, iters, Some(&gps));
+                gps_align_refined(&mut rs, &gps);
+                let cloud = dense_cloud(&rs, &imgs, &k, &in_region, dw);
+                let _ = tx.send(RefinedMsg {
+                    slot,
+                    sparse: rs,
+                    cloud,
+                    secs: t.elapsed().as_secs_f64(),
+                });
+            });
+        }
+        // 초벌 점군: 곧바로 만들어 최신 정밀 좌표계로 정렬해 내보낸다.
+        let t3 = Instant::now();
+        let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
+        let coarse = dense_cloud(&init, &imgs, &k, &in_region, cfg.dense_width);
+        st.secs_dense = t3.elapsed().as_secs_f64();
+        st.preview_points = coarse.len();
+        let ta = to_tracks(&init, &gids);
+        while let Ok(m) = rx.try_recv() {
+            in_flight -= 1;
+            handle(m, &mut recs, &mut events, &mut realigns, &mut latest_ref)?;
+        }
+        let (mut sim, mut target) = (None, None);
+        if let Some(m) = latest_ref {
+            let win = overlap_window(r, &recs[m].region);
+            let tbm = &recs[m].refined.as_ref().unwrap().0;
+            if let Some((s, n, med)) = cross_align(&ta, tbm, win) {
+                realigns.push(ReAlign {
+                    secs: t_now(),
+                    region: slot,
+                    target: m,
+                    pairs: n,
+                    median_m: med,
+                    scale: s.s,
+                });
+                events.push(format!(
+                    "{:.1}s coarse region {} aligned to refined {} pairs {n} median {med:.3} m",
+                    t_now(),
+                    r.index,
+                    recs[m].region.index
+                ));
+                sim = Some(s);
+                target = Some(m);
             }
-            if let Some(p) = ref_s.poses[a] {
-                reg_ref.insert(*g);
-                let c = p.center();
-                centers.insert(*g, [c.x, c.y, c.z]);
-            }
         }
-        if std::env::var("SKYLENS_DIAG").is_ok() {
-            let med = |mut v: Vec<f64>| {
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
-            };
-            let dp: Vec<Vector3<f64>> = init
-                .points
-                .iter()
-                .zip(&ref_s.points)
-                .map(|(a, b)| b - a)
-                .collect();
-            let dc: Vec<Vector3<f64>> = (0..gids.len())
-                .filter_map(|a| {
-                    Some(ref_s.poses[a]?.center().coords - init.poses[a]?.center().coords)
-                })
-                .collect();
-            let gi: Vec<f64> = (0..gids.len())
-                .filter_map(|a| Some((init.poses[a]?.center().coords - gps[a]).norm()))
-                .collect();
-            let gr: Vec<f64> = (0..gids.len())
-                .filter_map(|a| Some((ref_s.poses[a]?.center().coords - gps[a]).norm()))
-                .collect();
-            eprintln!(
-                "diag point shift |dxyz| med {:.2} dz med {:.2}; center shift med {:.2} dz {:.2}; gps dist init {:.2} refined {:.2}",
-                med(dp.iter().map(|d| d.norm()).collect()),
-                med(dp.iter().map(|d| d.z.abs()).collect()),
-                med(dc.iter().map(|d| d.norm()).collect()),
-                med(dc.iter().map(|d| d.z.abs()).collect()),
-                med(gi),
-                med(gr)
-            );
-        }
-        // 초벌 → 정밀 좌표 정렬(공유 3D 점, 같은 사진·같은 특징).
-        let (ta, tb) = (to_tracks(&init, &gids), to_tracks(&ref_s, &gids));
-        tr_pairs.push((*r, ta, tb));
-        prelim.push(pre_cloud);
-        refined.push(ref_cloud);
-        println!(
-            "region {} positions {} registered {}/{} tracks {} rms {:.3}->{:.3} points {}/{} secs feat {:.1} match {:.1} sparse {:.1} ba+dense {:.1}",
-            r.index, st.positions, st.registered, st.images, st.tracks, st.preview_rms,
-            st.refined_rms, st.preview_points, st.refined_points, st.secs_features,
-            st.secs_matching, st.secs_sparse, st.secs_ba
-        );
-        res.regions.push(st);
+        // 기준 모델이 없거나 겹침이 모자라면 GPS 좌표 그대로(초기 좌표계는 이미 GPS)로 내보낸다.
+        let shown = sim.clone().unwrap_or_else(Similarity::identity);
+        write_decimated(
+            out,
+            &preview_name(r),
+            &crate::stream::apply_cloud(&shown, &coarse),
+        )?;
+        events.push(format!("{:.1}s coarse output region {}", t_now(), r.index));
+        let registered_prev = (0..gids.len())
+            .filter(|&a| init.poses[a].is_some())
+            .map(|a| gids[a])
+            .collect();
+        recs.push(RegionRec {
+            region: *r,
+            stats: st,
+            gids,
+            ta,
+            coarse,
+            sim,
+            target,
+            own: None,
+            refined: None,
+            centers: BTreeMap::new(),
+            registered_prev,
+        });
     }
-    let mut sims: Vec<Option<Similarity>> = Vec::new();
-    let mut records = Vec::new();
-    for (r, ta, tb) in &tr_pairs {
-        let pos = |i: u32| (i / 3) as usize;
-        let win = align_window(r, ds.config.ovl, n_pos);
-        let mut pairs = point_pairs(ta, tb, pos, win);
-        let (mut sim, mut rec) = align_region(r, &pairs);
-        if sim.is_none() {
-            pairs = point_pairs(ta, tb, pos, (r.lo, r.hi));
-            (sim, rec) = align_region(r, &pairs);
-        }
-        sims.push(sim);
-        records.push(rec);
+    while in_flight > 0 {
+        let m = rx.recv().map_err(|e| e.to_string())?;
+        in_flight -= 1;
+        handle(m, &mut recs, &mut events, &mut realigns, &mut latest_ref)?;
     }
+    if recs.is_empty() {
+        return Err(format!("모든 구역 실패: {}", skipped.join("; ")));
+    }
+
+    let kept: Vec<Region> = recs.iter().map(|r| r.region).collect();
+    let sims: Vec<Option<Similarity>> = recs
+        .iter()
+        .map(|r| r.own.as_ref().and_then(|o| o.0.clone()))
+        .collect();
+    let records: Vec<AlignRecord> = recs
+        .iter()
+        .map(|r| r.own.as_ref().unwrap().1.clone())
+        .collect();
+    let prelim: Vec<PointCloud> = recs.iter().map(|r| r.coarse.clone()).collect();
+    let refined: Vec<PointCloud> = recs
+        .iter()
+        .map(|r| r.refined.as_ref().unwrap().1.clone())
+        .collect();
     let aligned = apply_alignments(&prelim, &sims);
-    let rep = write_outputs(out, &regions, &aligned, &refined, records.clone())
+    let rep = write_outputs(out, &kept, &aligned, &refined, records.clone())
         .map_err(|e| format!("출력 쓰기 실패: {e}"))?;
-    res.issues = rep.issues;
+    res.issues = skipped;
+    res.issues.extend(rep.issues);
     res.align = records;
+
+    // 사진 중심: 자기 구역 값을 쓰고, 자기 구역에서 등록 못한 사진만 이웃 구역 값으로 채운다.
     let name = |g: usize| {
         ds.positions[g / 3].images[g % 3]
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default()
     };
+    let mut centers: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
+    let mut diffs: Vec<f64> = Vec::new();
+    for rec in &recs {
+        let (olo, ohi) = owns[rec.region.index];
+        for (&g, c) in &rec.centers {
+            let own = g / 3 >= olo && g / 3 < ohi;
+            if own {
+                centers.insert(g, *c);
+            } else {
+                centers.entry(g).or_insert(*c);
+            }
+        }
+    }
+    for rec in &recs {
+        for (&g, c) in &rec.centers {
+            if let Some(o) = centers.get(&g) {
+                let d =
+                    ((o[0] - c[0]).powi(2) + (o[1] - c[1]).powi(2) + (o[2] - c[2]).powi(2)).sqrt();
+                if d > 0.0 {
+                    diffs.push(d);
+                }
+            }
+        }
+    }
+    let overlap_med = median(diffs.clone());
+    if let Some(m) = overlap_med {
+        res.issues.push(format!(
+            "겹침 구간 사진 중심 차이(구역 간) 중앙 {m:.3} m, 최대 {:.3} m, {} 건",
+            diffs.iter().copied().fold(0.0, f64::max),
+            diffs.len()
+        ));
+    }
     let mut poses_txt = String::new();
     for (g, c) in &centers {
         poses_txt += &format!("{} {} {} {}\n", name(*g), c[0], c[1], c[2]);
         res.centers.push((name(*g), *c));
     }
     std::fs::write(out.join("poses.txt"), poses_txt).map_err(|e| e.to_string())?;
+    let (mut reg_prev, mut reg_ref) = (
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    );
+    for rec in &recs {
+        reg_prev.extend(rec.registered_prev.iter().copied());
+        reg_ref.extend(rec.centers.keys().copied());
+    }
+    for rec in recs.iter() {
+        let st = &rec.stats;
+        println!(
+            "region {} positions {} registered {}/{} tracks {} rms {:.3}->{:.3} points {}/{} secs feat {:.1} match {:.1} sparse {:.1} ba {:.1} coarse-dense {:.1}",
+            st.region, st.positions, st.registered, st.images, st.tracks, st.preview_rms,
+            st.refined_rms, st.preview_points, st.refined_points, st.secs_features,
+            st.secs_matching, st.secs_sparse, st.secs_ba, st.secs_dense
+        );
+        res.regions.push(rec.stats.clone());
+    }
+    for e in &events {
+        println!("event {e}");
+    }
     let avg = |f: fn(&RegionStats) -> f64| {
         res.regions.iter().map(f).sum::<f64>() / res.regions.len().max(1) as f64
     };
+    let q = |s: &str| s.replace('\\', "/").replace('"', "'");
     let report = format!(
-        "{{\"registered\": {{\"total\": {}, \"preview\": {}, \"refined\": {}}}, \"reprojection_px\": {{\"preview\": {:.4}, \"refined\": {:.4}}}, \"regions\": [{}]}}\n",
+        "{{\"registered\": {{\"total\": {}, \"preview\": {}, \"refined\": {}}}, \"reprojection_px\": {{\"preview\": {:.4}, \"refined\": {:.4}}}, \"regions\": [{}], \"realign_count\": {}, \"realigns\": [{}], \"overlap_center_diff_median_m\": {}, \"events\": [{}]}}\n",
         ds.image_count(),
         reg_prev.len(),
         reg_ref.len(),
@@ -929,6 +1172,21 @@ pub fn run_pipeline(
                 "{{\"region\": {}, \"positions\": {}, \"images\": {}}}",
                 s.region, s.positions, s.images
             ))
+            .collect::<Vec<_>>()
+            .join(", "),
+        realigns.len(),
+        realigns
+            .iter()
+            .map(|a| format!(
+                "{{\"secs\": {:.2}, \"region\": {}, \"target\": {}, \"pairs\": {}, \"median_m\": {:.4}, \"scale\": {:.5}}}",
+                a.secs, recs[a.region].region.index, recs[a.target].region.index, a.pairs, a.median_m, a.scale
+            ))
+            .collect::<Vec<_>>()
+            .join(", "),
+        overlap_med.map_or("null".to_string(), |m| format!("{m:.4}")),
+        events
+            .iter()
+            .map(|e| format!("\"{}\"", q(e)))
             .collect::<Vec<_>>()
             .join(", ")
     );

@@ -13,6 +13,7 @@ pub mod matching;
 pub mod math;
 pub mod pipeline;
 pub mod ply;
+pub mod progressive;
 pub mod rotation_averaging;
 pub mod sparse;
 pub mod stream;
