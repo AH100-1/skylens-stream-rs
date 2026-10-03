@@ -588,6 +588,48 @@ fn run_ba(s: &mut Sparse, k: &Intrinsics, iters: usize) -> f64 {
     }
 }
 
+/// 점마다 관측 광선 사이의 최대 각(도). 광선 각이 작은 점은 깊이가 불안정하다.
+fn ray_angles(s: &Sparse) -> Vec<f64> {
+    s.points
+        .iter()
+        .zip(&s.obs)
+        .map(|(x, o)| {
+            let rays: Vec<Vector3<f64>> = o
+                .iter()
+                .filter_map(|&(i, _, _)| {
+                    let d = x - s.poses[i]?.center().coords;
+                    (d.norm() > 1e-9).then(|| d.normalize())
+                })
+                .collect();
+            let mut best = 0.0f64;
+            for a in 0..rays.len() {
+                for b in a + 1..rays.len() {
+                    best = best.max(rays[a].angle(&rays[b]).to_degrees());
+                }
+            }
+            best
+        })
+        .collect()
+}
+
+/// 광선 각이 `min_deg` 이상인 점만 남긴 모델. 남는 점이 `keep_min` 개 미만이면 그대로 둔다.
+fn well_conditioned(s: &Sparse, min_deg: f64, keep_min: usize) -> Sparse {
+    let ang = ray_angles(s);
+    let keep: Vec<usize> = (0..s.points.len()).filter(|&p| ang[p] >= min_deg).collect();
+    if keep.len() < keep_min {
+        return s.clone();
+    }
+    Sparse {
+        poses: s.poses.clone(),
+        points: keep.iter().map(|&p| s.points[p]).collect(),
+        obs: keep.iter().map(|&p| s.obs[p].clone()).collect(),
+        rms: s.rms,
+    }
+}
+
+/// 초벌 점의 최소 광선 각(도): 이보다 좁은 점은 초벌 점군·정렬 대응에서 뺀다.
+const PREVIEW_MIN_RAY_DEG: f64 = 2.0;
+
 /// 밀집: 깊이 맵(stand_in) → 융합. 희소 점도 함께 담는다.
 fn dense_cloud(
     s: &Sparse,
@@ -737,13 +779,14 @@ pub fn run_pipeline(
             sparse_init(&imgs, &pm, &gps, &k).map_err(|e| format!("구역 {}: {e}", r.index))?;
         st.secs_sparse = t2.elapsed().as_secs_f64();
         let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
+        let good = well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200);
         let t3 = Instant::now();
         let ((pre_cloud, ref_s, ref_cloud), secs_dense_pre) = {
             let ((pc, dt), (rs, rc)) = rayon::join(
                 || {
                     let t = Instant::now();
                     (
-                        dense_cloud(&init, &imgs, &k, &in_region, cfg.dense_width),
+                        dense_cloud(&good, &imgs, &k, &in_region, cfg.dense_width),
                         t.elapsed().as_secs_f64(),
                     )
                 },
@@ -808,7 +851,7 @@ pub fn run_pipeline(
             );
         }
         // 초벌 → 정밀 좌표 정렬(공유 3D 점, 같은 사진·같은 특징).
-        let (ta, tb) = (to_tracks(&init, &gids), to_tracks(&ref_s, &gids));
+        let (ta, tb) = (to_tracks(&good, &gids), to_tracks(&ref_s, &gids));
         tr_pairs.push((*r, ta, tb));
         prelim.push(pre_cloud);
         refined.push(ref_cloud);
@@ -872,4 +915,191 @@ pub fn run_pipeline(
     );
     std::fs::write(out.join("report.json"), report).map_err(|e| e.to_string())?;
     Ok(res)
+}
+
+#[cfg(test)]
+mod diag {
+    //! 초벌 점 오차 분해 진단(오래 걸려 기본 시험에서 뺀다): `cargo test --release diagnose_preview -- --ignored --nocapture`.
+    use super::*;
+    use crate::dataset::{load_dataset, DatasetConfig};
+    use crate::stream::{apply_cloud, point_pairs};
+    use crate::synth::{Scene, SceneConfig};
+    use crate::verify::{height_pair_median, median, nn_median};
+
+    fn med(mut v: Vec<f64>) -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        median(&mut v)
+    }
+
+    #[test]
+    #[ignore]
+    fn diagnose_preview() {
+        let root = std::env::temp_dir().join(format!("skylens_diag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let scene = Scene::new(SceneConfig {
+            width: 320,
+            height: 180,
+            ..SceneConfig::default()
+        });
+        scene.write_dataset(&root).unwrap();
+        let ds = load_dataset(
+            &root,
+            DatasetConfig {
+                stride: 2,
+                span: 48,
+                ovl: 2,
+                max_skip_run: 2,
+            },
+        )
+        .unwrap();
+        let n = ds.positions.len() * 3;
+        let gids: Vec<usize> = (0..n).collect();
+        let data: Vec<ImgData> = gids
+            .iter()
+            .map(|g| load(&ds.positions[g / 3].images[g % 3], 800).unwrap())
+            .collect();
+        let imgs: Vec<&ImgData> = data.iter().collect();
+        let k = Intrinsics::from_hfov(
+            data[0].rgb.width(),
+            data[0].rgb.height(),
+            65f64.to_radians(),
+        );
+        let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
+        let gps: Vec<Vector3<f64>> = gids
+            .iter()
+            .map(|g| ds.positions[g / 3].image_enu[g % 3])
+            .collect();
+        let pm = match_pairs(&imgs, &views, &k);
+        let init = sparse_init(&imgs, &pm, &gps, &k).unwrap();
+        let mut rs = init.clone();
+        run_ba(&mut rs, &k, 10);
+        gps_align_refined(&mut rs, &gps);
+        // 정답 카메라(첫 GPS 기준 좌표).
+        let truth_pose = |g: usize| -> Pose {
+            let name = ds.positions[g / 3].images[g % 3]
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let v = scene.views.iter().find(|v| v.name == name).unwrap();
+            let c = scene.to_first_gps_frame(&v.camera.pose.center());
+            Pose::from_center(v.camera.pose.rotation, &c)
+        };
+        let tp: Vec<Pose> = gids.iter().map(|&g| truth_pose(g)).collect();
+        let origin = scene.to_first_gps_frame(&Point3::new(0.0, 0.0, 0.0)).coords;
+        let surf = |p: &Vector3<f64>| {
+            let q = p - origin;
+            (q.z - scene.surface_height(q.x, q.y)).abs()
+        };
+        // (a) 포즈 오차
+        let ce = |s: &Sparse| {
+            med((0..n)
+                .map(|i| (s.poses[i].unwrap().center() - tp[i].center()).norm())
+                .collect())
+        };
+        let re = |s: &Sparse| {
+            med((0..n)
+                .map(|i| {
+                    (s.poses[i].unwrap().rotation * tp[i].rotation.inverse())
+                        .angle()
+                        .to_degrees()
+                })
+                .collect())
+        };
+        eprintln!(
+            "DIAG a pose: init center err med {:.2} m rot err med {:.2} deg | refined center {:.2} m rot {:.2} deg",
+            ce(&init), re(&init), ce(&rs), re(&rs)
+        );
+        // (b) 삼각측량: 같은 트랙을 정답 포즈로 삼각측량한 점과 비교, 광선 각 구간별.
+        let ang = ray_angles(&init);
+        let tri_true: Vec<Option<Vector3<f64>>> = init
+            .obs
+            .iter()
+            .map(|o| {
+                let cams: Vec<_> = o
+                    .iter()
+                    .map(|&(i, _, px)| {
+                        (
+                            Camera {
+                                intrinsics: k,
+                                pose: tp[i],
+                            },
+                            px,
+                        )
+                    })
+                    .collect();
+                stand_in::triangulate_track(&cams, 6.0)
+            })
+            .collect();
+        let bins = [(0.0, 1.0), (1.0, 2.0), (2.0, 5.0), (5.0, 90.0)];
+        for (lo, hi) in bins {
+            let ix: Vec<usize> = (0..init.points.len())
+                .filter(|&p| ang[p] >= lo && ang[p] < hi)
+                .collect();
+            let by =
+                |f: &dyn Fn(usize) -> Option<f64>| med(ix.iter().filter_map(|&p| f(p)).collect());
+            eprintln!(
+                "DIAG b ray angle [{lo},{hi}) n {}: surface dist init {:.2} | true-pose tri {:.2} (n ok {}) | refined {:.2} | init-vs-refined shift {:.2}",
+                ix.len(),
+                by(&|p| Some(surf(&init.points[p]))),
+                by(&|p| tri_true[p].map(|x| surf(&x))),
+                ix.iter().filter(|&&p| tri_true[p].is_some()).count(),
+                by(&|p| Some(surf(&rs.points[p]))),
+                by(&|p| Some((init.points[p] - rs.points[p]).norm())),
+            );
+        }
+        // (c) 정렬 대응: 구성과 잔차.
+        let good = well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200);
+        let tb = to_tracks(&rs, &gids);
+        let region = split_regions(ds.positions.len(), ds.config.span, ds.config.ovl)[0];
+        let win = (region.lo, region.hi);
+        let run_align = |s: &Sparse| {
+            let ta = to_tracks(s, &gids);
+            let pairs = point_pairs(&ta, &tb, |i| (i / 3) as usize, win);
+            let (sim, rec) = align_region(&region, &pairs);
+            (sim, rec, pairs)
+        };
+        let (sim_all, rec_all, _) = run_align(&init);
+        let (sim_good, rec_good, _) = run_align(&good);
+        eprintln!(
+            "DIAG c align: all points pairs {} resid med {:?} scale {:?} | angle>=2 pairs {} resid med {:?} scale {:?} (points {} -> {})",
+            rec_all.pairs, rec_all.fit_median_m, rec_all.scale,
+            rec_good.pairs, rec_good.fit_median_m, rec_good.scale,
+            init.points.len(), good.points.len()
+        );
+        // (d) 높이 차 비교: 밀집 점군(초벌 전체 / 초벌 광선 각 필터) vs 정밀, 정답 표면 대비.
+        let inr = vec![true; n];
+        let ref_cloud = dense_cloud(&rs, &imgs, &k, &inr, 96);
+        let xyz = |c: &PointCloud| -> Vec<[f64; 3]> {
+            c.points
+                .iter()
+                .map(|p| [p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64])
+                .collect()
+        };
+        let rx = xyz(&ref_cloud);
+        eprintln!(
+            "DIAG d refined cloud {} pts, surface dist med {:.2}",
+            rx.len(),
+            med(rx
+                .iter()
+                .map(|p| surf(&Vector3::new(p[0], p[1], p[2])))
+                .collect())
+        );
+        for (label, s, sim) in [("all", &init, &sim_all), ("angle>=2", &good, &sim_good)] {
+            let c = dense_cloud(s, &imgs, &k, &inr, 96);
+            let raw = xyz(&c);
+            let al = sim.as_ref().map(|m| xyz(&apply_cloud(m, &c)));
+            eprintln!(
+                "DIAG d preview[{label}] {} pts: raw surface dist {:.2} | aligned nn {:?} dz {:?} surface dist {:?}",
+                raw.len(),
+                med(raw.iter().map(|p| surf(&Vector3::new(p[0], p[1], p[2]))).collect()),
+                al.as_ref().and_then(|a| nn_median(a, &rx)),
+                al.as_ref().and_then(|a| height_pair_median(a, &rx, 2.0)),
+                al.as_ref().map(|a| med(a.iter().map(|p| surf(&Vector3::new(p[0], p[1], p[2]))).collect())),
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
