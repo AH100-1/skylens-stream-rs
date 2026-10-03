@@ -1557,45 +1557,36 @@ pub fn run_pipeline_with(
         }
         // 이미 내보낸 정밀 구역도 새 정밀 모델 좌표계로 다시 맞춘다(공유 3D 점 대응 닮음 변환).
         // 새 구역과 겹치지 않는 구역은 겹치는 이웃을 거쳐 변환을 연쇄 합성한다.
-        let mut total: Vec<Option<Similarity>> = vec![None; recs.len()];
-        total[k] = Some(Similarity::identity());
-        let mut queue = std::collections::VecDeque::from([k]);
-        while let Some(m) = queue.pop_front() {
-            for j in 0..recs.len() {
-                if total[j].is_some() || recs[j].refined.is_none() {
-                    continue;
-                }
-                let tm = &recs[m].refined.as_ref().unwrap().0;
-                let tj = &recs[j].refined.as_ref().unwrap().0;
-                let Some((s, n, med)) = crate::pipeline_stream::realign_refined(
-                    (&recs[j].region, tj),
-                    (&recs[m].region, tm),
-                ) else {
-                    continue;
-                };
-                let acc = total[m].as_ref().unwrap().compose(&s);
-                realigns.push(ReAlign {
-                    secs: t_now(),
-                    region: j,
-                    target: k,
-                    pairs: n,
-                    median_m: med,
-                    scale: acc.s,
-                });
-                let jr = recs[j].region;
-                let moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
-                write_decimated(out, &refined_name(&jr), &moved)?;
-                events.push(format!(
-                    "{:.1}s realign refined {} to refined {} via {} pairs {n} median {med:.3} m",
-                    t_now(),
-                    jr.index,
-                    recs[k].region.index,
-                    recs[m].region.index
-                ));
-                recs[j].rsim = Some(acc);
-                total[j] = Some(acc);
-                queue.push_back(j);
-            }
+        let steps = {
+            let items: Vec<_> = recs
+                .iter()
+                .map(|x| x.refined.as_ref().map(|(t, _)| (x.region, t.as_slice())))
+                .collect();
+            crate::progressive::chain_realign(&items, k)
+        };
+        for st in steps {
+            let (j, acc) = (st.region, st.total);
+            realigns.push(ReAlign {
+                secs: t_now(),
+                region: j,
+                target: k,
+                pairs: st.pairs,
+                median_m: st.median_m,
+                scale: acc.s,
+            });
+            let jr = recs[j].region;
+            let moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
+            write_decimated(out, &refined_name(&jr), &moved)?;
+            events.push(format!(
+                "{:.1}s realign refined {} to refined {} via {} pairs {} median {:.3} m",
+                t_now(),
+                jr.index,
+                recs[k].region.index,
+                recs[st.via].region.index,
+                st.pairs,
+                st.median_m
+            ));
+            recs[j].rsim = Some(acc);
         }
         if realigns.len() > n_realign0 {
             live.snapshot(t_now(), "realign", r.index, &live_state(recs))?;
@@ -1761,6 +1752,7 @@ pub fn run_pipeline_with(
             st.registered,
             st.images
         ));
+        live.note(t_now(), "register", r.index);
         {
             let flags: Vec<bool> = init.poses.iter().map(|p| p.is_some()).collect();
             let tab = crate::pipeline_stream::missing_by_camera(&gids, &flags);
@@ -1981,6 +1973,15 @@ pub fn run_pipeline_with(
     };
     let mut centers: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
     let mut diffs: Vec<f64> = Vec::new();
+    // 정밀 중심도 점군과 같이 최신 정밀 모델 좌표계로 옮긴다.
+    for rec in recs.iter_mut() {
+        if let Some(s) = &rec.rsim {
+            for c in rec.centers.values_mut() {
+                let y = s.apply_point(&Vector3::new(c[0], c[1], c[2]));
+                *c = [y.x, y.y, y.z];
+            }
+        }
+    }
     for rec in &recs {
         let (olo, ohi) = owns[rec.region.index];
         for (&g, c) in &rec.centers {
