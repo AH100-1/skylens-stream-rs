@@ -7,7 +7,7 @@ use skylens_core::dataset::{load_dataset, DatasetConfig};
 use skylens_core::pipeline::{run_pipeline, DenseMethod, PipelineConfig, PositionMethod};
 
 pub const USAGE: &str =
-    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N] [--max-features N] [--dense-width N] [--hfov DEG] [--ba-iters N] [--dense-method sweep|patchmatch] [--position gps|translation-averaging] [--preview-ba-iters N] [--preview-refine-iters N] [--gps-sigma-h M] [--gps-sigma-v M] [--tri-loose-frac F] [--tri-median-k K] [--tri-min-px PX] [--list-only]";
+    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N] [--cross-offset N] [--max-features N] [--dense-width N] [--hfov DEG] [--ba-iters N] [--dense-method sweep|patchmatch] [--position gps|translation-averaging] [--preview-ba-iters N] [--preview-refine-iters N] [--gps-sigma-h M] [--gps-sigma-v M] [--tri-loose-frac F] [--tri-median-k K] [--tri-min-px PX] [--list-only]";
 
 /// 출력 폴더 아래에 만드는 하위 폴더.
 pub const OUTPUT_DIRS: [&str; 3] = ["preview", "refined", "snapshots"];
@@ -80,6 +80,7 @@ fn parse_options(rest: &[&str]) -> Result<(DatasetConfig, PipelineConfig, bool),
             "--span" => &mut cfg.span,
             "--ovl" => &mut cfg.ovl,
             "--max-skip-run" => &mut cfg.max_skip_run,
+            "--cross-offset" => &mut pc.cross_offset,
             _ => return Err(format!("알 수 없는 옵션: {key}")),
         };
         let v = it.next().ok_or_else(|| format!("{key} 뒤에 값이 없음"))?;
@@ -205,6 +206,15 @@ mod tests {
         let (_, pc, _) = parse(&["--dense-method", "sweep", "--position", "gps"]).unwrap();
         assert_eq!(pc.dense_method, DenseMethod::Sweep);
         assert_eq!(pc.position, PositionMethod::GpsLeastSquares);
+    }
+
+    #[test]
+    fn cross_offset_option() {
+        let (_, pc, _) = parse(&[]).unwrap();
+        assert_eq!(pc.cross_offset, 24);
+        let (_, pc, _) = parse(&["--cross-offset", "0"]).unwrap();
+        assert_eq!(pc.cross_offset, 0);
+        assert!(parse(&["--cross-offset", "x"]).is_err());
     }
 
     #[test]

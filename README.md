@@ -72,7 +72,7 @@ skylens-stream --help
 
 ### 합성 장면으로 한 번 돌려 보기
 
-`synth` → `run` → `verify` 를 끝까지 잇는다. 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(`--span 48`)으로 잡는다.
+`synth` → `run` → `verify` 를 끝까지 잇는다. 인자 없이 돌리면 구역은 SPAN 12·OVL 2 이고, 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 R·L 카메라의 구역 창을 `--cross-offset`(기본 24 위치)만큼 뒤로 밀어 한 구역 안에서 세 카메라가 이어진다(기본 장면 3구역, 81/81, verify 7/7: `skylens-stream synth d/in && skylens-stream run d/in d/out && skylens-stream verify d/out`, 시험 `crates/cli/tests/default_path.rs`). 아래 명령은 `--span 48` 로 구역을 크게 잡는 설정이다.
 같은 명령을 `crates/cli/tests/pipeline_e2e.rs` 가 프로세스로 돌려 아래 수치에 상한을 건다(`cargo test --release -p skylens-stream --test pipeline_e2e`, 구역 2개 시험 포함 약 3~6 분).
 
 ```bash

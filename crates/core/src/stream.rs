@@ -79,6 +79,39 @@ pub fn split_regions(n_positions: usize, span: usize, ovl: usize) -> Vec<Region>
         .collect()
 }
 
+/// 카메라(0 F, 1 R, 2 L)마다 구역이 '같은 땅을 보는' 위치 창 `[lo, hi)`.
+/// F 는 기준 창, R·L 은 `offset` 만큼 뒤로 민 창이며 장면 끝(`n_positions`)에서 잘린다.
+/// 밀린 창이 장면 밖으로 완전히 나가면 빈 창이다.
+pub fn camera_window(
+    region: &Region,
+    cam: usize,
+    offset: usize,
+    n_positions: usize,
+) -> (usize, usize) {
+    if cam == 0 {
+        return (region.lo, region.hi.min(n_positions));
+    }
+    (
+        (region.lo + offset).min(n_positions),
+        (region.hi + offset).min(n_positions),
+    )
+}
+
+/// 기준 창 뒤로 이어 붙이는 R·L 보조 위치 범위 `[hi, 밀린 창 끝)`.
+/// 밀린 창이 비어 있지 않을 때만 있고, 기준 창 R·L 사슬에서 밀린 창까지 끊기지 않게 잇는다.
+/// 이 사진들은 등록에만 쓰고 구역 출력·점수에는 넣지 않는다.
+pub fn partner_positions(
+    region: &Region,
+    offset: usize,
+    n_positions: usize,
+) -> std::ops::Range<usize> {
+    let (a, b) = camera_window(region, 1, offset, n_positions);
+    if a >= b {
+        return region.hi..region.hi;
+    }
+    region.hi.min(b)..b
+}
+
 /// 초벌 정렬에 쓰는 이미지의 위치 범위 `[lo, hi)`.
 /// 구역 0 은 자기 구역 전체, 그 외는 `[start-OVL, start+OVL)`.
 pub fn align_window(region: &Region, ovl: usize, n_positions: usize) -> (usize, usize) {
@@ -1088,6 +1121,30 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!((r[0].lo, r[0].hi), (0, 14));
         assert!(split_regions(0, 12, 2).is_empty());
+    }
+
+    #[test]
+    fn camera_windows_and_partners() {
+        let r = split_regions(27, 12, 2);
+        // 구역 0: F 0..14, R·L 24..27(장면 끝에서 잘림), 보조 R·L 은 기준 창 뒤 14..27.
+        assert_eq!(camera_window(&r[0], 0, 24, 27), (0, 14));
+        assert_eq!(camera_window(&r[0], 1, 24, 27), (24, 27));
+        assert_eq!(camera_window(&r[0], 2, 24, 27), (24, 27));
+        assert_eq!(partner_positions(&r[0], 24, 27), 14..27);
+        // 구역 1·2: 밀린 창이 장면 밖이라 비고 보조도 없다.
+        assert_eq!(camera_window(&r[1], 1, 24, 27), (27, 27));
+        assert!(partner_positions(&r[1], 24, 27).is_empty());
+        assert!(partner_positions(&r[2], 24, 27).is_empty());
+        // 이동 0: 세 카메라 같은 창, 보조 없음.
+        assert_eq!(camera_window(&r[1], 2, 0, 27), (10, 26));
+        assert!(partner_positions(&r[1], 0, 27).is_empty());
+        // 80 위치: 구역 1(lo 10, hi 26) R·L 창 34..50, 보조 26..50.
+        let r = split_regions(80, 12, 2);
+        assert_eq!(camera_window(&r[1], 1, 24, 80), (34, 50));
+        assert_eq!(partner_positions(&r[1], 24, 80), 26..50);
+        // 마지막 구역은 80 에서 잘린다.
+        let last = r.last().unwrap();
+        assert!(camera_window(last, 1, 24, 80).1 <= 80);
     }
 
     #[test]

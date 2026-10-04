@@ -71,7 +71,14 @@ pub struct PipelineConfig {
     pub preview_ba_iters: usize,
     /// 초벌 위치 전용 다듬기 반복 수(회전 고정, 카메라 중심만). 0 이면 끈다. BA 가 아니다.
     pub preview_refine_iters: usize,
+    /// R·L 카메라의 구역 창을 F 창보다 뒤로 미는 위치 수(구역 k 의 R·L 창 = F 창 + 이 값, 장면 끝에서 잘림).
+    /// 정답 기하 겹침 표(F-197)에서 F→R·F→L 겹침이 위치 차 +16~+40 에서 10% 이상 생기고
+    /// 카메라 간 짝 일정의 시작(+20~+24)이 이 범위에 든다. 0 이면 밀지 않는다(세 카메라 같은 창).
+    pub cross_offset: usize,
 }
+
+/// 기본 R·L 창 이동량(위치 수).
+pub const DEFAULT_CROSS_OFFSET: usize = 24;
 
 impl PipelineConfig {
     /// BA 사전항에 넘기는 등방 σ.
@@ -106,6 +113,7 @@ impl Default for PipelineConfig {
             gps_sigma_v: 2.0,
             preview_ba_iters: 0,
             preview_refine_iters: 5,
+            cross_offset: DEFAULT_CROSS_OFFSET,
         }
     }
 }
@@ -2110,14 +2118,23 @@ pub fn run_pipeline_with(
             .map(|p| 3 * p)
             .collect();
         let n_help = helpers.len();
+        // R·L 창은 F 창보다 cross_offset 만큼 뒤에 있다: 그 사이 R·L 사진을 보조로 이어 붙여
+        // 구역 F 와 겹치는 R·L 짝이 구역 안에 생기게 한다(등록에만 쓰고 출력에는 넣지 않는다).
+        let partner_pos = crate::stream::partner_positions(r, cfg.cross_offset, n_pos);
+        // 사진은 위치 단위로 도착하므로 보조 R·L 위치는 F 도 함께 읽는다(다음 구역이 그대로 쓴다).
+        // 구역 완료 시점 = 이 구역에 필요한 마지막 위치(보조 끝)의 도착.
+        let arrive_extra: Vec<usize> = partner_pos.clone().map(|p| 3 * p).collect();
+        let n_base = 3 * (r.hi - r.lo);
         let gids: Vec<usize> = helpers
             .into_iter()
             .chain((r.lo..r.hi).flat_map(|p| (0..3).map(move |c| 3 * p + c)))
+            .chain(partner_pos.flat_map(|p| (1..3).map(move |c| 3 * p + c)))
             .collect();
         let t0 = Instant::now();
         let need: Vec<usize> = gids
             .iter()
             .copied()
+            .chain(arrive_extra.iter().copied())
             .filter(|g| !cache.contains_key(g))
             .collect();
         // 사진은 위치 단위로 차례로 도착한다(위치마다 세 카메라 사진을 함께 읽는다).
@@ -2236,7 +2253,10 @@ pub fn run_pipeline_with(
             coarse_start
         };
         st.secs_sparse = t2.elapsed().as_secs_f64();
-        st.registered = init.poses[n_help..].iter().filter(|p| p.is_some()).count();
+        st.registered = init.poses[n_help..n_help + n_base]
+            .iter()
+            .filter(|p| p.is_some())
+            .count();
         st.tracks = init.points.len();
         st.preview_rms = init.rms;
         events.push(format!(

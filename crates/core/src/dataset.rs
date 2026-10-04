@@ -225,6 +225,12 @@ impl Dataset {
         chunk_ranges(self.positions.len(), self.config.span, self.config.ovl)
     }
 
+    /// 구역마다 카메라(F·R·L)별 '같은 땅을 보는' 위치 창. F 는 구역 범위, R·L 은 `offset` 만큼 뒤로
+    /// 밀고 장면 끝에서 자른다(`crate::stream::camera_window` 와 같다).
+    pub fn camera_chunks(&self, offset: usize) -> Vec<[Range<usize>; 3]> {
+        camera_ranges(&self.chunks(), self.positions.len(), offset)
+    }
+
     /// 건너뛴 프레임 번호.
     pub fn skipped_frames(&self) -> Vec<u32> {
         self.skipped.iter().map(|s| s.frame).collect()
@@ -245,6 +251,17 @@ pub fn chunk_ranges(n: usize, span: usize, ovl: usize) -> Vec<Range<usize>> {
         .step_by(span)
         .filter(|&s| s == 0 || s + ovl < n)
         .map(|s| s.saturating_sub(ovl)..(s + span + ovl).min(n))
+        .collect()
+}
+
+/// 구역 범위 목록에서 카메라별 창을 만든다: F 는 그대로, R·L 은 `offset` 뒤로 밀고 `n` 에서 자른다.
+pub fn camera_ranges(chunks: &[Range<usize>], n: usize, offset: usize) -> Vec<[Range<usize>; 3]> {
+    chunks
+        .iter()
+        .map(|c| {
+            let shifted = (c.start + offset).min(n)..(c.end + offset).min(n);
+            [c.clone(), shifted.clone(), shifted]
+        })
         .collect()
 }
 
@@ -613,6 +630,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 카메라별 창(데이터셋)이 스트림 구역의 `camera_window` 와 같고, 장면 끝에서 잘린다.
+    #[test]
+    fn camera_windows_match_stream() {
+        for n in 1..=100 {
+            for off in [0, 24] {
+                let regs = crate::stream::split_regions(n, 12, 2);
+                for (r, w) in regs.iter().zip(camera_windows_of(n, off)) {
+                    for (cam, rng) in w.iter().enumerate() {
+                        let (a, b) = crate::stream::camera_window(r, cam, off, n);
+                        assert_eq!((rng.start, rng.end), (a, b), "{n} {off} {cam}");
+                        assert!(rng.end <= n);
+                    }
+                }
+            }
+        }
+        // 27 위치, 이동 24: 구역 0 의 R·L 창은 24..27, 구역 1·2 는 장면 밖이라 빈 창.
+        let w = camera_windows_of(27, 24);
+        assert_eq!(w[0][0], 0..14);
+        assert_eq!(w[0][1], 24..27);
+        assert_eq!(w[1][0], 10..26);
+        assert!(w[1][1].is_empty() && w[2][2].is_empty());
+    }
+
+    fn camera_windows_of(n: usize, off: usize) -> Vec<[Range<usize>; 3]> {
+        camera_ranges(&chunk_ranges(n, 12, 2), n, off)
     }
 
     #[test]

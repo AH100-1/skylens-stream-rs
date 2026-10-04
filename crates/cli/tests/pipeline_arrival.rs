@@ -7,7 +7,7 @@ use skylens_core::math::{Rotation3, Vector3};
 use skylens_core::pipeline::{run_pipeline_with, PipelineConfig};
 use skylens_core::pipeline_stream::StreamOptions;
 use skylens_core::progressive::chain_realign;
-use skylens_core::stream::{split_regions, Region, Track};
+use skylens_core::stream::{partner_positions, split_regions, Region, Track};
 use skylens_core::synth::{Scene, SceneConfig};
 
 struct Lcg(u64);
@@ -201,7 +201,9 @@ fn arrival_order_and_realigned_centers() {
     // 구역마다: 자기 위치 도착 → 등록 → 초벌 출력 → 정밀 교체, 그리고 초벌 출력은 다음 구역의 새 위치 도착보다 먼저.
     for (i, r) in regs.iter().enumerate().take(res.regions.len()) {
         let ri = r.index;
-        let last_arrival = pos_of("arrive_position", r.hi - 1);
+        // 구역에 필요한 마지막 위치: 기준 창 끝과 R·L 보조(밀린 창) 끝 가운데 뒤쪽.
+        let need_hi = partner_positions(r, cfg.cross_offset, n_pos).end.max(r.hi);
+        let last_arrival = pos_of("arrive_position", need_hi - 1);
         let (reg, co, rf) = (
             pos_of("register", ri),
             pos_of("coarse_output", ri),
@@ -211,11 +213,20 @@ fn arrival_order_and_realigned_centers() {
             last_arrival < reg && reg < co && co < rf,
             "구역 {ri}: {kinds:?}"
         );
+        // 앞 구역이 이미 받은 위치 너머가 새로 필요한 구역이면, 그 도착은 앞 구역 초벌 출력 뒤.
         if i > 0 {
-            assert!(
-                pos_of("coarse_output", regs[i - 1].index) < pos_of("arrive_position", r.hi - 1),
-                "구역 {ri}"
-            );
+            let prev = &regs[i - 1];
+            let prev_hi = regs[..i]
+                .iter()
+                .map(|q| partner_positions(q, cfg.cross_offset, n_pos).end.max(q.hi))
+                .max()
+                .unwrap();
+            if need_hi > prev_hi {
+                assert!(
+                    pos_of("coarse_output", prev.index) < pos_of("arrive_position", need_hi - 1),
+                    "구역 {ri}"
+                );
+            }
         }
         // 다음 구역의 등록은 이전 구역의 등록 뒤.
         if i + 1 < regs.len() {
