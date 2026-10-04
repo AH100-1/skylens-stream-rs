@@ -71,6 +71,35 @@ pub struct PipelineConfig {
     pub preview_ba_iters: usize,
     /// 초벌 위치 전용 다듬기 반복 수(회전 고정, 카메라 중심만). 0 이면 끈다. BA 가 아니다.
     pub preview_refine_iters: usize,
+    /// 정밀 BA 의 손실·재삼각측량 바퀴·초점 정제 선택.
+    pub ba_refine: BaRefine,
+}
+
+/// 정밀 BA 선택지.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BaRefine {
+    /// 재투영 손실.
+    pub loss: crate::ba::Loss,
+    /// BA 바퀴 수(1 = 한 번만). 2 바퀴부터 앞 바퀴 뒤에 오차 큰 관측 제거 + 재삼각측량을 한다.
+    pub rounds: usize,
+    /// 재삼각측량 전 제거하는 재투영 오차 문턱(px).
+    pub reject_px: f64,
+    /// 재삼각측량 뒤 이 광선 각(도)보다 좁은 점은 뺀다.
+    pub min_tri_deg: f64,
+    /// 초점거리(fx, fy)를 BA 에서 같이 푼다.
+    pub free_focal: bool,
+}
+
+impl Default for BaRefine {
+    fn default() -> Self {
+        Self {
+            loss: crate::ba::Loss::Huber(2.0),
+            rounds: 1,
+            reject_px: 4.0,
+            min_tri_deg: 1.5,
+            free_focal: false,
+        }
+    }
 }
 
 impl PipelineConfig {
@@ -106,6 +135,7 @@ impl Default for PipelineConfig {
             gps_sigma_v: 2.0,
             preview_ba_iters: 0,
             preview_refine_iters: 5,
+            ba_refine: BaRefine::default(),
         }
     }
 }
@@ -137,6 +167,12 @@ pub struct PipelineResult {
     pub align: Vec<AlignRecord>,
     /// (사진 이름, 정밀 카메라 중심 동-북-위 m).
     pub centers: Vec<(String, [f64; 3])>,
+    /// (사진 이름, 정밀 포즈). `centers` 와 같은 사진·같은 좌표계.
+    pub poses: Vec<(String, Pose)>,
+    /// 정밀 모델의 관측별 재투영 잔차(px), 구역 순서대로 이어 붙임.
+    pub residuals_px: Vec<f64>,
+    /// 정밀 모델의 점별 삼각측량 최대 광선 각(도).
+    pub tri_angles_deg: Vec<f64>,
 }
 
 struct ImgData {
@@ -1369,6 +1405,19 @@ fn run_ba(
     prior_sigma: f64,
     fixed: &[usize],
 ) -> f64 {
+    run_ba_with(s, k, iters, gps, prior_sigma, fixed, &BaRefine::default()).0
+}
+
+/// `run_ba` + 손실·초점 선택. 반환: (재투영 RMS, 초점을 풀었으면 갱신된 내부 파라미터).
+fn run_ba_with(
+    s: &mut Sparse,
+    k: &Intrinsics,
+    iters: usize,
+    gps: Option<&[Vector3<f64>]>,
+    prior_sigma: f64,
+    fixed: &[usize],
+    ro: &BaRefine,
+) -> (f64, Intrinsics) {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
         .collect();
@@ -1403,7 +1452,17 @@ fn run_ba(
     };
     let opts = BaOptions {
         max_iterations: iters,
-        default_free_intrinsics: [false; 8],
+        loss: ro.loss,
+        default_free_intrinsics: [
+            ro.free_focal,
+            ro.free_focal,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ],
         fixed_cameras: if fixed.is_empty() {
             vec![0]
         } else {
@@ -1427,11 +1486,91 @@ fn run_ba(
             e.0 = p.coords;
         }
     }
-    if iters == 0 {
+    let mut k_out = *k;
+    if ro.free_focal && iters > 0 {
+        k_out.fx = prob.groups[0].fx;
+        k_out.fy = prob.groups[0].fy;
+    }
+    let rms = if iters == 0 {
         rep.initial_rms
     } else {
         rep.final_rms
+    };
+    (rms, k_out)
+}
+
+/// 정밀 BA 뒤 정리: 재투영 오차가 `reject_px` 를 넘는 관측을 빼고 점을 다시 삼각측량한다.
+/// 광선 각이 `min_tri_deg` 보다 좁은 점은 점·관측 목록에서 뺀다(BA 전용 점도 같다).
+fn retriangulate(s: &mut Sparse, k: &Intrinsics, ro: &BaRefine) {
+    type Obs = Vec<(usize, usize, Vector2<f64>)>;
+    let poses = &s.poses;
+    let fix = |x: &Vector3<f64>, obs: &Obs| -> Option<(Vector3<f64>, Obs)> {
+        let mut cams: Vec<(Camera, Vector2<f64>, usize, usize)> = Vec::new();
+        for &(i, f, px) in obs {
+            let Some(p) = poses[i] else { continue };
+            let cam = Camera {
+                intrinsics: *k,
+                pose: p,
+            };
+            if let Some(q) = cam.project(&Point3::from(*x)) {
+                if (q - px).norm() <= ro.reject_px {
+                    cams.push((cam, px, i, f));
+                }
+            }
+        }
+        if cams.len() < 2 {
+            return None;
+        }
+        let list: Vec<(Camera, Vector2<f64>)> = cams.iter().map(|c| (c.0, c.1)).collect();
+        let nx = stand_in::triangulate_track(&list, f64::INFINITY)?;
+        let rays: Vec<Vector3<f64>> = list
+            .iter()
+            .filter_map(|(c, _)| {
+                let d = nx - c.pose.center().coords;
+                (d.norm() > 1e-9).then(|| d.normalize())
+            })
+            .collect();
+        let mut best = 0.0f64;
+        for a in 0..rays.len() {
+            for b in a + 1..rays.len() {
+                best = best.max(rays[a].angle(&rays[b]).to_degrees());
+            }
+        }
+        (best >= ro.min_tri_deg).then(|| (nx, cams.iter().map(|c| (c.2, c.3, c.1)).collect()))
+    };
+    let (mut pts, mut obs) = (Vec::new(), Vec::new());
+    for (x, o) in s.points.iter().zip(&s.obs) {
+        if let Some((nx, no)) = fix(x, o) {
+            pts.push(nx);
+            obs.push(no);
+        }
     }
+    let ba_only: Vec<_> = s.ba_only.iter().filter_map(|(x, o)| fix(x, o)).collect();
+    // 점이 너무 많이 줄면 되돌린다(구름·BA 가 비지 않게).
+    if pts.len() * 2 >= s.points.len() {
+        s.points = pts;
+        s.obs = obs;
+        s.ba_only = ba_only;
+    }
+}
+
+/// 관측별 재투영 잔차(px). 카메라 뒤 관측은 뺀다.
+fn reproj_residuals(s: &Sparse, k: &Intrinsics) -> Vec<f64> {
+    let mut v = Vec::new();
+    for (x, o) in s.points.iter().zip(&s.obs) {
+        for &(i, _, px) in o {
+            if let Some(p) = s.poses[i] {
+                let cam = Camera {
+                    intrinsics: *k,
+                    pose: p,
+                };
+                if let Some(q) = cam.project(&Point3::from(*x)) {
+                    v.push((q - px).norm());
+                }
+            }
+        }
+    }
+    v
 }
 
 /// 점마다 관측 광선 사이의 최대 각(도). 광선 각이 작은 점은 깊이가 불안정하다.
@@ -1792,6 +1931,7 @@ struct RegionRec {
     /// 정밀 구역 → 가장 최근 정밀 모델 좌표계 닮음 변환(공유 3D 점 대응).
     rsim: Option<Similarity>,
     centers: BTreeMap<usize, [f64; 3]>,
+    diag: (Vec<f64>, Vec<f64>),
     registered_prev: Vec<usize>,
     /// gids 앞쪽 보조 사진 수(출력·점수 제외).
     n_help: usize,
@@ -1820,6 +1960,7 @@ fn live_state(recs: &[RegionRec]) -> Vec<crate::pipeline_stream::LiveRegion<'_>>
 
 /// 정밀(BA) 작업 결과.
 struct RefinedMsg {
+    diag: (Vec<f64>, Vec<f64>),
     slot: usize,
     sparse: Sparse,
     cloud: PointCloud,
@@ -1946,6 +2087,7 @@ pub fn run_pipeline_with(
                 rec.rposes.insert(*g, p);
             }
         }
+        rec.diag = m.diag.clone();
         rec.stats.refined_rms = m.sparse.rms;
         rec.stats.refined_points = m.cloud.len();
         rec.stats.secs_ba = m.secs;
@@ -2331,6 +2473,7 @@ pub fn run_pipeline_with(
             refined: None,
             rsim: None,
             centers: BTreeMap::new(),
+            diag: (Vec::new(), Vec::new()),
             registered_prev,
             n_help,
             rposes: HashMap::new(),
@@ -2345,6 +2488,7 @@ pub fn run_pipeline_with(
             let (gps, dw, iters, dmethod) =
                 (gps.clone(), cfg.dense_width, cfg.ba_iters, cfg.dense_method);
             let psig = cfg.prior_sigma();
+            let ro = cfg.ba_refine;
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
             in_flight += 1;
@@ -2361,16 +2505,27 @@ pub fn run_pipeline_with(
                         fixed.push(*i);
                     }
                 }
+                let mut kk = k;
                 rs.rms = crate::timing::timed("ba_refined", || {
-                    run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
+                    let (rms, k2) = run_ba_with(&mut rs, &kk, iters, Some(&gps), psig, &fixed, &ro);
+                    kk = k2;
+                    rms
                 });
+                for _ in 1..ro.rounds {
+                    retriangulate(&mut rs, &kk, &ro);
+                    let (rms, k2) = run_ba_with(&mut rs, &kk, iters, Some(&gps), psig, &fixed, &ro);
+                    kk = k2;
+                    rs.rms = rms;
+                }
                 if anchor.is_none() {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {
-                    dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod)
+                    dense_cloud(&rs, &imgs, &kk, &in_region, dw, dmethod)
                 });
+                let diag = (reproj_residuals(&rs, &kk), ray_angles(&rs));
                 let _ = tx.send(RefinedMsg {
+                    diag,
                     slot,
                     sparse: rs,
                     cloud,
@@ -2512,6 +2667,25 @@ pub fn run_pipeline_with(
     for (g, c) in &centers {
         poses_txt += &format!("{} {} {} {}\n", name(*g), c[0], c[1], c[2]);
         res.centers.push((name(*g), *c));
+    }
+    for rec in &recs {
+        res.residuals_px.extend_from_slice(&rec.diag.0);
+        res.tri_angles_deg.extend_from_slice(&rec.diag.1);
+    }
+    for rec in &recs {
+        let (olo, ohi) = owns[rec.region.index];
+        for (&g, p) in &rec.rposes {
+            if !rec.centers.contains_key(&g) {
+                continue;
+            }
+            let own = g / 3 >= olo && g / 3 < ohi;
+            let nm = name(g);
+            let have = res.poses.iter().any(|(n, _)| *n == nm);
+            if own || !have {
+                res.poses.retain(|(n, _)| *n != nm);
+                res.poses.push((nm, *p));
+            }
+        }
     }
     std::fs::write(out.join("poses.txt"), poses_txt).map_err(|e| e.to_string())?;
     let (mut reg_prev, mut reg_ref) = (
