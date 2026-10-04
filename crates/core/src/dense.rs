@@ -742,6 +742,16 @@ pub fn remove_speckles(map: &mut DepthMap, rel: f32, min_px: usize) -> usize {
     removed
 }
 
+/// 융합 전 깊이 지도 걸러내기 기본값: 반점 제거(상대 깊이차 0.007, 100 화소 미만).
+const SPECKLE_REL: f32 = 0.007;
+const SPECKLE_MIN_PX: usize = 100;
+
+fn filter_depth_maps(maps: &mut [DepthMap]) {
+    maps.par_iter_mut().for_each(|m| {
+        remove_speckles(m, SPECKLE_REL, SPECKLE_MIN_PX);
+    });
+}
+
 fn fuse_stage(st: &DepthStage, cfg: &DenseConfig) -> PointCloud {
     fuse_stage_with(st, &fusion_config(cfg))
 }
@@ -751,6 +761,7 @@ fn fusion_config(cfg: &DenseConfig) -> FusionConfig {
         reproj_px: cfg.reproj_px,
         depth_rel: cfg.depth_rel,
         min_views: cfg.min_views.max(1),
+        normal_deg: 25.0,
         ..FusionConfig::default()
     }
 }
@@ -782,6 +793,8 @@ fn region_cloud_impl(
     let Some(st) = depth_stage(views, sparse_points, cfg, estimate, sweep, take_nbrs) else {
         return PointCloud::default();
     };
+    let mut st = st;
+    filter_depth_maps(&mut st.maps);
     crate::timing::add("dense_depth", t_depth.elapsed().as_secs_f64());
     let t_fuse = std::time::Instant::now();
     let cloud = fuse_stage(&st, cfg);
@@ -1077,8 +1090,23 @@ mod tests {
         let st = gt_stage.unwrap();
         let base = fusion_config(&cfg);
         let variants: Vec<(&str, bool, FusionConfig)> = vec![
-            ("기준", false, base),
+            (
+                "기준(법선 30도)",
+                false,
+                FusionConfig {
+                    normal_deg: 30.0,
+                    ..base
+                },
+            ),
             ("반점 제거", true, base),
+            (
+                "반점 제거+법선 25도",
+                true,
+                FusionConfig {
+                    normal_deg: 25.0,
+                    ..base
+                },
+            ),
             (
                 "위치 중앙값",
                 false,
@@ -1137,6 +1165,7 @@ mod tests {
                 },
             ),
         ];
+        let mut results = Vec::new();
         for (name, speckle, fc) in variants {
             let mut st2 = DepthStage {
                 preps: Vec::new(),
@@ -1161,11 +1190,56 @@ mod tests {
             }
             let cloud = fuse_stage_with(&st2, &fc);
             let (med, p95, over1) = dist_stats(&s, &cloud);
+            results.push((name, med, p95, over1));
             eprintln!(
                 "VARIANT {name}: points {} med {med:.4} p95 {p95:.4} over1m {over1:.4} speckle_removed {removed}",
                 cloud.len()
             );
         }
+        let get = |n: &str| results.iter().find(|r| r.0 == n).copied().unwrap();
+        let (_, m0, p0, o0) = get("기준(법선 30도)");
+        let (_, m1, p1, o1) = get("반점 제거+법선 25도");
+        assert!(
+            m1 < m0 && p1 < 0.8 * p0 && o1 < 0.2 * o0,
+            "{m0} {p0} {o0} -> {m1} {p1} {o1}"
+        );
+        assert!(
+            m1 < 0.07 && p1 < 0.29,
+            "반점 제거+법선 25도: 중앙 {m1} 95% {p1}"
+        );
+    }
+
+    #[test]
+    fn speckles_are_removed_and_big_regions_kept() {
+        let (w, h) = (40usize, 40usize);
+        let mut m = DepthMap {
+            w,
+            h,
+            depth: vec![0.0; w * h],
+            normal: vec![[0.0, 0.0, 1.0]; w * h],
+            cost: vec![0.1; w * h],
+        };
+        // 20x20 평면(400화소)과 떨어진 3x3 조각(9화소), 깊이는 크게 다르다.
+        for y in 0..20 {
+            for x in 0..20 {
+                m.depth[y * w + x] = 10.0;
+            }
+        }
+        for y in 30..33 {
+            for x in 30..33 {
+                m.depth[y * w + x] = 10.0;
+            }
+        }
+        // 큰 평면 옆에 깊이가 크게 다른 이웃(별도 성분, 5화소).
+        for x in 20..25 {
+            m.depth[x] = 20.0;
+        }
+        let removed = remove_speckles(&mut m, 0.007, 100);
+        assert_eq!(removed, 14);
+        assert_eq!(m.depth[0], 10.0);
+        assert_eq!(m.depth[31 * w + 31], 0.0);
+        assert_eq!(m.depth[22], 0.0);
+        assert_eq!(m.cost[22], 1.0);
     }
 
     const POINTS48: usize = 300_000;
