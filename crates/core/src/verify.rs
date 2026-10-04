@@ -643,7 +643,7 @@ fn check_snapshots(
 
     // 단조 증가: 정수 단계 사이에만 (같은 수 허용).
     for w in ints.windows(2) {
-        if w[1].points < w[0].points {
+        if crate::stream::snapshot_count_decreased(w[0].points, w[1].points) {
             problems.push(format!(
                 "점 수 감소 단계 {}→{}: {}→{}",
                 w[0].step.unwrap_or(0),

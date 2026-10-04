@@ -8,7 +8,7 @@ use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
 
 const USAGE: &str = "사용법:\n  skylens-stream ply-info <파일.ply>\n  skylens-stream synth <출력 폴더> [폭 높이]\n  \
-     skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N]\n  \
+     skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N]\n       [--max-features N] [--dense-width N] [--hfov DEG] [--ba-iters N] [--dense-method sweep|patchmatch]\n       [--position gps|translation-averaging] [--preview-ba-iters N] [--preview-refine-iters N] [--gps-sigma-h M] [--gps-sigma-v M]\n       [--tri-loose-frac F] [--tri-median-k K] [--tri-min-px PX] [--list-only]\n  \
      skylens-stream verify <출력 폴더>\n  \
      skylens-stream --version\n  skylens-stream --help\n  \
      (출력 폴더는 빈 문자열 불가, 폭·높이는 16..=8192 의 숫자만(부호 불가), 둘 다 주거나 둘 다 생략)";
