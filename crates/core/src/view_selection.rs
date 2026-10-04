@@ -27,6 +27,10 @@ pub const TARGET_ANGLE_DEG: f64 = 10.0;
 pub const SIGMA_BELOW_DEG: f64 = 5.0;
 /// 목표보다 큰 각 쪽 감점 폭(도).
 pub const SIGMA_ABOVE_DEG: f64 = 15.0;
+/// 이웃으로 인정하는 최소 광선 사이 각(도) 기본값: 0 = 제한 없음. 자세 오차가 있으면 깊이 오차가
+/// (회전 오차 / 각)으로 커지므로 [`NeighborConfig::min_angle_deg`] 를 8 로 올리면 좋아지지만
+/// 기선이 짧은 장면에서 이웃이 비므로 기본으로 바꾸지 않았다(시험 `dense_pose_noise` 참고).
+pub const MIN_ANGLE_DEG: f64 = 0.0;
 /// 깊이 범위 분위(아래, 위).
 pub const DEPTH_QUANTILES: (f64, f64) = (0.05, 0.95);
 /// 깊이 범위 여유: 가까운 끝 × (1 − m), 먼 끝 × (1 + m).
@@ -50,17 +54,57 @@ pub struct SparsePoint {
     pub observers: Vec<usize>,
 }
 
-/// 광선 사이 각(라디안)에 대한 가중치.
-pub fn angle_weight(theta: f64) -> f64 {
-    let t0 = TARGET_ANGLE_DEG.to_radians();
-    let s = if theta < t0 {
-        SIGMA_BELOW_DEG
-    } else {
-        SIGMA_ABOVE_DEG
+/// 이웃 점수 설정. 기본값은 위 상수(최소 각 [`MIN_ANGLE_DEG`], 상한 180° 라 제외 없음)와 같다.
+///
+/// 자세 오차가 있을 때 두 시점 깊이 오차는 대략 (회전 오차 / 삼각측량 각) 이므로
+/// 최소 각을 올리고 최적 각을 키우면 작은 각 쌍이 점수를 못 얻는다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NeighborConfig {
+    /// 이 각(도)보다 작은 쌍 점은 점수 0.
+    pub min_angle_deg: f64,
+    /// 가중치가 1 인 목표 각(도).
+    pub target_angle_deg: f64,
+    /// 목표보다 작은 각 쪽 감점 폭(도).
+    pub sigma_below_deg: f64,
+    /// 목표보다 큰 각 쪽 감점 폭(도).
+    pub sigma_above_deg: f64,
+    /// 이 각(도)보다 큰 쌍 점은 점수 0.
+    pub max_angle_deg: f64,
+}
+
+impl Default for NeighborConfig {
+    fn default() -> Self {
+        Self {
+            min_angle_deg: MIN_ANGLE_DEG,
+            target_angle_deg: TARGET_ANGLE_DEG,
+            sigma_below_deg: SIGMA_BELOW_DEG,
+            sigma_above_deg: SIGMA_ABOVE_DEG,
+            max_angle_deg: 180.0,
+        }
     }
-    .to_radians();
-    let d = (theta - t0) / s;
-    (-0.5 * d * d).exp()
+}
+
+impl NeighborConfig {
+    /// 광선 사이 각(라디안)에 대한 가중치. 최소·상한 밖이면 0.
+    pub fn angle_weight(&self, theta: f64) -> f64 {
+        if theta < self.min_angle_deg.to_radians() || theta > self.max_angle_deg.to_radians() {
+            return 0.0;
+        }
+        let t0 = self.target_angle_deg.to_radians();
+        let s = if theta < t0 {
+            self.sigma_below_deg
+        } else {
+            self.sigma_above_deg
+        }
+        .to_radians();
+        let d = (theta - t0) / s;
+        (-0.5 * d * d).exp()
+    }
+}
+
+/// 광선 사이 각(라디안)에 대한 가중치(기본 설정).
+pub fn angle_weight(theta: f64) -> f64 {
+    NeighborConfig::default().angle_weight(theta)
 }
 
 /// 축척 비 가중치: 두 화소 크기 a, b(> 0)에 대해 (min/max)².
@@ -82,13 +126,18 @@ fn footprint(view: &View, x: &Point3<f64>) -> Option<f64> {
 
 /// 두 사진이 함께 본 점 하나의 쌍 점수.
 pub fn pair_score(a: &View, b: &View, x: &Point3<f64>) -> f64 {
+    pair_score_with(a, b, x, &NeighborConfig::default())
+}
+
+/// [`pair_score`] 의 설정 지정판.
+pub fn pair_score_with(a: &View, b: &View, x: &Point3<f64>, cfg: &NeighborConfig) -> f64 {
     let (Some(fa), Some(fb)) = (footprint(a, x), footprint(b, x)) else {
         return 0.0;
     };
     let ra = a.cam.pose.center() - x;
     let rb = b.cam.pose.center() - x;
     let c = (ra.dot(&rb) / (ra.norm() * rb.norm())).clamp(-1.0, 1.0);
-    let s = angle_weight(c.acos()) * scale_weight(fa, fb);
+    let s = cfg.angle_weight(c.acos()) * scale_weight(fa, fb);
     if s.is_finite() {
         s
     } else {
@@ -101,6 +150,16 @@ pub fn pair_score(a: &View, b: &View, x: &Point3<f64>) -> f64 {
 /// 반환값 `out[i]` 는 `views[i]` 의 이웃들을 점수 내림차순으로 담은 `views` 안 위치(색인)다.
 /// 관측자 id 가 `views` 에 없으면 무시한다.
 pub fn select_neighbors(views: &[View], points: &[SparsePoint], k: usize) -> Vec<Vec<usize>> {
+    select_neighbors_with(views, points, k, &NeighborConfig::default())
+}
+
+/// [`select_neighbors`] 의 설정 지정판.
+pub fn select_neighbors_with(
+    views: &[View],
+    points: &[SparsePoint],
+    k: usize,
+    cfg: &NeighborConfig,
+) -> Vec<Vec<usize>> {
     let pos: HashMap<usize, usize> = views.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
     let n = views.len();
     let mut score = vec![0.0f64; n * n];
@@ -115,7 +174,7 @@ pub fn select_neighbors(views: &[View], points: &[SparsePoint], k: usize) -> Vec
         obs.dedup();
         for (a, &i) in obs.iter().enumerate() {
             for &j in &obs[a + 1..] {
-                let s = pair_score(&views[i], &views[j], &p.xyz);
+                let s = pair_score_with(&views[i], &views[j], &p.xyz, cfg);
                 score[i * n + j] += s;
                 score[j * n + i] += s;
             }
