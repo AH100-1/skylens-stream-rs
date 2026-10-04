@@ -2032,6 +2032,7 @@ pub fn run_pipeline_with(
                 pairs: ar.pairs,
                 median_m: ar.fit_median_m.unwrap_or(f64::NAN),
                 scale: s.s,
+                applied: true,
             });
             rec.sim = sim;
             rec.target = Some(k);
@@ -2051,7 +2052,7 @@ pub fn run_pipeline_with(
             r.index,
             m.sparse.rms
         ));
-        let n_realign0 = realigns.len();
+        let n_realign0 = realigns.iter().filter(|a| a.applied).count();
         // 이미 내보낸, 아직 정밀이 없는 초벌 구역을 새 정밀 모델 좌표로 다시 맞춘다.
         for j in 0..recs.len() {
             if j == k || recs[j].refined.is_some() {
@@ -2069,6 +2070,7 @@ pub fn run_pipeline_with(
                     pairs: n,
                     median_m: med,
                     scale: s.s,
+                    applied: true,
                 });
                 let jr = recs[j].region;
                 write_decimated(
@@ -2101,6 +2103,7 @@ pub fn run_pipeline_with(
         let mut rejected: Vec<usize> = Vec::new();
         for st in steps {
             let (j, acc) = (st.region, st.total);
+            let ri = realigns.len();
             realigns.push(ReAlign {
                 secs: t_now(),
                 region: j,
@@ -2108,12 +2111,14 @@ pub fn run_pipeline_with(
                 pairs: st.pairs,
                 median_m: st.median_m,
                 scale: acc.s,
+                applied: true,
             });
             let jr = recs[j].region;
             if rejected.contains(&st.via) {
                 rejected.push(j);
+                realigns[ri].applied = false;
                 events.push(format!(
-                    "{:.1}s realign refined {} to refined {} via {} pairs {} median {:.3} m rejected: via region was rejected",
+                    "{:.1}s realign rejected refined {} to refined {} via {} pairs {} median {:.3} m: via region was rejected",
                     t_now(),
                     jr.index,
                     recs[k].region.index,
@@ -2166,8 +2171,9 @@ pub fn run_pipeline_with(
                 let a = med(&|v| acc.apply_point(v));
                 if a > b + REALIGN_CAM_SLACK_M {
                     rejected.push(j);
+                    realigns[ri].applied = false;
                     events.push(format!(
-                        "{:.1}s realign refined {} to refined {} via {} pairs {} median {:.3} m rejected: shared cameras {} center disagreement before {b:.3} m after {a:.3} m",
+                        "{:.1}s realign rejected refined {} to refined {} via {} pairs {} median {:.3} m: shared cameras {} center disagreement before {b:.3} m after {a:.3} m",
                         t_now(),
                         jr.index,
                         recs[k].region.index,
@@ -2206,7 +2212,7 @@ pub fn run_pipeline_with(
             }
             recs[j].rsim = Some(acc);
         }
-        if realigns.len() > n_realign0 {
+        if realigns.iter().filter(|a| a.applied).count() > n_realign0 {
             live.snapshot(t_now(), "realign", r.index, &live_state(recs))?;
         }
         Ok(())
@@ -2436,6 +2442,7 @@ pub fn run_pipeline_with(
                     pairs: n,
                     median_m: med,
                     scale: s.s,
+                    applied: true,
                 });
                 events.push(format!(
                     "{:.1}s coarse region {} aligned to refined {} pairs {n} median {med:.3} m",
@@ -2805,12 +2812,12 @@ pub fn run_pipeline_with(
             ))
             .collect::<Vec<_>>()
             .join(", "),
-        realigns.len(),
+        realigns.iter().filter(|a| a.applied).count(),
         realigns
             .iter()
             .map(|a| format!(
-                "{{\"secs\": {:.2}, \"region\": {}, \"target\": {}, \"pairs\": {}, \"median_m\": {:.4}, \"scale\": {:.5}}}",
-                a.secs, recs[a.region].region.index, recs[a.target].region.index, a.pairs, a.median_m, a.scale
+                "{{\"secs\": {:.2}, \"region\": {}, \"target\": {}, \"pairs\": {}, \"median_m\": {:.4}, \"scale\": {:.5}, \"applied\": {}}}",
+                a.secs, recs[a.region].region.index, recs[a.target].region.index, a.pairs, a.median_m, a.scale, a.applied
             ))
             .collect::<Vec<_>>()
             .join(", "),

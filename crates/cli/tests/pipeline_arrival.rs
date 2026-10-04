@@ -223,15 +223,11 @@ fn arrival_order_and_realigned_centers() {
         }
     }
     assert_eq!(kinds.last().unwrap().0, "final");
-    // 재정렬: 정밀 교체 뒤에 realign 사건이 있고, 마지막 정밀 구역이 나온 뒤 이전 정밀 구역이 다시 맞춰진다.
+    // 재정렬: realign 스냅샷은 적용된 재정렬이 있을 때만 남는다(아래 보고서 검사).
     let last_ref = kinds
         .iter()
         .rposition(|(k, _)| k == "refined_replace")
         .unwrap();
-    assert!(
-        kinds[last_ref..].iter().any(|(k, _)| k == "realign"),
-        "{kinds:?}"
-    );
 
     // 보고서 사건 문장: 초벌 출력 직전에 최신 정밀 위로 맞춘 기록, 정밀 재정렬 기록과 잔차.
     let rep = std::fs::read_to_string(out.join("report.json")).unwrap_or_default();
@@ -249,7 +245,11 @@ fn arrival_order_and_realigned_centers() {
     {
         eprintln!("  {l}");
     }
-    assert!(n_ref_realign >= 1);
+    // 마지막 정밀 구역 뒤의 realign 스냅샷은 적용된 정밀 재정렬이 있을 때만 있다.
+    let snap_after = kinds[last_ref..].iter().any(|(k, _)| k == "realign");
+    assert_eq!(snap_after, n_ref_realign >= 1, "{kinds:?}");
+    // 이 장면은 구역 1→2 정밀 재정렬을 버린다(공유 카메라 불일치): 버린 사건 줄이 있어야 한다.
+    assert!(count_at(&log, "realign rejected refined") >= 1);
     let meds: Vec<f64> = log
         .split("\", \"")
         .filter(|l| l.contains("realign refined"))
@@ -259,6 +259,50 @@ fn arrival_order_and_realigned_centers() {
         })
         .collect();
     assert!(meds.iter().all(|m| *m < REALIGN_MEDIAN_BOUND), "{meds:?}");
+
+    // manifest realigns: 버린 재정렬은 applied=false 로 남고, realign_count·median 상한은 적용된 것만 본다.
+    let entries: Vec<&str> = log
+        .split("{\"secs\"")
+        .skip(1)
+        .map(|e| e.split('}').next().unwrap())
+        .collect();
+    let field = |e: &str, key: &str| -> f64 {
+        let t = e.split(&format!("\"{key}\": ")).nth(1).unwrap();
+        t.split([',', ' ']).next().unwrap().parse().unwrap()
+    };
+    let applied: Vec<&&str> = entries
+        .iter()
+        .filter(|e| e.contains("\"applied\": true"))
+        .collect();
+    let dropped = entries
+        .iter()
+        .filter(|e| e.contains("\"applied\": false"))
+        .count();
+    assert_eq!(applied.len() + dropped, entries.len(), "{entries:?}");
+    assert_eq!(count_at(&log, "\"realign_count\": "), 1, "realign_count 키");
+    let cnt: usize = log
+        .split("\"realign_count\": ")
+        .nth(1)
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(cnt, applied.len(), "realign_count 는 적용된 것만");
+    assert_eq!(
+        count_at(&log, "realign rejected"),
+        dropped,
+        "버린 재정렬 사건 수와 applied=false 수"
+    );
+    // 버린 재정렬의 (구역, 기준 구역, 점쌍 수) 은 적용된 항목에 없고, 정밀↔정밀 median 상한은 위 사건 줄(적용된 것만)에 건다.
+    for d in entries.iter().filter(|e| e.contains("\"applied\": false")) {
+        let key = |e: &str| (field(e, "region"), field(e, "target"), field(e, "pairs"));
+        assert!(
+            !applied.iter().any(|a| key(a) == key(d)),
+            "버린 재정렬이 적용 목록에도 있다: {d}"
+        );
+    }
 
     // 최종 정밀 중심 대 정답(합성 장면 GPS 는 잡음 없는 위치): 구역 0 이 맡은 앞쪽 위치 포함 전체.
     let mut errs: Vec<(usize, f64)> = Vec::new();
