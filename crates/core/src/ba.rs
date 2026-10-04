@@ -575,7 +575,7 @@ fn linearize(
             }
             blk.w.push(wrow);
         }
-        if let Some((x0, sg)) = pp.and_then(|q| q.target(p).map(|(x, s)| (x, s))) {
+        if let Some((x0, sg)) = pp.and_then(|q| q.target(p)) {
             let k = pp.map_or(3.0, |q| q.huber_k);
             let r = (problem.points[p] - x0) / sg;
             let w = Loss::Huber(k).weight(r.norm_squared());

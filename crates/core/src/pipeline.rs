@@ -1224,6 +1224,7 @@ fn linked_targets(s: &Sparse, gids: &[usize], an: &Anchor) -> Vec<Option<Vector3
 
 /// 직전 정밀 구역에 닮음 변환으로 먼저 맞추고, 공유 점마다 재투영 px σ 에서 환산한 3D σ 를 만든다.
 /// 반환: 점별 (기준 위치, 3D σ), 연결된 점 수.
+#[allow(clippy::type_complexity)]
 fn link_to_previous(
     s: &mut Sparse,
     gids: &[usize],
@@ -1729,6 +1730,7 @@ struct RegionRec {
     /// 기준 구역과의 정렬 기록: (직전 구역 번호, 점 쌍 수, 잔차 중앙 m, 스케일).
     anchored: Option<(usize, usize, f64, f64)>,
     /// 등록된 사진 표시(gids 순서).
+    #[allow(dead_code)]
     reg_flags: Vec<bool>,
 }
 
