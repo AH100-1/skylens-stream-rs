@@ -23,15 +23,16 @@ pub struct Args {
 }
 
 impl Default for Args {
-    /// 인자 없는 실행: 24장(위치 8)·480×270·반복 3·번들 조정 점 3000.
+    /// 인자 없는 실행: 24장(위치 8)·480×270·반복 1·짝 상한 40·번들 조정 점 3000.
+    /// 4 코어 측정 기계에서 수 분 안에 끝나는 규모다. 기준 규모(240장)는 `--full`.
     fn default() -> Self {
         Args {
             positions: 8,
             width: 480,
             height: 270,
-            repeat: 3,
+            repeat: 1,
             threads: 0,
-            max_pairs: 0,
+            max_pairs: 40,
             ba_points: 3000,
             json: None,
             mode: "pipeline".to_string(),
@@ -50,6 +51,7 @@ fn apply_preset(a: &mut Args, name: &str) {
             a.width = d.width;
             a.height = d.height;
             a.repeat = d.repeat;
+            a.max_pairs = d.max_pairs;
             a.ba_points = d.ba_points;
         }
         "--full" => {
@@ -57,6 +59,7 @@ fn apply_preset(a: &mut Args, name: &str) {
             a.width = 960;
             a.height = 540;
             a.repeat = 3;
+            a.max_pairs = 0;
             a.ba_points = 20_000;
         }
         _ => unreachable!("묶음 인자가 아니다: {name}"),
