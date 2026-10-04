@@ -473,6 +473,142 @@ pub fn similarity_fixed_up(
     Some(Similarity { s, r, t })
 }
 
+/// 가중 닮음 정렬 선택지. 기본(`w_z` = 1, `up_weight` = 0)은 꺼짐 = 기존 강건 닮음 정렬.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AlignWeights {
+    /// 수직(z) 잔차 가중 배수(수평 1). 1 이면 등방.
+    pub w_z: f64,
+    /// 위 방향 사전항 세기. 0 이면 끔. 1 은 대응 전체의 데이터항과 비슷한 세기(아래 [`weighted_similarity`] 참고).
+    pub up_weight: f64,
+}
+
+impl Default for AlignWeights {
+    fn default() -> Self {
+        Self {
+            w_z: 1.0,
+            up_weight: 0.0,
+        }
+    }
+}
+
+impl AlignWeights {
+    /// 기존 정렬과 같은가(꺼짐).
+    pub fn is_off(&self) -> bool {
+        self.w_z == 1.0 && self.up_weight == 0.0
+    }
+}
+
+/// 카메라 중심 분포의 주축 표준편차(내림차순, 단위는 입력 단위). 첫째 대비 둘째·셋째 비가 작으면
+/// 중심이 일직선·평면에 가까워 가장 약한 축 둘레 회전이 약하게 정해진다.
+pub fn spread_axes(pts: &[Vector3<f64>]) -> [f64; 3] {
+    let n = pts.len().max(1) as f64;
+    let mu = pts.iter().sum::<Vector3<f64>>() / n;
+    let mut cov = Matrix3::zeros();
+    for p in pts {
+        let d = p - mu;
+        cov += d * d.transpose();
+    }
+    cov /= n;
+    let mut ev: Vec<f64> = cov
+        .symmetric_eigenvalues()
+        .iter()
+        .map(|&e| e.max(0.0).sqrt())
+        .collect();
+    ev.sort_by(|a, b| b.total_cmp(a));
+    [ev[0], ev[1], ev[2]]
+}
+
+fn skew(v: &Vector3<f64>) -> Matrix3<f64> {
+    Matrix3::new(0.0, -v.z, v.y, v.z, 0.0, -v.x, -v.y, v.x, 0.0)
+}
+
+/// 수직 가중 + 위 방향 사전항 닮음 정렬(가우스-뉴턴, 초기값 `init`).
+///
+/// 최소화: Σ |W(s·R·xᵢ + t − yᵢ)|² + |λ(R·u − e_z)|², W = diag(1, 1, w_z),
+/// λ = up_weight · √N · (목표 중심의 평균제곱근 반경). `up_src` 는 복원 좌표의 위 방향 u(단위화함).
+/// 사전항이 없으면(`up_src` 가 `None` 또는 `up_weight` 0) 가중만 쓴다.
+pub fn weighted_similarity(
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    init: &Similarity,
+    wt: &AlignWeights,
+    up_src: Option<&Vector3<f64>>,
+) -> Option<Similarity> {
+    let n = src.len();
+    if n != dst.len() || n < 3 || !(wt.w_z.is_finite() && wt.w_z > 0.0) {
+        return None;
+    }
+    if !src.iter().chain(dst.iter()).all(finite) {
+        return None;
+    }
+    let nf = n as f64;
+    let mu_d = dst.iter().sum::<Vector3<f64>>() / nf;
+    let rad = (dst.iter().map(|d| (d - mu_d).norm_squared()).sum::<f64>() / nf).sqrt();
+    let u = up_src
+        .filter(|u| finite(u) && u.norm() > 0.0)
+        .map(|u| u.normalize());
+    let lam = if wt.up_weight > 0.0 {
+        wt.up_weight * nf.sqrt() * rad
+    } else {
+        0.0
+    };
+    let w = Vector3::new(1.0, 1.0, wt.w_z);
+    let mut cur = *init;
+    for _ in 0..30 {
+        // 미지수 [ω(3), δt(3), δlog s]. R ← exp(ω)·R, t ← t + δt, s ← s·e^{δ}.
+        let mut h = nalgebra::SMatrix::<f64, 7, 7>::zeros();
+        let mut g = nalgebra::SVector::<f64, 7>::zeros();
+        let mut add = |j: nalgebra::SMatrix<f64, 3, 7>, r: Vector3<f64>| {
+            h += j.transpose() * j;
+            g -= j.transpose() * r;
+        };
+        for (x, y) in src.iter().zip(dst) {
+            let rx = cur.r * x;
+            let p = cur.s * rx + cur.t;
+            let r = (p - y).component_mul(&w);
+            let mut j = nalgebra::SMatrix::<f64, 3, 7>::zeros();
+            let jw = -skew(&p_minus_t(&p, &cur.t));
+            for a in 0..3 {
+                for b in 0..3 {
+                    j[(a, b)] = w[a] * jw[(a, b)];
+                }
+                j[(a, 3 + a)] = w[a];
+                j[(a, 6)] = w[a] * (p - cur.t)[a];
+            }
+            add(j, r);
+        }
+        if let (Some(u), true) = (u, lam > 0.0) {
+            let ru = cur.r * u;
+            let r = lam * (ru - Vector3::new(0.0, 0.0, 1.0));
+            let mut j = nalgebra::SMatrix::<f64, 3, 7>::zeros();
+            let jw = -lam * skew(&ru);
+            for a in 0..3 {
+                for b in 0..3 {
+                    j[(a, b)] = jw[(a, b)];
+                }
+            }
+            add(j, r);
+        }
+        let dx = h.lu().solve(&g)?;
+        let om = Vector3::new(dx[0], dx[1], dx[2]);
+        cur.r = Rotation3::from_scaled_axis(om) * cur.r;
+        cur.t += Vector3::new(dx[3], dx[4], dx[5]);
+        cur.s *= dx[6].exp();
+        if dx.norm() < 1e-12 {
+            break;
+        }
+    }
+    if cur.s.is_finite() && cur.s > 0.0 && finite(&cur.t) {
+        Some(cur)
+    } else {
+        None
+    }
+}
+
+fn p_minus_t(p: &Vector3<f64>, t: &Vector3<f64>) -> Vector3<f64> {
+    p - t
+}
+
 /// GPS 정렬 결과.
 #[derive(Clone, Debug)]
 pub struct GpsAlignment {
@@ -1570,6 +1706,73 @@ mod tests {
     }
 
     /// F-096: 대응 하나가 NaN 이어도 정렬은 살아 있고, 그 대응만 제외된다.
+    /// 거의 일직선(폭 ±1.5 m) 띠 + 축당 1 m GPS 잡음: 자유 정렬은 띠 축 둘레 기울기가 크게 틀리고,
+    /// 위 방향 사전항은 0.5° 이내로 회복한다. 수직 가중만 바꾼 정렬은 잡음 없을 때 정확히 회복한다.
+    #[test]
+    fn weighted_align_up_prior_recovers_tilt_of_thin_strip() {
+        let (mut free_sum, mut prior_sum, mut prior_max) = (0.0, 0.0, 0.0f64);
+        for seed in 0..10u64 {
+            let mut rng = Rng(900 + seed);
+            let gt = random_sim(&mut rng);
+            let truth: Vec<Vector3<f64>> = (0..40)
+                .flat_map(|i| {
+                    (0..2).map(move |d| Vector3::new(i as f64 * 1.0, (d as f64 - 0.5) * 3.0, 100.0))
+                })
+                .collect();
+            let src: Vec<Vector3<f64>> =
+                truth.iter().map(|p| gt.inverse().apply_point(p)).collect();
+            let dst: Vec<Vector3<f64>> = truth.iter().map(|p| p + rng.gvec(1.0)).collect();
+            let free = umeyama(&src, &dst).unwrap();
+            // 위 방향: 정답 + 0.2° 잡음.
+            let noise =
+                Rotation3::from_scaled_axis(rng.gvec(1.0).normalize() * 0.2f64.to_radians());
+            let up = noise * (gt.r.inverse() * Vector3::new(0.0, 0.0, 1.0));
+            let wt = AlignWeights {
+                w_z: 1.0,
+                up_weight: 1.0,
+            };
+            let prior = weighted_similarity(&src, &dst, &free, &wt, Some(&up)).unwrap();
+            let u_true = gt.r.inverse() * Vector3::new(0.0, 0.0, 1.0);
+            let tilt = |r: &Rotation3<f64>| (r * u_true).z.clamp(-1.0, 1.0).acos().to_degrees();
+            free_sum += tilt(&free.r);
+            let e = tilt(&prior.r);
+            prior_sum += e;
+            prior_max = prior_max.max(e);
+            // 잡음 없는 대응 + 수직 가중 10 배 → 정확 회복.
+            let exact_dst: Vec<Vector3<f64>> = truth.clone();
+            let wz = AlignWeights {
+                w_z: 10.0,
+                up_weight: 0.0,
+            };
+            let init = umeyama(&src, &exact_dst).unwrap();
+            let ex = weighted_similarity(&src, &exact_dst, &init, &wz, None).unwrap();
+            assert!(rot_err_deg(&ex.r, &gt.r) < 1e-6, "수직 가중 정확 회복");
+            assert!((ex.s / gt.s - 1.0).abs() < 1e-8);
+        }
+        eprintln!(
+            "자유 평균 {:.3}° 사전항 평균 {:.3}° 최대 {prior_max:.3}°",
+            free_sum / 10.0,
+            prior_sum / 10.0
+        );
+        assert!(prior_max < 0.5, "사전항 최대 {prior_max}");
+        assert!(prior_sum / 10.0 < 0.3, "사전항 평균 {}", prior_sum / 10.0);
+        assert!(
+            free_sum > 3.0 * prior_sum,
+            "자유 {free_sum} 사전항 {prior_sum}"
+        );
+    }
+
+    #[test]
+    fn spread_axes_flags_thin_strip() {
+        let pts: Vec<Vector3<f64>> = (0..40)
+            .flat_map(|i| (0..2).map(move |d| Vector3::new(i as f64, d as f64 * 3.0, 100.0)))
+            .collect();
+        let a = spread_axes(&pts);
+        assert!(a[0] > 11.0 && a[0] < 12.0, "{a:?}");
+        assert!((a[1] - 1.5).abs() < 1e-9, "{a:?}");
+        assert!(a[2] < 1e-9, "{a:?}");
+    }
+
     #[test]
     fn gps_alignment_ignores_nan_pair() {
         for seed in 0..10u64 {

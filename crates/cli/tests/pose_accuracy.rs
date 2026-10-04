@@ -310,12 +310,44 @@ fn refined_pose_accuracy_bounds() {
 #[test]
 #[ignore]
 fn measure_two_region_tilt() {
-    let root = std::env::temp_dir().join(format!("skylens_pose_acc2_{}", std::process::id()));
+    two_region(1, "기본", BaRefine::default());
+}
+
+/// GPS 정렬 선택지(수직 가중·위 방향 사전항) 비교: 시드 1·2, 구역별 기울기·회전·중심 오차를 표 한 줄씩 찍는다.
+/// 목표: 구역별 기울기를 기본의 절반 이하로, 회전 중앙 0.2° (F-321).
+#[test]
+#[ignore]
+fn measure_align_options() {
+    use skylens_core::align::AlignWeights;
+    let opts = [
+        ("끔", 1.0, 0.0),
+        ("수직x3", 3.0, 0.0),
+        ("수직x10", 10.0, 0.0),
+        ("위0.3", 1.0, 0.3),
+        ("위1", 1.0, 1.0),
+        ("위3", 1.0, 3.0),
+        ("수직x3+위1", 3.0, 1.0),
+    ];
+    for seed in [1u64, 2] {
+        for (name, w_z, up_weight) in opts {
+            let ba = BaRefine {
+                align: AlignWeights { w_z, up_weight },
+                ..BaRefine::default()
+            };
+            two_region(seed, name, ba);
+        }
+    }
+}
+
+fn two_region(seed: u64, label: &str, ba: BaRefine) {
+    let root =
+        std::env::temp_dir().join(format!("skylens_pose_acc2_{}_{seed}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let (input, output) = (root.join("in"), root.join("out"));
     let scene = Scene::new(SceneConfig {
         width: 320,
         height: 180,
+        seed,
         ..SceneConfig::default()
     });
     scene.write_dataset(&input).unwrap();
@@ -334,6 +366,7 @@ fn measure_two_region_tilt() {
         dense_width: 96,
         hfov_deg: 65.0,
         ba_iters: 15,
+        ba_refine: ba,
         ..PipelineConfig::default()
     };
     let res = run_pipeline(&ds, &cfg, &output).unwrap();
@@ -401,6 +434,23 @@ fn measure_two_region_tilt() {
         let rc = Rotation3::from_matrix_unchecked(v2.transpose() * dd * u2.transpose());
         let between = (rc * qt).angle().to_degrees();
         let mut sh: Vec<f64> = centers.iter().map(|(a, b)| (a - b).norm()).collect();
+        // 정렬 없이 직접 비교(GPS 정렬 결과 그대로): 회전 오차, 중심 오차.
+        let mut raw_rot: Vec<f64> = sel
+            .iter()
+            .map(|(n, p)| (p.rotation * tr(n).rotation.inverse()).angle().to_degrees())
+            .collect();
+        let tru_c: Vec<Vector3<f64>> = centers.iter().map(|c| c.1).collect();
+        let sp = skylens_core::align::spread_axes(&tru_c);
+        eprintln!(
+            "| 시드 {seed} | {label} | 구역 {half} | 포즈 {} | 기울기 {:.3}° | 회전 중앙 {:.3}° 최대 {:.3}° | 중심 중앙 {:.3} 최대 {:.3} m | 중심 분포 σ {:.1}/{:.1}/{:.2} m (2/1 비 {:.3}, 3/1 비 {:.4}) |",
+            sel.len(),
+            qt.angle().to_degrees(),
+            pct(&mut raw_rot.clone(), 0.5),
+            pct(&mut raw_rot, 1.0),
+            pct(&mut centers.iter().map(|(a, b)| (a - b).norm()).collect::<Vec<_>>(), 0.5),
+            pct(&mut centers.iter().map(|(a, b)| (a - b).norm()).collect::<Vec<_>>(), 1.0),
+            sp[0], sp[1], sp[2], sp[1] / sp[0], sp[2] / sp[0]
+        );
         eprintln!(
             "[2구역 절반 {half}] n {} 전역 정렬 회전 {:.3}° 중심 닮음 회전 {:.3}° 둘 사이 {between:.3}° | 정렬 뒤 회전 중앙 {:.3} 최대 {:.3} | 중심(평행 이동만) 중앙 {:.3} 최대 {:.3} m",
             sel.len(),

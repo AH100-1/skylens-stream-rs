@@ -88,6 +88,8 @@ pub struct BaRefine {
     pub min_tri_deg: f64,
     /// 초점거리(fx, fy)를 BA 에서 같이 푼다.
     pub free_focal: bool,
+    /// GPS 정렬 가중(수직 가중·위 방향 사전항). 기본은 끔 = 중심만 맞춘 강건 닮음 정렬.
+    pub align: crate::align::AlignWeights,
 }
 
 impl Default for BaRefine {
@@ -98,6 +100,10 @@ impl Default for BaRefine {
             reject_px: 4.0,
             min_tri_deg: 1.5,
             free_focal: false,
+            align: crate::align::AlignWeights {
+                w_z: 1.0,
+                up_weight: 0.0,
+            },
         }
     }
 }
@@ -1340,7 +1346,11 @@ fn sparse_init_with(
 
 /// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
 /// BA 는 자유 좌표계에서 움직이므로 정밀 모델을 다시 GPS 좌표계로 돌려놓는다.
-fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity> {
+fn gps_align_refined(
+    s: &mut Sparse,
+    gps: &[Vector3<f64>],
+    wt: &crate::align::AlignWeights,
+) -> Option<Similarity> {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
         .collect();
@@ -1349,7 +1359,26 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
         .map(|&i| s.poses[i].unwrap().center().coords)
         .collect();
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
-    let (sim, _, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    let (mut sim, inl, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    if !wt.is_off() {
+        // 정상 대응만으로 가중·위 방향 사전항 정렬. 위 방향은 카메라 x 축이 수평이라는 가정(짐벌)에서 구한다.
+        let rots: Vec<Rotation3<f64>> = ids.iter().map(|&i| s.poses[i].unwrap().rotation).collect();
+        let up = if wt.up_weight > 0.0 {
+            crate::align::up_from_rotations(&rots)
+        } else {
+            None
+        };
+        let (a, b): (Vec<_>, Vec<_>) = src
+            .iter()
+            .zip(&dst)
+            .zip(&inl)
+            .filter(|(_, &k)| k)
+            .map(|((a, b), _)| (*a, *b))
+            .unzip();
+        if let Some(w) = crate::align::weighted_similarity(&a, &b, &sim, wt, up.as_ref()) {
+            sim = w;
+        }
+    }
     apply_sparse_sim(s, &sim);
     Some(sim)
 }
@@ -2539,7 +2568,9 @@ pub fn run_pipeline_with(
                     rs.rms = rms;
                 }
                 if anchor.is_none() {
-                    crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
+                    crate::timing::timed("gps_align", || {
+                        gps_align_refined(&mut rs, &gps, &ro.align)
+                    });
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {
                     dense_cloud(&rs, &imgs, &kk, &in_region, dw, dmethod)
@@ -2954,7 +2985,7 @@ mod diag {
             if full {
                 let mut rs = init.clone();
                 run_ba(&mut rs, &k, 10, Some(&gps), 2.0, &[]);
-                gps_align_refined(&mut rs, &gps);
+                gps_align_refined(&mut rs, &gps, &Default::default());
                 let region = split_regions(ds.positions.len(), ds.config.span, ds.config.ovl)[0];
                 let win = (region.lo, region.hi);
                 let (ta, tb) = (to_tracks(&good, &gids), to_tracks(&rs, &gids));
@@ -3090,7 +3121,7 @@ mod diag {
         .unwrap();
         let mut rs = init.clone();
         run_ba(&mut rs, &k, 10, Some(&gps), 2.0, &[]);
-        gps_align_refined(&mut rs, &gps);
+        gps_align_refined(&mut rs, &gps, &Default::default());
         // 정답 카메라(첫 GPS 기준 좌표).
         let truth_pose = |g: usize| -> Pose {
             let name = ds.positions[g / 3].images[g % 3]
