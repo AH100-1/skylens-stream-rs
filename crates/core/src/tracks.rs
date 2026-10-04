@@ -28,6 +28,9 @@ use std::collections::HashMap;
 
 /// 국소 변위 일관성 기준 문턱(화소): 960x540 영상 기준. 영상 크기에 비례해 늘린다.
 const DISPLACEMENT_TOLERANCE: f64 = 40.0;
+/// 잔차 문턱 하한 비율(기준 문턱 대비). 이웃 변위가 잘 맞으면(MAD 작음) 문턱을 기준의 1/4(960 폭에서 10 px)까지
+/// 낮춰, 옆 격자 점으로 일관되게 바뀐 대응처럼 그래프만으로는 안 보이는 오대응을 짝 단계에서 거른다.
+const DISPLACEMENT_FLOOR: f64 = 0.25;
 /// 기준 영상 크기(화소).
 const DISPLACEMENT_REF_WIDTH: f64 = 960.0;
 const DISPLACEMENT_REF_HEIGHT: f64 = 540.0;
@@ -247,24 +250,81 @@ pub fn build_tracks(
         }
         ConflictPolicy::Split => {
             // 인접 목록(CSR: 오프셋 + 평탄 배열, 노드마다 정렬)으로 간선마다 공통 이웃 수를 센다.
-            let mut start = vec![0usize; n + 1];
-            for &(u, v) in &edges {
-                start[u + 1] += 1;
-                start[v + 1] += 1;
-            }
-            for i in 0..n {
-                start[i + 1] += start[i];
-            }
-            let mut fill = start.clone();
-            let mut flat = vec![0usize; 2 * edges.len()];
-            for &(u, v) in &edges {
-                flat[fill[u]] = v;
-                fill[u] += 1;
-                flat[fill[v]] = u;
-                fill[v] += 1;
-            }
-            for i in 0..n {
-                flat[start[i]..start[i + 1]].sort_unstable();
+            // 간선 투표: 한 노드가 같은 영상의 서로 다른 특징 둘 이상과 이어지면(갈래) 적어도 하나는 오대응이다.
+            // 지지도(공통 이웃 수)가 가장 큰 간선만 남기고, 가장 큰 지지도가 1 이상인 채 동률이면 모두 끊는다
+            // (일관되게 바뀐 점과 참 대응이 둘 다 삼각형을 이루는 경우). 지지도 0 동률은 아래 순서 규칙에 맡긴다.
+            let (mut start, mut flat);
+            loop {
+                start = vec![0usize; n + 1];
+                for &(u, v) in &edges {
+                    start[u + 1] += 1;
+                    start[v + 1] += 1;
+                }
+                for i in 0..n {
+                    start[i + 1] += start[i];
+                }
+                let mut fill = start.clone();
+                flat = vec![0usize; 2 * edges.len()];
+                for &(u, v) in &edges {
+                    flat[fill[u]] = v;
+                    fill[u] += 1;
+                    flat[fill[v]] = u;
+                    fill[v] += 1;
+                }
+                for i in 0..n {
+                    flat[start[i]..start[i + 1]].sort_unstable();
+                }
+                let sup: Vec<usize> = edges
+                    .iter()
+                    .map(|&(u, v)| {
+                        common_count(&flat[start[u]..start[u + 1]], &flat[start[v]..start[v + 1]])
+                    })
+                    .collect();
+                let mut cut = vec![false; edges.len()];
+                let mut any = false;
+                // 노드 x 의 이웃 중 같은 영상끼리 모아 갈래를 찾는다(간선 (x, y), x < y 기준 양쪽에서 본다).
+                let mut by_node: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+                for (e, &(u, v)) in edges.iter().enumerate() {
+                    by_node.entry(u).or_default().push((v, e));
+                    by_node.entry(v).or_default().push((u, e));
+                }
+                for list in by_node.values() {
+                    let mut i = 0;
+                    while i < list.len() {
+                        let img = node_image[list[i].0];
+                        let mut j = i;
+                        while j < list.len() && node_image[list[j].0] == img {
+                            j += 1;
+                        }
+                        if j - i > 1 {
+                            let best = list[i..j].iter().map(|&(_, e)| sup[e]).max().unwrap();
+                            let top = list[i..j].iter().filter(|&&(_, e)| sup[e] == best).count();
+                            for &(_, e) in &list[i..j] {
+                                let drop = if sup[e] < best {
+                                    best > 0
+                                } else {
+                                    top > 1 && best > 0
+                                };
+                                if drop && !cut[e] {
+                                    cut[e] = true;
+                                    any = true;
+                                }
+                            }
+                        }
+                        i = j;
+                    }
+                }
+                if !any {
+                    break;
+                }
+                let mut k = 0;
+                edges.retain(|_| {
+                    k += 1;
+                    if cut[k - 1] {
+                        stats.conflicts += 1;
+                    }
+                    !cut[k - 1]
+                });
             }
             let nb = |x: usize| &flat[start[x]..start[x + 1]];
             let mut order: Vec<(usize, usize, usize)> = edges
@@ -557,7 +617,7 @@ fn displacement_outliers(
                 };
                 // 대상 점은 u = 0, 변위 0(뺀 값)이므로 예측 (f[0], f[3]) 가 곧 어긋남이다.
                 let r = (f[0] * f[0] + f[3] * f[3]).sqrt();
-                r > (4.0 * s).clamp(tol, 3.0 * tol)
+                r > (4.0 * s).clamp(tol * DISPLACEMENT_FLOOR, 3.0 * tol)
             },
         )
         .collect();
@@ -1033,6 +1093,7 @@ mod tests {
         // 무작위 오대응의 두 점은 대개 멀어 겹치는 영상이 적으므로 5% 까지는 남을 수 있다고 본다.
         assert!(pd >= 0.95, "Drop 순도 {pd}");
         assert!(ps >= 0.99, "Split 순도 {ps}");
+        assert!(cs >= 0.95, "Split 완전도 {cs}");
         assert!(sd.conflicts > 0);
         // Split 완전도: 오대응 간선은 공통 이웃이 없어 마지막에 처리되고 충돌로 건너뛰므로
         // 참 관측은 거의 모두 제 트랙에 모인다: 98% 이상.
@@ -1203,6 +1264,21 @@ mod tests {
     }
 
     #[test]
+    fn consistent_swaps_at_low_recall() {
+        // 대응 재현율 30/50% 에서 정답 점 1% 를 일관되게 바꾼 경우: 순도 ≥ 0.99, 완전도 ≥ 0.95.
+        for keep in [30, 50] {
+            for seed in 1..=2 {
+                let s = synthetic_seeded(0, keep, 1, seed);
+                assert!(s.outliers > 0);
+                let (p, c, _, _) = run_policy(&s, ConflictPolicy::Split);
+                eprintln!("keep {keep} seed {seed}: purity {p:.4} completeness {c:.4}");
+                assert!(p >= 0.99, "keep {keep} seed {seed} 순도 {p}");
+                assert!(c >= 0.95, "keep {keep} seed {seed} 완전도 {c}");
+            }
+        }
+    }
+
+    #[test]
     fn consistent_swaps_stay_pure() {
         // 정답 점 1% 를 옆 격자 점과 모든 짝에서 일관되게 바꾼다(반복 무늬형 오대응).
         let s = synthetic(0, 100, 1);
@@ -1214,6 +1290,7 @@ mod tests {
             s.outliers, sd.tracks, ss.tracks
         );
         assert!(ps >= 0.99, "Split 순도 {ps}");
+        assert!(cs >= 0.95, "Split 완전도 {cs}");
     }
 
     #[test]
