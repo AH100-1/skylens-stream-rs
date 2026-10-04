@@ -144,6 +144,9 @@ pub fn run(input: &str, output: &str, rest: &[&str]) -> ExitCode {
             for i in &res.issues {
                 println!("issue {i}");
             }
+            for l in skylens_core::timing::table() {
+                eprintln!("{l}");
+            }
             println!("done regions {}", res.regions.len());
             ExitCode::SUCCESS
         }

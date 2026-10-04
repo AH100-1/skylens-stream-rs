@@ -52,6 +52,15 @@ pub fn to_json(wall_secs: f64) -> String {
     )
 }
 
+/// 단계별 누적을 사람이 읽는 표로: 초 큰 순, 단계 이름·초·호출 수. 한 줄에 하나.
+pub fn table() -> Vec<String> {
+    let mut rows: Vec<(&'static str, f64, u32)> = ACC.lock().map(|a| a.clone()).unwrap_or_default();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+    rows.iter()
+        .map(|(n, s, c)| format!("timing {n:<22} {s:>9.3} s {c:>6} calls"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +78,11 @@ mod tests {
         );
         assert!(j.contains("\"stage\": \"t_b\""), "{j}");
         assert!(j.contains("\"wall_secs\": 2.000"));
+        let t = table();
+        let (a, b) = (
+            t.iter().position(|l| l.contains("t_a")).unwrap(),
+            t.iter().position(|l| l.contains("t_b")).unwrap(),
+        );
+        assert!(a < b, "{t:?}");
     }
 }
