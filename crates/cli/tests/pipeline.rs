@@ -345,7 +345,8 @@ fn preview_ba_option_does_not_change_refined() {
 }
 
 /// 위치 평균 경로(`--position translation-averaging` 과 같은 설정), 트랙은 `tracks::build_tracks`.
-/// 실측(`PositionMethod::TranslationAveraging`, 초벌 BA 0, 다듬기 5): TA_MEASURED
+/// 실측(`PositionMethod::TranslationAveraging`, 초벌 BA 0, 다듬기 5): 등록 120/120, 중심 중앙 0.245/최대 0.508 m,
+/// 표면 중앙 0.390 m, 되돌아감 없음.
 /// 상한은 실측에 여유를 둔 값이고, 위치 평균이 실패해 GPS 최소제곱으로 되돌아가면 실패한다.
 #[test]
 fn synthetic_single_region_translation_averaging() {
@@ -442,7 +443,7 @@ fn preview_refine_settings_verify_outcome() {
     }
     // 정밀 쪽은 같고 초벌만 달라진다(위치 전용 다듬기는 정밀 시작점을 바꾸지 않는다).
     assert!((a.center_med - b.center_med).abs() < 1e-3);
-    // 다듬기가 초벌 재투영을 3분의 1 이하로 줄이고 초벌-정밀 차이를 줄인다.
+    // 다듬기가 초벌 재투영을 2.5분의 1 미만으로 줄이고(실측 2.985 → 0.948 px) 초벌-정밀 차이를 줄인다.
     assert!(b.preview_px < a.preview_px / 2.5);
     let ha = number_after(
         &a.report.item("preview_vs_refined").unwrap().measured,
