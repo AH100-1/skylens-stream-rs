@@ -1001,6 +1001,8 @@ fn average_core(
 /// 점–카메라 방향 제약 전역 위치 추정의 가정값.
 const GP_HUBER: f64 = 0.1;
 const GP_ITERS: usize = 300;
+const GP_COST_TOL: f64 = 1e-6;
+const GP_MOVE_TOL: f64 = 1e-5;
 const GP_MIN_SCALE: f64 = 1e-5;
 const GP_GATE_RAD: f64 = 2.0 * std::f64::consts::PI / 180.0;
 /// 마지막 정밀 풀이 전에 쓰는 좁은 각 문턱(1.5°).
@@ -1034,12 +1036,12 @@ fn gp_solve(
     n_pts: usize,
     obs: &[(usize, usize, Vector3<f64>, f64)],
     active: &[bool],
-    init: Option<&[Vector3<f64>]>,
+    init: Option<(&[Vector3<f64>], &[f64])>,
     seed: u64,
-) -> Vec<Vector3<f64>> {
+) -> (Vec<Vector3<f64>>, Vec<f64>) {
     let m = n_cam + n_pts;
     let mut x: Vec<Vector3<f64>> = match init {
-        Some(s) => s.to_vec(),
+        Some((s, _)) => s.to_vec(),
         None => {
             let mut st = seed;
             (0..m)
@@ -1077,10 +1079,14 @@ fn gp_solve(
         .step_by(chunk)
         .map(|lo| (lo, (lo + chunk).min(n_pts)))
         .collect();
-    let mut d = vec![1.0; obs.len()];
+    let mut d = match init {
+        Some((_, d0)) => d0.to_vec(),
+        None => vec![1.0; obs.len()],
+    };
     let mut irls = vec![1.0; obs.len()];
     let mut prev = f64::INFINITY;
     for it in 0..GP_ITERS {
+        let prev_centers: Vec<Vector3<f64>> = x[..n_cam].to_vec();
         // c, X 풀이: Σ w d² |(X_p − c_i) − v/d|² → 정규방정식(좌표 공통 행렬).
         // 점 블록은 스칼라 대각이라 점을 소거한 카메라 축소 계통(n_cam × n_cam)만 밀집으로 푼다.
         let mut s = DMatrix::<f64>::zeros(n_cam, n_cam);
@@ -1253,12 +1259,21 @@ fn gp_solve(
             })
             .collect();
         let cost: f64 = costs.iter().sum();
-        if it > 10 && (prev - cost).abs() <= 1e-9 * prev.max(1e-12) {
+        // 수렴: 비용 상대 변화와 중심 최대 이동이 모두 작을 때.
+        let max_move = x[..n_cam]
+            .iter()
+            .zip(&prev_centers)
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0, f64::max);
+        if it > 10
+            && (prev - cost).abs() <= GP_COST_TOL * prev.max(1e-12)
+            && max_move <= GP_MOVE_TOL
+        {
             break;
         }
         prev = cost;
     }
-    x
+    (x, d)
 }
 
 /// 점 관측을 주 경로로 쓰는 전역 위치 추정. 짝 간선은 회전 일관성으로만 거르고(`rejected[0]`) 각 잔차를 보고한다.
@@ -1342,7 +1357,7 @@ fn global_positioning(
         obs.retain(|o| comp[o.0] == Some(best));
     }
     let mut active = vec![true; obs.len()];
-    let mut x = gp_solve(n_cam, n_pts, &obs, &active, None, 1);
+    let (mut x, mut dsc) = gp_solve(n_cam, n_pts, &obs, &active, None, 1);
     // 관측 거르기: 각 오차, 카메라 뒤. 거른 뒤 같은 해에서 다시 푼다.
     for gate in [GP_GATE_RAD, GP_GATE_RAD, GP_FINAL_GATE_RAD] {
         let mut cnt = vec![0usize; n_cam];
@@ -1359,7 +1374,7 @@ fn global_positioning(
             }
         }
         let init = x.clone();
-        x = gp_solve(n_cam, n_pts, &obs, &active, Some(&init), 1);
+        (x, dsc) = gp_solve(n_cam, n_pts, &obs, &active, Some((&init, &dsc)), 1);
     }
     let mut cam_cnt = vec![0usize; n_cam];
     let mut pt_cnt = vec![0usize; n_pts];
