@@ -173,6 +173,8 @@ pub struct PipelineResult {
     pub residuals_px: Vec<f64>,
     /// 정밀 모델의 점별 삼각측량 최대 광선 각(도).
     pub tri_angles_deg: Vec<f64>,
+    /// (사진 이름, 정밀 모델 관측 수, 점을 공유하는 다른 사진 수). 구역마다 이어 붙임.
+    pub photo_links: Vec<(String, usize, usize)>,
 }
 
 struct ImgData {
@@ -1554,6 +1556,25 @@ fn retriangulate(s: &mut Sparse, k: &Intrinsics, ro: &BaRefine) {
     }
 }
 
+/// 정밀 모델 진단: (관측별 잔차, 점별 광선 각, 사진별 (관측 수, 점을 공유하는 다른 사진 수)).
+type Diag = (Vec<f64>, Vec<f64>, Vec<(usize, usize, usize)>);
+
+/// 사진(전역 번호)별 (번호, 관측 수, 점을 공유하는 다른 사진 수).
+fn photo_links(s: &Sparse) -> Vec<(usize, usize, usize)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut m: BTreeMap<usize, (usize, BTreeSet<usize>)> = BTreeMap::new();
+    for o in &s.obs {
+        for &(i, _, _) in o {
+            let e = m.entry(i).or_default();
+            e.0 += 1;
+            e.1.extend(o.iter().map(|x| x.0).filter(|&j| j != i));
+        }
+    }
+    m.into_iter()
+        .map(|(i, (n, set))| (i, n, set.len()))
+        .collect()
+}
+
 /// 관측별 재투영 잔차(px). 카메라 뒤 관측은 뺀다.
 fn reproj_residuals(s: &Sparse, k: &Intrinsics) -> Vec<f64> {
     let mut v = Vec::new();
@@ -1931,7 +1952,7 @@ struct RegionRec {
     /// 정밀 구역 → 가장 최근 정밀 모델 좌표계 닮음 변환(공유 3D 점 대응).
     rsim: Option<Similarity>,
     centers: BTreeMap<usize, [f64; 3]>,
-    diag: (Vec<f64>, Vec<f64>),
+    diag: Diag,
     registered_prev: Vec<usize>,
     /// gids 앞쪽 보조 사진 수(출력·점수 제외).
     n_help: usize,
@@ -1960,7 +1981,7 @@ fn live_state(recs: &[RegionRec]) -> Vec<crate::pipeline_stream::LiveRegion<'_>>
 
 /// 정밀(BA) 작업 결과.
 struct RefinedMsg {
-    diag: (Vec<f64>, Vec<f64>),
+    diag: Diag,
     slot: usize,
     sparse: Sparse,
     cloud: PointCloud,
@@ -2473,7 +2494,7 @@ pub fn run_pipeline_with(
             refined: None,
             rsim: None,
             centers: BTreeMap::new(),
-            diag: (Vec::new(), Vec::new()),
+            diag: Diag::default(),
             registered_prev,
             n_help,
             rposes: HashMap::new(),
@@ -2523,7 +2544,11 @@ pub fn run_pipeline_with(
                 let cloud = crate::timing::timed("refined_dense_total", || {
                     dense_cloud(&rs, &imgs, &kk, &in_region, dw, dmethod)
                 });
-                let diag = (reproj_residuals(&rs, &kk), ray_angles(&rs));
+                let diag = (
+                    reproj_residuals(&rs, &kk),
+                    ray_angles(&rs),
+                    photo_links(&rs),
+                );
                 let _ = tx.send(RefinedMsg {
                     diag,
                     slot,
@@ -2671,6 +2696,9 @@ pub fn run_pipeline_with(
     for rec in &recs {
         res.residuals_px.extend_from_slice(&rec.diag.0);
         res.tri_angles_deg.extend_from_slice(&rec.diag.1);
+        for &(i, n, pairs) in &rec.diag.2 {
+            res.photo_links.push((name(rec.gids[i]), n, pairs));
+        }
     }
     for rec in &recs {
         let (olo, ohi) = owns[rec.region.index];
