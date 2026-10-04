@@ -90,6 +90,9 @@ pub struct BaRefine {
     pub free_focal: bool,
     /// GPS 정렬 가중(수직 가중·위 방향 사전항). 기본은 끔 = 중심만 맞춘 강건 닮음 정렬.
     pub align: crate::align::AlignWeights,
+    /// 정밀 BA 카메라 롤 사전항 σ(도). 0 이하면 끔(기본). 카메라 x 축을 GPS(ENU) 좌표계에서
+    /// 수평으로 두려는 약한 사전항이다.
+    pub roll_sigma_deg: f64,
 }
 
 impl Default for BaRefine {
@@ -105,6 +108,7 @@ impl Default for BaRefine {
                 up_weight: 0.0,
                 up_plane: false,
             },
+            roll_sigma_deg: 0.0,
         }
     }
 }
@@ -1509,6 +1513,7 @@ fn run_ba_with(
             let mut pr =
                 PositionPrior::new(ids.iter().map(|&i| Some(Point3::from(g[i]))).collect());
             pr.sigma = prior_sigma;
+            pr.roll_sigma = ro.roll_sigma_deg.to_radians();
             pr
         }),
         ..BaOptions::default()

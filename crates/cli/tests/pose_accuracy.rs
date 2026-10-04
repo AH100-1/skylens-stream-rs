@@ -391,6 +391,49 @@ fn pose_up_plane_tilt_goal() {
     }
 }
 
+/// 카메라 롤 사전항(x 축 수평, 기본 끔) 비교. 환경변수 `ROLL_SEEDS`(기본 `1,2`)와 `ROLL_DEGS`(기본 `0,3,1,0.3`, σ 도, 0 = 끔)로 고른다.
+/// 구역별 기울기·중심 오차와 정밀 재투영 잔차를 표 한 줄씩 찍는다. 목표: 구역별 기울기 ≤ 0.5°.
+#[test]
+#[ignore]
+fn measure_roll_prior() {
+    let list = |k: &str, d: &str| -> Vec<f64> {
+        std::env::var(k)
+            .unwrap_or_else(|_| d.to_string())
+            .split(',')
+            .map(|v| v.trim().parse().unwrap())
+            .collect()
+    };
+    for seed in list("ROLL_SEEDS", "1,2") {
+        for deg in list("ROLL_DEGS", "0,3,1,0.3") {
+            let ba = BaRefine {
+                roll_sigma_deg: deg,
+                ..BaRefine::default()
+            };
+            let _ = two_region(seed as u64, &format!("롤 σ {deg}°"), ba);
+        }
+    }
+}
+
+/// 롤 사전항을 켠 두 구역 기울기 상한(시드 1·2, 목표 0.5°). 기본 시험에서 뺀다.
+#[test]
+#[ignore]
+fn pose_roll_prior_tilt_goal() {
+    let deg: f64 = std::env::var("ROLL_DEG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    for seed in [1u64, 2] {
+        let ba = BaRefine {
+            roll_sigma_deg: deg,
+            ..BaRefine::default()
+        };
+        let tilts = two_region(seed, "롤 목표", ba);
+        for (h, t) in tilts.iter().enumerate() {
+            assert!(*t <= 0.5, "시드 {seed} 구역 {h} 기울기 {t}");
+        }
+    }
+}
+
 fn two_region(seed: u64, label: &str, ba: BaRefine) -> Vec<f64> {
     let mut tilts = Vec::new();
     let root =
@@ -424,6 +467,16 @@ fn two_region(seed: u64, label: &str, ba: BaRefine) -> Vec<f64> {
     };
     let res = run_pipeline(&ds, &cfg, &output).unwrap();
     assert_eq!(res.regions.len(), 2, "두 구역이어야 한다");
+    {
+        let mut r = res.residuals_px.clone();
+        eprintln!(
+            "[재투영 시드 {seed} {label}] 중앙 {:.4} 95% {:.4} 최대 {:.3} px (n {})",
+            pct(&mut r.clone(), 0.5),
+            pct(&mut r.clone(), 0.95),
+            pct(&mut r, 1.0),
+            res.residuals_px.len()
+        );
+    }
     for half in 0..2 {
         let sel: Vec<_> = res
             .poses

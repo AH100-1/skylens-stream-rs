@@ -102,6 +102,11 @@ pub struct PositionPrior {
     pub huber_k: f64,
     /// 참이면(기본) `fixed_cameras` 를 무시하고 포즈를 고정하지 않는다.
     pub free_gauge: bool,
+    /// 카메라 롤 사전항 σ(라디안). 0 이하(기본)이면 끈다. 켜면 모든 카메라에서 카메라 x 축의
+    /// `roll_up` 방향 성분(= 수평에서 벗어난 각의 사인)을 σ 로 나눠 벌점으로 준다.
+    pub roll_sigma: f64,
+    /// 롤 사전항의 위 방향(사전 위치 좌표계, 예: ENU 의 +z). 기본 +z.
+    pub roll_up: Vector3<f64>,
 }
 
 impl PositionPrior {
@@ -113,7 +118,19 @@ impl PositionPrior {
             sigmas: Vec::new(),
             huber_k: 3.0,
             free_gauge: true,
+            roll_sigma: 0.0,
+            roll_up: Vector3::z(),
         }
+    }
+
+    fn roll_on(&self) -> bool {
+        self.roll_sigma.is_finite() && self.roll_sigma > 0.0 && self.roll_up.norm() > 1e-9
+    }
+
+    /// 카메라 x 축(세계 좌표)의 위 방향 성분 g = e_xᵀ R u 와 ∂g/∂ω(왼쪽 섭동) = (R u) × e_x.
+    fn roll_residual(&self, pose: &Pose) -> (f64, Vector3<f64>) {
+        let v = pose.rotation * self.roll_up.normalize();
+        (v.x, Vector3::new(0.0, v.z, -v.y))
     }
 
     fn sigma_of(&self, c: usize) -> f64 {
@@ -409,6 +426,12 @@ fn prior_cost(problem: &BaProblem, prior: Option<&PositionPrior>) -> f64 {
                 * huber.rho((pose.center() - g).norm_squared() / (pr.sigma_of(c) * pr.sigma_of(c)));
         }
     }
+    if pr.roll_on() {
+        for pose in &problem.poses {
+            let g = pr.roll_residual(pose).0 / pr.roll_sigma;
+            cost += 0.5 * g * g;
+        }
+    }
     cost
 }
 
@@ -421,6 +444,22 @@ fn add_prior(
     a: &mut DMatrix<f64>,
     gc: &mut DVector<f64>,
 ) {
+    if prior.roll_on() {
+        for (c, pose) in problem.poses.iter().enumerate() {
+            let (g, dg) = prior.roll_residual(pose);
+            let inv = 1.0 / prior.roll_sigma;
+            let idx = &lay.cam_idx[c];
+            for (ka, ia) in idx.iter().take(3).enumerate() {
+                let Some(ia) = *ia else { continue };
+                gc[ia] += dg[ka] * inv * g * inv;
+                for (kb, ib) in idx.iter().take(3).enumerate() {
+                    if let Some(ib) = *ib {
+                        a[(ia, ib)] += dg[ka] * dg[kb] * inv * inv;
+                    }
+                }
+            }
+        }
+    }
     let huber = Loss::Huber(prior.huber_k);
     for (c, pose) in problem.poses.iter().enumerate() {
         let Some(g) = prior.target(c) else { continue };
@@ -1741,6 +1780,25 @@ mod tests {
             );
         }
         println!("worst on: {worst_on:?}");
+    }
+
+    #[test]
+    fn roll_prior_jacobian_matches_finite_difference() {
+        let (p, _) = scene(3, 6, 10);
+        let mut pr = PositionPrior::new(vec![None; 6]);
+        pr.roll_sigma = 0.02;
+        assert!(pr.roll_on());
+        assert!(!PositionPrior::new(vec![None; 6]).roll_on());
+        for pose in &p.poses {
+            let (g0, dg) = pr.roll_residual(pose);
+            for k in 0..3 {
+                let h = 1e-6;
+                let mut d = [0.0; 6];
+                d[k] = h;
+                let g1 = pr.roll_residual(&apply_pose(pose, &d)).0;
+                assert!(((g1 - g0) / h - dg[k]).abs() < 1e-5, "k {k}");
+            }
+        }
     }
 
     #[test]
