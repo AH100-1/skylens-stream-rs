@@ -1998,6 +1998,8 @@ mod tests {
     struct Stats {
         median_rel: f64,
         p90_rel: f64,
+        p95_rel: f64,
+        valid: f64,
         within_1pct: f64,
         median_normal_deg: f64,
         count: usize,
@@ -2011,12 +2013,14 @@ mod tests {
     ) -> Stats {
         let mut rel = Vec::new();
         let mut ang = Vec::new();
+        let mut n_valid = 0usize;
         for y in 0..dm.h {
             for x in 0..dm.w {
                 if !mask(x, y) {
                     continue;
                 }
                 let i = y * dm.w + x;
+                n_valid += dm.is_valid(i) as usize;
                 rel.push((dm.depth[i] as f64 - gt[i]).abs() / gt[i]);
                 let n = dm.normal[i];
                 let n = Vector3::new(n[0] as f64, n[1] as f64, n[2] as f64);
@@ -2038,6 +2042,8 @@ mod tests {
         Stats {
             median_rel,
             p90_rel: rel[rel.len() * 9 / 10],
+            p95_rel: rel[rel.len() * 95 / 100],
+            valid: n_valid as f64 / count as f64,
             within_1pct: within,
             median_normal_deg: med(&mut ang),
             count,
@@ -2087,9 +2093,11 @@ mod tests {
 
     fn report(name: &str, s: &Stats) {
         eprintln!(
-            "{name}: 화소 {} 상대오차 중앙값 {:.4}% 1% 이내 {:.1}% 법선 중앙값 {:.2}°",
+            "{name}: 화소 {} 상대오차 중앙값 {:.4}% 95분위 {:.3}% 유효 {:.1}% 1% 이내 {:.1}% 법선 중앙값 {:.2}°",
             s.count,
             100.0 * s.median_rel,
+            100.0 * s.p95_rel,
+            100.0 * s.valid,
             100.0 * s.within_1pct,
             s.median_normal_deg
         );
@@ -2357,6 +2365,8 @@ mod tests {
         );
         report("960×540", &s);
         assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
+        assert!(s.p95_rel < 0.03, "상대오차 95분위 {}", s.p95_rel);
+        assert!(s.valid > 0.99, "유효 비율 {}", s.valid);
         assert!(el <= 0.7, "{el:.2} s > 0.7 s");
     }
 
@@ -2653,7 +2663,7 @@ mod tests {
         }
         let load = || std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
         let mut best = f64::INFINITY;
-        for round in 0..1 {
+        for round in 0..env("PM_ROUNDS", 1) {
             let mut st = Vec::new();
             let t = std::time::Instant::now();
             let cpu0 = cpu_seconds();
