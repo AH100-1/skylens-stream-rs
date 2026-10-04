@@ -13,7 +13,10 @@ use skylens_core::verify::verify_dir;
 fn cfg() -> PipelineConfig {
     PipelineConfig {
         max_features: 800,
-        dense_width: 96,
+        dense_width: std::env::var("ANCHOR_DW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(96),
         hfov_deg: 65.0,
         ba_iters: 15,
         ..PipelineConfig::default()
