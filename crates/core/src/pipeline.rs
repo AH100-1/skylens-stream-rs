@@ -2459,6 +2459,7 @@ pub fn run_pipeline_with(
             } else {
                 None
             };
+            let gids_coarse = if split { gids_t.clone() } else { Vec::new() };
             let (maxf, position, region) = (cfg.max_features, cfg.position, *r);
             let tri_t = TriConfig::from_config(cfg);
             let mut cached: HashMap<usize, Arc<ImgData>> =
@@ -2508,17 +2509,39 @@ pub fn run_pipeline_with(
                 }
                 let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
                 let mut fixed: Vec<usize> = Vec::new();
+                let mut anchored = false;
                 if let (Some(an), None) = (&anchor, &full) {
                     apply_sparse_sim(&mut rs, &an.sim);
                     for (i, p) in &an.fixed {
                         rs.poses[*i] = Some(*p);
                         fixed.push(*i);
                     }
+                    anchored = true;
+                } else if let (Some(an), Some((gf, _))) = (&anchor, &full) {
+                    // 다시 등록한 목록은 색인이 초벌과 다르므로 고정 사진을 gid 로 다시 찾는다.
+                    let at: HashMap<usize, usize> =
+                        gf.iter().enumerate().map(|(j, g)| (*g, j)).collect();
+                    let mapped: Vec<(usize, Pose)> = an
+                        .fixed
+                        .iter()
+                        .filter_map(|(i, p)| {
+                            let j = *at.get(gids_coarse.get(*i)?)?;
+                            rs.poses[j].is_some().then_some((j, *p))
+                        })
+                        .collect();
+                    if mapped.len() >= 3 {
+                        apply_sparse_sim(&mut rs, &an.sim);
+                        for (j, p) in mapped {
+                            rs.poses[j] = Some(p);
+                            fixed.push(j);
+                        }
+                        anchored = true;
+                    }
                 }
                 rs.rms = crate::timing::timed("ba_refined", || {
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
-                if anchor.is_none() {
+                if !anchored && (anchor.is_none() || full.is_some()) {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {

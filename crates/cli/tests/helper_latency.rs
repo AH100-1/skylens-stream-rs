@@ -24,7 +24,7 @@ fn region_lines(report: &str) -> Vec<(usize, usize, i64)> {
     v
 }
 
-fn run(coarse_back: bool, tag: &str) -> (Vec<(usize, usize, i64)>, usize, usize) {
+fn run(coarse_back: bool, tag: &str) -> (Vec<(usize, usize, i64)>, usize, usize, String) {
     let root = std::env::temp_dir().join(format!(
         "skylens_helper_latency_{tag}_{}",
         std::process::id()
@@ -69,12 +69,13 @@ fn run(coarse_back: bool, tag: &str) -> (Vec<(usize, usize, i64)>, usize, usize)
         region_lines(&report),
         res.regions.len(),
         split_regions(n_pos, 8, 2).len(),
+        report,
     )
 }
 
 #[test]
 fn coarse_without_back_helper_reads_no_future_position() {
-    let (off, got, want) = run(false, "off");
+    let (off, got, want, _) = run(false, "off");
     assert_eq!(got, want);
     assert_eq!(off.len(), want, "{off:?}");
     // 초벌 입력의 마지막 위치는 hi 바로 앞(-1) 이고 뒤쪽 보조는 없다. 앞쪽 F 보조는 첫 구역만 없다.
@@ -84,7 +85,7 @@ fn coarse_without_back_helper_reads_no_future_position() {
         assert_eq!(helper == 0, r == 0, "{off:?}");
     }
     // 대조: 뒤쪽 보조를 초벌에도 넣으면 마지막 구역을 뺀 모든 구역이 hi 이후 위치를 읽는다.
-    let (on, _, _) = run(true, "on");
+    let (on, _, _, _) = run(true, "on");
     assert!(on[..on.len() - 1].iter().all(|x| x.2 > 0), "{on:?}");
 }
 
@@ -99,4 +100,32 @@ fn write_80_position_scene() {
     })
     .write_dataset(std::path::Path::new(&out))
     .unwrap();
+}
+
+/// report.json 의 "refined A to refined B via V pairs N median M m" 기록에서 잔차 중앙값(m)을 모은다.
+fn refined_realign_medians(report: &str) -> Vec<f64> {
+    report
+        .split('"')
+        .filter(|p| p.contains("realign refined"))
+        .map(|p| {
+            let w: Vec<&str> = p.split_whitespace().collect();
+            let at = w.iter().position(|x| *x == "median").unwrap();
+            w[at + 1].parse().unwrap()
+        })
+        .collect()
+}
+
+/// F-353: 초벌에 뒤쪽 보조가 없어도(`--coarse-back off`) 정밀 구역 이음은 GPS 맞춤으로 조여야 한다.
+/// 정밀 구역끼리의 재정렬 잔차 중앙값이 모두 1 m 안이어야 한다(22위치 소형 장면 측정값 0.614 m).
+#[test]
+fn coarse_back_off_keeps_refined_seams_tight() {
+    let (_, _, want, report) = run(false, "seam");
+    let med = refined_realign_medians(&report);
+    assert!(
+        !med.is_empty() && med.len() < want,
+        "정밀 재정렬 기록 부족: {med:?}"
+    );
+    for m in &med {
+        assert!(*m < 1.0, "정밀 구역 이음 잔차 {m} m: {med:?}");
+    }
 }
