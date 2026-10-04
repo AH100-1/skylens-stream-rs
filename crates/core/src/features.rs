@@ -582,19 +582,63 @@ fn describe_with(
 
 /// DoG 극값 검출 + 방향 + 기술자. 입력은 이미 σ≈0.5 로 흐려진 영상으로 가정한다.
 ///
-/// 긴 변이 `upscale_below` 미만이면 2배 확대 영상에서 검출하고(확대 영상의 고유 흐림 σ≈1),
-/// 좌표·스케일을 원래 크기로 되돌린다. 기술자는 확대 영상에서 같은 축척으로 계산한 값이다.
+/// 긴 변이 `upscale_below` 미만이면서 원래 크기 검출이 목표 수(`max_features`)의 절반에 못 미칠 때만
+/// 2배 확대 영상(고유 흐림 σ≈1)에서도 검출해 모자란 만큼 채운다. 원래 크기 특징은 그대로 두고,
+/// 확대 쪽 특징은 원래 특징과 같은 자리(1 화소 이내·스케일비 1.5 이내)가 아닌 것만 응답 순으로 덧붙인다.
+/// 좌표·스케일은 원래 크기로 되돌리고 기술자는 확대 영상에서 같은 축척으로 계산한 값이다.
+/// (확대 쪽 특징으로 상위를 통째로 바꾸면 약한 특징이 강한 원래 특징을 밀어내 등록·포즈 정확도가 나빠졌다.)
 pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature> {
-    if cfg.upscale_below == 0 || img.width.max(img.height) >= cfg.upscale_below {
-        return detect_core(img, cfg, 0.5);
+    let mut feats = detect_core(img, cfg, 0.5);
+    if cfg.upscale_below == 0
+        || img.width.max(img.height) >= cfg.upscale_below
+        || feats.len() * 2 >= cfg.max_features
+    {
+        return feats;
     }
-    let mut feats = detect_core(&img.upsample2(), cfg, 1.0);
-    for f in &mut feats {
+    let extra = detect_core(&img.upsample2(), cfg, 1.0);
+    let need = cfg.max_features - feats.len();
+    // 원래 특징을 격자(4 화소)에 넣어 이웃 조회.
+    let cell = 4.0f32;
+    let gw = (img.width as f32 / cell) as i64 + 2;
+    let gh = (img.height as f32 / cell) as i64 + 2;
+    let key = |x: f32, y: f32| {
+        (
+            ((x / cell).floor() as i64).clamp(-1, gw - 1),
+            ((y / cell).floor() as i64).clamp(-1, gh - 1),
+        )
+    };
+    type Spot = (f32, f32, f32);
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<Spot>> = Default::default();
+    for f in &feats {
+        grid.entry(key(f.kp.x, f.kp.y))
+            .or_default()
+            .push((f.kp.x, f.kp.y, f.kp.sigma));
+    }
+    let mut added = Vec::new();
+    for mut f in extra {
+        if added.len() >= need {
+            break;
+        }
         // 확대 영상 화소 X 는 원래 영상 X/2 − 0.25 에 해당한다.
         f.kp.x = f.kp.x / 2.0 - 0.25;
         f.kp.y = f.kp.y / 2.0 - 0.25;
         f.kp.sigma /= 2.0;
+        let (kx, ky) = key(f.kp.x, f.kp.y);
+        let dup = (kx - 1..=kx + 1).any(|i| {
+            (ky - 1..=ky + 1).any(|j| {
+                grid.get(&(i, j)).is_some_and(|v| {
+                    v.iter().any(|&(x, y, s)| {
+                        let r = (s / f.kp.sigma).max(f.kp.sigma / s);
+                        (x - f.kp.x).hypot(y - f.kp.y) <= 1.0 && r <= 1.5
+                    })
+                })
+            })
+        });
+        if !dup {
+            added.push(f);
+        }
     }
+    feats.extend(added);
     feats
 }
 
