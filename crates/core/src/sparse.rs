@@ -152,7 +152,7 @@ pub(crate) struct VoteEdge {
 /// 카메라별 회전을 못 구한 간선, 가장 큰 무리가 2 미만인 쌍은 그대로 둔다. 가장 큰 무리가 전체의 절반
 /// 이하이면서 밖에 2 개 이상의 무리가 따로 있거나, 둘째 무리와 수가 같으면 어느 쪽이 맞는지 가릴 수 없어
 /// 그 쌍도 거르지 않는다. 반환은 (간선별 유지 표시, 거르지 않고 둔 쌍 수).
-/// `group[k]` 는 사진 k 의 카메라 번호. 반환은 간선별 유지 표시.
+/// `group[k]` 는 사진 k 의 카메라 번호.
 pub(crate) fn vote_keep(group: &[usize], edges: &[VoteEdge]) -> (Vec<bool>, usize) {
     let n = group.len();
     let groups = group.iter().copied().max().map_or(0, |g| g + 1);
