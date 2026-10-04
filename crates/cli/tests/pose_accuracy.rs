@@ -384,11 +384,28 @@ fn measure_two_region_tilt() {
                 )
             })
             .collect();
+        // 중심만으로 구한 닮음 회전: GPS 정렬이 정하는 회전과 같은 종류.
+        let n = centers.len() as f64;
+        let me = centers.iter().map(|c| c.0).sum::<Vector3<f64>>() / n;
+        let mt = centers.iter().map(|c| c.1).sum::<Vector3<f64>>() / n;
+        let mut h = Matrix3::zeros();
+        for (a, b) in &centers {
+            h += (a - me) * (b - mt).transpose();
+        }
+        let sv = h.svd(true, true);
+        let (u2, v2) = (sv.u.unwrap(), sv.v_t.unwrap());
+        let mut dd = Matrix3::identity();
+        if (v2.transpose() * u2.transpose()).determinant() < 0.0 {
+            dd[(2, 2)] = -1.0;
+        }
+        let rc = Rotation3::from_matrix_unchecked(v2.transpose() * dd * u2.transpose());
+        let between = (rc * qt).angle().to_degrees();
         let mut sh: Vec<f64> = centers.iter().map(|(a, b)| (a - b).norm()).collect();
         eprintln!(
-            "[2구역 절반 {half}] n {} 전역 정렬 회전 {:.3}° | 정렬 뒤 회전 중앙 {:.3} 최대 {:.3} | 중심(평행 이동만) 중앙 {:.3} 최대 {:.3} m",
+            "[2구역 절반 {half}] n {} 전역 정렬 회전 {:.3}° 중심 닮음 회전 {:.3}° 둘 사이 {between:.3}° | 정렬 뒤 회전 중앙 {:.3} 최대 {:.3} | 중심(평행 이동만) 중앙 {:.3} 최대 {:.3} m",
             sel.len(),
             qt.angle().to_degrees(),
+            rc.angle().to_degrees(),
             pct(&mut errs.clone(), 0.5),
             pct(&mut errs, 1.0),
             pct(&mut sh.clone(), 0.5),
