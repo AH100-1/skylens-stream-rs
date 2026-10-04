@@ -1580,6 +1580,7 @@ fn interpolated_cloud(
         min_ratio: 0.3,
         min_groups: 1,
         same_group_views: None,
+        ..FusionConfig::default()
     };
     fuse(&views, &maps, cfg)
 }

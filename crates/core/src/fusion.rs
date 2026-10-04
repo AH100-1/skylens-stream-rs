@@ -74,6 +74,20 @@ pub struct FusionConfig {
     /// 다른 무리가 보지 못하는 점에 요구하는 동의 사진 수(기준 포함). `None` 이면 버린다.
     /// 같은 배율 이상치가 우연히 맞아떨어질 확률은 동의 사진 수에 따라 거듭제곱으로 준다.
     pub same_group_views: Option<usize>,
+    /// 일치한 화소들의 3D 점에서 출력 위치를 정하는 방식.
+    pub position: FusePosition,
+}
+
+/// 융합 점 위치 결정 방식.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FusePosition {
+    /// 산술평균(기본).
+    #[default]
+    Mean,
+    /// 좌표별 중앙값.
+    Median,
+    /// 가중평균, 가중 1 / (max(1 − 신뢰도, 0.03) · d²) (신뢰도 = 1 − 비용).
+    Weighted,
 }
 
 /// [`FusionConfig::same_group_views`] 기본값. 실측 편대 42장(σ 0.1%·이상치 10%),
@@ -91,6 +105,7 @@ impl Default for FusionConfig {
             min_ratio: 0.5,
             min_groups: 2,
             same_group_views: SAME_GROUP_VIEWS,
+            position: FusePosition::Mean,
         }
     }
 }
@@ -460,21 +475,57 @@ pub fn try_fuse(
                 continue;
             }
             let k = (agree.len() + 1) as f64;
-            let mut pos = xw.coords;
             let mut nor = world_normal(r, ridx);
             let mut col = color(r, ridx);
-            for &(j, jidx, yw) in &agree {
-                pos += yw.coords;
+            for &(j, jidx, _) in &agree {
                 nor += world_normal(j, jidx);
                 col += color(j, jidx);
             }
-            pos /= k;
             col /= k;
             let nn = nor.norm();
             let nor = if nn > 1e-12 && nn.is_finite() {
                 nor / nn
             } else {
                 Vector3::zeros()
+            };
+            let pos = match cfg.position {
+                FusePosition::Mean => {
+                    let mut pos = xw.coords;
+                    for &(_, _, yw) in &agree {
+                        pos += yw.coords;
+                    }
+                    pos / k
+                }
+                FusePosition::Median => {
+                    let mut out = Vector3::zeros();
+                    for c in 0..3 {
+                        let mut v: Vec<f64> = vec![xw[c]];
+                        v.extend(agree.iter().map(|a| a.2[c]));
+                        v.sort_by(f64::total_cmp);
+                        let m = v.len();
+                        out[c] = if m % 2 == 1 {
+                            v[m / 2]
+                        } else {
+                            0.5 * (v[m / 2 - 1] + v[m / 2])
+                        };
+                    }
+                    out
+                }
+                FusePosition::Weighted => {
+                    let weight = |v: usize, idx: usize, p: &Point3<f64>| -> f64 {
+                        let conf = 1.0 - depth_maps[v].cost.get(idx).copied().unwrap_or(0.0) as f64;
+                        let d = views[v].camera.pose.transform(p).z.max(1e-6);
+                        1.0 / ((1.0 - conf).max(0.03) * d * d)
+                    };
+                    let w0 = weight(r, ridx, &xw);
+                    let (mut sum, mut ws) = (xw.coords * w0, w0);
+                    for &(j, jidx, yw) in &agree {
+                        let w = weight(j, jidx, &yw);
+                        sum += yw.coords * w;
+                        ws += w;
+                    }
+                    sum / ws
+                }
             };
             if !pos.iter().all(|v| v.is_finite()) {
                 continue;
