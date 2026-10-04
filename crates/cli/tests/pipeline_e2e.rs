@@ -312,9 +312,10 @@ fn two_region_end_to_end() {
     assert!(o.m.center_med < 0.35, "중심 오차 중앙 {}", o.m.center_med);
     assert!(o.m.center_max < 3.75, "중심 오차 최대 {}", o.m.center_max);
     assert!(o.m.surface_med < 0.60, "점 중앙 {}", o.m.surface_med);
-    assert!(o.m.surface_p95 < 3.63, "점 95% {}", o.m.surface_p95);
-    // 융합 전 반점 제거로 작은 깊이 조각이 빠진다: 점 19855 → 18575,
-    // 표면 거리 중앙 0.446 → 0.431 m, 95% 2.261 → 1.336 m.
+    assert!(o.m.surface_p95 < 1.70, "점 95% {}", o.m.surface_p95);
+    // 융합 전 반점 제거(작은 깊이 조각 삭제)로 점이 줄고 먼 점이 빠진다:
+    // 점 19855 → 18575 (-6.4%), 표면 거리 중앙 0.446 → 0.431 m, 95% 2.261 → 1.336 m.
+    // 95% 상한 1.70 m 는 현재 출력 1.336 m 의 약 1.27 배.
     assert!(
         o.m.points >= 18575 * 4 / 5 && o.m.points <= 18575 * 6 / 5,
         "점 수 {}",

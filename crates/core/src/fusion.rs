@@ -87,6 +87,7 @@ pub enum FusePosition {
     /// 좌표별 중앙값.
     Median,
     /// 가중평균, 가중 1 / (max(1 − 신뢰도, 0.03) · d²) (신뢰도 = 1 − 비용).
+    /// 비용이 유한하지 않은 관측이 하나라도 있으면 그 점은 균등 가중(평균).
     Weighted,
 }
 
@@ -512,16 +513,27 @@ pub fn try_fuse(
                     out
                 }
                 FusePosition::Weighted => {
-                    let weight = |v: usize, idx: usize, p: &Point3<f64>| -> f64 {
-                        let conf = 1.0 - depth_maps[v].cost.get(idx).copied().unwrap_or(0.0) as f64;
+                    // 비용이 유한하지 않으면 그 점은 가중을 정할 수 없으므로 균등 가중으로 돌아간다
+                    // (NaN 은 max 에서 조용히 무시되어 가중이 가장 커지는 것도 막는다).
+                    let weight = |v: usize, idx: usize, p: &Point3<f64>| -> Option<f64> {
+                        let cost = depth_maps[v].cost.get(idx).copied().unwrap_or(0.0) as f64;
+                        if !cost.is_finite() {
+                            return None;
+                        }
                         let d = views[v].camera.pose.transform(p).z.max(1e-6);
-                        1.0 / ((1.0 - conf).max(0.03) * d * d)
+                        Some(1.0 / (cost.max(0.03) * d * d))
                     };
-                    let w0 = weight(r, ridx, &xw);
-                    let (mut sum, mut ws) = (xw.coords * w0, w0);
-                    for &(j, jidx, yw) in &agree {
-                        let w = weight(j, jidx, &yw);
-                        sum += yw.coords * w;
+                    let mut obs: Vec<(Option<f64>, Point3<f64>)> = vec![(weight(r, ridx, &xw), xw)];
+                    obs.extend(
+                        agree
+                            .iter()
+                            .map(|&(j, jidx, yw)| (weight(j, jidx, &yw), yw)),
+                    );
+                    let uniform = obs.iter().any(|o| o.0.is_none());
+                    let (mut sum, mut ws) = (Vector3::zeros(), 0.0);
+                    for (w, y) in &obs {
+                        let w = if uniform { 1.0 } else { w.unwrap_or(1.0) };
+                        sum += y.coords * w;
                         ws += w;
                     }
                     sum / ws
@@ -977,6 +989,32 @@ mod tests {
             }
         }
         assert!(floor > 1000, "floor points {floor}");
+    }
+
+    /// 가중평균에서 비용이 NaN 인 화소는 균등 가중으로 융합돼 점이 빠지지 않고 유한하다.
+    #[test]
+    fn weighted_position_uniform_when_cost_not_finite() {
+        let cams = small_cameras();
+        let mut maps: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        let vs = views(&cams);
+        let mean = fuse(&vs, &maps, FusionConfig::default());
+        for m in &mut maps {
+            for (k, c) in m.cost.iter_mut().enumerate() {
+                if k % 3 == 0 {
+                    *c = f32::NAN;
+                }
+            }
+        }
+        let cfg = FusionConfig {
+            position: FusePosition::Weighted,
+            ..FusionConfig::default()
+        };
+        let w = fuse(&vs, &maps, cfg);
+        assert!(!w.has_nan());
+        println!("weighted nan cost: points {} mean {}", w.len(), mean.len());
+        assert_eq!(w.len(), mean.len());
+        let (med, _, _) = errors(&SMALL, &w);
+        assert!(med < 1e-5, "median {med}");
     }
 
     #[test]
