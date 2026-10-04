@@ -269,6 +269,9 @@ pub struct DetectorConfig {
     pub max_features: usize,
     /// 긴 변이 이 값 미만인 사진은 2배 양선형 확대 영상에서 검출한다(0 이면 끄기).
     pub upscale_below: usize,
+    /// 참이면 긴 변이 `upscale_below` 미만인 사진에서 원래 검출 수와 상관없이 확대 특징을 상한까지 더한다.
+    /// 거짓(기본)이면 원래 검출이 상한의 절반 미만일 때만 채운다.
+    pub upscale_fill: bool,
 }
 
 impl Default for DetectorConfig {
@@ -281,6 +284,7 @@ impl Default for DetectorConfig {
             edge_ratio: 10.0,
             max_features: 8192,
             upscale_below: 800,
+            upscale_fill: false,
         }
     }
 }
@@ -591,7 +595,8 @@ pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature
     let mut feats = detect_core(img, cfg, 0.5);
     if cfg.upscale_below == 0
         || img.width.max(img.height) >= cfg.upscale_below
-        || feats.len() * 2 >= cfg.max_features
+        || feats.len() >= cfg.max_features
+        || (!cfg.upscale_fill && feats.len() * 2 >= cfg.max_features)
     {
         return feats;
     }
@@ -1285,5 +1290,46 @@ mod tests {
         let b = detect_and_describe(&img, &DetectorConfig::default());
         eprintln!("scene 320x240 upscale off {} on {}", a.len(), b.len());
         assert!(b.len() > a.len(), "확대 {} <= 끔 {}", b.len(), a.len());
+    }
+
+    #[test]
+    fn upscale_fill_adds_features_only_when_requested() {
+        // 원래 검출이 상한의 절반 이상이면 기본은 확대 특징을 더하지 않고, upscale_fill 은 상한까지 더한다.
+        let img = scene_image(320, 240);
+        let off = DetectorConfig {
+            upscale_below: 0,
+            ..DetectorConfig::default()
+        };
+        let a = detect_and_describe(&img, &off);
+        let cap = a.len() * 3 / 2;
+        let dflt = DetectorConfig {
+            max_features: cap,
+            ..DetectorConfig::default()
+        };
+        let fill = DetectorConfig {
+            upscale_fill: true,
+            ..dflt
+        };
+        let d = detect_and_describe(&img, &dflt);
+        let f = detect_and_describe(&img, &fill);
+        eprintln!(
+            "orig {} cap {} default {} fill {}",
+            a.len(),
+            cap,
+            d.len(),
+            f.len()
+        );
+        assert_eq!(d.len(), a.len());
+        assert!(f.len() > a.len() && f.len() <= cap);
+        // 원래 크기 특징은 그대로 앞에 남는다.
+        for (x, y) in a.iter().zip(&f) {
+            assert_eq!((x.kp.x, x.kp.y), (y.kp.x, y.kp.y));
+        }
+        // 긴 변이 upscale_below 이상이면 켜도 바뀌지 않는다.
+        let big = DetectorConfig {
+            upscale_below: 300,
+            ..fill
+        };
+        assert_eq!(detect_and_describe(&img, &big).len(), a.len().min(cap));
     }
 }

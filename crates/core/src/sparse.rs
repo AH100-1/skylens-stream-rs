@@ -133,36 +133,45 @@ const PAIR_VOTE_DEG: f64 = 5.0;
 /// 투표용 간선: (결과 번호, 장착 회전 D).
 type EdgeMount = (usize, Rotation3<f64>);
 
+/// 카메라 쌍 투표에 넣는 간선: 사진 i, j 사이 상대 회전과 가중치.
+pub(crate) struct VoteEdge {
+    pub i: usize,
+    pub j: usize,
+    pub rot: Rotation3<f64>,
+    pub weight: f64,
+}
+
 /// 다른 카메라 짝(i, j 의 카메라 번호가 다른 간선)의 상대 회전을 카메라 쌍 단위로 투표해 거른다.
 ///
 /// 같은 장착이라 카메라 a, b 의 같은 카메라끼리 시간 이웃으로 이은 회전 E_i = R_i W_a(R_i = 위치 회전,
 /// W_a 는 카메라별 평균 기준 회전)로 D = E_jᵀ R_ij E_i = W_bᵀ W_a 는 짝이 어디든 같다. 쌍마다 D 를
-/// 서로 `PAIR_VOTE_DEG` 이내인 무리로 묶어 가장 큰 무리 밖의 간선을 뺀다. 같은 카메라끼리의 간선, 카메라별
-/// 회전을 못 구한 간선, 가장 큰 무리가 2 미만인 쌍은 그대로 둔다.
-fn vote_cross_camera_pairs(inputs: &[SparseInput], results: Vec<PairResult>) -> Vec<PairResult> {
-    let n = inputs.len();
-    let groups = inputs.iter().map(|x| x.group).max().map_or(0, |g| g + 1);
+/// 서로 `PAIR_VOTE_DEG` 이내인 무리로 묶어 가장 큰 무리 밖의 간선을 뺀다. 같은 카메라끼리의 간선,
+/// 카메라별 회전을 못 구한 간선, 가장 큰 무리가 2 미만인 쌍은 그대로 둔다.
+/// `group[k]` 는 사진 k 의 카메라 번호. 반환은 간선별 유지 표시.
+pub(crate) fn vote_keep(group: &[usize], edges: &[VoteEdge]) -> Vec<bool> {
+    let n = group.len();
+    let groups = group.iter().copied().max().map_or(0, |g| g + 1);
     let mut est: Vec<Option<Rotation3<f64>>> = vec![None; n];
     for g in 0..groups {
-        let edges: Vec<RelativeRotation> = results
+        let same: Vec<RelativeRotation> = edges
             .iter()
-            .filter(|p| inputs[p.i].group == g && inputs[p.j].group == g)
+            .filter(|p| group[p.i] == g && group[p.j] == g)
             .map(|p| RelativeRotation {
                 i: p.i,
                 j: p.j,
                 rotation: p.rot,
-                weight: p.matches.len() as f64,
+                weight: p.weight,
             })
             .collect();
-        if edges.is_empty() {
+        if same.is_empty() {
             continue;
         }
-        if let Some(avg) = average_rotations(n, &edges, &AveragingConfig::default()) {
+        if let Some(avg) = average_rotations(n, &same, &AveragingConfig::default()) {
             if !avg.reliable {
                 continue;
             }
             for (k, r) in avg.rotations.into_iter().enumerate() {
-                if inputs[k].group == g {
+                if group[k] == g {
                     est[k] = r;
                 }
             }
@@ -170,8 +179,8 @@ fn vote_cross_camera_pairs(inputs: &[SparseInput], results: Vec<PairResult>) -> 
     }
     // 쌍(작은 카메라, 큰 카메라) → (간선 번호, D) 목록. 간선은 작은 카메라 쪽을 i 로 본다.
     let mut by_pair: HashMap<(usize, usize), Vec<EdgeMount>> = HashMap::new();
-    for (k, p) in results.iter().enumerate() {
-        let (ga, gb) = (inputs[p.i].group, inputs[p.j].group);
+    for (k, p) in edges.iter().enumerate() {
+        let (ga, gb) = (group[p.i], group[p.j]);
         if ga == gb {
             continue;
         }
@@ -185,7 +194,7 @@ fn vote_cross_camera_pairs(inputs: &[SparseInput], results: Vec<PairResult>) -> 
             by_pair.entry((gb, ga)).or_default().push((k, d.inverse()));
         }
     }
-    let mut drop = vec![false; results.len()];
+    let mut keep = vec![true; edges.len()];
     for list in by_pair.values() {
         if list.len() < 3 {
             continue;
@@ -199,10 +208,7 @@ fn vote_cross_camera_pairs(inputs: &[SparseInput], results: Vec<PairResult>) -> 
         let mut best: Option<(usize, f64, Vec<usize>)> = None;
         for (_, c) in list {
             let members: Vec<usize> = (0..list.len()).filter(|&m| near(c, &list[m].1)).collect();
-            let w: f64 = members
-                .iter()
-                .map(|&m| results[list[m].0].matches.len() as f64)
-                .sum();
+            let w: f64 = members.iter().map(|&m| edges[list[m].0].weight).sum();
             if best
                 .as_ref()
                 .is_none_or(|(c0, w0, _)| (members.len(), w) > (*c0, *w0))
@@ -214,16 +220,31 @@ fn vote_cross_camera_pairs(inputs: &[SparseInput], results: Vec<PairResult>) -> 
             if count >= 2 {
                 for m in 0..list.len() {
                     if !members.contains(&m) {
-                        drop[list[m].0] = true;
+                        keep[list[m].0] = false;
                     }
                 }
             }
         }
     }
+    keep
+}
+
+fn vote_cross_camera_pairs(inputs: &[SparseInput], results: Vec<PairResult>) -> Vec<PairResult> {
+    let group: Vec<usize> = inputs.iter().map(|x| x.group).collect();
+    let edges: Vec<VoteEdge> = results
+        .iter()
+        .map(|p| VoteEdge {
+            i: p.i,
+            j: p.j,
+            rot: p.rot,
+            weight: p.matches.len() as f64,
+        })
+        .collect();
+    let keep = vote_keep(&group, &edges);
     results
         .into_iter()
-        .zip(drop)
-        .filter(|(_, d)| !d)
+        .zip(keep)
+        .filter(|(_, k)| *k)
         .map(|(p, _)| p)
         .collect()
 }
