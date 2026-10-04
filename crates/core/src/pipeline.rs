@@ -85,6 +85,9 @@ pub struct HelperConfig {
     pub back_span: usize,
     /// 뒤쪽 보조 위치 간격(1 이면 모든 위치).
     pub back_step: usize,
+    /// 초벌 등록에도 뒤쪽 보조를 넣을지. 거짓이면 초벌은 구역 시작 이전·구역 안 사진만 읽고(미래 위치를 기다리지 않음),
+    /// 정밀 작업이 뒤쪽 보조 사진을 직접 읽어 구역 전체로 다시 등록한 뒤 BA 를 한다.
+    pub coarse_back: bool,
 }
 
 impl Default for HelperConfig {
@@ -97,6 +100,7 @@ impl Default for HelperConfig {
             front_span: HELPER_SPAN,
             back_span: HELPER_SPAN,
             back_step: 1,
+            coarse_back: true,
         }
     }
 }
@@ -1853,6 +1857,8 @@ struct RefinedMsg {
     sparse: Sparse,
     cloud: PointCloud,
     secs: f64,
+    /// 정밀 작업이 뒤쪽 보조까지 넣어 다시 등록했을 때의 (사진 목록, 보조 수). 없으면 초벌과 같다.
+    full: Option<(Vec<usize>, usize)>,
 }
 
 /// 기준을 정밀 작업 스레드에 보내고 기록한다(`None` 이면 기준 없이 시작).
@@ -1991,6 +1997,10 @@ pub fn run_pipeline_with(
      -> Result<(), String> {
         let k = m.slot;
         let rec = &mut recs[k];
+        if let Some((g, nh)) = m.full.clone() {
+            rec.gids = g;
+            rec.n_help = nh;
+        }
         let tb = to_tracks(&m.sparse, &rec.gids);
         for (a, g) in rec.gids.iter().enumerate().skip(rec.n_help) {
             if let Some(p) = m.sparse.poses[a] {
@@ -2040,11 +2050,19 @@ pub fn run_pipeline_with(
                 send_anchor(&mut recs[k + 1], &tx, a, k, t_now(), events);
             }
         }
+        let own_reg = m.sparse.poses[recs[k].n_help..]
+            .iter()
+            .filter(|p| p.is_some())
+            .count();
         events.push(format!(
-            "{:.1}s refined region {} rms {:.3} done",
+            "{:.1}s refined region {} rms {:.3} done (images {} helper {} own registered {}/{})",
             t_now(),
             r.index,
-            m.sparse.rms
+            m.sparse.rms,
+            recs[k].gids.len(),
+            recs[k].n_help,
+            own_reg,
+            3 * (r.hi - r.lo)
         ));
         let n_realign0 = realigns.len();
         // 이미 내보낸, 아직 정밀이 없는 초벌 구역을 새 정밀 모델 좌표로 다시 맞춘다.
@@ -2157,14 +2175,38 @@ pub fn run_pipeline_with(
         events.push(format!("{:.1}s arrive region {}", t_now(), r.index));
         // 구역 시작 쪽 R·L 은 F(p-40..=p-20) 와만 겹친다(F-197). 구역 밖 앞쪽 F 사진을 보조로 넣어
         // 구역 첫 위치들의 카메라 간 짝이 끊기지 않게 한다. 보조 사진은 출력·점수에 넣지 않는다.
-        let (gids, n_help) = region_gids(r, n_pos, &cfg.helper);
+        let (gids_full, n_help_full) = region_gids(r, n_pos, &cfg.helper);
+        let split = !cfg.helper.coarse_back && gids_full.iter().any(|g| g / 3 >= r.hi);
+        let (gids, n_help) = if split {
+            region_gids(
+                r,
+                n_pos,
+                &HelperConfig {
+                    back_span: 0,
+                    ..cfg.helper
+                },
+            )
+        } else {
+            (gids_full.clone(), n_help_full)
+        };
+        let last_pos = gids.iter().map(|g| g / 3).max().unwrap_or(r.hi - 1);
+        let lead = last_pos as i64 - r.hi as i64;
         events.push(format!(
-            "{:.1}s region {} images {} (own {} + helper {})",
+            "{:.1}s region {} images {} (own {} + helper {}) last position - hi {}{}",
             t_now(),
             r.index,
             gids.len(),
             gids.len() - n_help,
-            n_help
+            n_help,
+            lead,
+            if split {
+                format!(
+                    " (refined adds back helper {})",
+                    gids_full.len() - gids.len()
+                )
+            } else {
+                String::new()
+            }
         ));
         let t0 = Instant::now();
         let need: Vec<usize> = gids
@@ -2401,14 +2443,72 @@ pub fn run_pipeline_with(
             let psig = cfg.prior_sigma();
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
+            // 초벌이 뒤쪽 보조를 빼고 등록했으면 정밀 작업이 그 사진을 읽어 구역 전체를 다시 등록한다.
+            let extra = if split {
+                let have: std::collections::HashSet<usize> = gids_t.iter().copied().collect();
+                let paths: Vec<(usize, std::path::PathBuf)> = gids_full
+                    .iter()
+                    .filter(|g| !have.contains(g))
+                    .map(|&g| (g, ds.positions[g / 3].images[g % 3].clone()))
+                    .collect();
+                let full_gps: Vec<Vector3<f64>> = gids_full
+                    .iter()
+                    .map(|g| ds.positions[g / 3].image_enu[g % 3])
+                    .collect();
+                Some((gids_full.clone(), n_help_full, paths, full_gps))
+            } else {
+                None
+            };
+            let (maxf, position, region) = (cfg.max_features, cfg.position, *r);
+            let tri_t = TriConfig::from_config(cfg);
+            let mut cached: HashMap<usize, Arc<ImgData>> =
+                gids_t.iter().copied().zip(arcs.iter().cloned()).collect();
             in_flight += 1;
             std::thread::spawn(move || {
                 let anchor = anchor_rx.recv().ok().flatten();
                 let t = Instant::now();
-                let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
                 let mut rs = init;
+                let mut full: Option<(Vec<usize>, usize)> = None;
+                let mut arcs = arcs;
+                let mut gps = gps;
+                let mut in_region = in_region;
+                if let Some((gf, nhf, paths, gps_f)) = extra {
+                    let loaded: Vec<Option<(usize, Arc<ImgData>)>> = paths
+                        .par_iter()
+                        .map(|(g, pth)| load(pth, maxf).ok().map(|d| (*g, Arc::new(d))))
+                        .collect();
+                    for (g, d) in loaded.into_iter().flatten() {
+                        cached.insert(g, d);
+                    }
+                    if gf.iter().all(|g| cached.contains_key(g)) {
+                        let arcs_f: Vec<Arc<ImgData>> =
+                            gf.iter().map(|g| cached[g].clone()).collect();
+                        let imgs_f: Vec<&ImgData> = arcs_f.iter().map(|a| a.as_ref()).collect();
+                        let views_f: Vec<(usize, usize)> =
+                            gf.iter().map(|g| (g % 3, g / 3)).collect();
+                        let pm_f =
+                            crate::timing::timed("matching", || match_pairs(&imgs_f, &views_f, &k));
+                        if let Ok(sf) = sparse_init_roll(
+                            &imgs_f,
+                            &pm_f,
+                            &gps_f,
+                            &k,
+                            position,
+                            &tri_t,
+                            (0, 2.0),
+                            true,
+                        ) {
+                            in_region = gf.iter().map(|g| region.contains(g / 3)).collect();
+                            rs = sf;
+                            arcs = arcs_f;
+                            gps = gps_f;
+                            full = Some((gf, nhf));
+                        }
+                    }
+                }
+                let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
                 let mut fixed: Vec<usize> = Vec::new();
-                if let Some(an) = &anchor {
+                if let (Some(an), None) = (&anchor, &full) {
                     apply_sparse_sim(&mut rs, &an.sim);
                     for (i, p) in &an.fixed {
                         rs.poses[*i] = Some(*p);
@@ -2429,6 +2529,7 @@ pub fn run_pipeline_with(
                     sparse: rs,
                     cloud,
                     secs: t.elapsed().as_secs_f64(),
+                    full,
                 });
             });
         }
