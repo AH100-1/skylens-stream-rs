@@ -42,7 +42,7 @@ pub struct AnchorPlan {
 
 /// 새 구역의 초벌 트랙 `ta` 를 정밀 모델(`prev` 트랙, 사진별 포즈 `prev_poses`) 에 붙일 계획을 세운다.
 /// 변환은 겹침 위치 범위의 공유 3D 점 대응(5회 트리밍)으로, 고정 카메라는 등록된 사진 중 정밀 포즈가
-/// 있는 것. 고정 카메라가 2 대 미만이거나 점 대응이 모자라면 `None`.
+/// 있는 것. 고정 카메라가 2 대 미만이거나 점 대응이 모자라면 이유를 담은 `Err`.
 pub fn plan_anchor(
     ta: &[Track],
     prev: &[Track],
@@ -50,9 +50,14 @@ pub fn plan_anchor(
     regions: (&Region, &Region),
     gids: &[usize],
     registered: &[bool],
-) -> Option<AnchorPlan> {
+) -> Result<AnchorPlan, String> {
     let win = overlap_window(regions.0, regions.1);
-    let (sim, pairs, median_m) = cross_align(ta, prev, win)?;
+    let (sim, pairs, median_m) = cross_align(ta, prev, win).ok_or_else(|| {
+        format!(
+            "겹침 위치 {}..{} 의 공유 3D 점 대응이 모자라거나 퇴화함",
+            win.0, win.1
+        )
+    })?;
     let fixed: Vec<(usize, Pose)> = gids
         .iter()
         .enumerate()
@@ -60,9 +65,14 @@ pub fn plan_anchor(
         .filter_map(|(a, g)| prev_poses.get(g).map(|p| (a, *p)))
         .collect();
     if fixed.len() < 2 {
-        return None;
+        return Err(format!(
+            "겹침 위치 {}..{} 에서 등록된 정밀 카메라 {} 대 < 2 (공유 점 {pairs} 쌍)",
+            win.0,
+            win.1,
+            fixed.len()
+        ));
     }
-    Some(AnchorPlan {
+    Ok(AnchorPlan {
         sim,
         fixed,
         pairs,
@@ -320,7 +330,7 @@ mod tests {
         assert!(plan.fixed.iter().all(|&(a, _)| gids[a] / 3 < 10));
         // 등록된 사진이 2장 미만이면 붙이지 않는다.
         let none = vec![false; gids.len()];
-        assert!(plan_anchor(&ta, &prev, &poses, (&ra, &rb), &gids, &none).is_none());
+        assert!(plan_anchor(&ta, &prev, &poses, (&ra, &rb), &gids, &none).is_err());
     }
 
     #[test]
