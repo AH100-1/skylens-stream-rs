@@ -39,7 +39,7 @@ impl Default for DatasetConfig {
     fn default() -> Self {
         Self {
             stride: 3,
-            span: 12,
+            span: 48,
             ovl: 2,
             max_skip_run: 2,
         }

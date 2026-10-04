@@ -84,6 +84,12 @@ skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --
 skylens-stream verify out2
 ```
 
+인자 없이도 같은 흐름이 7/7 로 끝난다(기본 구역 길이 `--span 48`, 960x540 장면 stride 3 → 81장 1구역, 4코어 측정 기계에서 `run` 약 2.5 분; `crates/cli/tests/default_path.rs`).
+
+```bash
+skylens-stream synth d/in && skylens-stream run d/in d/out && skylens-stream verify d/out
+```
+
 출력 폴더에는 `preview/`·`refined/`·`snapshots/`(와 `snapshots/manifest.json`)·`poses.txt`·`report.json` 이 생긴다. 4코어 기계(부하 약 20)에서 실측:
 
 | | 단구역 (`out`, 120장) | 구역 2개 (`out2`, 240장) |
@@ -326,6 +332,9 @@ skylens-stream verify out
 # two or more regions (neighbor-overlap item is judged): --stride 1 uses all 80 positions
 skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
 skylens-stream verify out2
+
+# Defaults also work end to end (default --span 48; 960x540 scene, stride 3 -> 81 images, one region; verify 7/7)
+skylens-stream synth d/in && skylens-stream run d/in d/out && skylens-stream verify d/out
 
 # Print the version ("skylens-stream 0.1.0")
 skylens-stream --version
