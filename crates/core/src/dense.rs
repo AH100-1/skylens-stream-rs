@@ -743,12 +743,20 @@ pub fn remove_speckles(map: &mut DepthMap, rel: f32, min_px: usize) -> usize {
 }
 
 /// 융합 전 깊이 지도 걸러내기 기본값: 반점 제거(상대 깊이차 0.007, 100 화소 미만).
+/// 100 화소는 480×270 에서 잰 값이다. 그보다 작은 지도에서는 면적 비례로 줄인다
+/// (80×45 에서 100 화소면 지도의 3% 가 한 조각이라 참 표면까지 지워진다).
 const SPECKLE_REL: f32 = 0.007;
 const SPECKLE_MIN_PX: usize = 100;
+const SPECKLE_REF_AREA: usize = 480 * 270;
+
+fn speckle_min_px(w: usize, h: usize) -> usize {
+    (SPECKLE_MIN_PX * w * h / SPECKLE_REF_AREA).min(SPECKLE_MIN_PX)
+}
 
 fn filter_depth_maps(maps: &mut [DepthMap]) {
     maps.par_iter_mut().for_each(|m| {
-        remove_speckles(m, SPECKLE_REL, SPECKLE_MIN_PX);
+        let min_px = speckle_min_px(m.w, m.h);
+        remove_speckles(m, SPECKLE_REL, min_px);
     });
 }
 
