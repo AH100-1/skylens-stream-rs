@@ -2822,8 +2822,7 @@ mod tests {
 
     /// 통과 간선 하나의 기록.
     struct EdgeRec {
-        kind: usize,
-        /// 위치 번호 (앞 시점, 뒤 시점) 와 카메라 번호.
+        /// (카메라 번호, 위치 번호). `a` 가 앞 시점, `b` 가 뒤 시점.
         a: (usize, usize),
         b: (usize, usize),
         matches: usize,
@@ -2945,7 +2944,6 @@ mod tests {
                     }
                 }
                 edge_log.push(EdgeRec {
-                    kind: kd,
                     a: (sel[i].0, sel[i].1),
                     b: (sel[j].0, sel[j].1),
                     matches: m.len(),
@@ -3033,12 +3031,12 @@ mod tests {
             for e in &r.edge_log {
                 let cam = |c: usize| ['F', 'R', 'L'][c];
                 eprintln!(
-                    "  | {}({})–{}({}) | +{} | {:.2} | {:.2} | {} | {} | {} | {:.0}% |",
+                    "  | {}({})–{}({}) | {:+} | {:.2} | {:.2} | {} | {} | {} | {:.0}% |",
                     cam(e.a.0),
                     e.a.1,
                     cam(e.b.0),
                     e.b.1,
-                    e.b.1 - e.a.1,
+                    e.b.1 as i64 - e.a.1 as i64,
                     e.err,
                     e.best_decomp,
                     e.second_cand.map_or("-".into(), |v| format!("{v:.2}")),
@@ -3046,7 +3044,6 @@ mod tests {
                     e.inliers,
                     100.0 * e.overlap
                 );
-                debug_assert!(e.kind != 0);
             }
             runs.push(r);
         }
