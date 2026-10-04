@@ -2560,7 +2560,8 @@ pub fn run_pipeline_with(
                 None
             };
             let gids_coarse = if split { gids_t.clone() } else { Vec::new() };
-            let (maxf, position, region) = (cfg.max_features, cfg.position, *r);
+            let (maxf, upf, position, region) =
+                (cfg.max_features, cfg.upscale_fill, cfg.position, *r);
             let tri_t = TriConfig::from_config(cfg);
             let mut cached: HashMap<usize, Arc<ImgData>> =
                 gids_t.iter().copied().zip(arcs.iter().cloned()).collect();
@@ -2576,7 +2577,7 @@ pub fn run_pipeline_with(
                 if let Some((gf, nhf, paths, gps_f)) = extra {
                     let loaded: Vec<Option<(usize, Arc<ImgData>)>> = paths
                         .par_iter()
-                        .map(|(g, pth)| load(pth, maxf).ok().map(|d| (*g, Arc::new(d))))
+                        .map(|(g, pth)| load(pth, maxf, upf).ok().map(|d| (*g, Arc::new(d))))
                         .collect();
                     for (g, d) in loaded.into_iter().flatten() {
                         cached.insert(g, d);
