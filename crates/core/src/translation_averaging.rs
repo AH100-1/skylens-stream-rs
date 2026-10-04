@@ -16,6 +16,7 @@
 use crate::math::{Matrix3, Point3, Rotation3, Vector3};
 use crate::two_view::RelativePose;
 use nalgebra::{DMatrix, DVector};
+use rayon::prelude::*;
 
 /// 짝별 이동 방향 관측 하나.
 #[derive(Clone, Debug)]
@@ -1000,6 +1001,8 @@ fn average_core(
 /// 점–카메라 방향 제약 전역 위치 추정의 가정값.
 const GP_HUBER: f64 = 0.1;
 const GP_ITERS: usize = 300;
+const GP_COST_TOL: f64 = 1e-6;
+const GP_MOVE_TOL: f64 = 1e-5;
 const GP_MIN_SCALE: f64 = 1e-5;
 const GP_GATE_RAD: f64 = 2.0 * std::f64::consts::PI / 180.0;
 /// 마지막 정밀 풀이 전에 쓰는 좁은 각 문턱(1.5°).
@@ -1033,12 +1036,12 @@ fn gp_solve(
     n_pts: usize,
     obs: &[(usize, usize, Vector3<f64>, f64)],
     active: &[bool],
-    init: Option<&[Vector3<f64>]>,
+    init: Option<(&[Vector3<f64>], &[f64])>,
     seed: u64,
-) -> Vec<Vector3<f64>> {
+) -> (Vec<Vector3<f64>>, Vec<f64>) {
     let m = n_cam + n_pts;
     let mut x: Vec<Vector3<f64>> = match init {
-        Some(s) => s.to_vec(),
+        Some((s, _)) => s.to_vec(),
         None => {
             let mut st = seed;
             (0..m)
@@ -1057,29 +1060,73 @@ fn gp_solve(
     for (k, o) in obs.iter().enumerate() {
         by_point[o.1].push(k);
     }
-    let mut d = vec![1.0; obs.len()];
+    // 점별 사용 카메라(중복 제거, 정렬)와 점 조각: 반복 사이에 구조가 고정이다.
+    let pt_cams: Vec<Vec<usize>> = by_point
+        .iter()
+        .map(|ks| {
+            let mut c: Vec<usize> = ks
+                .iter()
+                .filter(|&&k| active[k])
+                .map(|&k| obs[k].0)
+                .collect();
+            c.sort_unstable();
+            c.dedup();
+            c
+        })
+        .collect();
+    let chunk = n_pts.div_ceil(rayon::current_num_threads() * 4).max(1);
+    let pt_chunks: Vec<(usize, usize)> = (0..n_pts)
+        .step_by(chunk)
+        .map(|lo| (lo, (lo + chunk).min(n_pts)))
+        .collect();
+    let mut d = match init {
+        Some((_, d0)) => d0.to_vec(),
+        None => vec![1.0; obs.len()],
+    };
     let mut irls = vec![1.0; obs.len()];
     let mut prev = f64::INFINITY;
     for it in 0..GP_ITERS {
+        let prev_centers: Vec<Vector3<f64>> = x[..n_cam].to_vec();
         // c, X 풀이: Σ w d² |(X_p − c_i) − v/d|² → 정규방정식(좌표 공통 행렬).
         // 점 블록은 스칼라 대각이라 점을 소거한 카메라 축소 계통(n_cam × n_cam)만 밀집으로 푼다.
         let mut s = DMatrix::<f64>::zeros(n_cam, n_cam);
         let mut bc = DMatrix::<f64>::zeros(n_cam, 3);
         let mut diag_c = vec![0.0f64; n_cam];
-        let mut app = vec![0.0f64; n_pts];
-        let mut bp = vec![Vector3::<f64>::zeros(); n_pts];
-        for (k, &(cam, pt, v, wt)) in obs.iter().enumerate() {
-            if !active[k] {
-                continue;
-            }
-            let w = wt * irls[k] * d[k] * d[k];
-            diag_c[cam] += w;
-            app[pt] += w;
-            // d (X − c) = v 의 최소제곱: 행 (e_p − e_c)·d, 우변 v.
-            let rv = v * (wt * irls[k] * d[k]);
-            bp[pt] += rv;
-            for q in 0..3 {
-                bc[(cam, q)] -= rv[q];
+        // 관측별 가중 w = wt·irls·d² (쓰지 않는 관측은 0).
+        let wk: Vec<f64> = (0..obs.len())
+            .into_par_iter()
+            .map(|k| {
+                if active[k] {
+                    obs[k].3 * irls[k] * d[k] * d[k]
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        // d (X − c) = v 의 최소제곱: 행 (e_p − e_c)·d, 우변 v.
+        let pt_sums: Vec<(f64, Vector3<f64>)> = by_point
+            .par_iter()
+            .map(|ks| {
+                let mut a = 0.0;
+                let mut b = Vector3::<f64>::zeros();
+                for &k in ks {
+                    if active[k] {
+                        a += wk[k];
+                        b += obs[k].2 * (obs[k].3 * irls[k] * d[k]);
+                    }
+                }
+                (a, b)
+            })
+            .collect();
+        let mut app: Vec<f64> = pt_sums.iter().map(|p| p.0).collect();
+        let bp: Vec<Vector3<f64>> = pt_sums.iter().map(|p| p.1).collect();
+        for (k, &(cam, _, v, wt)) in obs.iter().enumerate() {
+            if active[k] {
+                diag_c[cam] += wk[k];
+                let rv = v * (wt * irls[k] * d[k]);
+                for q in 0..3 {
+                    bc[(cam, q)] -= rv[q];
+                }
             }
         }
         let trace: f64 = diag_c.iter().sum::<f64>() + app.iter().sum::<f64>();
@@ -1090,35 +1137,70 @@ fn gp_solve(
         for a in app.iter_mut() {
             *a += ridge;
         }
-        // 점별 (카메라, 가중) 목록을 합쳐(같은 카메라 중복 합산) 슈어 보수를 더한다.
-        let mut entries: Vec<(usize, f64)> = Vec::new();
-        for pt in 0..n_pts {
-            entries.clear();
-            for &k in &by_point[pt] {
-                if active[k] {
-                    let (cam, _, _, wt) = obs[k];
-                    entries.push((cam, wt * irls[k] * d[k] * d[k]));
+        // 슈어 보수: 점마다 u (카메라별 합산 가중) 를 만들고 S -= u uᵀ / app 을 상삼각에만 누적한다.
+        // 점을 스레드 조각으로 나눠 부분 (S, b) 에 쌓은 뒤 합친다. 점당 카메라 목록은 호출 동안 고정이다.
+        let parts: Vec<(Vec<f64>, Vec<f64>)> = pt_chunks
+            .par_iter()
+            .map(|&(lo, hi)| {
+                let mut su = vec![0.0f64; n_cam * n_cam];
+                let mut bb = vec![0.0f64; n_cam * 3];
+                let mut u = vec![0.0f64; n_cam];
+                for pt in lo..hi {
+                    let cams = &pt_cams[pt];
+                    if cams.is_empty() {
+                        continue;
+                    }
+                    for &k in &by_point[pt] {
+                        if active[k] {
+                            u[obs[k].0] += wk[k];
+                        }
+                    }
+                    let inv = 1.0 / app[pt];
+                    let dense = cams.len() * 4 >= n_cam;
+                    for (a, &ci) in cams.iter().enumerate() {
+                        let coef = u[ci] * inv;
+                        for q in 0..3 {
+                            bb[ci * 3 + q] += coef * bp[pt][q];
+                        }
+                        if dense {
+                            let row = &mut su[ci * n_cam + ci..(ci + 1) * n_cam];
+                            for (r, &uj) in row.iter_mut().zip(&u[ci..]) {
+                                *r -= coef * uj;
+                            }
+                        } else {
+                            let row = &mut su[ci * n_cam..(ci + 1) * n_cam];
+                            for &cj in &cams[a..] {
+                                row[cj] -= coef * u[cj];
+                            }
+                        }
+                    }
+                    for &ci in cams {
+                        u[ci] = 0.0;
+                    }
+                }
+                (su, bb)
+            })
+            .collect();
+        let mut s_up = vec![0.0f64; n_cam * n_cam];
+        let mut bc_add = vec![0.0f64; n_cam * 3];
+        for (su, bb) in &parts {
+            for (a, b) in s_up.iter_mut().zip(su) {
+                *a += b;
+            }
+            for (a, b) in bc_add.iter_mut().zip(bb) {
+                *a += b;
+            }
+        }
+        for i in 0..n_cam {
+            for j in i..n_cam {
+                let v = s_up[i * n_cam + j];
+                s[(i, j)] += v;
+                if j != i {
+                    s[(j, i)] += v;
                 }
             }
-            if entries.is_empty() {
-                continue;
-            }
-            entries.sort_unstable_by_key(|e| e.0);
-            let mut merged: Vec<(usize, f64)> = Vec::with_capacity(entries.len());
-            for &(c, w) in &entries {
-                match merged.last_mut() {
-                    Some(l) if l.0 == c => l.1 += w,
-                    _ => merged.push((c, w)),
-                }
-            }
-            let inv = 1.0 / app[pt];
-            for &(ci, wi) in &merged {
-                for q in 0..3 {
-                    bc[(ci, q)] += wi * inv * bp[pt][q];
-                }
-                for &(cj, wj) in &merged {
-                    s[(ci, cj)] -= wi * wj * inv;
-                }
+            for q in 0..3 {
+                bc[(i, q)] += bc_add[i * 3 + q];
             }
         }
         let Some(ch) = s.cholesky() else {
@@ -1129,42 +1211,69 @@ fn gp_solve(
             x[i] = Vector3::new(sol[(i, 0)], sol[(i, 1)], sol[(i, 2)]);
         }
         // 점 역대입: X_p = (b_p + Σ w c_i) / (app).
-        let mut acc = bp.clone();
-        for (k, &(cam, pt, _, wt)) in obs.iter().enumerate() {
-            if active[k] {
-                acc[pt] += x[cam] * (wt * irls[k] * d[k] * d[k]);
-            }
-        }
-        for pt in 0..n_pts {
-            x[n_cam + pt] = acc[pt] / app[pt];
-        }
-        // d 와 가중 갱신.
-        let mut cost = 0.0;
-        for (k, &(cam, pt, v, _)) in obs.iter().enumerate() {
-            if !active[k] {
-                continue;
-            }
-            let dx = x[n_cam + pt] - x[cam];
-            let dd = v.dot(&dx) / dx.norm_squared().max(1e-300);
-            d[k] = if Some(k) == first {
-                1.0
-            } else {
-                dd.max(GP_MIN_SCALE)
-            };
-            let r = (v - dx * d[k]).norm();
-            irls[k] = if r > GP_HUBER { GP_HUBER / r } else { 1.0 };
-            cost += if r > GP_HUBER {
-                2.0 * GP_HUBER * r - GP_HUBER * GP_HUBER
-            } else {
-                r * r
-            };
-        }
-        if it > 10 && (prev - cost).abs() <= 1e-9 * prev.max(1e-12) {
+        let xc = &x[..n_cam];
+        let xp: Vec<Vector3<f64>> = by_point
+            .par_iter()
+            .enumerate()
+            .map(|(pt, ks)| {
+                let mut acc = bp[pt];
+                for &k in ks {
+                    if active[k] {
+                        acc += xc[obs[k].0] * wk[k];
+                    }
+                }
+                acc / app[pt]
+            })
+            .collect();
+        x[n_cam..].copy_from_slice(&xp);
+        // d 와 가중 갱신(고정 크기 조각별 합을 순서대로 더해 결정적이다).
+        let xr = &x;
+        let costs: Vec<f64> = d
+            .par_chunks_mut(8192)
+            .zip(irls.par_chunks_mut(8192))
+            .enumerate()
+            .map(|(ci, (dc, ic))| {
+                let mut cost = 0.0;
+                for (o, (dk, ik)) in dc.iter_mut().zip(ic.iter_mut()).enumerate() {
+                    let k = ci * 8192 + o;
+                    if !active[k] {
+                        continue;
+                    }
+                    let (cam, pt, v, _) = obs[k];
+                    let dx = xr[n_cam + pt] - xr[cam];
+                    let dd = v.dot(&dx) / dx.norm_squared().max(1e-300);
+                    *dk = if Some(k) == first {
+                        1.0
+                    } else {
+                        dd.max(GP_MIN_SCALE)
+                    };
+                    let r = (v - dx * *dk).norm();
+                    *ik = if r > GP_HUBER { GP_HUBER / r } else { 1.0 };
+                    cost += if r > GP_HUBER {
+                        2.0 * GP_HUBER * r - GP_HUBER * GP_HUBER
+                    } else {
+                        r * r
+                    };
+                }
+                cost
+            })
+            .collect();
+        let cost: f64 = costs.iter().sum();
+        // 수렴: 비용 상대 변화와 중심 최대 이동이 모두 작을 때.
+        let max_move = x[..n_cam]
+            .iter()
+            .zip(&prev_centers)
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0, f64::max);
+        if it > 10
+            && (prev - cost).abs() <= GP_COST_TOL * prev.max(1e-12)
+            && max_move <= GP_MOVE_TOL
+        {
             break;
         }
         prev = cost;
     }
-    x
+    (x, d)
 }
 
 /// 점 관측을 주 경로로 쓰는 전역 위치 추정. 짝 간선은 회전 일관성으로만 거르고(`rejected[0]`) 각 잔차를 보고한다.
@@ -1248,7 +1357,7 @@ fn global_positioning(
         obs.retain(|o| comp[o.0] == Some(best));
     }
     let mut active = vec![true; obs.len()];
-    let mut x = gp_solve(n_cam, n_pts, &obs, &active, None, 1);
+    let (mut x, mut dsc) = gp_solve(n_cam, n_pts, &obs, &active, None, 1);
     // 관측 거르기: 각 오차, 카메라 뒤. 거른 뒤 같은 해에서 다시 푼다.
     for gate in [GP_GATE_RAD, GP_GATE_RAD, GP_FINAL_GATE_RAD] {
         let mut cnt = vec![0usize; n_cam];
@@ -1265,7 +1374,7 @@ fn global_positioning(
             }
         }
         let init = x.clone();
-        x = gp_solve(n_cam, n_pts, &obs, &active, Some(&init), 1);
+        (x, dsc) = gp_solve(n_cam, n_pts, &obs, &active, Some((&init, &dsc)), 1);
     }
     let mut cam_cnt = vec![0usize; n_cam];
     let mut pt_cnt = vec![0usize; n_pts];
