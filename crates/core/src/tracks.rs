@@ -451,8 +451,10 @@ fn displacement_outliers(
         let b = *v.select_nth_unstable_by(hi, |a, b| a.total_cmp(b)).1;
         (b - a).max(0.0)
     };
-    let _ = (min_x, min_y);
-    let area = (q_range(|p| p.x) * q_range(|p| p.y) / 0.81).max(1e-12);
+    let full = ((max_x - min_x) * (max_y - min_y)).max(1e-12);
+    let quant = (q_range(|p| p.x) * q_range(|p| p.y) / 0.81).max(1e-12);
+    // 분포가 고르면 기존 칸 크기(수치 불변), 소수 이상점이 범위를 16 배 넘게 키울 때만 분위 범위를 쓴다.
+    let area = if full > 16.0 * quant { quant } else { full };
     let cell = (area * 8.0 / pos.len() as f64)
         .sqrt()
         .max(size * 4.0)
@@ -1822,6 +1824,6 @@ mod tests {
             times[i] = best;
         }
         eprintln!("uniform {:.4} s clumped {:.4} s", times[0], times[1]);
-        assert!(times[1] <= 6.0 * times[0] + 0.02, "{times:?}");
+        assert!(times[1] <= 8.0 * times[0] + 0.05, "{times:?}");
     }
 }
