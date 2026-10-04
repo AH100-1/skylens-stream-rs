@@ -220,6 +220,39 @@ fn settings() -> Vec<(&'static str, NeighborConfig)> {
             },
         ),
         (
+            "자동(8도 상한, 25% 분위)",
+            NeighborConfig {
+                min_angle_deg: 8.0,
+                auto_min_quantile: 0.25,
+                ..base
+            },
+        ),
+        (
+            "자동(8도 상한, 50% 분위)",
+            NeighborConfig {
+                min_angle_deg: 8.0,
+                auto_min_quantile: 0.5,
+                ..base
+            },
+        ),
+        (
+            "8도 + 최소 6장 채움",
+            NeighborConfig {
+                min_angle_deg: 8.0,
+                min_keep: 6,
+                ..base
+            },
+        ),
+        (
+            "자동 50% + 최소 6장 채움",
+            NeighborConfig {
+                min_angle_deg: 8.0,
+                auto_min_quantile: 0.5,
+                min_keep: 6,
+                ..base
+            },
+        ),
+        (
             "최적 12도(최소 5도)",
             NeighborConfig {
                 min_angle_deg: 5.0,

@@ -31,6 +31,8 @@ pub const SIGMA_ABOVE_DEG: f64 = 15.0;
 /// (회전 오차 / 각)으로 커지므로 [`NeighborConfig::min_angle_deg`] 를 8 로 올리면 좋아지지만
 /// 기선이 짧은 장면에서 이웃이 비므로 기본으로 바꾸지 않았다(시험 `dense_pose_noise` 참고).
 pub const MIN_ANGLE_DEG: f64 = 0.0;
+/// 사진별 최소 각 자동 결정에 쓰는 후보 각 분포 분위 기본값(0 = 끔). 0.5 로 켜면 기선 짧은 장면 시험 2개가 깨진다.
+pub const AUTO_MIN_QUANTILE: f64 = 0.0;
 /// 깊이 범위 분위(아래, 위).
 pub const DEPTH_QUANTILES: (f64, f64) = (0.05, 0.95);
 /// 깊이 범위 여유: 가까운 끝 × (1 − m), 먼 끝 × (1 + m).
@@ -70,6 +72,12 @@ pub struct NeighborConfig {
     pub sigma_above_deg: f64,
     /// 이 각(도)보다 큰 쌍 점은 점수 0.
     pub max_angle_deg: f64,
+    /// 0 이 아니면 최소 각을 사진별로 낮춘다: 그 사진의 후보 이웃들의 평균 광선 각 분포에서
+    /// 이 분위(0~1)의 값과 `min_angle_deg` 중 작은 값을 그 사진의 최소 각으로 쓴다.
+    /// 기선이 짧은 장면에서는 분위 값이 작아 제한이 느슨해진다.
+    pub auto_min_quantile: f64,
+    /// 최소 각 등으로 걸러진 뒤 이웃이 이 수보다 적으면 걸러지기 전 점수 순으로 채운다(0 = 채우지 않음).
+    pub min_keep: usize,
 }
 
 impl Default for NeighborConfig {
@@ -80,6 +88,8 @@ impl Default for NeighborConfig {
             sigma_below_deg: SIGMA_BELOW_DEG,
             sigma_above_deg: SIGMA_ABOVE_DEG,
             max_angle_deg: 180.0,
+            auto_min_quantile: AUTO_MIN_QUANTILE,
+            min_keep: 0,
         }
     }
 }
@@ -162,33 +172,127 @@ pub fn select_neighbors_with(
 ) -> Vec<Vec<usize>> {
     let pos: HashMap<usize, usize> = views.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
     let n = views.len();
-    let mut score = vec![0.0f64; n * n];
-    let mut obs = Vec::new();
-    for p in points {
-        if !(p.xyz.x.is_finite() && p.xyz.y.is_finite() && p.xyz.z.is_finite()) {
-            continue;
+    let observed: Vec<Vec<usize>> = points
+        .iter()
+        .map(|p| {
+            if !(p.xyz.x.is_finite() && p.xyz.y.is_finite() && p.xyz.z.is_finite()) {
+                return Vec::new();
+            }
+            let mut obs: Vec<usize> = p
+                .observers
+                .iter()
+                .filter_map(|id| pos.get(id).copied())
+                .collect();
+            obs.sort_unstable();
+            obs.dedup();
+            obs
+        })
+        .collect();
+    // thr[i]: 사진 i 의 최소 각(도). 사진별 값이 필요 없으면 cfg 값 그대로.
+    let mut thr = vec![cfg.min_angle_deg; n];
+    if cfg.auto_min_quantile > 0.0 && cfg.min_angle_deg > 0.0 {
+        let mut sum = vec![0.0f64; n * n];
+        let mut cnt = vec![0u32; n * n];
+        for (p, obs) in points.iter().zip(&observed) {
+            for (a, &i) in obs.iter().enumerate() {
+                for &j in &obs[a + 1..] {
+                    let ra = views[i].cam.pose.center() - p.xyz;
+                    let rb = views[j].cam.pose.center() - p.xyz;
+                    let c = (ra.dot(&rb) / (ra.norm() * rb.norm())).clamp(-1.0, 1.0);
+                    let th = c.acos().to_degrees();
+                    if th.is_finite() {
+                        for (x, y) in [(i, j), (j, i)] {
+                            sum[x * n + y] += th;
+                            cnt[x * n + y] += 1;
+                        }
+                    }
+                }
+            }
         }
-        obs.clear();
-        obs.extend(p.observers.iter().filter_map(|id| pos.get(id).copied()));
-        obs.sort_unstable();
-        obs.dedup();
-        for (a, &i) in obs.iter().enumerate() {
-            for &j in &obs[a + 1..] {
-                let s = pair_score_with(&views[i], &views[j], &p.xyz, cfg);
-                score[i * n + j] += s;
-                score[j * n + i] += s;
+        for i in 0..n {
+            let mut ang: Vec<f64> = (0..n)
+                .filter(|&j| cnt[i * n + j] > 0)
+                .map(|j| sum[i * n + j] / cnt[i * n + j] as f64)
+                .collect();
+            if !ang.is_empty() {
+                ang.sort_by(f64::total_cmp);
+                thr[i] = cfg
+                    .min_angle_deg
+                    .min(quantile(&ang, cfg.auto_min_quantile.min(1.0)));
             }
         }
     }
+    let scores = |per_view: bool| {
+        let mut score = vec![0.0f64; n * n];
+        for (p, obs) in points.iter().zip(&observed) {
+            for (a, &i) in obs.iter().enumerate() {
+                for &j in &obs[a + 1..] {
+                    if per_view {
+                        let ci = NeighborConfig {
+                            min_angle_deg: thr[i],
+                            ..*cfg
+                        };
+                        let cj = NeighborConfig {
+                            min_angle_deg: thr[j],
+                            ..*cfg
+                        };
+                        score[i * n + j] += pair_score_with(&views[i], &views[j], &p.xyz, &ci);
+                        score[j * n + i] += pair_score_with(&views[j], &views[i], &p.xyz, &cj);
+                    } else {
+                        let s = pair_score_with(&views[i], &views[j], &p.xyz, cfg);
+                        score[i * n + j] += s;
+                        score[j * n + i] += s;
+                    }
+                }
+            }
+        }
+        score
+    };
+    let per_view = thr.iter().any(|&t| t != cfg.min_angle_deg);
+    let score = scores(per_view);
+    let fallback = (cfg.min_keep > 0 && cfg.min_angle_deg > 0.0).then(|| {
+        let open = NeighborConfig {
+            min_angle_deg: 0.0,
+            ..*cfg
+        };
+        let mut sc = vec![0.0f64; n * n];
+        for (p, obs) in points.iter().zip(&observed) {
+            for (a, &i) in obs.iter().enumerate() {
+                for &j in &obs[a + 1..] {
+                    let s = pair_score_with(&views[i], &views[j], &p.xyz, &open);
+                    sc[i * n + j] += s;
+                    sc[j * n + i] += s;
+                }
+            }
+        }
+        sc
+    });
+    let ranked = |sc: &[f64], i: usize| -> Vec<usize> {
+        let mut cand: Vec<(usize, f64)> = (0..n)
+            .filter(|&j| j != i && sc[i * n + j] > 0.0)
+            .map(|j| (j, sc[i * n + j]))
+            .collect();
+        cand.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        cand.into_iter().map(|(j, _)| j).collect()
+    };
     (0..n)
         .map(|i| {
-            let mut cand: Vec<(usize, f64)> = (0..n)
-                .filter(|&j| j != i && score[i * n + j] > 0.0)
-                .map(|j| (j, score[i * n + j]))
-                .collect();
-            cand.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            cand.truncate(k);
-            cand.into_iter().map(|(j, _)| j).collect()
+            let mut out = ranked(&score, i);
+            out.truncate(k);
+            if let Some(fb) = &fallback {
+                let want = cfg.min_keep.min(k);
+                if out.len() < want {
+                    for j in ranked(fb, i) {
+                        if out.len() >= want {
+                            break;
+                        }
+                        if !out.contains(&j) {
+                            out.push(j);
+                        }
+                    }
+                }
+            }
+            out
         })
         .collect()
 }
