@@ -34,18 +34,23 @@ pub fn timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     r
 }
 
+type Row = (&'static str, f64, u32);
+
+fn snapshot() -> Vec<Row> {
+    ACC.lock().map(|a| a.clone()).unwrap_or_default()
+}
+
 /// 지금까지의 누적을 JSON 으로: 전체 벽시계와 단계별 `secs`·`calls`.
 pub fn to_json(wall_secs: f64) -> String {
-    let rows: Vec<String> = ACC
-        .lock()
-        .map(|a| {
-            a.iter()
-                .map(|(n, s, c)| {
-                    format!("    {{\"stage\": \"{n}\", \"secs\": {s:.3}, \"calls\": {c}}}")
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    json_from(wall_secs, &snapshot())
+}
+
+/// 스냅숏 `rows` 로 JSON 을 만든다(전역 누적을 읽지 않는다).
+fn json_from(wall_secs: f64, rows: &[Row]) -> String {
+    let rows: Vec<String> = rows
+        .iter()
+        .map(|(n, s, c)| format!("    {{\"stage\": \"{n}\", \"secs\": {s:.3}, \"calls\": {c}}}"))
+        .collect();
     format!(
         "{{\n  \"wall_secs\": {wall_secs:.3},\n  \"stages\": [\n{}\n  ]\n}}\n",
         rows.join(",\n")
@@ -54,7 +59,12 @@ pub fn to_json(wall_secs: f64) -> String {
 
 /// 단계별 누적을 사람이 읽는 표로: 초 큰 순, 단계 이름·초·호출 수. 한 줄에 하나.
 pub fn table() -> Vec<String> {
-    let mut rows: Vec<(&'static str, f64, u32)> = ACC.lock().map(|a| a.clone()).unwrap_or_default();
+    table_from(&snapshot())
+}
+
+/// 스냅숏 `rows` 로 표를 만든다(전역 누적을 읽지 않는다).
+fn table_from(rows: &[Row]) -> Vec<String> {
+    let mut rows = rows.to_vec();
     rows.sort_by(|a, b| b.1.total_cmp(&a.1));
     rows.iter()
         .map(|(n, s, c)| format!("timing {n:<22} {s:>9.3} s {c:>6} calls"))
@@ -65,24 +75,31 @@ pub fn table() -> Vec<String> {
 mod tests {
     use super::*;
 
+    const ROWS: [Row; 2] = [("t_b", 0.25, 1), ("t_a", 1.5, 2)];
+
     #[test]
-    fn accumulates_by_name() {
-        add("t_a", 1.0);
-        add("t_a", 0.5);
-        let v = timed("t_b", || 7);
-        assert_eq!(v, 7);
-        let j = to_json(2.0);
+    fn json_from_snapshot() {
+        let j = json_from(2.0, &ROWS);
         assert!(
             j.contains("\"stage\": \"t_a\", \"secs\": 1.500, \"calls\": 2"),
             "{j}"
         );
-        assert!(j.contains("\"stage\": \"t_b\""), "{j}");
-        assert!(j.contains("\"wall_secs\": 2.000"));
-        let t = table();
-        let (a, b) = (
-            t.iter().position(|l| l.contains("t_a")).unwrap(),
-            t.iter().position(|l| l.contains("t_b")).unwrap(),
+        assert!(
+            j.contains("\"stage\": \"t_b\", \"secs\": 0.250, \"calls\": 1"),
+            "{j}"
         );
-        assert!(a < b, "{t:?}");
+        assert!(j.contains("\"wall_secs\": 2.000"), "{j}");
+        assert!(json_from(0.0, &[]).contains("\"stages\": [\n\n  ]"));
+    }
+
+    #[test]
+    fn table_sorted_largest_first() {
+        let t = table_from(&ROWS);
+        assert_eq!(t.len(), 2);
+        assert_eq!(
+            t[0],
+            format!("timing {:<22} {:>9.3} s {:>6} calls", "t_a", 1.5, 2)
+        );
+        assert!(t[1].contains("t_b"), "{t:?}");
     }
 }
