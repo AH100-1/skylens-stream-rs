@@ -2532,6 +2532,41 @@ pub fn run_pipeline_with(
             diffs.len()
         ));
     }
+    // 이웃 정밀 구역이 겹침 위치에서 낸 카메라의 최종 좌표계 차이(중심 성분별 부호 있는 중앙, 회전 각).
+    for w in recs.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        let mov = |rec: &RegionRec, g: usize| {
+            let p = rec.rposes.get(&g)?;
+            let sim = rec.rsim.unwrap_or_else(crate::align::Similarity::identity);
+            let c = sim.apply_point(&p.center().coords);
+            Some((c, p.rotation * sim.r.inverse()))
+        };
+        let (mut dx, mut dy, mut dz, mut dn, mut da) = (vec![], vec![], vec![], vec![], vec![]);
+        for &g in a.rposes.keys() {
+            if let (Some((ca, ra)), Some((cb, rb))) = (mov(a, g), mov(b, g)) {
+                let d = cb - ca;
+                dx.push(d.x);
+                dy.push(d.y);
+                dz.push(d.z);
+                dn.push(d.norm());
+                da.push((ra.inverse() * rb).angle().to_degrees());
+            }
+        }
+        if let (Some(mx), Some(my), Some(mz), Some(mn), Some(ma)) = (
+            median(dx.clone()),
+            median(dy.clone()),
+            median(dz.clone()),
+            median(dn.clone()),
+            median(da.clone()),
+        ) {
+            events.push(format!(
+                "overlap cameras {}-{} n {} center diff median {mn:.3} m (dx {mx:.3} dy {my:.3} dz {mz:.3}) rotation diff median {ma:.3} deg",
+                a.region.index,
+                b.region.index,
+                dn.len()
+            ));
+        }
+    }
     let mut poses_txt = String::new();
     for (g, c) in &centers {
         poses_txt += &format!("{} {} {} {}\n", name(*g), c[0], c[1], c[2]);

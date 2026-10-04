@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use skylens_core::dataset::{load_dataset, Dataset, DatasetConfig};
 use skylens_core::pipeline::{run_pipeline_with, PipelineConfig, PipelineResult};
 use skylens_core::pipeline_stream::StreamOptions;
-use skylens_core::synth::{Scene, SceneConfig};
+use skylens_core::ply::read_ply_file;
+use skylens_core::synth::{Scene, SceneConfig, GPS_ORIGIN};
 use skylens_core::verify::verify_dir;
 
 fn cfg() -> PipelineConfig {
@@ -64,6 +65,107 @@ struct Row {
     final_err_max: f64,
     pass: usize,
     items: usize,
+}
+
+/// 정밀 점군의 정답 표면 대비 높이 편향(부호 있는 중앙 m). 이웃 구역 쌍의 겹침(수평 1 m 안 짝)에서 구역별
+/// 편향과, 짝 높이 차의 부호 있는 중앙·절대 중앙을 낸다.
+struct OverlapBias {
+    pairs: usize,
+    /// 앞·뒤 구역 점의 정답 대비 부호 있는 높이 차 중앙.
+    bias_a: f64,
+    bias_b: f64,
+    /// (뒤 − 앞) 짝 높이 차의 부호 있는 중앙, 절대 중앙(verify 와 같은 값).
+    signed: f64,
+    abs: f64,
+    /// 구역 전체 점의 편향 중앙.
+    all_a: f64,
+    all_b: f64,
+    /// 정답 대비 높이 오차 절대 중앙(앞·뒤), 짝 두 점의 정답 표면 높이 차 절대 중앙(수평 어긋남 몫).
+    abs_a: f64,
+    abs_b: f64,
+    slope_part: f64,
+}
+
+fn med(mut v: Vec<f64>) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+fn truth_dz(scene: &Scene, p: [f32; 3]) -> f64 {
+    let first = scene.first_gps_origin();
+    let g = skylens_core::geo::enu_to_geodetic(
+        &skylens_core::nalgebra::Vector3::new(p[0] as f64, p[1] as f64, p[2] as f64),
+        &first,
+    );
+    let e = skylens_core::geo::geodetic_to_enu(&g, &GPS_ORIGIN);
+    e.z - scene.surface_height(e.x, e.y)
+}
+
+fn overlap_bias(out: &Path, scene: &Scene, ka: usize, kb: usize) -> Option<OverlapBias> {
+    let find = |k: usize| {
+        let pre = format!("refined_{k:02}");
+        std::fs::read_dir(out.join("refined"))
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with(&pre))
+            .map(|e| read_ply_file(e.path()).unwrap())
+    };
+    let (ca, cb) = (find(ka)?, find(kb)?);
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = Default::default();
+    for (i, p) in cb.points.iter().enumerate() {
+        grid.entry((p.xyz[0].floor() as i64, p.xyz[1].floor() as i64))
+            .or_default()
+            .push(i);
+    }
+    let (mut ba, mut bb, mut sg, mut sl) = (vec![], vec![], vec![], vec![]);
+    for p in &ca.points {
+        let (cx, cy) = (p.xyz[0].floor() as i64, p.xyz[1].floor() as i64);
+        let mut best: Option<(f32, usize)> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for &j in grid.get(&(cx + dx, cy + dy)).into_iter().flatten() {
+                    let q = &cb.points[j].xyz;
+                    let d = ((p.xyz[0] - q[0]).powi(2) + (p.xyz[1] - q[1]).powi(2)).sqrt();
+                    if d < 1.0 && best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, j));
+                    }
+                }
+            }
+        }
+        if let Some((_, j)) = best {
+            let q = cb.points[j].xyz;
+            ba.push(truth_dz(scene, p.xyz));
+            bb.push(truth_dz(scene, q));
+            sg.push(q[2] as f64 - p.xyz[2] as f64);
+            sl.push(
+                (truth_dz(scene, q) - truth_dz(scene, p.xyz) - (q[2] as f64 - p.xyz[2] as f64))
+                    .abs(),
+            );
+        }
+    }
+    let all = |c: &skylens_core::ply::PointCloud| {
+        med(c
+            .points
+            .iter()
+            .step_by(7)
+            .map(|p| truth_dz(scene, p.xyz))
+            .collect())
+    };
+    Some(OverlapBias {
+        pairs: sg.len(),
+        bias_a: med(ba.clone()),
+        bias_b: med(bb.clone()),
+        signed: med(sg.clone()),
+        abs: med(sg.iter().map(|x| x.abs()).collect()),
+        all_a: all(&ca),
+        all_b: all(&cb),
+        abs_a: med(ba.iter().map(|x| x.abs()).collect()),
+        abs_b: med(bb.iter().map(|x| x.abs()).collect()),
+        slope_part: med(sl),
+    })
 }
 
 fn num_after(s: &str, key: &str) -> Option<f64> {
@@ -124,6 +226,17 @@ fn run(ds: &Dataset, scene: &Scene, out: &Path, anchor: bool) -> Row {
     errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let vr = verify_dir(out);
     eprintln!("{}", vr.to_table());
+    for e in &evs {
+        if e.contains("overlap cameras") {
+            eprintln!("DIAG {e}");
+        }
+    }
+    if let Some(b) = overlap_bias(out, scene, 0, 1) {
+        eprintln!(
+            "DIAG dense bias pairs {} region0 {:.3} region1 {:.3} signed(1-0) {:.3} abs {:.3} all0 {:.3} all1 {:.3} abs_err0 {:.3} abs_err1 {:.3} surface_pair_part {:.3}",
+            b.pairs, b.bias_a, b.bias_b, b.signed, b.abs, b.all_a, b.all_b, b.abs_a, b.abs_b, b.slope_part
+        );
+    }
     Row {
         pass: vr.items.iter().filter(|i| i.pass).count(),
         items: vr.items.len(),
@@ -160,6 +273,9 @@ fn anchored_registration_keeps_regions_in_one_frame() {
     for seed in seeds() {
         let (root, ds, scene) = setup(seed);
         let on = run(&ds, &scene, &root.join("out_on"), true);
+        if std::env::var("ANCHOR_ONLY").is_ok() {
+            continue;
+        }
         let off = run(&ds, &scene, &root.join("out_off"), false);
         for (tag, r) in [("켬", &on), ("끔", &off)] {
             table += &format!(
@@ -209,4 +325,24 @@ fn anchored_registration_keeps_regions_in_one_frame() {
             eprintln!("kept {}", root.display());
         }
     }
+}
+
+/// 보관한 출력 폴더(`ANALYZE_DIR`)의 겹침 높이 편향만 다시 계산한다. 시드는 `ANALYZE_SEED`.
+#[test]
+#[ignore]
+fn analyze_kept_output() {
+    let dir = std::env::var("ANALYZE_DIR").unwrap();
+    let seed: u64 = std::env::var("ANALYZE_SEED").unwrap().parse().unwrap();
+    let scene = Scene::new(SceneConfig {
+        positions: 80,
+        width: 320,
+        height: 180,
+        seed,
+        ..SceneConfig::default()
+    });
+    let b = overlap_bias(Path::new(&dir), &scene, 0, 1).unwrap();
+    eprintln!(
+        "DIAG dense bias pairs {} region0 {:.3} region1 {:.3} signed(1-0) {:.3} abs {:.3} all0 {:.3} all1 {:.3} abs_err0 {:.3} abs_err1 {:.3} surface_pair_part {:.3}",
+        b.pairs, b.bias_a, b.bias_b, b.signed, b.abs, b.all_a, b.all_b, b.abs_a, b.abs_b, b.slope_part
+    );
 }
