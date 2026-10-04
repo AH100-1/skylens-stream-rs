@@ -615,6 +615,9 @@ pub fn region_cloud_with(
 
 /// 사진별 깊이 단계의 결과: 보정된 사진, 이웃 목록, 깊이 맵.
 struct DepthStage {
+    /// `preps[i]` 가 입력 사진 몇 번째에서 왔는지(준비에 실패한 사진은 건너뛰므로 어긋날 수 있다).
+    #[cfg_attr(not(test), allow(dead_code))]
+    src: Vec<usize>,
     preps: Vec<DepthView>,
     neighbors: Vec<Vec<usize>>,
     maps: Vec<DepthMap>,
@@ -633,7 +636,11 @@ fn depth_stage(
         .par_iter()
         .map(|v| prepare(v, cfg.max_width))
         .collect();
-    let preps: Vec<DepthView> = prepared.into_iter().flatten().collect();
+    let (src, preps): (Vec<usize>, Vec<DepthView>) = prepared
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.map(|p| (i, p)))
+        .unzip();
     if preps.len() < 2 {
         return None;
     }
@@ -684,6 +691,7 @@ fn depth_stage(
         })
         .collect();
     Some(DepthStage {
+        src,
         preps,
         neighbors,
         maps,
@@ -747,22 +755,31 @@ pub fn remove_speckles(map: &mut DepthMap, rel: f32, min_px: usize) -> usize {
 }
 
 /// 융합 전 깊이 지도 걸러내기 기본값: 반점 제거(상대 깊이차 0.007, 100 화소 미만).
-/// 100 화소는 480×270 에서 잰 값이다. 문턱은 지도 면적에 비례한다: 작은 지도에서는 줄이고
-/// (80×45 에서 100 화소면 지도의 3% 가 한 조각이라 참 표면까지 지워진다),
-/// 큰 지도에서는 키운다(960×540 에서 400 화소가 100 화소보다 중앙·95% 가 모두 낫다).
+/// 100 화소는 480×270 에서 잰 값이고 문턱은 지도 면적에 비례한다. 작은 지도에서는 줄이되
+/// 하한 4 화소를 둔다(80×45 에서 100 화소면 지도의 3% 가 한 조각이라 참 표면까지 지워진다).
+/// 큰 지도에서는 상한 없이 키운다(960×540 에서 400 화소가 100 화소보다 중앙·95% 가 모두 낫다).
 const SPECKLE_REL: f32 = 0.007;
 const SPECKLE_MIN_PX: usize = 100;
+const SPECKLE_MIN_PX_FLOOR: usize = 4;
 const SPECKLE_REF_AREA: usize = 480 * 270;
 
 fn speckle_min_px(w: usize, h: usize) -> usize {
-    SPECKLE_MIN_PX * w * h / SPECKLE_REF_AREA
+    (SPECKLE_MIN_PX * w * h / SPECKLE_REF_AREA).max(SPECKLE_MIN_PX_FLOOR)
 }
 
-fn filter_depth_maps(maps: &mut [DepthMap]) {
-    maps.par_iter_mut().for_each(|m| {
-        let min_px = speckle_min_px(m.w, m.h);
-        remove_speckles(m, SPECKLE_REL, min_px);
-    });
+/// 깊이 지도마다 반점 제거를 적용한다. (지워진 화소 수, 걸러내기 전 유효 화소 수).
+fn filter_depth_maps(maps: &mut [DepthMap]) -> (usize, usize) {
+    maps.par_iter_mut()
+        .map(|m| {
+            let valid = m
+                .depth
+                .iter()
+                .filter(|d| d.is_finite() && **d > 0.0)
+                .count();
+            let min_px = speckle_min_px(m.w, m.h);
+            (remove_speckles(m, SPECKLE_REL, min_px), valid)
+        })
+        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
 }
 
 fn fuse_stage(st: &DepthStage, cfg: &DenseConfig) -> PointCloud {
@@ -807,7 +824,7 @@ fn region_cloud_impl(
         return PointCloud::default();
     };
     let mut st = st;
-    filter_depth_maps(&mut st.maps);
+    let _ = filter_depth_maps(&mut st.maps);
     crate::timing::add("dense_depth", t_depth.elapsed().as_secs_f64());
     let t_fuse = std::time::Instant::now();
     let cloud = fuse_stage(&st, cfg);
@@ -1010,7 +1027,7 @@ mod tests {
     fn depth_error(s: &Scene, st: &DepthStage) -> (f64, f64, f64, f64) {
         let (mut e, mut tot, mut valid, mut bad) = (Vec::new(), 0usize, 0usize, 0usize);
         for (i, m) in st.maps.iter().enumerate() {
-            let mut v = s.views[i].clone();
+            let mut v = s.views[st.src[i]].clone();
             v.camera = st.preps[i].camera;
             let (_, gt) = s.render(&v);
             for (k, &d) in m.depth.iter().enumerate() {
@@ -1045,6 +1062,25 @@ mod tests {
             .collect();
         let over1 = d.iter().filter(|&&x| x > 1.0).count() as f64 / d.len().max(1) as f64;
         (pct(&mut d, 0.5), pct(&mut d, 0.95), over1)
+    }
+
+    /// 융합에 필요한 것만 복사한 깊이 단계(깊이 맵은 걸러내기를 따로 적용할 수 있게 복사).
+    fn copy_stage(st: &DepthStage) -> DepthStage {
+        DepthStage {
+            src: st.src.clone(),
+            preps: st
+                .preps
+                .iter()
+                .map(|v| DepthView {
+                    camera: v.camera,
+                    gray: Vec::new(),
+                    rgb: v.rgb.clone(),
+                    valid: Vec::new(),
+                })
+                .collect(),
+            neighbors: st.neighbors.clone(),
+            maps: st.maps.clone(),
+        }
     }
 
     fn stage(vs: &[DenseView], sparse: &[[f64; 3]], cfg: &DenseConfig) -> DepthStage {
@@ -1084,7 +1120,10 @@ mod tests {
             let t = Instant::now();
             let st = stage(&vs, &sparse, &cfg);
             let secs = t.elapsed().as_secs_f64();
-            let cloud = fuse_stage(&st, &cfg);
+            // 기본 흐름과 같게 반점 제거를 거친 뒤 융합한다(깊이 오차 줄은 제거 전 지도).
+            let mut filtered = copy_stage(&st);
+            let (removed, valid) = filter_depth_maps(&mut filtered.maps);
+            let cloud = fuse_stage(&filtered, &cfg);
             let (med, p95, over1) = dist_stats(&s, &cloud);
             let line = if ps == 0.0 {
                 let (v, m, p, b) = depth_error(&s, &st);
@@ -1093,8 +1132,10 @@ mod tests {
                 String::from("depth (pose differs)")
             };
             eprintln!(
-                "DECOMP {name}: points {} surf med {med:.4} p95 {p95:.4} over1m {over1:.4} {line} depth_secs {secs:.1}",
-                cloud.len()
+                "DECOMP {name} [반점 제거 적용, 법선 25도]: points {} surf med {med:.4} p95 {p95:.4} \
+                 over1m {over1:.4} speckle_removed {:.4} {line} depth_secs {secs:.1}",
+                cloud.len(),
+                removed as f64 / valid.max(1) as f64
             );
             if ps == 0.0 {
                 gt_stage = Some(st);
@@ -1104,22 +1145,15 @@ mod tests {
         let base = fusion_config(&cfg);
         let variants: Vec<(&str, bool, FusionConfig)> = vec![
             (
-                "기준(법선 30도)",
+                "법선 30도",
                 false,
                 FusionConfig {
                     normal_deg: 30.0,
                     ..base
                 },
             ),
-            ("반점 제거", true, base),
-            (
-                "반점 제거+법선 25도",
-                true,
-                FusionConfig {
-                    normal_deg: 25.0,
-                    ..base
-                },
-            ),
+            ("법선 25도", false, base),
+            ("기본 흐름(법선 25도)", true, base),
             (
                 "위치 중앙값",
                 false,
@@ -1180,46 +1214,78 @@ mod tests {
         ];
         let mut results = Vec::new();
         for (name, speckle, fc) in variants {
-            let mut st2 = DepthStage {
-                preps: Vec::new(),
-                neighbors: st.neighbors.clone(),
-                maps: st.maps.clone(),
+            let mut st2 = copy_stage(&st);
+            let (removed, valid) = if speckle {
+                filter_depth_maps(&mut st2.maps)
+            } else {
+                (0, 0)
             };
-            st2.preps = st
-                .preps
-                .iter()
-                .map(|v| DepthView {
-                    camera: v.camera,
-                    gray: Vec::new(),
-                    rgb: v.rgb.clone(),
-                    valid: Vec::new(),
-                })
-                .collect();
-            let mut removed = 0;
-            if speckle {
-                for m in &mut st2.maps {
-                    removed += remove_speckles(m, 0.007, 100);
-                }
-            }
             let cloud = fuse_stage_with(&st2, &fc);
             let (med, p95, over1) = dist_stats(&s, &cloud);
             results.push((name, med, p95, over1));
             eprintln!(
-                "VARIANT {name}: points {} med {med:.4} p95 {p95:.4} over1m {over1:.4} speckle_removed {removed}",
-                cloud.len()
+                "VARIANT {name} [반점 제거 {}, 법선 {:.0}도]: points {} med {med:.4} p95 {p95:.4} \
+                 over1m {over1:.4} speckle_removed {:.4}",
+                if speckle { "적용" } else { "없음" },
+                fc.normal_deg,
+                cloud.len(),
+                removed as f64 / valid.max(1) as f64
             );
         }
         let get = |n: &str| results.iter().find(|r| r.0 == n).copied().unwrap();
-        let (_, m0, p0, o0) = get("기준(법선 30도)");
-        let (_, m1, p1, o1) = get("반점 제거+법선 25도");
+        let (_, m0, p0, o0) = get("법선 30도");
+        let (_, m1, p1, o1) = get("기본 흐름(법선 25도)");
         assert!(
             m1 < m0 && p1 < 0.8 * p0 && o1 < 0.2 * o0,
             "{m0} {p0} {o0} -> {m1} {p1} {o1}"
         );
-        assert!(
-            m1 < 0.07 && p1 < 0.29,
-            "반점 제거+법선 25도: 중앙 {m1} 95% {p1}"
-        );
+        assert!(m1 < 0.07 && p1 < 0.29, "기본 흐름: 중앙 {m1} 95% {p1}");
+    }
+
+    #[test]
+    fn speckle_floor_scales_with_map_area() {
+        assert_eq!(speckle_min_px(960, 540), 400);
+        assert_eq!(speckle_min_px(480, 270), 100);
+        assert_eq!(speckle_min_px(240, 135), 25);
+        assert_eq!(speckle_min_px(80, 45), SPECKLE_MIN_PX_FLOOR);
+        assert_eq!(speckle_min_px(8, 8), SPECKLE_MIN_PX_FLOOR);
+    }
+
+    /// 반점 제거로 지워진 비율과 960 폭 장당 시간(무시 측정).
+    #[test]
+    #[ignore]
+    fn speckle_share_and_time_by_width() {
+        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        for (positions, w, h) in [(4usize, 80u32, 45u32), (2, 960, 540)] {
+            let (_, views, sparse) = scene_views(positions, w, h);
+            let cfg = DenseConfig {
+                max_width: w,
+                ..DenseConfig::default()
+            };
+            let t = Instant::now();
+            let mut st = stage(&views, &sparse, &cfg);
+            let secs = t.elapsed().as_secs_f64();
+            // 비교: 최소 화소 수를 100 으로 고정했을 때 지워지는 비율.
+            let mut fixed = st.maps.clone();
+            let fixed_removed: usize = fixed
+                .iter_mut()
+                .map(|m| remove_speckles(m, SPECKLE_REL, SPECKLE_MIN_PX))
+                .sum();
+            let (removed, valid) = filter_depth_maps(&mut st.maps);
+            let share = removed as f64 / valid.max(1) as f64;
+            let fixed_share = fixed_removed as f64 / valid.max(1) as f64;
+            eprintln!(
+                "SPECKLE width {w}: min_px {} images {} removed {removed} of {valid} valid ({share:.4}); \
+                 min_px 100 고정이면 {fixed_removed} ({fixed_share:.4}) \
+                 depth {secs:.2} s ({:.3} s/image) cores {} load {}",
+                speckle_min_px(w as usize, h as usize),
+                views.len(),
+                secs / views.len() as f64,
+                std::thread::available_parallelism().map_or(0, |n| n.get()),
+                load.trim()
+            );
+            assert!(share <= fixed_share, "너비 {w}: {share} > {fixed_share}");
+        }
     }
 
     /// 반점 제거 효과 측정(무시 측정): 폭 × 추정기 × 문턱별 점 수·표면 거리, 지워진 화소의 성격.
@@ -1279,7 +1345,7 @@ mod tests {
                     for (i, m) in maps.iter_mut().enumerate() {
                         let before = m.depth.clone();
                         removed += remove_speckles(m, rel, minpx);
-                        let mut v = s.views[i].clone();
+                        let mut v = s.views[st.src[i]].clone();
                         v.camera = st.preps[i].camera;
                         let (_, gt) = s.render(&v);
                         for k in 0..before.len() {
@@ -1294,6 +1360,7 @@ mod tests {
                     }
                 }
                 let st2 = DepthStage {
+                    src: st.src.clone(),
                     preps: st
                         .preps
                         .iter()

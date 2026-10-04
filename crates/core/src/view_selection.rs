@@ -696,4 +696,105 @@ mod tests {
             assert!((d0 - pred).abs() <= 1, "1위 간격 {d0} 예측 {pred}");
         }
     }
+
+    /// 한 점(원점)을 높이 30 m 에서 연직 하방으로 보는 카메라 4대(x = 0, 1, 2, 10 m).
+    /// 원점에서 본 광선 각: 0-1 1.9°, 1-2 1.9°, 0-2 3.8°, 2-3 14.6°, 1-3 16.5°, 0-3 18.4°.
+    fn tiny_scene() -> (Vec<View>, Vec<SparsePoint>) {
+        let k = Intrinsics::from_hfov(1600, 1200, 70f64.to_radians());
+        let r = Rotation3::from_matrix_unchecked(Matrix3::new(
+            1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0,
+        ));
+        let views: Vec<View> = [0.0, 1.0, 2.0, 10.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| View {
+                cam: Camera {
+                    intrinsics: k,
+                    pose: Pose::from_center(r, &Point3::new(x, 0.0, 30.0)),
+                },
+                id: 7 + i,
+            })
+            .collect();
+        let pts = vec![SparsePoint {
+            xyz: Point3::new(0.0, 0.0, 0.0),
+            observers: views.iter().map(|v| v.id).collect(),
+        }];
+        (views, pts)
+    }
+
+    #[test]
+    fn neighbor_config_options_on_tiny_scene() {
+        let (views, pts) = tiny_scene();
+        let sel = |cfg: NeighborConfig, k: usize| select_neighbors_with(&views, &pts, k, &cfg);
+        let base = NeighborConfig::default();
+
+        // 기본: 각 제한 없음, 모두 이웃(점수 순).
+        let all = sel(base, 3);
+        eprintln!("all {all:?}");
+        assert_eq!(all[3].len(), 3);
+        assert_eq!(all[0][0], 3);
+
+        // 최소 각 5°: 0, 1, 2 번은 3 번만 남는다.
+        let min5 = NeighborConfig {
+            min_angle_deg: 5.0,
+            ..base
+        };
+        let r = sel(min5, 3);
+        eprintln!("min5 {r:?}");
+        assert_eq!(r, vec![vec![3], vec![3], vec![3], vec![2, 1, 0]]);
+
+        // max_angle_deg 15°: 3 번과 0·1 번 쌍(18.4°, 16.5°)이 빠진다.
+        let max15 = NeighborConfig {
+            max_angle_deg: 15.0,
+            ..base
+        };
+        let r = sel(max15, 3);
+        eprintln!("max15 {r:?}");
+        assert_eq!(r[3], vec![2]);
+        assert_eq!(r[0], vec![2, 1]);
+        assert!(!r[0].contains(&3) && !r[1].contains(&3));
+
+        // auto_min_quantile 0.25: 0 번의 최소 각이 5° 에서 약 2.9° 로 내려가 2 번(3.8°)이 다시 들어온다.
+        let auto = NeighborConfig {
+            min_angle_deg: 5.0,
+            auto_min_quantile: 0.25,
+            ..base
+        };
+        let r = sel(auto, 3);
+        eprintln!("auto {r:?}");
+        assert_eq!(r[0], vec![3, 2]);
+        assert_eq!(r[3], vec![2, 1, 0]);
+
+        // min_keep 2: 이웃이 2 보다 적은 사진만 걸러지기 전 점수 순으로 채운다.
+        let keep = NeighborConfig {
+            min_angle_deg: 5.0,
+            min_keep: 2,
+            ..base
+        };
+        let r = sel(keep, 3);
+        eprintln!("keep {r:?}");
+        // 3 번은 이미 3 장(k) 이라 그대로(채우는 조건은 `<`: 같으면 채우지 않는다).
+        assert_eq!(r[3], vec![2, 1, 0]);
+        // 0 번은 [3] 뿐이라 min_keep(2)까지 한 장만 채운다: 3.8° 쌍인 2 번.
+        assert_eq!(r[0], vec![3, 2]);
+        assert_eq!(r[1].len(), 2);
+        assert_eq!(r[2].len(), 2);
+        assert_eq!(r[1][0], 3);
+        assert_eq!(r[2][0], 3);
+        // k 가 min_keep 보다 작으면 k 까지만.
+        let r1 = sel(keep, 1);
+        assert!(r1.iter().all(|v| v.len() == 1));
+        // 이미 min_keep 장이 걸러진 뒤에 있으면 더 채우지 않는다: 최소 각 1° 면 0 번은 1·2·3 모두 통과, k=2.
+        let r2 = sel(
+            NeighborConfig {
+                min_angle_deg: 1.0,
+                min_keep: 2,
+                ..base
+            },
+            2,
+        );
+        assert!(r2.iter().all(|v| v.len() == 2));
+        // min_keep = 0 이면 채우지 않는다.
+        assert_eq!(sel(min5, 3)[0], vec![3]);
+    }
 }
