@@ -16,6 +16,7 @@
 use crate::math::{Matrix3, Point3, Rotation3, Vector3};
 use crate::two_view::RelativePose;
 use nalgebra::{DMatrix, DVector};
+use rayon::prelude::*;
 
 /// 짝별 이동 방향 관측 하나.
 #[derive(Clone, Debug)]
@@ -1001,6 +1002,9 @@ fn average_core(
 const GP_HUBER: f64 = 0.1;
 const GP_ITERS: usize = 300;
 const GP_MIN_SCALE: f64 = 1e-5;
+/// 축소 계통 공액 기울기: 상대 잔차 문턱과 최대 반복.
+const GP_CG_TOL: f64 = 1e-10;
+const GP_CG_ITERS: usize = 500;
 const GP_GATE_RAD: f64 = 2.0 * std::f64::consts::PI / 180.0;
 /// 마지막 정밀 풀이 전에 쓰는 좁은 각 문턱(1.5°).
 const GP_FINAL_GATE_RAD: f64 = 1.5 * std::f64::consts::PI / 180.0;
@@ -1053,9 +1057,33 @@ fn gp_solve(
         }
     };
     let first = (0..obs.len()).find(|&k| active[k]);
-    let mut by_point: Vec<Vec<usize>> = vec![Vec::new(); n_pts];
+    // 활성 관측의 카메라별·점별 색인(CSR). 곱을 병렬로 모으기 위함.
+    let mut cam_ptr = vec![0usize; n_cam + 1];
+    let mut pt_ptr = vec![0usize; n_pts + 1];
     for (k, o) in obs.iter().enumerate() {
-        by_point[o.1].push(k);
+        if active[k] {
+            cam_ptr[o.0 + 1] += 1;
+            pt_ptr[o.1 + 1] += 1;
+        }
+    }
+    for i in 0..n_cam {
+        cam_ptr[i + 1] += cam_ptr[i];
+    }
+    for i in 0..n_pts {
+        pt_ptr[i + 1] += pt_ptr[i];
+    }
+    let mut cam_obs = vec![0usize; cam_ptr[n_cam]];
+    let mut pt_obs = vec![0usize; pt_ptr[n_pts]];
+    {
+        let (mut cf, mut pf) = (cam_ptr.clone(), pt_ptr.clone());
+        for (k, o) in obs.iter().enumerate() {
+            if active[k] {
+                cam_obs[cf[o.0]] = k;
+                cf[o.0] += 1;
+                pt_obs[pf[o.1]] = k;
+                pf[o.1] += 1;
+            }
+        }
     }
     let mut d = vec![1.0; obs.len()];
     let mut irls = vec![1.0; obs.len()];
@@ -1063,102 +1091,157 @@ fn gp_solve(
     for it in 0..GP_ITERS {
         // c, X 풀이: Σ w d² |(X_p − c_i) − v/d|² → 정규방정식(좌표 공통 행렬).
         // 점 블록은 스칼라 대각이라 점을 소거한 카메라 축소 계통(n_cam × n_cam)만 밀집으로 푼다.
-        let mut s = DMatrix::<f64>::zeros(n_cam, n_cam);
-        let mut bc = DMatrix::<f64>::zeros(n_cam, 3);
+        let mut wk = vec![0.0f64; obs.len()];
+        wk.par_iter_mut().enumerate().for_each(|(k, w)| {
+            if active[k] {
+                *w = obs[k].3 * irls[k] * d[k] * d[k];
+            }
+        });
+        // d (X − c) = v 의 최소제곱: 행 (e_p − e_c)·d, 우변 v → 관측 우변 rv = v · wt · irls · d.
+        let rv_of = |k: usize| obs[k].2 * (obs[k].3 * irls[k] * d[k]);
         let mut diag_c = vec![0.0f64; n_cam];
+        let mut bc = vec![Vector3::<f64>::zeros(); n_cam];
+        diag_c
+            .par_iter_mut()
+            .zip(bc.par_iter_mut())
+            .enumerate()
+            .for_each(|(c, (dc, b))| {
+                for &k in &cam_obs[cam_ptr[c]..cam_ptr[c + 1]] {
+                    *dc += wk[k];
+                    *b -= rv_of(k);
+                }
+            });
         let mut app = vec![0.0f64; n_pts];
         let mut bp = vec![Vector3::<f64>::zeros(); n_pts];
-        for (k, &(cam, pt, v, wt)) in obs.iter().enumerate() {
-            if !active[k] {
-                continue;
-            }
-            let w = wt * irls[k] * d[k] * d[k];
-            diag_c[cam] += w;
-            app[pt] += w;
-            // d (X − c) = v 의 최소제곱: 행 (e_p − e_c)·d, 우변 v.
-            let rv = v * (wt * irls[k] * d[k]);
-            bp[pt] += rv;
-            for q in 0..3 {
-                bc[(cam, q)] -= rv[q];
-            }
-        }
+        app.par_iter_mut()
+            .zip(bp.par_iter_mut())
+            .enumerate()
+            .for_each(|(p, (a, b))| {
+                for &k in &pt_obs[pt_ptr[p]..pt_ptr[p + 1]] {
+                    *a += wk[k];
+                    *b += rv_of(k);
+                }
+            });
         let trace: f64 = diag_c.iter().sum::<f64>() + app.iter().sum::<f64>();
         let ridge = 1e-9 * (1.0 + trace / m as f64);
-        for i in 0..n_cam {
-            s[(i, i)] += diag_c[i] + ridge;
+        for a in diag_c.iter_mut() {
+            *a += ridge;
         }
         for a in app.iter_mut() {
             *a += ridge;
         }
-        // 점별 (카메라, 가중) 목록을 합쳐(같은 카메라 중복 합산) 슈어 보수를 더한다.
-        let mut entries: Vec<(usize, f64)> = Vec::new();
-        for pt in 0..n_pts {
-            entries.clear();
-            for &k in &by_point[pt] {
-                if active[k] {
-                    let (cam, _, _, wt) = obs[k];
-                    entries.push((cam, wt * irls[k] * d[k] * d[k]));
-                }
+        // 점을 소거한 카메라 축소 계통 S = D_c − W D_p⁻¹ Wᵀ 는 만들지 않고 곱만 쓴다(관측 한 번 훑기).
+        // 우변: b_c += Σ_{k∈c} w_k · b_p / app_p.
+        bc.par_iter_mut().enumerate().for_each(|(c, b)| {
+            for &k in &cam_obs[cam_ptr[c]..cam_ptr[c + 1]] {
+                *b += bp[obs[k].1] * (wk[k] / app[obs[k].1]);
             }
-            if entries.is_empty() {
-                continue;
+        });
+        // 야코비 전처리: S_ii = D_c,i − Σ_{k∈i} w_k² / app_p.
+        let mut minv = vec![0.0f64; n_cam];
+        for (c, mi) in minv.iter_mut().enumerate() {
+            let mut sii = diag_c[c];
+            for &k in &cam_obs[cam_ptr[c]..cam_ptr[c + 1]] {
+                sii -= wk[k] * wk[k] / app[obs[k].1];
             }
-            entries.sort_unstable_by_key(|e| e.0);
-            let mut merged: Vec<(usize, f64)> = Vec::with_capacity(entries.len());
-            for &(c, w) in &entries {
-                match merged.last_mut() {
-                    Some(l) if l.0 == c => l.1 += w,
-                    _ => merged.push((c, w)),
-                }
-            }
-            let inv = 1.0 / app[pt];
-            for &(ci, wi) in &merged {
-                for q in 0..3 {
-                    bc[(ci, q)] += wi * inv * bp[pt][q];
-                }
-                for &(cj, wj) in &merged {
-                    s[(ci, cj)] -= wi * wj * inv;
-                }
-            }
+            *mi = 1.0 / sii.max(1e-12 * diag_c[c]).max(1e-300);
         }
-        let Some(ch) = s.cholesky() else {
-            break;
+        let mut u = vec![Vector3::<f64>::zeros(); n_pts];
+        let mut apply = |xv: &[Vector3<f64>], y: &mut [Vector3<f64>]| {
+            u.par_iter_mut().enumerate().for_each(|(p, up)| {
+                let mut acc = Vector3::<f64>::zeros();
+                for &k in &pt_obs[pt_ptr[p]..pt_ptr[p + 1]] {
+                    acc += xv[obs[k].0] * wk[k];
+                }
+                *up = acc / app[p];
+            });
+            y.par_iter_mut().enumerate().for_each(|(c, yc)| {
+                let mut acc = xv[c] * diag_c[c];
+                for &k in &cam_obs[cam_ptr[c]..cam_ptr[c + 1]] {
+                    acc -= u[obs[k].1] * wk[k];
+                }
+                *yc = acc;
+            });
         };
-        let sol = ch.solve(&bc);
-        for i in 0..n_cam {
-            x[i] = Vector3::new(sol[(i, 0)], sol[(i, 1)], sol[(i, 2)]);
-        }
-        // 점 역대입: X_p = (b_p + Σ w c_i) / (app).
-        let mut acc = bp.clone();
-        for (k, &(cam, pt, _, wt)) in obs.iter().enumerate() {
-            if active[k] {
-                acc[pt] += x[cam] * (wt * irls[k] * d[k] * d[k]);
+        let dot = |a: &[Vector3<f64>], b: &[Vector3<f64>]| -> f64 {
+            a.iter().zip(b).map(|(x, y)| x.dot(y)).sum()
+        };
+        // 이전 반복 해로 워밍 스타트한 공액 기울기.
+        let mut sol: Vec<Vector3<f64>> = x[..n_cam].to_vec();
+        let mut ax = vec![Vector3::<f64>::zeros(); n_cam];
+        apply(&sol, &mut ax);
+        let mut r: Vec<Vector3<f64>> = bc.iter().zip(&ax).map(|(b, a)| b - a).collect();
+        let bnorm = dot(&bc, &bc).sqrt().max(1e-300);
+        let mut z: Vec<Vector3<f64>> = r.iter().zip(&minv).map(|(r, mi)| r * *mi).collect();
+        let mut p = z.clone();
+        let mut rz = dot(&r, &z);
+        let mut ap = vec![Vector3::<f64>::zeros(); n_cam];
+        let mut failed = false;
+        for _ in 0..GP_CG_ITERS {
+            if dot(&r, &r).sqrt() <= GP_CG_TOL * bnorm {
+                break;
+            }
+            apply(&p, &mut ap);
+            let pap = dot(&p, &ap);
+            if pap.is_nan() || pap <= 0.0 {
+                failed = true;
+                break;
+            }
+            let alpha = rz / pap;
+            for c in 0..n_cam {
+                sol[c] += p[c] * alpha;
+                r[c] -= ap[c] * alpha;
+                z[c] = r[c] * minv[c];
+            }
+            let rz_new = dot(&r, &z);
+            let beta = rz_new / rz;
+            rz = rz_new;
+            for c in 0..n_cam {
+                p[c] = z[c] + p[c] * beta;
             }
         }
-        for pt in 0..n_pts {
-            x[n_cam + pt] = acc[pt] / app[pt];
+        if failed || sol.iter().any(|v| !v.iter().all(|c| c.is_finite())) {
+            break;
+        }
+        x[..n_cam].copy_from_slice(&sol);
+        // 점 역대입: X_p = (b_p + Σ w c_i) / (app).
+        {
+            let (xc, xp) = x.split_at_mut(n_cam);
+            xp.par_iter_mut().enumerate().for_each(|(p, xv)| {
+                let mut acc = bp[p];
+                for &k in &pt_obs[pt_ptr[p]..pt_ptr[p + 1]] {
+                    acc += xc[obs[k].0] * wk[k];
+                }
+                *xv = acc / app[p];
+            });
         }
         // d 와 가중 갱신.
-        let mut cost = 0.0;
-        for (k, &(cam, pt, v, _)) in obs.iter().enumerate() {
-            if !active[k] {
-                continue;
-            }
-            let dx = x[n_cam + pt] - x[cam];
-            let dd = v.dot(&dx) / dx.norm_squared().max(1e-300);
-            d[k] = if Some(k) == first {
-                1.0
-            } else {
-                dd.max(GP_MIN_SCALE)
-            };
-            let r = (v - dx * d[k]).norm();
-            irls[k] = if r > GP_HUBER { GP_HUBER / r } else { 1.0 };
-            cost += if r > GP_HUBER {
-                2.0 * GP_HUBER * r - GP_HUBER * GP_HUBER
-            } else {
-                r * r
-            };
-        }
+        let xr = &x;
+        let cost: f64 = d
+            .par_iter_mut()
+            .zip(irls.par_iter_mut())
+            .enumerate()
+            .map(|(k, (dk, ik))| {
+                if !active[k] {
+                    return 0.0;
+                }
+                let (cam, pt, v, _) = obs[k];
+                let dx = xr[n_cam + pt] - xr[cam];
+                let dd = v.dot(&dx) / dx.norm_squared().max(1e-300);
+                *dk = if Some(k) == first {
+                    1.0
+                } else {
+                    dd.max(GP_MIN_SCALE)
+                };
+                let r = (v - dx * *dk).norm();
+                *ik = if r > GP_HUBER { GP_HUBER / r } else { 1.0 };
+                if r > GP_HUBER {
+                    2.0 * GP_HUBER * r - GP_HUBER * GP_HUBER
+                } else {
+                    r * r
+                }
+            })
+            .sum();
         if it > 10 && (prev - cost).abs() <= 1e-9 * prev.max(1e-12) {
             break;
         }
