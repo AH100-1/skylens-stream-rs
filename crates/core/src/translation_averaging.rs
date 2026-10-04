@@ -2097,6 +2097,155 @@ mod tests {
         }
     }
 
+    /// 카메라별 진단 한 줄: (오차, 점 관측 수, 짝 직선 수, 짝 직선 중 3° 이내 수, 점 광선 최대 쌍 각(도),
+    /// 점 광선 평균 방향 대비 최대 각(도), 정렬된 고윳값 비 λ2/λ1·λ3/λ1(점+짝 제약), 이웃 방향 산포 λ2/λ1·λ3/λ1).
+    #[derive(Clone, Debug)]
+    struct CamRow {
+        cam: usize,
+        err: f64,
+        n_pt: usize,
+        n_pair: usize,
+        n_pair_good: usize,
+        ray_pair_max: f64,
+        ray_mean_max: f64,
+        eig_all: [f64; 2],
+        eig_nb: [f64; 2],
+    }
+
+    fn sorted_ratios(m: &Matrix3<f64>) -> [f64; 2] {
+        let mut e: Vec<f64> = m.symmetric_eigen().eigenvalues.iter().cloned().collect();
+        e.sort_by(|a, b| b.total_cmp(a));
+        let hi = e[0].max(1e-300);
+        [e[1] / hi, e[2] / hi]
+    }
+
+    fn cam_rows(seed: u64, frac: f64, pfrac: f64) -> Vec<CamRow> {
+        let case = Case {
+            noise_deg: 1.0,
+            outlier_frac: frac,
+            unobservable_frac: 0.05,
+        };
+        let (poses, rots, obs) = observations(seed, &case);
+        let (pts, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, pfrac);
+        let res =
+            average_translations_with_points(&rots, &obs, &pobs, &TranslationConfig::default());
+        let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+        let errs = similarity_aligned_errors(&res.centers, &truth);
+        (0..poses.len())
+            .map(|c| {
+                let cc = poses[c].center();
+                let mut rays = Vec::new();
+                let mut a_all = Matrix3::<f64>::zeros();
+                for o in pobs.iter().filter(|o| o.camera == c) {
+                    let dx = pts[o.point] - cc;
+                    let u = dx.normalize();
+                    rays.push(u);
+                    let w = 1.0 / dx.norm_squared();
+                    a_all += (Matrix3::identity() - u * u.transpose()) * w;
+                }
+                let mut a_nb = Matrix3::<f64>::zeros();
+                let (mut n_pair, mut n_good) = (0, 0);
+                for o in obs.iter().filter(|o| o.i == c || o.j == c) {
+                    let other = if o.i == c { o.j } else { o.i };
+                    let dx = poses[other].center() - cc;
+                    let u = dx.normalize();
+                    let w = 0.1 / dx.norm_squared();
+                    a_all += (Matrix3::identity() - u * u.transpose()) * w;
+                    a_nb += u * u.transpose();
+                    n_pair += 1;
+                    let t = poses[o.i].center() - poses[o.j].center();
+                    let dir = poses[o.j].rotation.inverse() * o.direction;
+                    if angle_between(&dir, &t).to_degrees() <= 3.0 {
+                        n_good += 1;
+                    }
+                }
+                let mut pair_max = 0.0f64;
+                for (k, a) in rays.iter().enumerate() {
+                    for b in &rays[k + 1..] {
+                        pair_max = pair_max.max(angle_between(a, b).to_degrees());
+                    }
+                }
+                let mean = rays.iter().fold(Vector3::zeros(), |s, r| s + r);
+                let mean_max = if mean.norm() > 1e-12 {
+                    rays.iter()
+                        .map(|r| angle_between(r, &mean).to_degrees())
+                        .fold(0.0, f64::max)
+                } else {
+                    0.0
+                };
+                CamRow {
+                    cam: c,
+                    err: errs[c],
+                    n_pt: rays.len(),
+                    n_pair,
+                    n_pair_good: n_good,
+                    ray_pair_max: pair_max,
+                    ray_mean_max: mean_max,
+                    eig_all: sorted_ratios(&a_all),
+                    eig_nb: sorted_ratios(&a_nb),
+                }
+            })
+            .collect()
+    }
+
+    /// F-303 진단: 시드별 최대 오차 카메라 표와 고윳값 구간별 오차 분포.
+    /// DIAG_CASES="시드:짝:점,..." (기본: 실패 시드 4·7·9·15·19), DIAG_REF="시드,..." (통과 시드 기준).
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_f303_camera_table() {
+        let cases = std::env::var("DIAG_CASES")
+            .unwrap_or_else(|_| "4:0.1:0.05,7:0.1:0.05,9:0.1:0.05,15:0.2:0.0,19:0.2:0.0".into());
+        let refs = std::env::var("DIAG_REF").unwrap_or_else(|_| "1,2,5,6".into());
+        let mut pool: Vec<(bool, CamRow)> = Vec::new();
+        for spec in cases.split(',') {
+            let v: Vec<&str> = spec.split(':').collect();
+            let (seed, frac, pfrac): (u64, f64, f64) = (
+                v[0].parse().unwrap(),
+                v[1].parse().unwrap(),
+                v[2].parse().unwrap(),
+            );
+            let mut rows = cam_rows(seed, frac, pfrac);
+            for r in &rows {
+                pool.push((true, r.clone()));
+            }
+            rows.sort_by(|a, b| b.err.total_cmp(&a.err));
+            for r in rows.iter().take(4) {
+                println!(
+                    "T303 seed {seed} pair {frac} pt {pfrac} cam {} err {:.3} pt {} pair {} good {} ray_pair {:.1} ray_mean {:.1} eigAll {:.2e}/{:.2e} eigNb {:.3}/{:.3}",
+                    r.cam, r.err, r.n_pt, r.n_pair, r.n_pair_good, r.ray_pair_max, r.ray_mean_max,
+                    r.eig_all[0], r.eig_all[1], r.eig_nb[0], r.eig_nb[1]
+                );
+            }
+        }
+        for s in refs.split(',').filter_map(|x| x.parse::<u64>().ok()) {
+            for r in cam_rows(s, 0.2, 0.05) {
+                pool.push((false, r));
+            }
+        }
+        // 구간별 분포: 점+짝 제약 λ3/λ1 (로그 구간), 실패 시드군/통과 시드군.
+        let edges = [0.0, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 1.0 + 1e-9];
+        for fail in [true, false] {
+            for w in edges.windows(2) {
+                let sel: Vec<&CamRow> = pool
+                    .iter()
+                    .filter(|(f, r)| *f == fail && r.eig_all[1] >= w[0] && r.eig_all[1] < w[1])
+                    .map(|(_, r)| r)
+                    .collect();
+                if sel.is_empty() {
+                    continue;
+                }
+                let mean = sel.iter().map(|r| r.err).sum::<f64>() / sel.len() as f64;
+                let max = sel.iter().map(|r| r.err).fold(0.0, f64::max);
+                let big = sel.iter().filter(|r| r.err > 0.5).count();
+                println!(
+                    "T303BIN {} lambda3/lambda1 [{:.0e},{:.0e}): n {} mean err {mean:.3} max {max:.3} err>0.5: {big}",
+                    if fail { "fail-seeds" } else { "pass-seeds" },
+                    w[0], w[1], sel.len()
+                );
+            }
+        }
+    }
+
     /// 80경우(시드 범위 × 짝 이상치 10·20% × 점 이상치 0·5%) 표. 시드 범위는 환경변수 TA_SEEDS="처음:끝".
     fn grid(seeds: std::ops::RangeInclusive<u64>) -> Vec<(f64, f64, u64, usize, f64, f64)> {
         let mut fails = Vec::new();
