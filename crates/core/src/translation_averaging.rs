@@ -1009,6 +1009,8 @@ const GP_PAIR_WEIGHT: f64 = 0.1;
 const GP_PAIR_GATE_RAD: f64 = 3.0 * std::f64::consts::PI / 180.0;
 const GP_MIN_CAM_OBS: usize = 4;
 const GP_MIN_POINT_VIEWS: usize = 3;
+/// 중심 정밀화가 받아들이는 정규방정식의 최소/최대 고윳값 비 하한.
+const GP_MIN_EIG_RATIO: f64 = 1e-4;
 /// 보충 단계에서 카메라를 놓는 데 필요한 직선 지지 수.
 const GP_SUPPLEMENT_SUPPORT: usize = 3;
 
@@ -1117,6 +1119,39 @@ fn gp_solve(
 
 /// 점 관측을 주 경로로 쓰는 전역 위치 추정. 짝 간선은 회전 일관성으로만 거르고(`rejected[0]`) 각 잔차를 보고한다.
 /// 점이 하나도 쓸 수 없으면 None.
+/// 중심 정밀화 한 걸음. 제약은 (원점, 방향, 가중, 문턱). 문턱 안 제약이 `GP_MIN_CAM_OBS` 개 미만이거나
+/// 정규방정식의 최소/최대 고윳값 비가 `GP_MIN_EIG_RATIO` 미만(한 방향뿐)이면 `None`(이전 중심 유지).
+fn refine_center(
+    cur: &Vector3<f64>,
+    cons: &[(Vector3<f64>, Vector3<f64>, f64, f64)],
+) -> Option<Vector3<f64>> {
+    let mut a = Matrix3::<f64>::zeros();
+    let mut rhs = Vector3::<f64>::zeros();
+    let mut n_in = 0usize;
+    for (o, u, wt, gate) in cons {
+        let dx = cur - o;
+        if dx.dot(u) <= 0.0 || angle_between(&dx, u) > *gate {
+            continue;
+        }
+        let w = wt / dx.norm_squared().max(1e-12);
+        let pr = Matrix3::identity() - u * u.transpose();
+        a += pr * w;
+        rhs += pr * o * w;
+        n_in += 1;
+    }
+    if n_in < GP_MIN_CAM_OBS {
+        return None;
+    }
+    let eig = a.symmetric_eigen().eigenvalues;
+    let (lo, hi) = (eig.min(), eig.max());
+    if !(hi > 0.0 && lo >= GP_MIN_EIG_RATIO * hi) {
+        return None;
+    }
+    a += Matrix3::identity() * (1e-9 * a.trace().max(1e-12));
+    let sol = a.cholesky()?.solve(&rhs);
+    sol.iter().all(|v| v.is_finite()).then_some(sol)
+}
+
 fn global_positioning(
     rotations: &[Option<Rotation3<f64>>],
     observations: &[RelativeTranslation],
@@ -1209,13 +1244,22 @@ fn global_positioning(
             (ok && consistent).then(|| (o.i, o.j, (rj.inverse() * o.direction).normalize()))
         })
         .collect();
+    // 카메라별 관측·짝 직선 색인(한 번만 만든다). 짝 항목은 (이웃, 이웃에서 나오는 직선 방향).
+    let mut cam_obs: Vec<Vec<usize>> = vec![Vec::new(); n_cam];
+    for (k, o) in obs.iter().enumerate() {
+        cam_obs[o.0].push(k);
+    }
+    let mut cam_pairs: Vec<Vec<(usize, Vector3<f64>)>> = vec![Vec::new(); n_cam];
+    for &(i, j, d) in pair_dirs.iter().flatten() {
+        cam_pairs[i].push((j, d));
+        cam_pairs[j].push((i, -d));
+    }
     // 점 광선 지지가 더 큰 위치가 있으면 그 위치로 바꾼다(전역 풀이가 국소해에 머문 카메라 보정).
     for (cam, slot) in centers.iter_mut().enumerate() {
         let Some(cur) = *slot else { continue };
-        let lines: Vec<(Vector3<f64>, Vector3<f64>)> = obs
+        let lines: Vec<(Vector3<f64>, Vector3<f64>)> = cam_obs[cam]
             .iter()
-            .filter(|o| o.0 == cam)
-            .filter_map(|&(_, pt, v, _)| Some((points[pt]?.coords, -v)))
+            .filter_map(|&k| Some((points[obs[k].1]?.coords, -obs[k].2)))
             .collect();
         let support = |c: &Vector3<f64>| {
             lines
@@ -1262,41 +1306,21 @@ fn global_positioning(
         let prev = centers.clone();
         for (cam, slot) in centers.iter_mut().enumerate() {
             let Some(cur) = prev[cam] else { continue };
-            let mut a = Matrix3::<f64>::zeros();
-            let mut rhs = Vector3::<f64>::zeros();
-            let mut add = |o: &Vector3<f64>, u: &Vector3<f64>, wt: f64, gate: f64| {
-                let dx = cur.coords - o;
-                if dx.dot(u) <= 0.0 || angle_between(&dx, u) > gate {
-                    return;
-                }
-                let w = wt / dx.norm_squared().max(1e-12);
-                let pr = Matrix3::identity() - u * u.transpose();
-                a += pr * w;
-                rhs += pr * o * w;
-            };
-            for &(c, pt, v, wt) in obs.iter().filter(|o| o.0 == cam) {
-                let _ = c;
+            let mut cons: Vec<(Vector3<f64>, Vector3<f64>, f64, f64)> =
+                Vec::with_capacity(cam_obs[cam].len() + cam_pairs[cam].len());
+            for &k in &cam_obs[cam] {
+                let (_, pt, v, wt) = obs[k];
                 if let Some(p) = points[pt] {
-                    add(&p.coords, &(-v), wt, GP_FINAL_GATE_RAD);
+                    cons.push((p.coords, -v, wt, GP_FINAL_GATE_RAD));
                 }
             }
-            for pd in pair_dirs.iter().flatten() {
-                let (i, j, d) = *pd;
-                if i == cam {
-                    if let Some(cj) = prev[j] {
-                        add(&cj.coords, &d, GP_PAIR_WEIGHT, GP_PAIR_GATE_RAD);
-                    }
-                } else if j == cam {
-                    if let Some(ci) = prev[i] {
-                        add(&ci.coords, &(-d), GP_PAIR_WEIGHT, GP_PAIR_GATE_RAD);
-                    }
+            for &(other, d) in &cam_pairs[cam] {
+                if let Some(co) = prev[other] {
+                    cons.push((co.coords, d, GP_PAIR_WEIGHT, GP_PAIR_GATE_RAD));
                 }
             }
-            a += Matrix3::identity() * (1e-9 * a.trace().max(1e-12));
-            if let Some(sol) = a.cholesky().map(|c| c.solve(&rhs)) {
-                if sol.iter().all(|v| v.is_finite()) {
-                    *slot = Some(Point3::from(sol));
-                }
+            if let Some(c) = refine_center(&cur.coords, &cons) {
+                *slot = Some(Point3::from(c));
             }
         }
     }
@@ -1305,10 +1329,9 @@ fn global_positioning(
         if centers[cam].is_some() || rotations[cam].is_none() {
             continue;
         }
-        let mut lines: Vec<(Vector3<f64>, Vector3<f64>)> = obs
+        let mut lines: Vec<(Vector3<f64>, Vector3<f64>)> = cam_obs[cam]
             .iter()
-            .filter(|o| o.0 == cam)
-            .filter_map(|&(_, pt, v, _)| Some((points[pt]?.coords, -v)))
+            .filter_map(|&k| Some((points[obs[k].1]?.coords, -obs[k].2)))
             .collect();
         let supported = |c: &Vector3<f64>, lines: &[(Vector3<f64>, Vector3<f64>)], gate: f64| {
             lines
@@ -1319,16 +1342,9 @@ fn global_positioning(
         let mut found = robust_ray_point(&lines, GP_GATE_RAD)
             .filter(|c| supported(c, &lines, GP_GATE_RAD) >= GP_SUPPLEMENT_SUPPORT);
         if found.is_none() {
-            for pd in &pair_dirs {
-                let Some((a, b, d)) = *pd else { continue };
-                if a == cam {
-                    if let Some(cb) = registered_at[b] {
-                        lines.push((cb.coords, d));
-                    }
-                } else if b == cam {
-                    if let Some(ca) = registered_at[a] {
-                        lines.push((ca.coords, -d));
-                    }
+            for &(other, d) in &cam_pairs[cam] {
+                if let Some(co) = registered_at[other] {
+                    lines.push((co.coords, d));
                 }
             }
             let gate = cfg.outlier_threshold_rad;
@@ -1839,6 +1855,165 @@ mod tests {
                 assert!(max <= 1.0, "pair {frac} seed {seed} max {max}");
             }
         }
+    }
+
+    /// 진단: 최대 오차 카메라의 점 관측 수·짝 직선 수 (시드·짝 이상치·점 이상치는 환경변수 DIAG_CASES="시드:짝:점,...").
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_worst_camera() {
+        let cases = std::env::var("DIAG_CASES").unwrap_or_else(|_| "15:0.2:0.0,7:0.1:0.05".into());
+        for spec in cases.split(',') {
+            let v: Vec<&str> = spec.split(':').collect();
+            let (seed, frac, pfrac): (u64, f64, f64) = (
+                v[0].parse().unwrap(),
+                v[1].parse().unwrap(),
+                v[2].parse().unwrap(),
+            );
+            let case = Case {
+                noise_deg: 1.0,
+                outlier_frac: frac,
+                unobservable_frac: 0.05,
+            };
+            let (poses, rots, obs) = observations(seed, &case);
+            let (_, pobs) = point_observations(seed, &poses, POINTS.0, POINTS.1, pfrac);
+            let res =
+                average_translations_with_points(&rots, &obs, &pobs, &TranslationConfig::default());
+            let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
+            let errs = similarity_aligned_errors(&res.centers, &truth);
+            let mut idx: Vec<usize> = (0..errs.len()).collect();
+            idx.sort_by(|&a, &b| errs[b].total_cmp(&errs[a]));
+            for &c in idx.iter().take(5) {
+                let n_pt = pobs.iter().filter(|o| o.camera == c).count();
+                let n_pair = obs.iter().filter(|o| o.i == c || o.j == c).count();
+                println!(
+                    "seed {seed} pair {frac} point {pfrac}: cam {c} err {:.3} m point obs {n_pt} pair lines {n_pair}",
+                    errs[c]
+                );
+            }
+            // 최대 오차 카메라의 짝 직선: 정답 방향 대비 각 오차(도)와 이웃 정답 방향 분포.
+            let c = idx[0];
+            let mut ang = Vec::new();
+            for o in obs.iter().filter(|o| o.i == c || o.j == c) {
+                let rj = poses[o.j].rotation;
+                let dir = rj.inverse() * o.direction;
+                let t = poses[o.i].center() - poses[o.j].center();
+                ang.push(angle_between(&dir, &t).to_degrees());
+            }
+            ang.sort_by(|a, b| a.total_cmp(b));
+            println!(
+                "  worst cam {c} pair-line angle err deg: {:?}",
+                ang.iter()
+                    .map(|a| (a * 10.0).round() / 10.0)
+                    .collect::<Vec<_>>()
+            );
+            let mut dirs = Vec::new();
+            for o in obs.iter().filter(|o| o.i == c || o.j == c) {
+                let other = if o.i == c { o.j } else { o.i };
+                let t = (poses[other].center() - poses[c].center()).normalize();
+                dirs.push((t.x, t.y, t.z));
+            }
+            let m = dirs.iter().fold(Matrix3::<f64>::zeros(), |a, d| {
+                let v = Vector3::new(d.0, d.1, d.2);
+                a + v * v.transpose()
+            });
+            let e = m.symmetric_eigen().eigenvalues;
+            println!(
+                "  worst cam {c} neighbour-direction scatter eigenvalues {:?}",
+                e.as_slice()
+            );
+            let mean_pt = pobs.len() as f64 / 240.0;
+            println!("  mean point obs per camera {mean_pt:.1}");
+        }
+    }
+
+    /// 80경우(시드 범위 × 짝 이상치 10·20% × 점 이상치 0·5%) 표. 시드 범위는 환경변수 TA_SEEDS="처음:끝".
+    fn grid(seeds: std::ops::RangeInclusive<u64>) -> Vec<(f64, f64, u64, usize, f64, f64)> {
+        let mut fails = Vec::new();
+        for pfrac in [0.0, 0.05] {
+            for frac in [0.10, 0.20] {
+                for seed in seeds.clone() {
+                    let case = Case {
+                        noise_deg: 1.0,
+                        outlier_frac: frac,
+                        unobservable_frac: 0.05,
+                    };
+                    let (reg, rms, max) = run_with(seed, &case, pfrac);
+                    println!(
+                        "GRID point {pfrac} pair {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m"
+                    );
+                    if reg < 238 || rms > 0.3 || max > 1.0 {
+                        fails.push((pfrac, frac, seed, reg, rms, max));
+                    }
+                }
+            }
+        }
+        fails
+    }
+
+    #[test]
+    #[ignore = "기준 미달(열린 문제 F-276)"]
+    fn noisy_outliers_grid_seeds_1_to_20() {
+        let fails = grid(1..=20);
+        assert!(fails.is_empty(), "{} fails: {fails:?}", fails.len());
+    }
+
+    #[test]
+    #[ignore = "기준 미달(시드 22 점 이상치 5% RMS 0.36 m)로 열린 문제, 조정에 쓰지 않은 시드 21~25"]
+    fn noisy_outliers_unseen_seeds_21_to_25() {
+        let fails = grid(21..=25);
+        assert!(fails.is_empty(), "{} fails: {fails:?}", fails.len());
+    }
+
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_grid_env() {
+        let r = std::env::var("TA_SEEDS").unwrap_or_else(|_| "1:20".into());
+        let (a, b) = r.split_once(':').unwrap();
+        let fails = grid(a.parse().unwrap()..=b.parse().unwrap());
+        println!("GRID fails {}: {fails:?}", fails.len());
+    }
+
+    #[test]
+    fn refine_center_keeps_previous_when_underconstrained() {
+        let cur = Vector3::new(1.0, 2.0, 30.0);
+        let gate = 0.05;
+        // 제약 없음 → 유지.
+        assert!(refine_center(&cur, &[]).is_none());
+        // 점이 모두 문턱 밖(원래 방향에서 10° 이상 벗어남) → 문턱 안 제약 0 → 유지.
+        let tilt = Rotation3::from_axis_angle(&Vector3::x_axis(), 12f64.to_radians());
+        let far: Vec<_> = (0..8)
+            .map(|k| {
+                let x = Vector3::new(k as f64 * 3.0 - 10.0, 5.0 * (k % 3) as f64, 0.0);
+                (x, tilt * (cur - x).normalize(), 1.0, gate)
+            })
+            .collect();
+        assert!(refine_center(&cur, &far).is_none());
+        // 모든 직선이 거의 같은 방향(같은 원점에서 나오는 한 직선) → 고윳값 비 작음 → 유지.
+        let o = Vector3::new(1.0, 2.0, 0.0);
+        let one_dir: Vec<_> = (0..8)
+            .map(|k| {
+                (
+                    o + Vector3::new(0.0, 0.0, -(k as f64)),
+                    Vector3::z(),
+                    1.0,
+                    gate,
+                )
+            })
+            .collect();
+        assert!(refine_center(&cur, &one_dir).is_none());
+        // 여러 방향에서 오는 직선은 정답 근처로 해를 낸다.
+        let good: Vec<_> = (0..8)
+            .map(|k| {
+                let x = Vector3::new(
+                    (k % 4) as f64 * 8.0 - 12.0,
+                    (k / 4) as f64 * 14.0 - 7.0,
+                    0.0,
+                );
+                (x, (cur - x).normalize(), 1.0, gate)
+            })
+            .collect();
+        let c = refine_center(&cur, &good).expect("well constrained");
+        assert!((c - cur).norm() < 1e-6, "{c:?}");
     }
 
     #[test]
