@@ -76,7 +76,7 @@ pub struct Item {
     /// false 면 SPEC §2 출력만으로는 판정할 수 없는 항목(입력 파일 없음).
     pub decided: bool,
     pub measured: String,
-    pub criterion: &'static str,
+    pub criterion: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -160,7 +160,12 @@ pub const ITEM_PREVIEW_REFINED: &str = "preview_vs_refined";
 pub const ITEM_OVERLAP: &str = "refined_overlap";
 pub const ITEM_SNAPSHOTS: &str = "snapshots";
 
-fn item(name: &'static str, criterion: &'static str, r: Result<(bool, String), String>) -> Item {
+fn item(
+    name: &'static str,
+    criterion: impl Into<String>,
+    r: Result<(bool, String), String>,
+) -> Item {
+    let criterion = criterion.into();
     match r {
         Ok((pass, measured)) => Item {
             name,
@@ -183,11 +188,12 @@ fn item(name: &'static str, criterion: &'static str, r: Result<(bool, String), S
 /// `absent_note` 는 report.json 이 없을 때 SPEC §2 출력에서 읽은 참고 값(판정에는 쓰지 않음).
 fn report_item(
     name: &'static str,
-    criterion: &'static str,
+    criterion: impl Into<String>,
     report: &ReportJson,
     check: fn(&Json) -> Result<(bool, String), String>,
     absent_note: &str,
 ) -> Item {
+    let criterion = criterion.into();
     match report {
         ReportJson::Absent => Item {
             name,
@@ -260,7 +266,7 @@ pub fn verify_dir(dir: &Path) -> Report {
     let items = vec![
         report_item(
             ITEM_REGISTERED,
-            "초벌·정밀 모두 전체 등록 (240/240)",
+            registered_criterion(&report),
             &report_src,
             check_registered,
             "",
@@ -331,6 +337,18 @@ fn as_index(j: &Json) -> Option<usize> {
     match j {
         Json::Num(v) if v.fract() == 0.0 && *v >= 0.0 && *v < 1e9 => Some(*v as usize),
         _ => None,
+    }
+}
+
+/// 기준 열 문구: 전체 등록 사진 수는 report 의 `registered.total` (읽지 못하면 수 없이).
+fn registered_criterion(report: &Result<Json, String>) -> String {
+    match report
+        .as_ref()
+        .ok()
+        .and_then(|r| num(r, &["registered", "total"]).ok())
+    {
+        Some(t) => format!("초벌·정밀 모두 전체 등록 ({t}/{t})"),
+        None => "초벌·정밀 모두 전체 등록".to_string(),
     }
 }
 
@@ -1373,5 +1391,20 @@ mod tests {
         let m = height_pair_median(&query, &reference, 2.0).unwrap();
         assert!((m - 1.5).abs() < 1e-12);
         assert!((nn_median(&query, &reference).unwrap() - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn registered_criterion_uses_real_total() {
+        let r = parse_json(r#"{"registered":{"total":81,"preview":81,"refined":81}}"#);
+        assert_eq!(registered_criterion(&r), "초벌·정밀 모두 전체 등록 (81/81)");
+        let r = parse_json(r#"{"registered":{"total":240}}"#);
+        assert_eq!(
+            registered_criterion(&r),
+            "초벌·정밀 모두 전체 등록 (240/240)"
+        );
+        assert_eq!(
+            registered_criterion(&Err("x".into())),
+            "초벌·정밀 모두 전체 등록"
+        );
     }
 }
