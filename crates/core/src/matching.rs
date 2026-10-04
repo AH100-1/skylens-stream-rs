@@ -61,7 +61,9 @@ pub enum CrossSchedule {
 
 impl CrossSchedule {
     /// 실측 편대 기본값: F–R·F–L +20..=+40, 4칸 간격. 겹침 12% 미만(+12~+16)은 매칭은 되지만
-    /// 회전 오차가 5~17° 라 뺀다(연구 노트 experiments/formation-pairs.md).
+    /// 회전 오차가 5~17° 라 뺀다(연구 노트 experiments/formation-pairs.md). 24시점 bench 에서는 +20 간선 5/12 가
+    /// 2° 를 넘지만(experiments/bench-schedule.md) 시작을 24 로 올리면 위치 40곳 구역(`pipeline_e2e`
+    /// single_region)의 등록이 80/120 으로 떨어져 20 을 유지한다. bench 는 `--cross-min 24` 로 따로 쓴다.
     pub const FORMATION: CrossSchedule = CrossSchedule::Formation {
         right_min: 20,
         left_min: 20,
@@ -2814,6 +2816,26 @@ mod tests {
         comps: usize,
         returned: usize,
         align_median_deg: f64,
+        /// 통과한 간선별 기록(다른 카메라 짝 보고용).
+        edge_log: Vec<EdgeRec>,
+    }
+
+    /// 통과 간선 하나의 기록.
+    struct EdgeRec {
+        kind: usize,
+        /// 위치 번호 (앞 시점, 뒤 시점) 와 카메라 번호.
+        a: (usize, usize),
+        b: (usize, usize),
+        matches: usize,
+        inliers: usize,
+        /// `recover_pose` 가 고른 회전의 정답 대비 오차(도).
+        err: f64,
+        /// E 분해 네 후보 중 정답에 가장 가까운 회전의 오차(도). 키랄리티 선택이 틀렸는지 가른다.
+        best_decomp: f64,
+        /// 두 번째 RANSAC 후보(있으면)의 `recover_pose` 회전 오차(도).
+        second_cand: Option<f64>,
+        /// 정답 기하 겹침: a 영상 격자 화소 광선이 장면 표면에서 만난 점 중 b 영상 안에 투영되는 비율(가림 무시).
+        overlap: f64,
     }
 
     fn run_schedule(sel: &[(usize, usize)], sch: &PairSchedule) -> ScheduleRun {
@@ -2858,6 +2880,7 @@ mod tests {
         let mut kinds = [(0usize, 0usize, 0usize); 4];
         let mut edges = Vec::new();
         let mut verified = 0;
+        let mut edge_log = Vec::new();
         for &(i, j) in &pairs {
             let kd = kind(sel[i].0, sel[j].0);
             kinds[kd].0 += 1;
@@ -2886,8 +2909,52 @@ mod tests {
             };
             kinds[kd].1 += 1;
             let truth = b.pose.rotation * a.pose.rotation.inverse();
-            if (p.rotation * truth.inverse()).angle().to_degrees() > 2.0 {
+            let err = (p.rotation * truth.inverse()).angle().to_degrees();
+            if err > 2.0 {
                 kinds[kd].2 += 1;
+            }
+            if kd != 0 {
+                let best_decomp = crate::two_view::decompose_essential(e)
+                    .iter()
+                    .map(|(r, _)| (*r * truth.inverse()).angle().to_degrees())
+                    .fold(f64::INFINITY, f64::min);
+                let second_cand = cands.get(1).and_then(|(e2, inl2)| {
+                    let t1: Vec<_> = (0..n1.len()).filter(|&k| inl2[k]).map(|k| n1[k]).collect();
+                    let t2: Vec<_> = (0..n1.len()).filter(|&k| inl2[k]).map(|k| n2[k]).collect();
+                    crate::two_view::recover_pose(e2, &t1, &t2)
+                        .map(|q| (q.rotation * truth.inverse()).angle().to_degrees())
+                });
+                let (kx, ky) = (24usize, 14usize);
+                let o = a.pose.center();
+                let (mut hit, mut inside) = (0usize, 0usize);
+                for gy in 0..ky {
+                    for gx in 0..kx {
+                        let px = Vector2::new(
+                            (gx as f64 + 0.5) / kx as f64 * w as f64,
+                            (gy as f64 + 0.5) / ky as f64 * h as f64,
+                        );
+                        let d = a.unproject(&px, 1.0) - o;
+                        if let Some(hh) = scene.intersect(&o, &d) {
+                            hit += 1;
+                            if b.project(&hh.point)
+                                .is_some_and(|q| b.intrinsics.contains(&q))
+                            {
+                                inside += 1;
+                            }
+                        }
+                    }
+                }
+                edge_log.push(EdgeRec {
+                    kind: kd,
+                    a: (sel[i].0, sel[i].1),
+                    b: (sel[j].0, sel[j].1),
+                    matches: m.len(),
+                    inliers: s1.len(),
+                    err,
+                    best_decomp,
+                    second_cand,
+                    overlap: inside as f64 / hit.max(1) as f64,
+                });
             }
             edges.push(RelativeRotation {
                 i,
@@ -2929,6 +2996,7 @@ mod tests {
             comps,
             returned,
             align_median_deg: err[err.len() / 2].to_degrees(),
+            edge_log,
         }
     }
 
@@ -2961,7 +3029,39 @@ mod tests {
             for (n, k) in names.iter().zip(&r.kinds) {
                 eprintln!("  {n}: 일정 {} 성공 {} 2° 초과 {}", k.0, k.1, k.2);
             }
+            eprintln!("  | 짝 | 위치 차 | 회전 오차(°) | 분해 네 후보 최선(°) | 둘째 RANSAC 후보(°) | 대응 | 정상 | 겹침 |");
+            for e in &r.edge_log {
+                let cam = |c: usize| ['F', 'R', 'L'][c];
+                eprintln!(
+                    "  | {}({})–{}({}) | +{} | {:.2} | {:.2} | {} | {} | {} | {:.0}% |",
+                    cam(e.a.0),
+                    e.a.1,
+                    cam(e.b.0),
+                    e.b.1,
+                    e.b.1 - e.a.1,
+                    e.err,
+                    e.best_decomp,
+                    e.second_cand.map_or("-".into(), |v| format!("{v:.2}")),
+                    e.matches,
+                    e.inliers,
+                    100.0 * e.overlap
+                );
+                debug_assert!(e.kind != 0);
+            }
             runs.push(r);
+        }
+        // +20 의 큰 회전 오차는 키랄리티·쌍둥이 선택 실수가 아니다: 네 분해 후보 중 최선이 고른 것과 같다.
+        for r in &runs {
+            for e in &r.edge_log {
+                assert!(
+                    e.err - e.best_decomp < 1e-6,
+                    "{:?}–{:?}: 고른 {} 최선 {}",
+                    e.a,
+                    e.b,
+                    e.err,
+                    e.best_decomp
+                );
+            }
         }
         let r = &runs[0];
         assert_eq!(r.returned, sel.len(), "반환 시점");

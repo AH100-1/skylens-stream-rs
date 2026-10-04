@@ -10,10 +10,10 @@
 //! | `--threads T` | 0 | rayon 스레드 수(0 = rayon 기본 = 논리 코어 수) |
 //! | `--max-pairs P` | 0 | 매칭·검증·자세 구간에서 잴 영상 짝 수 상한(0 = 전부). 앞에서부터 고르게 뽑는다 |
 //! | `--ba-points M` | 3000 | 번들 조정 문제의 점 수 |
-//! | `--full` | | SPEC 기준 규모: `--positions 80 --width 960 --height 540 --repeat 3 --ba-points 20000` 과 같다 |
+//! | `--full` | | SPEC 기준 규모: `--positions 80 --pos-step 1 --width 960 --height 540 --repeat 3 --ba-points 20000` 과 같다(위치 번호 0..=79, 간격은 `--pos-step` 으로 덮어쓸 수 있고 그러면 위치 번호가 (N-1)·K 까지 늘어난다) |
 //! | `--quick` | | 기본값과 같다(예전 이름, 그대로 받는다) |
 //! | `--schedule S` | `formation` | 짝 일정. `formation`: 같은 카메라 SPEC + F–R·F–L 양의 위치 차 일정(`scheduled_pairs`), `spec`: SPEC §3.2 전체 짝 |
-//! | `--pos-step K` | 4(`spec` 이면 1) | 선택한 위치 사이의 실제 위치 번호 간격. `--positions N` 은 고른 위치 수라 장면은 위치 번호 0..=(N-1)·K 를 쓴다 |
+//! | `--pos-step K` | 4(`spec` 이거나 `--full` 이면 1) | 선택한 위치 사이의 실제 위치 번호 간격. `--positions N` 은 고른 위치 수라 장면은 위치 번호 0..=(N-1)·K 를 쓴다 |
 //! | `--cross-min M` | 24 | `formation` 일정에서 F–R·F–L 위치 차 시작값(끝은 +40, 4칸 간격). 20 이면 main 기본 일정 |
 //!
 //! 기본 실행(위치 8, 간격 4 → 위치 번호 0·4·…·28, 24장)은 F–R·F–L 위치 차 +24·+28 이 있어 다른 카메라 확정 간선이 생긴다.
@@ -186,7 +186,9 @@ impl Sched {
                 }
             }
         }
-        let step = step.unwrap_or(if schedule == "spec" { 1 } else { 4 });
+        // `--full` 은 SPEC 규모(위치 번호 0..80)라 간격 1 이 기본이다. 간격 4 면 위치 번호가 316 까지 늘어난다.
+        let full = argv.iter().any(|a| a == "--full");
+        let step = step.unwrap_or(if schedule == "spec" || full { 1 } else { 4 });
         (
             Sched {
                 schedule,
@@ -290,6 +292,8 @@ fn pipeline(args: &Args, sch: &Sched) -> Vec<Row> {
         ..SceneConfig::default()
     };
     let mut scene = Scene::new(config);
+    // 거르고 나면 `scene.config.positions` 는 만든 위치 번호 수(마지막 번호 + 1)로 남고 영상 수와 다르다.
+    // 이 함수 뒤쪽은 `config` 를 다시 쓰지 않고 `scene.views`·`nv` 만 쓴다.
     let keep: Vec<bool> = scene.views.iter().map(|v| v.position % step == 0).collect();
     let mut k = 0;
     scene.views.retain(|_| {
