@@ -620,10 +620,12 @@ fn region_cloud_impl(
 ) -> PointCloud {
     // 1. 왜곡 보정·축소. 실패한 사진은 건너뛴다(빈 깊이 맵).
     let t_depth = std::time::Instant::now();
-    let prepared: Vec<Option<DepthView>> = views
-        .par_iter()
-        .map(|v| prepare(v, cfg.max_width))
-        .collect();
+    let prepared: Vec<Option<DepthView>> = crate::timing::timed("dense_prepare", || {
+        views
+            .par_iter()
+            .map(|v| prepare(v, cfg.max_width))
+            .collect()
+    });
     let ok: Vec<usize> = (0..views.len())
         .filter(|&i| prepared[i].is_some())
         .collect();
@@ -661,7 +663,10 @@ fn region_cloud_impl(
         .collect();
 
     // 2. 이웃 선택·깊이 범위.
-    let neighbors = view_selection::select_neighbors(&vs, &sparse, cfg.neighbors);
+    let neighbors = crate::timing::timed("dense_neighbors", || {
+        view_selection::select_neighbors(&vs, &sparse, cfg.neighbors)
+    });
+    let t_est = std::time::Instant::now();
 
     // 3. 사진별 깊이·법선.
     let maps: Vec<DepthMap> = (0..preps.len())
@@ -677,6 +682,7 @@ fn region_cloud_impl(
         })
         .collect();
 
+    crate::timing::add("dense_estimate", t_est.elapsed().as_secs_f64());
     crate::timing::add("dense_depth", t_depth.elapsed().as_secs_f64());
     // 4. 융합.
     let t_fuse = std::time::Instant::now();

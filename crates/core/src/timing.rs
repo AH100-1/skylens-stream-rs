@@ -26,6 +26,14 @@ pub fn add(name: &'static str, secs: f64) {
     }
 }
 
+/// 단계 `name` 의 누적 초(없으면 0).
+pub fn total(name: &str) -> f64 {
+    ACC.lock()
+        .ok()
+        .and_then(|a| a.iter().find(|e| e.0 == name).map(|e| e.1))
+        .unwrap_or(0.0)
+}
+
 /// `f` 를 돌리고 걸린 시간을 단계 `name` 에 더한다.
 pub fn timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     let t = Instant::now();
