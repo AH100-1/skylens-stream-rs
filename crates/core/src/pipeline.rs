@@ -69,6 +69,8 @@ pub struct PipelineConfig {
     pub gps_sigma_v: f64,
     /// 초벌 점군을 만들기 전 GPS 사전항 BA 반복 수. 0 이면 BA 없이(SPEC §초벌) 닮음 정렬 포즈 그대로.
     pub preview_ba_iters: usize,
+    /// 초벌 위치 전용 다듬기 반복 수(회전 고정, 카메라 중심만). 0 이면 끈다. BA 가 아니다.
+    pub preview_refine_iters: usize,
 }
 
 impl PipelineConfig {
@@ -103,6 +105,7 @@ impl Default for PipelineConfig {
             gps_sigma_h: 2.0,
             gps_sigma_v: 2.0,
             preview_ba_iters: 0,
+            preview_refine_iters: 5,
         }
     }
 }
@@ -719,6 +722,140 @@ fn averaged_centers(
     Some(out)
 }
 
+/// 초벌 위치 전용 다듬기(번들 조정이 아니다): 회전을 고정하고 카메라 중심만 고친다.
+/// 트랙 점을 현재 중심에서 광선 교차로 삼각측량하고, 카메라마다 점–카메라 광선 제약
+/// (각 잔차 Huber 가중, 3x3 정규방정식)으로 중심을 갱신하는 일을 `iters` 번 번갈아 한다.
+/// 길이 3 이상 트랙만, 긴 트랙 우선. 두 번째 바퀴부터 각도 잔차가 `drop_deg` 를 넘는 관측과,
+/// 최대 삼각측량각이 1° 미만인 점은 뺀다. 시작 위치로 당기는 약한 항이 좌표 자유도를 잡는다.
+fn refine_centers(
+    poses: &mut [Option<Pose>],
+    k: &Intrinsics,
+    tracks: &[Vec<(usize, usize, Vector2<f64>)>],
+    opts: &PreviewOpts,
+) {
+    let n = poses.len();
+    let mut sel: Vec<&Vec<(usize, usize, Vector2<f64>)>> =
+        tracks.iter().filter(|t| t.len() >= 3).collect();
+    sel.sort_by_key(|t| std::cmp::Reverse(t.len()));
+    sel.truncate(4000);
+    if sel.is_empty() {
+        return;
+    }
+    // 관측: (카메라, 점, 세계 방향 단위 광선).
+    let rots: Vec<Option<Rotation3<f64>>> = poses.iter().map(|p| p.map(|p| p.rotation)).collect();
+    let mut obs: Vec<(usize, usize, Vector3<f64>)> = Vec::new();
+    for (j, t) in sel.iter().enumerate() {
+        for &(i, _, px) in t.iter() {
+            let (Some(r), Some(b)) = (rots[i], k.unproject(&px)) else {
+                continue;
+            };
+            let v = r.inverse() * Vector3::new(b.x, b.y, 1.0).normalize();
+            obs.push((i, j, v));
+        }
+    }
+    let c0: Vec<Option<Vector3<f64>>> =
+        poses.iter().map(|p| p.map(|p| p.center().coords)).collect();
+    let mut c = c0.clone();
+    let mut alive = vec![true; obs.len()];
+    let proj = |v: &Vector3<f64>| Matrix3::identity() - v * v.transpose();
+    let delta = opts.refine_huber_deg.to_radians();
+    let drop = opts.refine_drop_deg.to_radians();
+    let np = sel.len();
+    let by_pt: Vec<Vec<usize>> = {
+        let mut b = vec![Vec::new(); np];
+        for (o, &(_, j, _)) in obs.iter().enumerate() {
+            b[j].push(o);
+        }
+        b
+    };
+    for it in 0..opts.refine_iters {
+        // 점: 살아 있는 광선의 최소제곱 교차(각 광선 수직 거리).
+        let pts: Vec<Option<Vector3<f64>>> = by_pt
+            .par_iter()
+            .map(|ids| {
+                let mut a = Matrix3::zeros();
+                let mut b = Vector3::zeros();
+                let mut m = 0;
+                for &o in ids.iter().filter(|&&o| alive[o]) {
+                    let (i, _, v) = obs[o];
+                    let Some(ci) = c[i] else { continue };
+                    let pm = proj(&v);
+                    a += pm;
+                    b += pm * ci;
+                    m += 1;
+                }
+                if m < 2 {
+                    return None;
+                }
+                let x = a.lu().solve(&b)?;
+                // 최대 삼각측량각 < 1° 이면 깊이를 믿을 수 없다.
+                let rays: Vec<Vector3<f64>> = ids
+                    .iter()
+                    .filter(|&&o| alive[o])
+                    .filter_map(|&o| Some((x - c[obs[o].0]?).normalize()))
+                    .collect();
+                let mut maxang: f64 = 0.0;
+                for (ia, ra) in rays.iter().enumerate() {
+                    for rb in &rays[ia + 1..] {
+                        maxang = maxang.max(ra.dot(rb).clamp(-1.0, 1.0).acos());
+                    }
+                }
+                (maxang >= 1f64.to_radians()).then_some(x)
+            })
+            .collect();
+        let mut by_cam: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (o, &(i, j, _)) in obs.iter().enumerate() {
+            if alive[o] && pts[j].is_some() {
+                by_cam[i].push(o);
+            }
+        }
+        let new_c: Vec<Option<Vector3<f64>>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let ci = c[i]?;
+                if by_cam[i].len() < 3 {
+                    return c[i];
+                }
+                let mut a = Matrix3::zeros();
+                let mut b = Vector3::zeros();
+                for &o in &by_cam[i] {
+                    let (_, j, v) = obs[o];
+                    let x = pts[j]?;
+                    let d = (x - ci).norm().max(1e-5);
+                    let pm = proj(&v);
+                    let ang = (pm * (x - ci)).norm() / d;
+                    let w = if ang <= delta { 1.0 } else { delta / ang } / (d * d);
+                    a += w * pm;
+                    b += w * pm * x;
+                }
+                let mu = opts.refine_anchor * a.trace() / 3.0;
+                let anchor = c0[i]?;
+                a += Matrix3::identity() * mu;
+                b += mu * anchor;
+                a.lu().solve(&b)
+            })
+            .collect();
+        c = new_c;
+        // 바깥 관측 제거(두 번째 바퀴부터).
+        if it >= 1 && it + 1 < opts.refine_iters {
+            for (o, &(i, j, v)) in obs.iter().enumerate() {
+                if let (Some(x), Some(ci)) = (pts[j], c[i]) {
+                    let d = x - ci;
+                    let ang = d.cross(&v).norm() / d.norm().max(1e-9);
+                    if ang.asin() > drop {
+                        alive[o] = false;
+                    }
+                }
+            }
+        }
+    }
+    for i in 0..n {
+        if let (Some(p), Some(ci)) = (poses[i], c[i]) {
+            poses[i] = Some(Pose::from_center(p.rotation, &Point3::from(ci)));
+        }
+    }
+}
+
 /// 초벌 포즈 단계 선택(후보 비교용). 기본값은 비교에서 가장 좋았던 조합.
 #[derive(Clone, Copy, Debug)]
 pub struct PreviewOpts {
@@ -741,6 +878,14 @@ pub struct PreviewOpts {
     /// 비행 축 둘레 회전을 보는 방향 평균 z 가 가장 작은 각(2° 격자)으로 고른다. 정밀 BA 시작점용:
     /// 정밀 BA 는 이 축 둘레 회전을 15회 안에 다 못 풀어 시작 롤이 정밀 표면 오차에 그대로 남는다.
     pub legacy_roll: bool,
+    /// 위치 전용 다듬기 반복 수(0 이면 끔).
+    pub refine_iters: usize,
+    /// 다듬기 Huber 문턱(도).
+    pub refine_huber_deg: f64,
+    /// 다듬기 바깥 관측 제거 각(도), 두 번째 바퀴부터.
+    pub refine_drop_deg: f64,
+    /// 다듬기: 시작 위치로 당기는 약한 항의 상대 가중.
+    pub refine_anchor: f64,
 }
 
 impl Default for PreviewOpts {
@@ -755,6 +900,10 @@ impl Default for PreviewOpts {
             ray_deg: PREVIEW_MIN_RAY_DEG,
             tri_deg: None,
             legacy_roll: false,
+            refine_iters: 0,
+            refine_huber_deg: 0.3,
+            refine_drop_deg: 2.0,
+            refine_anchor: 0.02,
         }
     }
 }
@@ -773,6 +922,10 @@ impl PreviewOpts {
                 Some(("vfix", v)) => o.vfix = v == "1",
                 Some(("ray", v)) => o.ray_deg = v.parse().unwrap_or(o.ray_deg),
                 Some(("tri", v)) => o.tri_deg = v.parse().ok(),
+                Some(("refine", v)) => o.refine_iters = v.parse().unwrap_or(0),
+                Some(("huber", v)) => o.refine_huber_deg = v.parse().unwrap_or(o.refine_huber_deg),
+                Some(("drop", v)) => o.refine_drop_deg = v.parse().unwrap_or(o.refine_drop_deg),
+                Some(("anchor", v)) => o.refine_anchor = v.parse().unwrap_or(o.refine_anchor),
                 _ => {}
             }
         }
@@ -902,6 +1055,7 @@ fn roll_by_level_spread(
 }
 
 /// 회전 평균 → 방향으로 좌표계 맞춤 → 위치 → 삼각측량. 초벌 희소 모델.
+#[cfg_attr(not(test), allow(dead_code))]
 fn sparse_init(
     imgs: &[&ImgData],
     pm: &[PairMatch],
@@ -1109,6 +1263,11 @@ fn sparse_init_with(
                 .collect()
         })
         .collect();
+    if opts.refine_iters > 0 {
+        crate::timing::timed("position_refine", || {
+            refine_centers(&mut poses, k, &track_obs, opts)
+        });
+    }
     let mut tri_eff = *tri;
     if let Some(d) = opts.tri_deg {
         tri_eff.min_deg = d;
@@ -2023,7 +2182,22 @@ pub fn run_pipeline_with(
             .collect();
         let own_registered = |s: &Sparse| s.poses[n_help..].iter().filter(|p| p.is_some()).count();
         let start = match check_motion(&gps, &views, &own_pairs)
-            .and_then(|_| sparse_init(&imgs, &pm, &gps, &k, cfg.position, &tri, (0, 2.0)))
+            .and_then(|_| {
+                sparse_init_with(
+                    &imgs,
+                    &pm,
+                    &gps,
+                    &k,
+                    cfg.position,
+                    &tri,
+                    (0, 2.0),
+                    &PreviewOpts {
+                        refine_iters: cfg.preview_refine_iters,
+                        ..PreviewOpts::default()
+                    },
+                )
+                .map(|r| r.0)
+            })
             .and_then(|s| {
                 if own_registered(&s) < 3 {
                     Err(format!(
@@ -3235,5 +3409,62 @@ mod tri_tests {
         assert!(s.rms < 0.7 && all_rms < 0.7, "{} {all_rms}", s.rms);
         assert!(med < 1.5, "{med}");
         let _ = &sc.truth;
+    }
+}
+
+#[cfg(test)]
+mod refine_tests {
+    use super::*;
+
+    /// 회전을 알고 중심에 1 m 잡음이 있는 카메라 줄을 점 광선 제약으로 다듬으면 오차가 줄어든다.
+    #[test]
+    fn refine_centers_reduces_noise() {
+        let k = Intrinsics::from_hfov(320, 180, 65f64.to_radians());
+        let r = Rotation3::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI);
+        let truth: Vec<Vector3<f64>> = (0..12).map(|i| Vector3::new(i as f64, 0.0, 60.0)).collect();
+        let noisy: Vec<Vector3<f64>> = truth
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                c + Vector3::new(0.0, ((i * 7) % 5) as f64 - 2.0, ((i * 3) % 5) as f64 - 2.0)
+            })
+            .collect();
+        let tracks: Vec<Vec<(usize, usize, Vector2<f64>)>> = (0..300)
+            .map(|t| {
+                let x = Point3::new(
+                    (t % 20) as f64 - 4.0,
+                    ((t / 20) % 15) as f64 * 4.0 - 28.0,
+                    0.0,
+                );
+                (0..12)
+                    .filter_map(|i| {
+                        let cam = Camera {
+                            intrinsics: k,
+                            pose: Pose::from_center(r, &Point3::from(truth[i])),
+                        };
+                        Some((i, 0, cam.project(&x)?))
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut poses: Vec<Option<Pose>> = noisy
+            .iter()
+            .map(|c| Some(Pose::from_center(r, &Point3::from(*c))))
+            .collect();
+        let err = |p: &[Option<Pose>]| -> f64 {
+            p.iter()
+                .zip(&truth)
+                .map(|(a, t)| (a.unwrap().center().coords - t).norm())
+                .sum::<f64>()
+                / 12.0
+        };
+        let before = err(&poses);
+        let opts = PreviewOpts {
+            refine_iters: 8,
+            ..PreviewOpts::default()
+        };
+        refine_centers(&mut poses, &k, &tracks, &opts);
+        let after = err(&poses);
+        assert!(after < 0.7 * before, "{before} -> {after}");
     }
 }
