@@ -1039,6 +1039,21 @@ fn gp_solve(
     init: Option<(&[Vector3<f64>], &[f64])>,
     seed: u64,
 ) -> (Vec<Vector3<f64>>, Vec<f64>) {
+    let (x, d, _) = gp_solve_iters(n_cam, n_pts, obs, active, init, seed);
+    (x, d)
+}
+
+/// `gp_solve` 와 같고 반복 횟수도 돌려준다. 이어 풀기(`init`)에서는 쓰는 관측마다 d 를 현재 (c, X) 에서
+/// 다시 계산한다(거르기 사이에 되살아난 관측의 d 는 마지막 풀이값이라 바닥 1e-5 일 수 있다). 기준(첫 쓰는)
+/// 관측이 바뀌었으면 해 전체를 새 기준의 d 만큼 키워 새 기준의 d 가 1 이 되게 한다.
+fn gp_solve_iters(
+    n_cam: usize,
+    n_pts: usize,
+    obs: &[(usize, usize, Vector3<f64>, f64)],
+    active: &[bool],
+    init: Option<(&[Vector3<f64>], &[f64])>,
+    seed: u64,
+) -> (Vec<Vector3<f64>>, Vec<f64>, usize) {
     let m = n_cam + n_pts;
     let mut x: Vec<Vector3<f64>> = match init {
         Some((s, _)) => s.to_vec(),
@@ -1083,9 +1098,33 @@ fn gp_solve(
         Some((_, d0)) => d0.to_vec(),
         None => vec![1.0; obs.len()],
     };
+    if init.is_some() {
+        for (k, &(cam, pt, v, _)) in obs.iter().enumerate() {
+            if active[k] {
+                let dx = x[n_cam + pt] - x[cam];
+                d[k] = (v.dot(&dx) / dx.norm_squared().max(1e-300)).max(GP_MIN_SCALE);
+            }
+        }
+        if let Some(f) = first {
+            let s = d[f];
+            if (s - 1.0).abs() > 1e-12 {
+                for p in x.iter_mut() {
+                    *p *= s;
+                }
+                for (k, dk) in d.iter_mut().enumerate() {
+                    if active[k] {
+                        *dk = (*dk / s).max(GP_MIN_SCALE);
+                    }
+                }
+                d[f] = 1.0;
+            }
+        }
+    }
     let mut irls = vec![1.0; obs.len()];
     let mut prev = f64::INFINITY;
+    let mut iters = 0usize;
     for it in 0..GP_ITERS {
+        iters = it + 1;
         let prev_centers: Vec<Vector3<f64>> = x[..n_cam].to_vec();
         // c, X 풀이: Σ w d² |(X_p − c_i) − v/d|² → 정규방정식(좌표 공통 행렬).
         // 점 블록은 스칼라 대각이라 점을 소거한 카메라 축소 계통(n_cam × n_cam)만 밀집으로 푼다.
@@ -1273,7 +1312,7 @@ fn gp_solve(
         }
         prev = cost;
     }
-    (x, d)
+    (x, d, iters)
 }
 
 /// 점 관측을 주 경로로 쓰는 전역 위치 추정. 짝 간선은 회전 일관성으로만 거르고(`rejected[0]`) 각 잔차를 보고한다.
@@ -2185,6 +2224,67 @@ mod tests {
             .collect();
         let c = refine_center(&cur, &good).expect("well constrained");
         assert!((c - cur).norm() < 1e-6, "{c:?}");
+    }
+
+    /// 거르기 사이에 관측이 되살아나는 이어 풀기: 처음부터 푼 해와 같고 반복이 더 많지 않다.
+    #[test]
+    fn warm_start_with_revived_observations_matches_cold() {
+        let mut st = 77u64;
+        let n_cam = 14;
+        let n_pts = 50;
+        let cams: Vec<Vector3<f64>> = (0..n_cam)
+            .map(|_| {
+                Vector3::new(
+                    gp_uniform(&mut st) * 40.0 - 20.0,
+                    gp_uniform(&mut st) * 40.0 - 20.0,
+                    30.0 + gp_uniform(&mut st) * 4.0,
+                )
+            })
+            .collect();
+        let pts: Vec<Vector3<f64>> = (0..n_pts)
+            .map(|_| {
+                Vector3::new(
+                    gp_uniform(&mut st) * 50.0 - 25.0,
+                    gp_uniform(&mut st) * 50.0 - 25.0,
+                    gp_uniform(&mut st) * 3.0,
+                )
+            })
+            .collect();
+        let noise = 0.3f64.to_radians();
+        let mut obs: Vec<(usize, usize, Vector3<f64>, f64)> = Vec::new();
+        for c in 0..n_cam {
+            for p in 0..n_pts {
+                let dir = (pts[p] - cams[c]).normalize();
+                let mut g = || {
+                    let u1 = gp_uniform(&mut st).max(1e-300);
+                    let u2 = gp_uniform(&mut st);
+                    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+                };
+                let v = (dir + Vector3::new(g(), g(), g()) * noise).normalize();
+                obs.push((c, p, v, 1.0));
+            }
+        }
+        // 1차: 기준 관측(0)과 약 30% 가 빠진 집합. 2차: 모두 되살아난 집합.
+        let first_round: Vec<bool> = (0..obs.len())
+            .map(|k| k != 0 && gp_uniform(&mut st) > 0.3)
+            .collect();
+        let second_round = vec![true; obs.len()];
+        let (x1, d1) = gp_solve(n_cam, n_pts, &obs, &first_round, None, 1);
+        let (xc, _, it_cold) = gp_solve_iters(n_cam, n_pts, &obs, &second_round, None, 1);
+        let (xw, dw, it_warm) =
+            gp_solve_iters(n_cam, n_pts, &obs, &second_round, Some((&x1, &d1)), 1);
+        assert_eq!(dw[0], 1.0);
+        let cold: Vec<Option<Point3<f64>>> =
+            xc[..n_cam].iter().map(|c| Some(Point3::from(*c))).collect();
+        let warm: Vec<Option<Point3<f64>>> =
+            xw[..n_cam].iter().map(|c| Some(Point3::from(*c))).collect();
+        let cold_pts: Vec<Point3<f64>> = xc[..n_cam].iter().map(|c| Point3::from(*c)).collect();
+        let errs = similarity_aligned_errors(&warm, &cold_pts);
+        let max = errs.iter().cloned().fold(0.0, f64::max);
+        println!("warm vs cold: max {max:.5} m, iterations warm {it_warm} cold {it_cold}");
+        let _ = cold;
+        assert!(max < 0.05, "max {max}");
+        assert!(it_warm <= it_cold, "warm {it_warm} cold {it_cold}");
     }
 
     #[test]
