@@ -878,6 +878,9 @@ pub struct PreviewOpts {
     /// 비행 축 둘레 회전을 보는 방향 평균 z 가 가장 작은 각(2° 격자)으로 고른다. 정밀 BA 시작점용:
     /// 정밀 BA 는 이 축 둘레 회전을 15회 안에 다 못 풀어 시작 롤이 정밀 표면 오차에 그대로 남는다.
     pub legacy_roll: bool,
+    /// 0 보다 크면 방향 맞춤 행렬의 둘째/첫째 특이값 비가 이 값 이상일 때(축 둘레 회전이 방향 짝만으로 정해질 때)
+    /// 롤 선택을 건너뛰고 방향 맞춤 그대로 쓴다.
+    pub kabsch_roll_ratio: f64,
     /// 위치 전용 다듬기 반복 수(0 이면 끔).
     pub refine_iters: usize,
     /// 다듬기 Huber 문턱(도).
@@ -900,6 +903,7 @@ impl Default for PreviewOpts {
             ray_deg: PREVIEW_MIN_RAY_DEG,
             tri_deg: None,
             legacy_roll: false,
+            kabsch_roll_ratio: 0.0,
             refine_iters: 0,
             refine_huber_deg: 0.3,
             refine_drop_deg: 2.0,
@@ -926,6 +930,7 @@ impl PreviewOpts {
                 Some(("huber", v)) => o.refine_huber_deg = v.parse().unwrap_or(o.refine_huber_deg),
                 Some(("drop", v)) => o.refine_drop_deg = v.parse().unwrap_or(o.refine_drop_deg),
                 Some(("anchor", v)) => o.refine_anchor = v.parse().unwrap_or(o.refine_anchor),
+                Some(("kroll", v)) => o.kabsch_roll_ratio = v.parse().unwrap_or(0.0),
                 _ => {}
             }
         }
@@ -942,6 +947,12 @@ pub struct PreviewStages {
     pub placed: Vec<Option<Pose>>,
     /// 회전 평균 뒤 뺀 간선 수 / 전체.
     pub pruned: (usize, usize),
+    /// 방향 맞춤(Kabsch) 직후, 비행 축 롤 선택 전의 좌표계 맞춤 회전.
+    pub g_dir: Matrix3<f64>,
+    /// 롤 선택까지 끝난 좌표계 맞춤 회전(포즈 회전 = 평균 회전 · gᵀ).
+    pub g: Matrix3<f64>,
+    /// 방향 맞춤 행렬의 특이값(내림차순).
+    pub sv: Vector3<f64>,
 }
 
 type RotsAndKeep = (Vec<Option<Rotation3<f64>>>, Vec<bool>);
@@ -1150,6 +1161,8 @@ fn sparse_init_with(
     let mut g = vt.transpose() * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, d)) * u.transpose();
     // 편대가 거의 한 직선으로 날면 Kabsch 는 직선 둘레 회전을 못 정한다: 비행 축 둘레 회전을
     // 광축 높이 분산이 최소인 각(닫힌 식)으로 고른다.
+    stages.g_dir = g;
+    stages.sv = svd.singular_values;
     let valid: Vec<Rotation3<f64>> = rots.iter().flatten().copied().collect();
     let mut axis = Vector3::zeros();
     let mut first: Option<Vector3<f64>> = None;
@@ -1161,7 +1174,9 @@ fn sparse_init_with(
             axis += if dn.dot(&r) >= 0.0 { dn } else { -dn };
         }
     }
-    if axis.norm() > 1e-9 && !valid.is_empty() {
+    let ratio = svd.singular_values[1] / svd.singular_values.max();
+    let skip_roll = opts.kabsch_roll_ratio > 0.0 && ratio >= opts.kabsch_roll_ratio;
+    if axis.norm() > 1e-9 && !valid.is_empty() && !skip_roll {
         let axis = nalgebra::Unit::new_normalize(axis);
         if opts.legacy_roll {
             let mut best = (f64::INFINITY, g);
@@ -1183,6 +1198,7 @@ fn sparse_init_with(
             g = *Rotation3::from_axis_angle(&axis, theta).matrix() * g;
         }
     }
+    stages.g = g;
     let ids: Vec<usize> = (0..n).filter(|&i| rots[i].is_some()).collect();
     let loc: HashMap<usize, usize> = ids.iter().enumerate().map(|(a, &i)| (i, a)).collect();
     let dirs: Vec<(usize, usize, Vector3<f64>)> = dirs_model
@@ -2819,6 +2835,246 @@ mod diag {
             old.placed_c_med
         );
         assert!(new.placed_rot_med < 0.6 * old.placed_rot_med);
+    }
+
+    /// 초벌 공통 회전 오프셋 분해(오래 걸려 기본 시험에서 뺀다):
+    /// `SKYLENS_STRIDE=1 cargo test --release -j 2 -p <core> preview_offset -- --ignored --nocapture`.
+    /// 단계마다 정답 대비 회전 오차 중앙을 (a) 그대로, (b) 공통 회전 하나를 뺀 값으로 잰다.
+    #[test]
+    #[ignore]
+    fn preview_offset_stages() {
+        let stride: usize = std::env::var("SKYLENS_STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let root = std::env::temp_dir().join(format!("skylens_offset_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let scene = Scene::new(SceneConfig {
+            width: 320,
+            height: 180,
+            ..SceneConfig::default()
+        });
+        scene.write_dataset(&root).unwrap();
+        let ds = load_dataset(
+            &root,
+            DatasetConfig {
+                stride,
+                span: 48,
+                ovl: 2,
+                max_skip_run: 2,
+            },
+        )
+        .unwrap();
+        let region = split_regions(ds.positions.len(), ds.config.span, ds.config.ovl)[0];
+        let gids: Vec<usize> = (region.lo * 3..region.hi * 3).collect();
+        let n = gids.len();
+        let data: Vec<ImgData> = gids
+            .iter()
+            .map(|g| load(&ds.positions[g / 3].images[g % 3], 800).unwrap())
+            .collect();
+        let imgs: Vec<&ImgData> = data.iter().collect();
+        let k = Intrinsics::from_hfov(
+            data[0].rgb.width(),
+            data[0].rgb.height(),
+            65f64.to_radians(),
+        );
+        let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
+        let gps: Vec<Vector3<f64>> = gids
+            .iter()
+            .map(|g| ds.positions[g / 3].image_enu[g % 3])
+            .collect();
+        let pm = match_pairs(&imgs, &views, &k);
+        let opts = PreviewOpts {
+            refine_iters: 5,
+            kabsch_roll_ratio: std::env::var("SKYLENS_RATIO")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
+            ..PreviewOpts::default()
+        };
+        let (init, st) = sparse_init_with(
+            &imgs,
+            &pm,
+            &gps,
+            &k,
+            PipelineConfig::default().position,
+            &TriConfig::from_config(&PipelineConfig::default()),
+            (0, 2.0),
+            &opts,
+        )
+        .unwrap();
+        let tp: Vec<Pose> = gids
+            .iter()
+            .map(|&g| {
+                let name = ds.positions[g / 3].images[g % 3]
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let v = scene.views.iter().find(|v| v.name == name).unwrap();
+                let c = scene.to_first_gps_frame(&v.camera.pose.center());
+                Pose::from_center(v.camera.pose.rotation, &c)
+            })
+            .collect();
+        // 공통 회전 Q: 모든 i 에 대해 Rᵢ·Q ≈ Tᵢ 인 폴라 분해 해(세계 쪽 곱).
+        let common = |rs: &[Option<Rotation3<f64>>]| -> Rotation3<f64> {
+            let mut m = Matrix3::zeros();
+            for (r, t) in rs.iter().zip(&tp) {
+                if let Some(r) = r {
+                    m += r.matrix().transpose() * t.rotation.matrix();
+                }
+            }
+            let sv = m.svd(true, true);
+            Rotation3::from_matrix_unchecked(sv.u.unwrap() * sv.v_t.unwrap())
+        };
+        let errs = |rs: &[Option<Rotation3<f64>>], q: &Rotation3<f64>| -> f64 {
+            med(rs
+                .iter()
+                .zip(&tp)
+                .filter_map(|(r, t)| {
+                    Some(
+                        ((*r.as_ref()?) * q * t.rotation.inverse())
+                            .angle()
+                            .to_degrees(),
+                    )
+                })
+                .collect())
+        };
+        let pose_rots = |ps: &[Option<Pose>]| -> Vec<Option<Rotation3<f64>>> {
+            ps.iter().map(|p| p.map(|p| p.rotation)).collect()
+        };
+        let ident = Rotation3::identity();
+        let mut rows: Vec<(String, f64, f64)> = Vec::new();
+        // 비행 축(정답 중심의 주성분 방향) 둘레 성분 분해.
+        let c0 = tp.first().unwrap().center().coords;
+        let c1 = tp.last().unwrap().center().coords;
+        let axis = Vector3::new(c1.x - c0.x, c1.y - c0.y, 0.0).normalize();
+        let split = |q: &Rotation3<f64>| -> (f64, f64, f64) {
+            let v = q.scaled_axis();
+            let a = v.dot(&axis);
+            let perp = v - a * axis;
+            (
+                q.angle().to_degrees(),
+                a.to_degrees(),
+                perp.norm().to_degrees(),
+            )
+        };
+        // 1. 회전 평균 직후(자유 좌표계): (a) 그대로는 의미 없음(좌표계 임의), (b) 공통 회전 뺀 값.
+        let q1 = common(&st.rots);
+        rows.push((
+            "1 회전 평균 직후".into(),
+            errs(&st.rots, &ident),
+            errs(&st.rots, &q1),
+        ));
+        // 2. 좌표계 맞춤: 방향만(롤 전), 롤 선택 뒤.
+        let rot_g = |g: &Matrix3<f64>| -> Vec<Option<Rotation3<f64>>> {
+            st.rots
+                .iter()
+                .map(|r| r.map(|r| Rotation3::from_matrix_unchecked(r.matrix() * g.transpose())))
+                .collect()
+        };
+        let (rd, rg) = (rot_g(&st.g_dir), rot_g(&st.g));
+        let (qd, qg) = (common(&rd), common(&rg));
+        rows.push((
+            "2a 방향 맞춤 직후(롤 전)".into(),
+            errs(&rd, &ident),
+            errs(&rd, &qd),
+        ));
+        rows.push(("2b 롤 선택 직후".into(), errs(&rg, &ident), errs(&rg, &qg)));
+        // 3. 위치 풀이 직후 · 다듬기 뒤(회전은 고정이라 같은 값이어야 한다).
+        let pl = pose_rots(&st.placed);
+        let qp = common(&pl);
+        rows.push((
+            "3a 위치 풀이 직후".into(),
+            errs(&pl, &ident),
+            errs(&pl, &qp),
+        ));
+        let fr = pose_rots(&init.poses);
+        let qf = common(&fr);
+        rows.push((
+            "3b 위치 다듬기 뒤".into(),
+            errs(&fr, &ident),
+            errs(&fr, &qf),
+        ));
+        // 4. 초벌 정렬 뒤: 정밀(BA 10회 + GPS 정렬)에 구역 점 대응 닮음으로 맞춘다.
+        let good = well_conditioned(&init, opts.ray_deg, 200);
+        let mut rs = init.clone();
+        run_ba(&mut rs, &k, 10, Some(&gps), 2.0, &[]);
+        gps_align_refined(&mut rs, &gps);
+        let (ta, tb) = (to_tracks(&good, &gids), to_tracks(&rs, &gids));
+        let pairs = point_pairs(&ta, &tb, |i| (i / 3) as usize, (region.lo, region.hi));
+        let (sim, rec) = align_region(&region, &pairs);
+        let sim = sim.expect("초벌 정렬 실패");
+        let mut aligned = init.clone();
+        apply_sparse_sim(&mut aligned, &sim);
+        let al = pose_rots(&aligned.poses);
+        let qa = common(&al);
+        rows.push(("4 초벌 정렬 뒤".into(), errs(&al, &ident), errs(&al, &qa)));
+        let rr = pose_rots(&rs.poses);
+        let qr = common(&rr);
+        rows.push((
+            "4' 정밀(BA+GPS 정렬)".into(),
+            errs(&rr, &ident),
+            errs(&rr, &qr),
+        ));
+        eprintln!(
+            "OFFSET stride {stride} images {n} pairs {} fit_med {:?}",
+            pairs.len(),
+            rec.fit_median_m
+        );
+        for (name, a, b) in &rows {
+            eprintln!("OFFSET row [{name}] as-is {a:.3} common-removed {b:.3}");
+        }
+        for (name, q) in [
+            ("1", &q1),
+            ("2a", &qd),
+            ("2b", &qg),
+            ("3", &qp),
+            ("4", &qa),
+            ("4'", &qr),
+        ] {
+            let (t, a, p) = split(q);
+            eprintln!("OFFSET common[{name}] total {t:.3} deg, about flight axis {a:+.3}, off-axis {p:.3}");
+        }
+        // 정렬 뒤 위치 오차: 중심 중앙, 높이 중앙.
+        let cen = |ps: &[Option<Pose>]| -> (f64, f64) {
+            let d: Vec<f64> = (0..n)
+                .filter_map(|i| Some((ps[i]?.center() - tp[i].center()).norm()))
+                .collect();
+            let z: Vec<f64> = (0..n)
+                .filter_map(|i| Some((ps[i]?.center().z - tp[i].center().z).abs()))
+                .collect();
+            (med(d), med(z))
+        };
+        let (c_p, z_p) = cen(&init.poses);
+        let (c_a, z_a) = cen(&aligned.poses);
+        let (c_r, z_r) = cen(&rs.poses);
+        eprintln!("OFFSET centers placed/refined c {c_p:.3} dz {z_p:.3} | aligned c {c_a:.3} dz {z_a:.3} | refined-BA c {c_r:.3} dz {z_r:.3}");
+        // 초벌(정렬 뒤) ↔ 정밀 점군: 최근접 중앙·높이 차 중앙.
+        let inr = vec![true; n];
+        let xyz = |c: &PointCloud| -> Vec<[f64; 3]> {
+            c.points
+                .iter()
+                .map(|p| [p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64])
+                .collect()
+        };
+        let rc = dense_cloud(&rs, &imgs, &k, &inr, 96, DenseMethod::Sweep);
+        let pc = dense_cloud(&good, &imgs, &k, &inr, 96, DenseMethod::Sweep);
+        let pa = xyz(&apply_cloud(&sim, &pc));
+        let rx = xyz(&rc);
+        eprintln!(
+            "OFFSET cloud nn_med {:?} height_diff_med {:?}",
+            nn_median(&pa, &rx),
+            height_pair_median(&pa, &rx, 2.0)
+        );
+        // 가상 비교: 초벌 정렬 닮음의 회전이 포즈에 만든 변화량(정렬 회전 각).
+        eprintln!("OFFSET kabsch singular values {:?}", st.sv);
+        eprintln!(
+            "OFFSET align rotation angle {:.3} deg scale {:.4}",
+            sim.r.angle().to_degrees(),
+            sim.s
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
