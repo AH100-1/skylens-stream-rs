@@ -204,8 +204,12 @@ fn stream_order_events_and_numbers_match_sequential() {
         [count("refined", 0), count("refined", 1)],
     );
     assert_eq!(ev[c0].points, n_pre[0], "구역 0 초벌 직후");
-    assert_eq!(ev[c1].points, n_pre[0] + n_pre[1], "구역 1 초벌 직후");
-    assert_eq!(ev[r0].points, n_ref[0] + n_pre[1], "구역 0 정밀 교체 직후");
+    // 스트림 등록은 구역 1 을 최신 정밀 모델에 붙이려고 구역 0 정밀을 기다린다. 그러면 구역 1 초벌 출력
+    // 시점에 구역 0 은 이미 정밀로 교체돼 있다: 구성은 그 시점의 사건 순서가 정한다(여전히 정확히 단언).
+    let first = if r0 < c1 { n_ref[0] } else { n_pre[0] };
+    assert_eq!(ev[c1].points, first + n_pre[1], "구역 1 초벌 직후");
+    let second = if r0 < c1 { 0 } else { n_pre[1] };
+    assert_eq!(ev[r0].points, n_ref[0] + second, "구역 0 정밀 교체 직후");
     assert_eq!(ev[r1].points, n_ref[0] + n_ref[1], "구역 1 정밀 교체 직후");
     let last_snap = ev.iter().rev().find(|e| e.snapshot.is_some()).unwrap();
     assert_eq!(last_snap.points, n_ref[0] + n_ref[1], "{last_snap:?}");
