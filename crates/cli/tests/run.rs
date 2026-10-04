@@ -41,10 +41,12 @@ fn make_dataset(root: &Path, frames: u32) {
     std::fs::write(root.join("gps.txt"), gps).unwrap();
 }
 
+/// 데이터셋 읽기·구역 목록만 본다(복원은 `tests/pipeline.rs` 에서). 단색 사진이라 복원은 돌지 않는다.
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_skylens-stream"))
         .arg("run")
         .args(args)
+        .arg("--list-only")
         .output()
         .unwrap()
 }
@@ -131,6 +133,14 @@ fn run_rejects_bad_options_and_missing_input() {
     assert_eq!(out.status.code(), Some(2));
     let out = run(&[t.0.to_str().unwrap(), o.to_str().unwrap(), "--stride", "0"]);
     assert_eq!(out.status.code(), Some(2));
+    for bad in [
+        ["--dense-method", "x"],
+        ["--position", "x"],
+        ["--gps-sigma-h", "0"],
+    ] {
+        let out = run(&[t.0.to_str().unwrap(), o.to_str().unwrap(), bad[0], bad[1]]);
+        assert_eq!(out.status.code(), Some(2), "{bad:?}");
+    }
     let out = run(&[t.0.join("nope").to_str().unwrap(), o.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
     assert!(!o.exists());

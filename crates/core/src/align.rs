@@ -265,6 +265,134 @@ pub fn robust_similarity(
     Some((sim, inl, med))
 }
 
+/// 공유 이미지 양방향 검사 닮음 변환 결과.
+#[derive(Clone, Debug)]
+pub struct ImageSim3 {
+    pub sim: Similarity,
+    /// 대응마다 정상 여부(정상 이미지에서 양방향 문턱 안인 대응).
+    pub inlier: Vec<bool>,
+    /// 정상 이미지 수 / 전체 이미지 수.
+    pub good_images: usize,
+    pub total_images: usize,
+    /// 정상 대응의 정방향 잔차 중앙값.
+    pub median: f64,
+}
+
+/// 같은 이미지·특징 관측으로 이어진 3D 점 대응 `src[i] ↔ dst[i]` 의 닮음 변환을 공유 이미지 단위
+/// 합의로 구한다. `images[i]` 는 대응 i 를 본 이미지 번호들.
+///
+/// 가설은 3점 Umeyama 해. 대응의 정방향 잔차 `|S(x)-y|` 가 `tol_m` 이하이고 역방향 잔차
+/// `|S⁻¹(y)-x|` 가 `tol_m / s` 이하일 때 양방향 통과. 이미지는 그 이미지가 본 대응의
+/// `image_frac`(0.3) 이상이 통과하면 정상 이미지. 정상 이미지가 전체의 `min_good_ratio`(0.2)
+/// 이상인 가설 중 정상 이미지 수(동률이면 통과 대응 수)가 가장 큰 것을 고른 뒤,
+/// 정상 이미지의 통과 대응으로 Umeyama 를 다시 풀고 문턱 `max(3·중앙값, tol_m)` 로 재가중 3회.
+pub fn image_consensus_similarity(
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    images: &[Vec<u32>],
+    tol_m: f64,
+    image_frac: f64,
+    min_good_ratio: f64,
+) -> Option<ImageSim3> {
+    let n = src.len();
+    if n < 3 || dst.len() != n || images.len() != n {
+        return None;
+    }
+    let mut ids: Vec<u32> = images.iter().flatten().copied().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let total = ids.len();
+    if total == 0 {
+        return None;
+    }
+    let slot = |im: u32| ids.binary_search(&im).unwrap();
+    let mut seen = vec![0usize; total];
+    for o in images {
+        for &im in o {
+            seen[slot(im)] += 1;
+        }
+    }
+    let passes = |sim: &Similarity, tol: f64| -> Vec<bool> {
+        let inv = sim.inverse();
+        (0..n)
+            .map(|i| {
+                (sim.apply_point(&src[i]) - dst[i]).norm() <= tol
+                    && (inv.apply_point(&dst[i]) - src[i]).norm() <= tol / sim.s
+            })
+            .collect()
+    };
+    // 정상 이미지 표시와 정상 이미지 안의 통과 대응 표시.
+    let classify = |pass: &[bool]| -> (Vec<bool>, usize, usize) {
+        let mut ok = vec![0usize; total];
+        for i in 0..n {
+            if pass[i] {
+                for &im in &images[i] {
+                    ok[slot(im)] += 1;
+                }
+            }
+        }
+        let good: Vec<bool> = (0..total)
+            .map(|a| seen[a] > 0 && ok[a] as f64 >= image_frac * seen[a] as f64)
+            .collect();
+        let ng = good.iter().filter(|&&g| g).count();
+        let np = (0..n)
+            .filter(|&i| pass[i] && images[i].iter().any(|&im| good[slot(im)]))
+            .count();
+        (good, ng, np)
+    };
+    let mut rng = SplitMix(0xA11C_E5ED ^ n as u64);
+    let mut best: Option<((usize, usize), Similarity)> = None;
+    for _ in 0..MIN_SAMPLE_TRIALS * 2 {
+        let (i, j, k) = (rng.below(n), rng.below(n), rng.below(n));
+        if i == j || j == k || i == k {
+            continue;
+        }
+        let Some(h) = umeyama(&[src[i], src[j], src[k]], &[dst[i], dst[j], dst[k]]) else {
+            continue;
+        };
+        if !(h.s.is_finite() && h.s > 0.0) {
+            continue;
+        }
+        let (_, ng, np) = classify(&passes(&h, tol_m));
+        if (ng as f64) < min_good_ratio * total as f64 {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(b, _)| (ng, np) > *b) {
+            best = Some(((ng, np), h));
+        }
+    }
+    let mut sim = best?.1;
+    let mut tol = tol_m;
+    for _ in 0..3 {
+        let pass = passes(&sim, tol);
+        let (good, _, _) = classify(&pass);
+        let use_: Vec<bool> = (0..n)
+            .map(|i| pass[i] && images[i].iter().any(|&im| good[slot(im)]))
+            .collect();
+        let new = fit_masked(src, dst, &use_, None)?;
+        let res = residuals(&new, src, dst);
+        tol = (3.0 * masked_median(&res, &use_)).max(tol_m);
+        sim = new;
+    }
+    let pass = passes(&sim, tol);
+    let (good, ng, _) = classify(&pass);
+    let inlier: Vec<bool> = (0..n)
+        .map(|i| pass[i] && images[i].iter().any(|&im| good[slot(im)]))
+        .collect();
+    if inlier.iter().filter(|&&b| b).count() < 3 || (ng as f64) < min_good_ratio * total as f64 {
+        return None;
+    }
+    let res = residuals(&sim, src, dst);
+    let median = masked_median(&res, &inlier);
+    Some(ImageSim3 {
+        sim,
+        inlier,
+        good_images: ng,
+        total_images: total,
+        median,
+    })
+}
+
 fn masked_median(res: &[f64], mask: &[bool]) -> f64 {
     let mut cur: Vec<f64> = res
         .iter()
@@ -655,6 +783,43 @@ mod tests {
             rot_err_deg(&est.r, &gt.r),
             (est.t - gt.t).norm(),
         )
+    }
+
+    #[test]
+    fn image_consensus_survives_bad_images() {
+        let mut rng = Rng(77);
+        let gt = Similarity {
+            s: 1.1,
+            r: Rotation3::from_scaled_axis(Vector3::new(0.1, -0.2, 0.7)),
+            t: Vector3::new(30.0, -10.0, 4.0),
+        };
+        let (mut src, mut dst, mut imgs) = (vec![], vec![], vec![]);
+        for i in 0..400usize {
+            let x = rng.uvec(60.0);
+            // 이미지 0..8 은 정상, 8..12 는 관측이 모두 어긋난 이미지.
+            let im = (i % 12) as u32;
+            let mut y = gt.apply_point(&x) + rng.gvec(0.2);
+            if im >= 8 {
+                y += rng.uvec(40.0);
+            }
+            src.push(x);
+            dst.push(y);
+            imgs.push(vec![im, (im + 1) % 12]);
+        }
+        let r = image_consensus_similarity(&src, &dst, &imgs, 1.0, 0.3, 0.2).unwrap();
+        let (se, re, te) = errs(&r.sim, &gt);
+        assert!(se < 0.01 && re < 0.5 && te < 1.0, "{se} {re} {te}");
+        assert!(r.good_images >= 6 && r.good_images <= 12);
+        assert!(r.median < 0.5);
+    }
+
+    #[test]
+    fn image_consensus_none_when_all_images_bad() {
+        let mut rng = Rng(5);
+        let src: Vec<_> = (0..60).map(|_| rng.uvec(50.0)).collect();
+        let dst: Vec<_> = (0..60).map(|_| rng.uvec(50.0)).collect();
+        let imgs: Vec<Vec<u32>> = (0..60).map(|i| vec![(i % 10) as u32]).collect();
+        assert!(image_consensus_similarity(&src, &dst, &imgs, 0.5, 0.3, 0.2).is_none());
     }
 
     #[test]

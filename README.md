@@ -11,7 +11,7 @@
 새 구역이 들어올 때마다 빠른 초벌 점군을 먼저 보여 주고, 정밀 계산이 끝난 구역은 정밀본으로 바꿔 끼운다.
 화면에는 단계마다 "이전 구역은 정밀본 + 최신 구역은 초벌" 점군이 나간다.
 
-> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth`·`verify` 만 있고, 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정 → GPS 정렬 → 구역 분할 → 밀집 준비·융합 → 초벌 정렬·스냅샷 = 점진 스트림)를 묶어 만들어 가는 중이다.
+> 개발 중이다. 지금 명령행 도구에는 `ply-info`·`synth`·`run`·`verify` 가 있고, `run` 이 아래 단계를 묶어 초벌·정밀·스냅샷을 낸다. 점진적 점군 생성은 아래 라이브러리 단계(특징점 → 매칭 → 두 시점 자세 → 회전 평균 → 번들 조정 → GPS 정렬 → 구역 분할 → 밀집 준비·융합 → 초벌 정렬·스냅샷 = 점진 스트림)를 묶어 만들어 가는 중이다.
 
 ### 설치
 
@@ -69,6 +69,34 @@ skylens-stream --help
 ```
 
 인자 없이 실행하거나 모르는 명령이면 사용법을 표준 오류로 내고 종료 코드 2 로 끝난다.
+
+### 합성 장면으로 한 번 돌려 보기
+
+`synth` → `run` → `verify` 를 끝까지 잇는다. 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(`--span 48`)으로 잡는다.
+같은 명령을 `crates/cli/tests/pipeline_e2e.rs` 가 프로세스로 돌려 아래 수치에 상한을 건다(`cargo test --release -p skylens-stream --test pipeline_e2e`, 구역 2개 시험 포함 약 3~6 분).
+
+```bash
+skylens-stream synth scene 320 180
+skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
+skylens-stream verify out
+# 구역 2개(80위치 전부, 이웃 구역 겹침 항목 판정)
+skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
+skylens-stream verify out2
+```
+
+출력 폴더에는 `preview/`·`refined/`·`snapshots/`(와 `snapshots/manifest.json`)·`poses.txt`·`report.json` 이 생긴다. 4코어 기계(부하 약 20)에서 실측:
+
+| | 단구역 (`out`, 120장) | 구역 2개 (`out2`, 240장) |
+|---|---|---|
+| run 시간 | 약 30 초 (부하 낮을 때) | 332 초 (부하 22), 시험 전체 179 초 (부하 낮을 때) |
+| verify | 7/7, 종료 코드 0 | 6/7, 종료 코드 1 |
+| 미달 항목 | 없음 (preview_vs_refined 최근접 중앙 1.416 m, 높이 차 중앙 1.553 m 통과) | preview_vs_refined (최근접 4.923 m, 높이 차 5.829 m). preview_align 은 통과(점쌍 최소 1221, 스케일 차 0.05%, 잔차 5.130 m) |
+| refined_overlap | 해당 없음 (구역 1개) | PASS, 1쌍 겹침 차 중앙 최대 0.257 m |
+| 재투영 (초벌 → 정밀) | 3.026 → 0.300 px | 3.232 → 0.282 px |
+| 카메라 중심 오차 중앙 / 최대 | 0.329 / 2.912 m | 0.290 / 3.115 m |
+| 정밀 점 → 정답 표면 중앙 / 95% | 0.475 / 1.465 m (점 11054) | 0.494 / 3.022 m (점 19855) |
+
+오차는 정답 카메라 `truth/cameras.txt`·정답 표면(`Scene::surface_height`, 수직 거리)과 `poses.txt`·`refined/*.ply` 를 비교한 값이다(정답 원점과 첫 GPS 원점 차를 옮겨서). 회전 오차는 `poses.txt` 에 카메라 중심만 있어 재지 못한다.
 
 ### 라이브러리: 특징점
 
@@ -241,7 +269,7 @@ A Rust tool that builds a **progressively refined 3D point cloud** from the vide
 Each time a new region arrives, a fast preview cloud is shown first; once the accurate solve for a region finishes, its preview is swapped for the refined cloud.
 At every step the output is "refined clouds for earlier regions + preview for the newest region".
 
-> Work in progress. The command-line tool currently has only `ply-info`, `synth` and `verify`; the progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment → GPS alignment → region split → dense preparation and fusion → preview alignment and snapshots = progressive stream).
+> Work in progress. The command-line tool currently has `ply-info`, `synth`, `run` and `verify`; `run` chains the stages below into preview, refined and snapshot outputs. The progressive point cloud is being assembled from the library stages below (features → matching → two-view pose → rotation averaging → bundle adjustment → GPS alignment → region split → dense preparation and fusion → preview alignment and snapshots = progressive stream).
 
 ### Build
 
@@ -290,6 +318,14 @@ skylens-stream synth <output dir> [width height]
 # Exit code: 1 if any FAIL, 2 if no FAIL but some undecided, 0 if all PASS
 # Registered images, region images and reprojection error are decided only when report.json is in the output folder
 skylens-stream verify <output dir>
+
+# Run a synthetic scene end to end (synth -> run -> verify); cross-camera overlap only appears between positions 12-40 apart, so use regions of 40+ positions (--span 48)
+skylens-stream synth scene 320 180
+skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
+skylens-stream verify out
+# two or more regions (neighbor-overlap item is judged): --stride 1 uses all 80 positions
+skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
+skylens-stream verify out2
 
 # Print the version ("skylens-stream 0.1.0")
 skylens-stream --version
