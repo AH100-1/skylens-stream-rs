@@ -299,44 +299,75 @@ struct KdTree {
 
 const NO_CHILD: u32 = u32::MAX;
 
+/// 이 점 수 이상인 부분 트리는 두 자식을 병렬로 짓는다.
+const PAR_BUILD: usize = 1 << 16;
+
 impl KdTree {
     fn build(mut pts: Vec<[f32; 3]>) -> Self {
-        let mut nodes = Vec::with_capacity(2 * pts.len() / LEAF + 1);
         let n = pts.len();
-        Self::build_rec(&mut pts, 0, n, &mut nodes);
+        let nodes = Self::build_rec(&mut pts, 0);
+        debug_assert!(n == 0 || !nodes.is_empty());
         Self { pts, nodes }
     }
 
-    fn build_rec(pts: &mut [[f32; 3]], start: usize, end: usize, nodes: &mut Vec<Node>) -> u32 {
+    /// `pts`(전체 배열에서 `base` 부터) 의 부분 트리. 마디 번호는 이 부분 트리 안 상대 번호.
+    /// 큰 부분은 두 자식을 rayon 으로 나눠 짓고 마디 벡터를 이어 붙인다(결과는 순서와 무관하게 같다).
+    fn build_rec(pts: &mut [[f32; 3]], base: usize) -> Vec<Node> {
         let mut lo = [f64::INFINITY; 3];
         let mut hi = [f64::NEG_INFINITY; 3];
-        for q in &pts[start..end] {
+        for q in pts.iter() {
             for i in 0..3 {
                 lo[i] = lo[i].min(q[i] as f64);
                 hi[i] = hi[i].max(q[i] as f64);
             }
         }
-        let id = nodes.len();
-        nodes.push(Node {
+        let len = pts.len();
+        let mut root = Node {
             lo,
             hi,
-            start: start as u32,
-            end: end as u32,
+            start: base as u32,
+            end: (base + len) as u32,
             left: NO_CHILD,
             right: NO_CHILD,
-        });
-        if end - start > LEAF {
-            let axis = (0..3)
-                .max_by(|&a, &b| (hi[a] - lo[a]).total_cmp(&(hi[b] - lo[b])))
-                .unwrap_or(0);
-            let mid = start + (end - start) / 2;
-            pts[start..end].select_nth_unstable_by(mid - start, |a, b| a[axis].total_cmp(&b[axis]));
-            let l = Self::build_rec(pts, start, mid, nodes);
-            let r = Self::build_rec(pts, mid, end, nodes);
-            nodes[id].left = l;
-            nodes[id].right = r;
+        };
+        if len <= LEAF {
+            return vec![root];
         }
-        id as u32
+        let axis = (0..3)
+            .max_by(|&a, &b| (hi[a] - lo[a]).total_cmp(&(hi[b] - lo[b])))
+            .unwrap_or(0);
+        let mid = len / 2;
+        pts.select_nth_unstable_by(mid, |a, b| a[axis].total_cmp(&b[axis]));
+        let (lp, rp) = pts.split_at_mut(mid);
+        let (mut ln, rn) = if len >= PAR_BUILD {
+            rayon::join(
+                || Self::build_rec(lp, base),
+                || Self::build_rec(rp, base + mid),
+            )
+        } else {
+            (Self::build_rec(lp, base), Self::build_rec(rp, base + mid))
+        };
+        let lshift = 1u32;
+        let rshift = 1 + ln.len() as u32;
+        root.left = lshift;
+        root.right = rshift;
+        let shift = |nd: &mut Node, by: u32| {
+            if nd.left != NO_CHILD {
+                nd.left += by;
+                nd.right += by;
+            }
+        };
+        let mut out = Vec::with_capacity(1 + ln.len() + rn.len());
+        out.push(root);
+        for nd in ln.iter_mut() {
+            shift(nd, lshift);
+        }
+        out.append(&mut ln);
+        for mut nd in rn {
+            shift(&mut nd, rshift);
+            out.push(nd);
+        }
+        out
     }
 
     /// 반경 안(제곱 거리 ≤ r2)에 점이 있는가. 가까운 자식부터, 상자가 반경 밖이면 건너뛰고,
@@ -470,14 +501,73 @@ pub fn remove_ghosts(prelim: &PointCloud, index: &RadiusIndex) -> PointCloud {
     if index.is_empty() {
         return prelim.clone();
     }
+    // 질의를 공간 순서(모턴 코드)로 정렬해 이웃 질의가 같은 트리 마디를 연달아 쓰게 한다(캐시 지역성).
+    let n = prelim.points.len();
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for p in &prelim.points {
+        for i in 0..3 {
+            if p.xyz[i].is_finite() {
+                lo[i] = lo[i].min(p.xyz[i]);
+                hi[i] = hi[i].max(p.xyz[i]);
+            }
+        }
+    }
+    let scale: Vec<f32> = (0..3)
+        .map(|i| {
+            let w = hi[i] - lo[i];
+            if w.is_finite() && w > 0.0 {
+                1023.0 / w
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let mut order: Vec<(u32, u32)> = prelim
+        .points
+        .par_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mut c = [0u32; 3];
+            for a in 0..3 {
+                let v = ((p.xyz[a] - lo[a]) * scale[a]) as i64; // NaN·무한은 0 또는 끝으로
+                c[a] = v.clamp(0, 1023) as u32;
+            }
+            (morton(c), i as u32)
+        })
+        .collect();
+    order.par_sort_unstable();
+    let hit: Vec<bool> = order
+        .par_iter()
+        .map(|&(_, i)| {
+            let p = &prelim.points[i as usize];
+            index.has_within([p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64])
+        })
+        .collect();
+    let mut drop = vec![false; n];
+    for (&(_, i), &h) in order.iter().zip(&hit) {
+        drop[i as usize] = h;
+    }
     PointCloud {
         points: prelim
             .points
-            .par_iter()
-            .filter(|p| !index.has_within([p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64]))
-            .copied()
+            .iter()
+            .zip(&drop)
+            .filter(|(_, &d)| !d)
+            .map(|(p, _)| *p)
             .collect(),
     }
+}
+
+/// 10비트 3축 좌표의 모턴 코드.
+fn morton(c: [u32; 3]) -> u32 {
+    fn spread(mut x: u32) -> u32 {
+        x &= 0x3ff;
+        x = (x | (x << 16)) & 0x0300_00ff;
+        x = (x | (x << 8)) & 0x0300_f00f;
+        x = (x | (x << 4)) & 0x030c_30c3;
+        (x | (x << 2)) & 0x0924_9249
+    }
+    spread(c[0]) | (spread(c[1]) << 1) | (spread(c[2]) << 2)
 }
 
 /// `every` 개 중 첫 번째만 남기는 간격 추출(0, every, 2·every, …).
