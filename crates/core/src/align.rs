@@ -480,6 +480,9 @@ pub struct AlignWeights {
     pub w_z: f64,
     /// 위 방향 사전항 세기. 0 이면 끔. 1 은 대응 전체의 데이터항과 비슷한 세기(아래 [`weighted_similarity`] 참고).
     pub up_weight: f64,
+    /// 위 방향을 카메라 x 축 수평 가정 대신 희소점 바닥 평면 법선(강건 평면 맞춤)에서 구한다.
+    /// `up_weight` > 0 일 때만 쓰며, 평면을 못 구하면 카메라 x 축 방식으로 돌아간다.
+    pub up_plane: bool,
 }
 
 impl Default for AlignWeights {
@@ -487,6 +490,7 @@ impl Default for AlignWeights {
         Self {
             w_z: 1.0,
             up_weight: 0.0,
+            up_plane: false,
         }
     }
 }
@@ -496,6 +500,133 @@ impl AlignWeights {
     pub fn is_off(&self) -> bool {
         self.w_z == 1.0 && self.up_weight == 0.0
     }
+}
+
+/// 강건 평면 맞춤 결과.
+#[derive(Clone, Copy, Debug)]
+pub struct PlaneFit {
+    /// 단위 법선(`above` 쪽을 향함).
+    pub normal: Vector3<f64>,
+    pub centroid: Vector3<f64>,
+    /// 정상점 수.
+    pub inliers: usize,
+    /// 정상점의 평면 수직 거리 RMS(입력 단위).
+    pub rms: f64,
+}
+
+/// 평면 맞춤 문턱: 점 집합 RMS 반경의 이 비율.
+pub const PLANE_THR_FRAC: f64 = 0.03;
+/// 평면 맞춤 최소 정상점 비율.
+pub const PLANE_MIN_INLIER_FRAC: f64 = 0.3;
+
+fn plane_lsq(pts: &[Vector3<f64>], mask: &[bool]) -> Option<(Vector3<f64>, Vector3<f64>)> {
+    let idx: Vec<usize> = (0..pts.len()).filter(|&i| mask[i]).collect();
+    if idx.len() < 3 {
+        return None;
+    }
+    let n = idx.len() as f64;
+    let c = idx.iter().map(|&i| pts[i]).sum::<Vector3<f64>>() / n;
+    let mut cov = Matrix3::zeros();
+    for &i in &idx {
+        let d = pts[i] - c;
+        cov += d * d.transpose();
+    }
+    let eig = cov.symmetric_eigen();
+    let k = (0..3)
+        .min_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))
+        .unwrap();
+    let nrm: Vector3<f64> = eig.eigenvectors.column(k).into();
+    Some((c, nrm.normalize()))
+}
+
+/// 점 집합의 지배 평면(바닥)을 RANSAC(결정적 난수, 3점 가설) + 정상점 최소제곱 반복으로 맞춘다.
+///
+/// 문턱 = [`PLANE_THR_FRAC`] × 점 집합 RMS 반경(좌표 단위에 무관). 정상점이 [`PLANE_MIN_INLIER_FRAC`]
+/// 미만이면 `None`. 법선 부호는 `above`(평면 위쪽에 있는 기준점, 예: 카메라 중심 평균) 쪽이 양이 되게 정한다.
+pub fn robust_plane(pts: &[Vector3<f64>], above: &Vector3<f64>, iters: usize) -> Option<PlaneFit> {
+    let pts: Vec<Vector3<f64>> = pts.iter().copied().filter(finite).collect();
+    let n = pts.len();
+    if n < 10 || !finite(above) {
+        return None;
+    }
+    let nf = n as f64;
+    let mu = pts.iter().sum::<Vector3<f64>>() / nf;
+    let rad = (pts.iter().map(|p| (p - mu).norm_squared()).sum::<f64>() / nf).sqrt();
+    if rad <= 0.0 || !rad.is_finite() {
+        return None;
+    }
+    let thr = PLANE_THR_FRAC * rad;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n as u64) as usize
+    };
+    let mut best: Option<(usize, Vector3<f64>, Vector3<f64>)> = None;
+    for _ in 0..iters {
+        let (a, b, c) = (next(), next(), next());
+        if a == b || b == c || a == c {
+            continue;
+        }
+        let nrm = (pts[b] - pts[a]).cross(&(pts[c] - pts[a]));
+        let len = nrm.norm();
+        if len < 1e-9 * rad * rad {
+            continue;
+        }
+        let nrm = nrm / len;
+        let cnt = pts
+            .iter()
+            .filter(|p| (*p - pts[a]).dot(&nrm).abs() <= thr)
+            .count();
+        if best.is_none_or(|(k, _, _)| cnt > k) {
+            best = Some((cnt, pts[a], nrm));
+        }
+    }
+    let (_, p0, mut nrm) = best?;
+    let mut c = p0;
+    let mut mask = vec![false; n];
+    for _ in 0..5 {
+        for (m, p) in mask.iter_mut().zip(&pts) {
+            *m = (p - c).dot(&nrm).abs() <= thr;
+        }
+        let (c2, n2) = plane_lsq(&pts, &mask)?;
+        c = c2;
+        nrm = n2;
+    }
+    for (m, p) in mask.iter_mut().zip(&pts) {
+        *m = (p - c).dot(&nrm).abs() <= thr;
+    }
+    let inl = mask.iter().filter(|&&m| m).count();
+    if (inl as f64) < PLANE_MIN_INLIER_FRAC * nf {
+        return None;
+    }
+    let rms = (pts
+        .iter()
+        .zip(&mask)
+        .filter(|(_, &m)| m)
+        .map(|(p, _)| (p - c).dot(&nrm).powi(2))
+        .sum::<f64>()
+        / inl as f64)
+        .sqrt();
+    if (above - c).dot(&nrm) < 0.0 {
+        nrm = -nrm;
+    }
+    Some(PlaneFit {
+        normal: nrm,
+        centroid: c,
+        inliers: inl,
+        rms,
+    })
+}
+
+/// 희소점 바닥 평면 법선에서 복원 좌표의 위 방향을 구한다(`centers` = 카메라 중심, 부호 기준).
+pub fn up_from_plane(points: &[Vector3<f64>], centers: &[Vector3<f64>]) -> Option<Vector3<f64>> {
+    if centers.is_empty() {
+        return None;
+    }
+    let above = centers.iter().sum::<Vector3<f64>>() / centers.len() as f64;
+    robust_plane(points, &above, 300).map(|f| f.normal)
 }
 
 /// 카메라 중심 분포의 주축 표준편차(내림차순, 단위는 입력 단위). 첫째 대비 둘째·셋째 비가 작으면
@@ -1730,6 +1861,7 @@ mod tests {
             let wt = AlignWeights {
                 w_z: 1.0,
                 up_weight: 1.0,
+                up_plane: false,
             };
             let prior = weighted_similarity(&src, &dst, &free, &wt, Some(&up)).unwrap();
             let u_true = gt.r.inverse() * Vector3::new(0.0, 0.0, 1.0);
@@ -1743,6 +1875,7 @@ mod tests {
             let wz = AlignWeights {
                 w_z: 10.0,
                 up_weight: 0.0,
+                up_plane: false,
             };
             let init = umeyama(&src, &exact_dst).unwrap();
             let ex = weighted_similarity(&src, &exact_dst, &init, &wz, None).unwrap();
@@ -1794,5 +1927,44 @@ mod tests {
             assert!(keep >= 0.95, "seed {seed}: keep {keep}");
             assert!(al.median_residual.is_finite());
         }
+    }
+
+    /// 기울어진 바닥 평면(법선을 z 에서 3° 기울임) + 건물 이상점 + 잡음: 법선을 0.3° 이내로 회복하고
+    /// 부호는 카메라 쪽, 이상점이 절반 가까워도 바닥을 고른다. 평면 위 방향으로 정렬한 기울기도 확인한다.
+    #[test]
+    fn robust_plane_recovers_tilted_ground_normal() {
+        let mut worst = 0.0f64;
+        for seed in 0..10u64 {
+            let mut rng = Rng(4100 + seed);
+            let tilt = 3.0f64.to_radians();
+            let axis = Vector3::new(1.0, 0.3, 0.0).normalize();
+            let rot = Rotation3::from_scaled_axis(axis * tilt);
+            let n_true = rot * Vector3::new(0.0, 0.0, 1.0);
+            let mut pts = Vec::new();
+            for i in 0..600 {
+                let (x, y) = (
+                    (rng.gvec(1.0).x * 40.0).clamp(-100.0, 100.0),
+                    rng.gvec(1.0).y * 12.0,
+                );
+                let z = if i % 5 < 2 {
+                    4.0 + (i % 7) as f64 // 건물 지붕: 이상점 40%
+                } else {
+                    rng.gvec(1.0).z * 0.15
+                };
+                pts.push(rot * Vector3::new(x, y, z) + Vector3::new(5.0, 6.0, 7.0));
+            }
+            let cams = vec![Vector3::new(5.0, 6.0, 7.0) + n_true * 30.0];
+            let up = up_from_plane(&pts, &cams).expect("plane");
+            let err = up.dot(&n_true).clamp(-1.0, 1.0).acos().to_degrees();
+            worst = worst.max(err);
+            assert!(up.dot(&n_true) > 0.0);
+            // 반대편 카메라면 부호가 뒤집힌다.
+            let below = vec![Vector3::new(5.0, 6.0, 7.0) - n_true * 30.0];
+            assert!(up_from_plane(&pts, &below).unwrap().dot(&n_true) < 0.0);
+        }
+        eprintln!("평면 법선 최대 오차 {worst:.3}°");
+        assert!(worst < 0.3, "최대 {worst}");
+        // 점이 한 점뿐/모자라면 None.
+        assert!(up_from_plane(&[Vector3::zeros(); 5], &[Vector3::zeros()]).is_none());
     }
 }

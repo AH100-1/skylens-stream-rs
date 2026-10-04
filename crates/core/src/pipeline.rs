@@ -103,6 +103,7 @@ impl Default for BaRefine {
             align: crate::align::AlignWeights {
                 w_z: 1.0,
                 up_weight: 0.0,
+                up_plane: false,
             },
         }
     }
@@ -1364,7 +1365,12 @@ fn gps_align_refined(
         // 정상 대응만으로 가중·위 방향 사전항 정렬. 위 방향은 카메라 x 축이 수평이라는 가정(짐벌)에서 구한다.
         let rots: Vec<Rotation3<f64>> = ids.iter().map(|&i| s.poses[i].unwrap().rotation).collect();
         let up = if wt.up_weight > 0.0 {
-            crate::align::up_from_rotations(&rots)
+            let plane = if wt.up_plane {
+                crate::align::up_from_plane(&s.points, &src)
+            } else {
+                None
+            };
+            plane.or_else(|| crate::align::up_from_rotations(&rots))
         } else {
             None
         };

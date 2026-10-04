@@ -310,7 +310,7 @@ fn refined_pose_accuracy_bounds() {
 #[test]
 #[ignore]
 fn measure_two_region_tilt() {
-    two_region(1, "기본", BaRefine::default());
+    let _ = two_region(1, "기본", BaRefine::default());
 }
 
 /// GPS 정렬 선택지(수직 가중·위 방향 사전항) 비교: 시드 1·2, 구역별 기울기·회전·중심 오차를 표 한 줄씩 찍는다.
@@ -331,15 +331,68 @@ fn measure_align_options() {
     for seed in [1u64, 2] {
         for (name, w_z, up_weight) in opts {
             let ba = BaRefine {
-                align: AlignWeights { w_z, up_weight },
+                align: AlignWeights {
+                    w_z,
+                    up_weight,
+                    up_plane: false,
+                },
                 ..BaRefine::default()
             };
-            two_region(seed, name, ba);
+            let _ = two_region(seed, name, ba);
         }
     }
 }
 
-fn two_region(seed: u64, label: &str, ba: BaRefine) {
+/// 위 방향 추정 방식 비교(F-321): 시드 1·2 구역별 기울기. 끔 / 카메라 x 축 수평 가정 / 희소점 바닥 평면.
+/// 각 시드의 첫 줄 앞에 포즈 자체의 x 축 수평 위반과 지형 평면 법선(참값)도 찍는다.
+#[test]
+#[ignore]
+fn measure_up_plane() {
+    use skylens_core::align::AlignWeights;
+    let opts = [
+        ("끔", 0.0, false),
+        ("위1 x축", 1.0, false),
+        ("위1 평면", 1.0, true),
+        ("위3 평면", 3.0, true),
+    ];
+    for seed in [1u64, 2] {
+        for (name, up_weight, up_plane) in opts {
+            let ba = BaRefine {
+                align: AlignWeights {
+                    w_z: 1.0,
+                    up_weight,
+                    up_plane,
+                },
+                ..BaRefine::default()
+            };
+            let _ = two_region(seed, name, ba);
+        }
+    }
+}
+
+/// 위 방향 추정 방식별 구역 기울기 상한(목표 0.5°, 시드 1·2). 시간이 걸려 기본 시험에서 뺀다.
+#[test]
+#[ignore]
+fn pose_up_plane_tilt_goal() {
+    use skylens_core::align::AlignWeights;
+    for seed in [1u64, 2] {
+        let ba = BaRefine {
+            align: AlignWeights {
+                w_z: 1.0,
+                up_weight: 1.0,
+                up_plane: true,
+            },
+            ..BaRefine::default()
+        };
+        let tilts = two_region(seed, "평면 목표", ba);
+        for (h, t) in tilts.iter().enumerate() {
+            assert!(*t <= 0.5, "시드 {seed} 구역 {h} 기울기 {t}");
+        }
+    }
+}
+
+fn two_region(seed: u64, label: &str, ba: BaRefine) -> Vec<f64> {
+    let mut tilts = Vec::new();
     let root =
         std::env::temp_dir().join(format!("skylens_pose_acc2_{}_{seed}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -440,6 +493,42 @@ fn two_region(seed: u64, label: &str, ba: BaRefine) {
             .map(|(n, p)| (p.rotation * tr(n).rotation.inverse()).angle().to_degrees())
             .collect();
         let tru_c: Vec<Vector3<f64>> = centers.iter().map(|c| c.1).collect();
+        tilts.push(qt.angle().to_degrees());
+        // (a) 포즈 자체의 카메라 x 축 수평 위반: x 축(Rᵀe_x)의 z 성분(도) RMS.
+        let xz = |rots: &[Rotation3<f64>]| -> f64 {
+            (rots
+                .iter()
+                .map(|r| r.matrix().transpose()[(2, 0)].asin().to_degrees().powi(2))
+                .sum::<f64>()
+                / rots.len() as f64)
+                .sqrt()
+        };
+        let truth_rots: Vec<Rotation3<f64>> = sel.iter().map(|(n, _)| tr(n).rotation).collect();
+        let out_rots: Vec<Rotation3<f64>> = sel.iter().map(|(_, p)| p.rotation).collect();
+        let fit_rots: Vec<Rotation3<f64>> = sel.iter().map(|(_, p)| p.rotation * qt).collect();
+        let up_rot = skylens_core::align::up_from_rotations(&out_rots);
+        // 지형 참값 평면(구역 중심 주변 ±25 m 격자, 건물 제외) 기울기.
+        let cm = tru_c.iter().sum::<Vector3<f64>>() / tru_c.len() as f64;
+        let mut gp = Vec::new();
+        for i in -10..=10 {
+            for j in -10..=10 {
+                let (x, y) = (cm.x + i as f64 * 5.0, cm.y + j as f64 * 5.0);
+                gp.push(Vector3::new(
+                    x,
+                    y,
+                    skylens_core::synth::terrain_height(x, y),
+                ));
+            }
+        }
+        let g0 = skylens_core::align::robust_plane(&gp, &Vector3::new(0.0, 0.0, 1e3), 100);
+        eprintln!(
+            "[진단 시드 {seed} {label} 구역 {half}] x축 수평 위반 RMS 참값 {:.3}° 출력 {:.3}° 전역정렬 뒤 {:.3}° | 출력 포즈 위 방향(x축법) 기울기 {} | 지형 평면 법선 기울기 {}",
+            xz(&truth_rots),
+            xz(&out_rots),
+            xz(&fit_rots),
+            up_rot.map_or("없음".to_string(), |u| format!("{:.3}°", u.z.clamp(-1.0, 1.0).acos().to_degrees())),
+            g0.map_or("없음".to_string(), |f| format!("{:.3}°", f.normal.z.clamp(-1.0, 1.0).acos().to_degrees())),
+        );
         let sp = skylens_core::align::spread_axes(&tru_c);
         eprintln!(
             "| 시드 {seed} | {label} | 구역 {half} | 포즈 {} | 기울기 {:.3}° | 회전 중앙 {:.3}° 최대 {:.3}° | 중심 중앙 {:.3} 최대 {:.3} m | 중심 분포 σ {:.1}/{:.1}/{:.2} m (2/1 비 {:.3}, 3/1 비 {:.4}) |",
@@ -463,4 +552,5 @@ fn two_region(seed: u64, label: &str, ba: BaRefine) {
         );
     }
     let _ = std::fs::remove_dir_all(&root);
+    tilts
 }
