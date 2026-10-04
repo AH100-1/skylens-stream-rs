@@ -133,6 +133,38 @@ impl PositionPrior {
     }
 }
 
+/// 고정된 3D 점 사전항: 점 i 를 기준 위치 `points[i]` 근처로 당긴다(이웃 구역 정밀 모델과 같은 좌표계로 묶는 용도).
+/// 비용 ½ρ_Huber(|X_i − X0_i|²/σ_i²). σ_i 는 모델 단위(예: 재투영 px σ 를 깊이/초점거리로 환산한 값).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PointPrior {
+    /// 점별 기준 위치. 길이는 점 수 이하이며 `None`·비유한 값은 사전항 없음.
+    pub points: Vec<Option<Point3<f64>>>,
+    /// 점별 σ(모델 단위). 양의 유한수가 아니면 `sigma` 를 쓴다.
+    pub sigmas: Vec<f64>,
+    /// 기본 σ(모델 단위).
+    pub sigma: f64,
+    /// Huber 문턱(σ 단위).
+    pub huber_k: f64,
+}
+
+impl PointPrior {
+    fn target(&self, p: usize) -> Option<(Point3<f64>, f64)> {
+        let x = self
+            .points
+            .get(p)
+            .copied()
+            .flatten()
+            .filter(|g| g.iter().all(|v| v.is_finite()))?;
+        let s = self
+            .sigmas
+            .get(p)
+            .copied()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(self.sigma);
+        (s.is_finite() && s > 0.0).then_some((x, s))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BaOptions {
     /// 0 = 초벌(평가만), 1 이상 = 정밀.
@@ -150,6 +182,8 @@ pub struct BaOptions {
     pub function_tolerance: f64,
     /// 카메라 중심 위치 사전항. 기본 None(끔).
     pub position_prior: Option<PositionPrior>,
+    /// 고정 3D 점 사전항. 기본 None(끔).
+    pub point_prior: Option<PointPrior>,
 }
 
 impl Default for BaOptions {
@@ -164,6 +198,7 @@ impl Default for BaOptions {
             initial_lambda: 1e-4,
             function_tolerance: 1e-10,
             position_prior: None,
+            point_prior: None,
         }
     }
 }
@@ -379,8 +414,9 @@ fn evaluate(
     obs: &[Observation],
     loss: Loss,
     prior: Option<&PositionPrior>,
+    pp: Option<&PointPrior>,
 ) -> (f64, f64, usize) {
-    let mut cost = prior_cost(problem, prior);
+    let mut cost = prior_cost(problem, prior) + point_prior_cost(problem, pp);
     let mut sq = 0.0;
     let mut bad = 0;
     for o in obs {
@@ -396,6 +432,18 @@ fn evaluate(
         sq += z;
     }
     (cost, sq, bad)
+}
+
+/// 점 사전항 비용 Σ ½ρ_Huber(|X_i − X0_i|²/σ_i²).
+fn point_prior_cost(problem: &BaProblem, pp: Option<&PointPrior>) -> f64 {
+    let Some(pp) = pp else { return 0.0 };
+    let huber = Loss::Huber(pp.huber_k);
+    (0..problem.points.len())
+        .filter_map(|p| {
+            let (x0, s) = pp.target(p)?;
+            Some(0.5 * huber.rho((problem.points[p] - x0).norm_squared() / (s * s)))
+        })
+        .sum()
 }
 
 /// 위치 사전항 비용 Σ ½ρ_Huber(|c_i − g_i|²/σ²).
@@ -470,6 +518,7 @@ struct Linearization {
     points: Vec<(usize, PointBlock)>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn linearize(
     problem: &BaProblem,
     lay: &Layout,
@@ -478,6 +527,7 @@ fn linearize(
     obs: &[Observation],
     loss: Loss,
     prior: Option<&PositionPrior>,
+    pp: Option<&PointPrior>,
 ) -> Linearization {
     let mut a = DMatrix::<f64>::zeros(lay.n, lay.n);
     let mut gc = DVector::<f64>::zeros(lay.n);
@@ -524,6 +574,13 @@ fn linearize(
                 wrow.push((ia, wgt * jp.transpose() * ca));
             }
             blk.w.push(wrow);
+        }
+        if let Some((x0, sg)) = pp.and_then(|q| q.target(p).map(|(x, s)| (x, s))) {
+            let k = pp.map_or(3.0, |q| q.huber_k);
+            let r = (problem.points[p] - x0) / sg;
+            let w = Loss::Huber(k).weight(r.norm_squared());
+            blk.c += Matrix3::identity() * (w / (sg * sg));
+            blk.g += r * (w / sg);
         }
         points.push((p, blk));
     }
@@ -728,6 +785,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
     }
     let lay = layout(problem, opts);
     let prior = opts.position_prior.as_ref();
+    let pp = opts.point_prior.as_ref();
     let rms = |sq: f64, behind: usize| (sq / (obs.len() - behind).max(1) as f64).sqrt();
     // Cauchy 는 비볼록이라 먼 초기값에서 일부 점이 이상치 쪽 해에 걸린다. 같은 척도의
     // Huber 로 먼저 수렴시킨 뒤 Cauchy 로 바꾼다(단계 방식).
@@ -735,11 +793,11 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
         Loss::Cauchy(d) => Some(Loss::Huber(d)),
         _ => None,
     };
-    let (initial_cost, sq0, behind0) = evaluate(problem, &obs, opts.loss, prior);
+    let (initial_cost, sq0, behind0) = evaluate(problem, &obs, opts.loss, prior, pp);
     let initial_rms = rms(sq0, behind0);
     let mut loss = staged.unwrap_or(opts.loss);
     let mut cost = if staged.is_some() {
-        evaluate(problem, &obs, loss, prior).0
+        evaluate(problem, &obs, loss, prior, pp).0
     } else {
         initial_cost
     };
@@ -769,7 +827,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
             {
                 staged = None;
                 loss = opts.loss;
-                cost = evaluate(problem, &obs, loss, prior).0;
+                cost = evaluate(problem, &obs, loss, prior, pp).0;
                 lambda = opts.initial_lambda;
                 stop = BaStop::MaxIterations;
                 if iterations < opts.max_iterations {
@@ -779,14 +837,14 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
             break;
         }
         iterations += 1;
-        let lin = linearize(problem, &lay, &tracks, &by_point, &obs, loss, prior);
-        let (_, _, bad0) = evaluate(problem, &obs, loss, prior);
+        let lin = linearize(problem, &lay, &tracks, &by_point, &obs, loss, prior, pp);
+        let (_, _, bad0) = evaluate(problem, &obs, loss, prior, pp);
         let mut accepted = false;
         for _ in 0..12 {
             match solve(&lin, lambda) {
                 Some((dc, dp)) => {
                     let cand = apply(problem, &lay, &lin, &dc, &dp);
-                    let (c_new, sq_new, bad) = evaluate(&cand, &obs, loss, prior);
+                    let (c_new, sq_new, bad) = evaluate(&cand, &obs, loss, prior, pp);
                     if bad <= bad0 && c_new < cost {
                         let rel = (cost - c_new) / cost.max(1e-300);
                         *problem = cand;
@@ -819,7 +877,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
         initial_rms,
         final_rms: rms(final_sq, final_behind),
         initial_cost,
-        final_cost: evaluate(problem, &obs, opts.loss, prior).0,
+        final_cost: evaluate(problem, &obs, opts.loss, prior, pp).0,
         converged: stop == BaStop::Converged,
         stop,
         num_observations_rejected: rejected,
@@ -1807,6 +1865,7 @@ mod tests {
             &p.observations,
             opts.loss,
             None,
+            None,
         );
         let lambda = 1e-3;
         let (s, rhs, _) = schur(&lin, lambda);
@@ -1875,6 +1934,7 @@ mod tests {
             &p.observations,
             opts.loss,
             None,
+            None,
         );
         let t_lin = t.elapsed().as_secs_f64();
         let t = Instant::now();
@@ -1884,7 +1944,7 @@ mod tests {
         let ok = s.cholesky().map(|c| c.solve(&rhs)).is_some();
         let t_chol = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let (cost, _, _) = evaluate(&p, &p.observations, opts.loss, None);
+        let (cost, _, _) = evaluate(&p, &p.observations, opts.loss, None, None);
         let t_eval = t.elapsed().as_secs_f64();
         let t = Instant::now();
         let rep = bundle_adjust(

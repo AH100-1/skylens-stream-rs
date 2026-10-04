@@ -69,6 +69,11 @@ pub struct PipelineConfig {
     pub gps_sigma_v: f64,
     /// 초벌 점군을 만들기 전 GPS 사전항 BA 반복 수. 0 이면 BA 없이(SPEC §초벌) 닮음 정렬 포즈 그대로.
     pub preview_ba_iters: usize,
+    /// 구역 k(≥1) 정밀 BA 에 이웃 정밀 구역의 공유 3D 점을 고정 사전항으로 넣는 가중: 재투영 px 단위 σ.
+    /// 점 사전항의 3D σ 는 이 값 × 점 깊이 / 초점거리. 0 이하이면(기본) 연결하지 않는다.
+    pub link_sigma_px: f64,
+    /// 정밀 BA 시작점의 비행 축 둘레 회전을 예전 규칙(방향 평균 z 최소 2° 격자)으로 고른다(기본 켬: 이웃 구역 연결이 겹침 차를 아직 못 낮춤).
+    pub refined_legacy_roll: bool,
 }
 
 impl PipelineConfig {
@@ -103,6 +108,8 @@ impl Default for PipelineConfig {
             gps_sigma_h: 2.0,
             gps_sigma_v: 2.0,
             preview_ba_iters: 0,
+            link_sigma_px: 0.0,
+            refined_legacy_roll: true,
         }
     }
 }
@@ -1171,34 +1178,93 @@ fn apply_sparse_sim(s: &mut Sparse, sim: &Similarity) {
     }
 }
 
-/// 다음 구역의 정밀 BA 를 직전 정밀 모델 기준으로 시작할지. 3구역 측정(재투영 RMS 0.81/0.51 px 대 0.28/0.32 px)에서
-/// 초벌 기반 닮음 변환의 잔차(1.7~3.1 m)가 커서 오히려 나빠져 기본은 끈다.
-const ANCHOR_NEXT_REGION: bool = false;
-
-/// 직전 정밀 모델에 맞춘 시작: 닮음 변환으로 같은 좌표계로 옮기고 공유 사진 포즈를 직전 값으로 고정.
+/// 직전 정밀 구역과 같은 좌표계로 묶는 기준: 겹침 위치 사진이 관측한 직전 정밀 3D 점.
 struct Anchor {
-    sim: Similarity,
-    /// (구역 안 사진 번호, 직전 정밀 포즈)
-    fixed: Vec<(usize, Pose)>,
+    /// (전역 사진 번호, 특징 번호) → 직전 정밀 구역의 3D 점.
+    prior: HashMap<(u32, u32), Vector3<f64>>,
 }
 
-/// 새 구역 `rec` 의 초벌 희소 모델을 직전 정밀 구역 `prev` 에 맞출 기준을 만든다.
-/// 반환: 기준(닮음 변환 + 고정 포즈), 점 쌍 수, 잔차 중앙값. 겹침이 모자라면 `None`.
+/// 새 구역의 정밀 BA 를 묶을 직전 정밀 구역 `prev` 의 공유 점을 모은다(겹침 위치의 사진 관측만).
+/// 반환: 기준, 점 수, 0(잔차는 BA 시작 때 잰다). 점이 없으면 `None`.
 fn make_anchor(rec: &RegionRec, prev: &RegionRec) -> Option<(Anchor, usize, f64)> {
-    if !ANCHOR_NEXT_REGION {
+    let tb = &prev.refined.as_ref()?.0;
+    let (lo, hi) = crate::progressive::overlap_window(&rec.region, &prev.region);
+    if lo >= hi {
         return None;
     }
-    let tb = &prev.refined.as_ref()?.0;
-    let win = crate::progressive::overlap_window(&rec.region, &prev.region);
-    let (sim, n, med) = crate::progressive::cross_align(&rec.ta, tb, win)?;
-    let fixed: Vec<(usize, Pose)> = rec
-        .gids
+    let mut prior = HashMap::new();
+    for t in tb {
+        for &(g, f) in &t.obs {
+            let p = (g / 3) as usize;
+            if p >= lo && p < hi {
+                prior.insert((g, f), t.xyz);
+            }
+        }
+    }
+    (!prior.is_empty()).then(|| {
+        let n = prior.len();
+        (Anchor { prior }, n, 0.0)
+    })
+}
+
+/// 정밀 시작 모델의 점마다 직전 정밀 구역의 같은 점(공유 사진·특징 번호)을 찾는다.
+/// 반환: 점별 기준 위치(없으면 None).
+fn linked_targets(s: &Sparse, gids: &[usize], an: &Anchor) -> Vec<Option<Vector3<f64>>> {
+    s.obs
         .iter()
-        .enumerate()
-        .filter(|&(a, _)| rec.reg_flags[a])
-        .filter_map(|(a, g)| prev.rposes.get(g).map(|p| (a, *p)))
+        .map(|o| {
+            let hits: Vec<Vector3<f64>> = o
+                .iter()
+                .filter_map(|&(i, f, _)| an.prior.get(&(gids[i] as u32, f as u32)).copied())
+                .collect();
+            (!hits.is_empty()).then(|| hits.iter().sum::<Vector3<f64>>() / hits.len() as f64)
+        })
+        .collect()
+}
+
+/// 직전 정밀 구역에 닮음 변환으로 먼저 맞추고, 공유 점마다 재투영 px σ 에서 환산한 3D σ 를 만든다.
+/// 반환: 점별 (기준 위치, 3D σ), 연결된 점 수.
+fn link_to_previous(
+    s: &mut Sparse,
+    gids: &[usize],
+    an: &Anchor,
+    k: &Intrinsics,
+    sigma_px: f64,
+) -> Option<(Vec<Option<(Vector3<f64>, f64)>>, usize)> {
+    let tg = linked_targets(s, gids, an);
+    let (mut src, mut dst) = (Vec::new(), Vec::new());
+    for (p, t) in s.points.iter().zip(&tg) {
+        if let Some(t) = t {
+            src.push(*p);
+            dst.push(*t);
+        }
+    }
+    if src.len() < 10 {
+        return None;
+    }
+    let (sim, _, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    apply_sparse_sim(s, &sim);
+    let f = 0.5 * (k.fx + k.fy);
+    let out: Vec<Option<(Vector3<f64>, f64)>> = s
+        .points
+        .iter()
+        .zip(&s.obs)
+        .zip(&tg)
+        .map(|((x, o), t)| {
+            let t = (*t)?;
+            let depths: Vec<f64> = o
+                .iter()
+                .filter_map(|&(i, _, _)| Some((x - s.poses[i]?.center().coords).norm()))
+                .collect();
+            if depths.is_empty() {
+                return None;
+            }
+            let d = depths.iter().sum::<f64>() / depths.len() as f64;
+            Some((t, sigma_px * d / f))
+        })
         .collect();
-    Some((Anchor { sim, fixed }, n, med))
+    let n = out.iter().flatten().count();
+    Some((out, n))
 }
 
 /// 번들 조정(`iters == 0` 이면 재투영 오차만 잰다). 반환: 재투영 RMS(px).
@@ -1209,6 +1275,20 @@ fn run_ba(
     gps: Option<&[Vector3<f64>]>,
     prior_sigma: f64,
     fixed: &[usize],
+) -> f64 {
+    run_ba_linked(s, k, iters, gps, prior_sigma, fixed, None)
+}
+
+/// `run_ba` + 고정 3D 점 사전항(`link`: 주 점마다 (기준 위치, 3D σ)).
+#[allow(clippy::type_complexity)]
+fn run_ba_linked(
+    s: &mut Sparse,
+    k: &Intrinsics,
+    iters: usize,
+    gps: Option<&[Vector3<f64>]>,
+    prior_sigma: f64,
+    fixed: &[usize],
+    link: Option<&[Option<(Vector3<f64>, f64)>]>,
 ) -> f64 {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
@@ -1255,6 +1335,12 @@ fn run_ba(
                 PositionPrior::new(ids.iter().map(|&i| Some(Point3::from(g[i]))).collect());
             pr.sigma = prior_sigma;
             pr
+        }),
+        point_prior: link.map(|l| crate::ba::PointPrior {
+            points: l.iter().map(|t| t.map(|(x, _)| Point3::from(x))).collect(),
+            sigmas: l.iter().map(|t| t.map_or(0.0, |(_, s)| s)).collect(),
+            sigma: 1.0,
+            huber_k: 3.0,
         }),
         ..BaOptions::default()
     };
@@ -1679,12 +1765,10 @@ fn send_anchor(
     match a {
         Some((an, n, med)) => {
             events.push(format!(
-                "{secs:.1}s anchor region {} on refined {prev} pairs {n} median {med:.3} m scale {:.4} fixed {}",
-                rec.region.index,
-                an.sim.s,
-                an.fixed.len()
+                "{secs:.1}s anchor region {} on refined {prev} shared observations {n}",
+                rec.region.index
             ));
-            rec.anchored = Some((prev, n, med, an.sim.s));
+            rec.anchored = Some((prev, n, med, 1.0));
             let _ = tx.send(Some(an));
         }
         None => {
@@ -2043,8 +2127,12 @@ pub fn run_pipeline_with(
         };
         // 초벌(미리보기)은 위의 광축 높이 분산 롤을 쓰고, 정밀 BA 시작점만 예전 롤 규칙으로 따로 만든다.
         let coarse_start = start;
-        let start = sparse_init_roll(&imgs, &pm, &gps, &k, cfg.position, &tri, (0, 2.0), true)
-            .unwrap_or_else(|_| coarse_start.clone());
+        let start = if cfg.refined_legacy_roll {
+            sparse_init_roll(&imgs, &pm, &gps, &k, cfg.position, &tri, (0, 2.0), true)
+                .unwrap_or_else(|_| coarse_start.clone())
+        } else {
+            coarse_start.clone()
+        };
         let init = if cfg.preview_ba_iters > 0 {
             let mut p = coarse_start.clone();
             p.rms = crate::timing::timed("ba_preview", || {
@@ -2171,6 +2259,7 @@ pub fn run_pipeline_with(
             let (gps, dw, iters, dmethod) =
                 (gps.clone(), cfg.dense_width, cfg.ba_iters, cfg.dense_method);
             let psig = cfg.prior_sigma();
+            let link_px = cfg.link_sigma_px;
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
             in_flight += 1;
@@ -2179,18 +2268,20 @@ pub fn run_pipeline_with(
                 let t = Instant::now();
                 let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
                 let mut rs = init;
-                let mut fixed: Vec<usize> = Vec::new();
-                if let Some(an) = &anchor {
-                    apply_sparse_sim(&mut rs, &an.sim);
-                    for (i, p) in &an.fixed {
-                        rs.poses[*i] = Some(*p);
-                        fixed.push(*i);
+                let link = match (&anchor, link_px > 0.0) {
+                    (Some(an), true) => link_to_previous(&mut rs, &gids_t, an, &k, link_px),
+                    _ => None,
+                };
+                if let Some((_, n)) = &link {
+                    if std::env::var("PIPE_DEBUG").is_ok() {
+                        eprintln!("debug region {slot} linked points {n}");
                     }
                 }
+                let lk = link.as_ref().map(|l| l.0.as_slice());
                 rs.rms = crate::timing::timed("ba_refined", || {
-                    run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
+                    run_ba_linked(&mut rs, &k, iters, Some(&gps), psig, &[], lk)
                 });
-                if anchor.is_none() {
+                if link.is_none() {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {
