@@ -1696,6 +1696,11 @@ fn region_align(
     Some((r.sim, s.len(), r.median))
 }
 
+/// 초벌 → 정밀 닮음 맞춤에 넣는 카메라 중심 쌍의 반복 수. 점 쌍만으로 맞추면 점이 위치를 직접
+/// 맞추지 않아 정렬 뒤 초벌 카메라 중심 오차가 커진다(0.49 → 0.64 m). 중심 쌍을 같이 넣으면
+/// 같은 구역에서 0.43 m, 최근접 중앙·높이 차도 함께 줄었다.
+const CENTER_PAIR_REPEAT: usize = 3;
+
 /// 자기 구역 초벌 → 정밀 정렬(SPEC §3.7). 기본은 기존 `align_region`(트리밍).
 /// 모드 1 은 같은 점쌍에 공유 이미지 양방향 합의를, 모드 2 는 점쌍 수집 범위도 양쪽으로 넓힌다.
 fn own_align(
@@ -1704,6 +1709,7 @@ fn own_align(
     r: &Region,
     ovl: usize,
     n_pos: usize,
+    cpairs: &[(Vector3<f64>, Vector3<f64>)],
 ) -> (Option<Similarity>, AlignRecord) {
     let mode = region_sim3_mode();
     let base = crate::stream::align_window(r, ovl, n_pos);
@@ -1718,10 +1724,16 @@ fn own_align(
         } else {
             (r.lo, r.hi)
         };
-        let mut pairs = point_pairs(ta, tb, pos, scope);
+        let with_centers = |mut v: Vec<(Vector3<f64>, Vector3<f64>)>| {
+            for _ in 0..CENTER_PAIR_REPEAT {
+                v.extend_from_slice(cpairs);
+            }
+            v
+        };
+        let mut pairs = with_centers(point_pairs(ta, tb, pos, scope));
         let (mut sim, mut ar) = align_region(r, &pairs);
         if sim.is_none() {
-            pairs = point_pairs(ta, tb, pos, (r.lo, r.hi));
+            pairs = with_centers(point_pairs(ta, tb, pos, (r.lo, r.hi)));
             (sim, ar) = align_region(r, &pairs);
         }
         return (sim, ar);
@@ -1820,6 +1832,8 @@ struct RegionRec {
     /// 정밀 구역 → 가장 최근 정밀 모델 좌표계 닮음 변환(공유 3D 점 대응).
     rsim: Option<Similarity>,
     centers: BTreeMap<usize, [f64; 3]>,
+    /// 초벌 포즈의 사진별 카메라 중심(`gids` 순서). 자기 구역 닮음 맞춤의 중심 쌍용.
+    coarse_centers: Vec<Option<Vector3<f64>>>,
     registered_prev: Vec<usize>,
     /// gids 앞쪽 보조 사진 수(출력·점수 제외).
     n_help: usize,
@@ -1981,7 +1995,14 @@ pub fn run_pipeline_with(
         // 자기 구역 초벌 → 정밀 정렬(SPEC §3.7).
         let r = rec.region;
         let (sim, ar) = crate::timing::timed("align_ghost", || {
-            own_align(&rec.ta, &tb, &r, ds.config.ovl, n_pos)
+            let cpairs: Vec<(Vector3<f64>, Vector3<f64>)> = rec
+                .coarse_centers
+                .iter()
+                .zip(&m.sparse.poses)
+                .skip(rec.n_help)
+                .filter_map(|(a, b)| Some((((*a)?), b.as_ref()?.center().coords)))
+                .collect();
+            own_align(&rec.ta, &tb, &r, ds.config.ovl, n_pos, &cpairs)
         });
         if let Some(s) = &sim {
             realigns.push(ReAlign {
@@ -2359,6 +2380,11 @@ pub fn run_pipeline_with(
             refined: None,
             rsim: None,
             centers: BTreeMap::new(),
+            coarse_centers: init
+                .poses
+                .iter()
+                .map(|p| p.map(|p| p.center().coords))
+                .collect(),
             registered_prev,
             n_help,
             rposes: HashMap::new(),
@@ -2923,7 +2949,10 @@ mod diag {
             PipelineConfig::default().position,
             &TriConfig::from_config(&PipelineConfig::default()),
             (0, 2.0),
-            &PreviewOpts::default(),
+            &PreviewOpts {
+                refine_iters: PipelineConfig::default().preview_refine_iters,
+                ..PreviewOpts::default()
+            },
         )
         .unwrap();
         let mut rs = init.clone();
