@@ -259,12 +259,13 @@ fn synthetic_two_region_end_to_end() {
     assert_eq!(c.images, 3 * 80);
     assert_eq!(c.registered, 240, "등록 수");
     check_item(&c, "registered", true);
+    // 실측: 등록 240/240, 중심 오차 중앙 0.279 m / 최대 3.152 m, 표면 거리 중앙 0.446 m.
     assert!(c.center_med < 2.5, "중심 오차 중앙 {}", c.center_med);
     assert!(c.surface_med < 4.5, "표면 거리 중앙 {}", c.surface_med);
     for n in ["region_images", "refined_reprojection", "snapshots"] {
         check_item(&c, n, true);
     }
-    // 겹침은 실제로 판정된다(구역 2개): 1쌍, 높이 차 중앙 최대 0.257 m (목표 < 0.3 m) 통과.
+    // 겹침은 실제로 판정된다(구역 2개): 1쌍, 겹침 차 중앙 최대 0.285 m (목표 < 0.3 m) 통과.
     check_item(&c, "refined_overlap", true);
     let ov = c.report.item("refined_overlap").unwrap();
     assert!(!ov.measured.contains("해당 없음"), "{}", ov.measured);
@@ -273,7 +274,7 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         ov.measured
     );
-    // 미달: 높이 차 중앙 최대 5.829 m, 최근접 4.923 m (목표 높이 차 < 2 m, 최근접 < 3 m).
+    // 미달: 높이 차 중앙 최대 4.590 m, 최근접 중앙 최대 4.100 m (목표 높이 차 < 2 m, 최근접 < 3 m).
     check_item(&c, "preview_vs_refined", false);
     let pr = c.report.item("preview_vs_refined").unwrap();
     eprintln!(
@@ -286,8 +287,8 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         pr.measured
     );
-    // 통과: 구역 간 대응을 구역의 모든 이미지 관측으로 만들어 점쌍 최소 1221 (창 안 12장만 쓰면 324),
-    // 구역 간 스케일 차 0.05%, 잔차 중앙 최대 5.130 m (< 6 m).
+    // 통과: 구역 간 대응을 구역의 모든 이미지 관측으로 만들어 점쌍 최소 1211 (창 안 12장만 쓰면 324),
+    // 구역 간 스케일 차 0.36%, 잔차 중앙 최대 4.965 m (< 6 m).
     check_item(&c, "preview_align", true);
     let pa = c.report.item("preview_align").unwrap();
     assert!(
