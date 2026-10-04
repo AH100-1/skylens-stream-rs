@@ -2343,60 +2343,10 @@ pub fn run_pipeline_with(
         } else {
             coarse_start
         };
-        // 스트림 등록: 직전 정밀 모델이 나올 때까지 기다린 뒤(특징·짝 맞춤·희소 초기화는 이미 끝났다)
-        // 그 좌표계 위에 겹침 카메라를 고정해 붙인다.
-        let mut init = init;
+        // 초벌은 앵커(직전 정밀 모델)를 기다리지 않고 그 시점의 최신 모델 위에서 바로 낸다(SPEC 순서 규칙).
+        // 앵커 붙이기는 초벌 출력과 기록 뒤 정밀 BA 시작점(`start`)에만 적용한다.
         let mut start = start;
         let mut attach: Option<AttachRec> = None;
-        let mut anchor_note = if !opts.anchor {
-            "anchor 끔".to_string()
-        } else if recs.is_empty() {
-            "첫 구역(기준 정밀 모델 없음)".to_string()
-        } else {
-            String::new()
-        };
-        if opts.anchor && !recs.is_empty() {
-            while recs.last().is_some_and(|x| x.refined.is_none()) && in_flight > 0 {
-                let m = rx.recv().map_err(|e| e.to_string())?;
-                in_flight -= 1;
-                handle(
-                    m,
-                    &mut recs,
-                    &mut events,
-                    &mut realigns,
-                    &mut latest_ref,
-                    &mut live,
-                )?;
-            }
-            if let Some(m) = latest_ref {
-                let psig = cfg.prior_sigma();
-                let iters = cfg.ba_iters.min(6);
-                let a = attach_to_refined(&mut init, &k, &gps, psig, iters, &gids, r, &recs[m]);
-                let b = attach_to_refined(&mut start, &k, &gps, psig, iters, &gids, r, &recs[m]);
-                match (a, b) {
-                    (Ok((n, med, fx)), Ok((_, _, fx2))) => {
-                        events.push(format!(
-                            "{:.1}s register region {} on refined {} shared cameras {} shared points {n} sim3 median {med:.3} m",
-                            t_now(),
-                            r.index,
-                            recs[m].region.index,
-                            fx.len()
-                        ));
-                        attach = Some((m, n, med, fx2));
-                    }
-                    (Err(e), _) | (_, Err(e)) => anchor_note = e,
-                }
-            } else {
-                anchor_note = "정밀 모델이 아직 하나도 없음".to_string();
-            }
-        }
-        if attach.is_none() {
-            events.push(format!(
-                "{:.1}s register region {} unanchored: {anchor_note}",
-                t_now(),
-                r.index
-            ));
-        }
         st.secs_sparse = t2.elapsed().as_secs_f64();
         st.registered = init.poses[n_help..].iter().filter(|p| p.is_some()).count();
         st.tracks = init.points.len();
@@ -2435,9 +2385,7 @@ pub fn run_pipeline_with(
         st.preview_points = coarse.len();
         let ta = to_tracks(&init, &gids);
         let (mut sim, mut target) = (None, None);
-        if let Some((m, ..)) = &attach {
-            target = Some(*m);
-        } else if let Some(m) = latest_ref {
+        if let Some(m) = latest_ref {
             let tbm = &recs[m].refined.as_ref().unwrap().0;
             let ca =
                 crate::timing::timed("align_ghost", || region_align(&ta, tbm, r, &recs[m].region));
@@ -2499,6 +2447,82 @@ pub fn run_pipeline_with(
             n_help,
             rposes: HashMap::new(),
         });
+        // 스트림 등록: 직전 정밀 모델이 나오면(이미 낸 초벌은 handle 이 공유 3D 점 sim3 로 다시 맞춘다)
+        // 그 좌표계 위에 겹침 카메라를 고정해 정밀 BA 시작점을 붙인다.
+        let mut anchor_note = if !opts.anchor {
+            "anchor 끔".to_string()
+        } else if slot == 0 {
+            "첫 구역(기준 정밀 모델 없음)".to_string()
+        } else {
+            String::new()
+        };
+        if opts.anchor && slot > 0 {
+            let t_wait = Instant::now();
+            while recs[slot - 1].refined.is_none() && in_flight > 0 {
+                let m = rx.recv().map_err(|e| e.to_string())?;
+                in_flight -= 1;
+                handle(
+                    m,
+                    &mut recs,
+                    &mut events,
+                    &mut realigns,
+                    &mut latest_ref,
+                    &mut live,
+                )?;
+            }
+            events.push(format!(
+                "{:.1}s anchor wait region {} {:.2}s after coarse output",
+                t_now(),
+                r.index,
+                t_wait.elapsed().as_secs_f64()
+            ));
+            if let Some(m) = latest_ref {
+                let psig = cfg.prior_sigma();
+                let iters = cfg.ba_iters.min(6);
+                match attach_to_refined(
+                    &mut start,
+                    &k,
+                    &gps,
+                    psig,
+                    iters,
+                    &recs[slot].gids,
+                    r,
+                    &recs[m],
+                ) {
+                    Ok((n, med, fx)) => {
+                        // 보고하는 공유 점 수·sim3 잔차는 (이미 낸) 초벌 모델 기준으로 잰다.
+                        let flags: Vec<bool> = init.poses.iter().map(|p| p.is_some()).collect();
+                        let (n, med) = crate::pipeline_stream::plan_anchor(
+                            &recs[slot].ta,
+                            &recs[m].refined.as_ref().unwrap().0,
+                            &recs[m].rposes,
+                            (r, &recs[m].region),
+                            &recs[slot].gids,
+                            &flags,
+                        )
+                        .map_or((n, med), |p| (p.pairs, p.median_m));
+                        events.push(format!(
+                            "{:.1}s register region {} on refined {} shared cameras {} shared points {n} sim3 median {med:.3} m",
+                            t_now(),
+                            r.index,
+                            recs[m].region.index,
+                            fx.len()
+                        ));
+                        attach = Some((m, n, med, fx));
+                    }
+                    Err(e) => anchor_note = e,
+                }
+            } else {
+                anchor_note = "정밀 모델이 아직 하나도 없음".to_string();
+            }
+        }
+        if attach.is_none() {
+            events.push(format!(
+                "{:.1}s register region {} unanchored: {anchor_note}",
+                t_now(),
+                r.index
+            ));
+        }
         // 정밀(BA)은 다른 스레드에서. 이미 최신 정밀 좌표계에 붙은 시작점이면 같은 겹침 카메라를 고정한다.
         let fixed_cams: Vec<usize> = attach
             .as_ref()
