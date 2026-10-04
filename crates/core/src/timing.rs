@@ -4,7 +4,9 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
-static ACC: Mutex<Vec<(&'static str, f64, u32)>> = Mutex::new(Vec::new());
+type Row = (&'static str, f64, u32);
+
+static ACC: Mutex<Vec<Row>> = Mutex::new(Vec::new());
 
 /// 누적을 비운다(실행 시작 때).
 pub fn reset() {
@@ -16,13 +18,18 @@ pub fn reset() {
 /// 단계 `name` 에 `secs` 초를 더한다.
 pub fn add(name: &'static str, secs: f64) {
     if let Ok(mut a) = ACC.lock() {
-        match a.iter_mut().find(|e| e.0 == name) {
-            Some(e) => {
-                e.1 += secs;
-                e.2 += 1;
-            }
-            None => a.push((name, secs, 1)),
+        accumulate(&mut a, name, secs);
+    }
+}
+
+/// `rows` 에서 `name` 행에 `secs` 를 더하고 호출 수를 하나 늘린다. 없으면 새 행을 넣는다(전역 누적을 읽지 않는다).
+fn accumulate(rows: &mut Vec<Row>, name: &'static str, secs: f64) {
+    match rows.iter_mut().find(|e| e.0 == name) {
+        Some(e) => {
+            e.1 += secs;
+            e.2 += 1;
         }
+        None => rows.push((name, secs, 1)),
     }
 }
 
@@ -33,8 +40,6 @@ pub fn timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     add(name, t.elapsed().as_secs_f64());
     r
 }
-
-type Row = (&'static str, f64, u32);
 
 fn snapshot() -> Vec<Row> {
     ACC.lock().map(|a| a.clone()).unwrap_or_default()
@@ -101,5 +106,20 @@ mod tests {
             format!("timing {:<22} {:>9.3} s {:>6} calls", "t_a", 1.5, 2)
         );
         assert!(t[1].contains("t_b"), "{t:?}");
+    }
+
+    #[test]
+    fn accumulate_same_name_one_row() {
+        let mut rows: Vec<Row> = Vec::new();
+        accumulate(&mut rows, "t_a", 1.5);
+        accumulate(&mut rows, "t_a", 0.5);
+        accumulate(&mut rows, "t_b", 0.25);
+        assert_eq!(rows, vec![("t_a", 2.0, 2), ("t_b", 0.25, 1)]);
+    }
+
+    #[test]
+    fn timed_returns_closure_value() {
+        // 전역 누적은 다른 시험의 `reset()` 과 겹칠 수 있어 반환값만 확인한다.
+        assert_eq!(timed("t_timed_ret", || 7), 7);
     }
 }
