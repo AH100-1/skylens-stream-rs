@@ -1363,6 +1363,20 @@ fn apply_sparse_sim(s: &mut Sparse, sim: &Similarity) {
     }
 }
 
+/// 다시 등록한 희소 모델 `rs` 의 사진 중심을 고정 자세 중심에 맞추는 닮음 변환(Umeyama).
+/// 대응이 3쌍 미만이거나 중심이 한 점·한 직선에 가까우면 `None`.
+fn refit_anchor_sim(rs: &Sparse, mapped: &[(usize, Pose)]) -> Option<Similarity> {
+    let src: Vec<Vector3<f64>> = mapped
+        .iter()
+        .filter_map(|(j, _)| rs.poses[*j].as_ref().map(|p| p.center().coords))
+        .collect();
+    if src.len() != mapped.len() {
+        return None;
+    }
+    let dst: Vec<Vector3<f64>> = mapped.iter().map(|(_, p)| p.center().coords).collect();
+    crate::align::umeyama(&src, &dst)
+}
+
 /// 다음 구역의 정밀 BA 를 직전 정밀 모델 기준으로 시작할지. 3구역 측정(재투영 RMS 0.81/0.51 px 대 0.28/0.32 px)에서
 /// 초벌 기반 닮음 변환의 잔차(1.7~3.1 m)가 커서 오히려 나빠져 기본은 끈다.
 const ANCHOR_NEXT_REGION: bool = false;
@@ -2529,8 +2543,9 @@ pub fn run_pipeline_with(
                             rs.poses[j].is_some().then_some((j, *p))
                         })
                         .collect();
-                    if mapped.len() >= 3 {
-                        apply_sparse_sim(&mut rs, &an.sim);
+                    // 새 좌표계 기준으로 (새 등록 중심 → 고정 자세 중심) 닮음 변환을 다시 구한다.
+                    if let Some(sim) = refit_anchor_sim(&rs, &mapped) {
+                        apply_sparse_sim(&mut rs, &sim);
                         for (j, p) in mapped {
                             rs.poses[j] = Some(p);
                             fixed.push(j);
@@ -3678,5 +3693,86 @@ mod refine_tests {
             }
             assert_eq!(all, expect_all);
         }
+    }
+}
+
+#[cfg(test)]
+mod refit_anchor_tests {
+    use super::*;
+
+    fn sparse_with(poses: Vec<Option<Pose>>) -> Sparse {
+        Sparse {
+            poses,
+            points: vec![],
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        }
+    }
+
+    fn centers() -> Vec<Vector3<f64>> {
+        vec![
+            Vector3::new(0.0, 0.0, 50.0),
+            Vector3::new(10.0, 2.0, 52.0),
+            Vector3::new(20.0, -3.0, 49.0),
+            Vector3::new(5.0, 14.0, 51.0),
+            Vector3::new(15.0, 9.0, 55.0),
+        ]
+    }
+
+    #[test]
+    fn refit_anchor_sim_recovers_known_sim3() {
+        let truth = Similarity {
+            s: 1.3,
+            r: Rotation3::from_euler_angles(0.2, -0.4, 1.1),
+            t: Vector3::new(30.0, -12.0, 4.0),
+        };
+        let rot = Rotation3::from_axis_angle(&Vector3::x_axis(), 3.0);
+        let cs = centers();
+        let poses: Vec<Option<Pose>> = cs
+            .iter()
+            .map(|c| Some(Pose::from_center(rot, &Point3::from(*c))))
+            .collect();
+        let rs = sparse_with(poses);
+        let mapped: Vec<(usize, Pose)> = cs
+            .iter()
+            .enumerate()
+            .map(|(j, c)| {
+                (
+                    j,
+                    Pose::from_center(rot, &Point3::from(truth.apply_point(c))),
+                )
+            })
+            .collect();
+        let est = refit_anchor_sim(&rs, &mapped).unwrap();
+        assert!((est.s - 1.3).abs() < 1e-6);
+        let da = (est.r.matrix() - truth.r.matrix()).norm();
+        assert!(da < 1e-6, "da={da}");
+        assert!((est.t - truth.t).norm() < 1e-6);
+        for c in &cs {
+            assert!((est.apply_point(c) - truth.apply_point(c)).norm() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn refit_anchor_sim_rejects_too_few_or_degenerate() {
+        let rot = Rotation3::identity();
+        let cs = centers();
+        let mk = |idx: &[usize], cs2: &[Vector3<f64>]| {
+            let rs = sparse_with(
+                cs2.iter()
+                    .map(|c| Some(Pose::from_center(rot, &Point3::from(*c))))
+                    .collect(),
+            );
+            let mapped: Vec<(usize, Pose)> = idx
+                .iter()
+                .map(|&j| (j, Pose::from_center(rot, &Point3::from(cs2[j] * 2.0))))
+                .collect();
+            refit_anchor_sim(&rs, &mapped)
+        };
+        assert!(mk(&[0, 1], &cs).is_none());
+        let line: Vec<Vector3<f64>> = (0..4).map(|i| Vector3::new(i as f64, 0.0, 0.0)).collect();
+        assert!(mk(&[0, 1, 2, 3], &line).is_none());
+        assert!(mk(&[0, 1, 2], &cs).is_some());
     }
 }
