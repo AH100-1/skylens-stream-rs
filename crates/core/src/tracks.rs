@@ -1849,11 +1849,7 @@ mod tests {
                 s.outliers, st.inconsistent, same.0, same.1, cross.0, cross.1
             );
             assert!(s.outliers > 0);
-            let (pmin, wmax) = if mode == "swap" {
-                (0.97, 0.03)
-            } else {
-                (0.99, 0.01)
-            };
+            let (pmin, wmax) = (0.99, 0.01);
             if pu < pmin || co < 0.95 || wm > wmax || lc > 0.015 {
                 failures.push(format!(
                     "{mode} keep {keep}: pu {pu} co {co} wm {wm} cross {lc}"
