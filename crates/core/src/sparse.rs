@@ -127,6 +127,107 @@ struct PairResult {
     t: Option<Vector3<f64>>,
 }
 
+/// 카메라 쌍 일치 투표의 무리 반경(도).
+const PAIR_VOTE_DEG: f64 = 5.0;
+
+/// 투표용 간선: (결과 번호, 장착 회전 D).
+type EdgeMount = (usize, Rotation3<f64>);
+
+/// 다른 카메라 짝(i, j 의 카메라 번호가 다른 간선)의 상대 회전을 카메라 쌍 단위로 투표해 거른다.
+///
+/// 같은 장착이라 카메라 a, b 의 같은 카메라끼리 시간 이웃으로 이은 회전 E_i = R_i W_a(R_i = 위치 회전,
+/// W_a 는 카메라별 평균 기준 회전)로 D = E_jᵀ R_ij E_i = W_bᵀ W_a 는 짝이 어디든 같다. 쌍마다 D 를
+/// 서로 `PAIR_VOTE_DEG` 이내인 무리로 묶어 가장 큰 무리 밖의 간선을 뺀다. 같은 카메라끼리의 간선, 카메라별
+/// 회전을 못 구한 간선, 가장 큰 무리가 2 미만인 쌍은 그대로 둔다.
+fn vote_cross_camera_pairs(inputs: &[SparseInput], results: Vec<PairResult>) -> Vec<PairResult> {
+    let n = inputs.len();
+    let groups = inputs.iter().map(|x| x.group).max().map_or(0, |g| g + 1);
+    let mut est: Vec<Option<Rotation3<f64>>> = vec![None; n];
+    for g in 0..groups {
+        let edges: Vec<RelativeRotation> = results
+            .iter()
+            .filter(|p| inputs[p.i].group == g && inputs[p.j].group == g)
+            .map(|p| RelativeRotation {
+                i: p.i,
+                j: p.j,
+                rotation: p.rot,
+                weight: p.matches.len() as f64,
+            })
+            .collect();
+        if edges.is_empty() {
+            continue;
+        }
+        if let Some(avg) = average_rotations(n, &edges, &AveragingConfig::default()) {
+            if !avg.reliable {
+                continue;
+            }
+            for (k, r) in avg.rotations.into_iter().enumerate() {
+                if inputs[k].group == g {
+                    est[k] = r;
+                }
+            }
+        }
+    }
+    // 쌍(작은 카메라, 큰 카메라) → (간선 번호, D) 목록. 간선은 작은 카메라 쪽을 i 로 본다.
+    let mut by_pair: HashMap<(usize, usize), Vec<EdgeMount>> = HashMap::new();
+    for (k, p) in results.iter().enumerate() {
+        let (ga, gb) = (inputs[p.i].group, inputs[p.j].group);
+        if ga == gb {
+            continue;
+        }
+        let (Some(ei), Some(ej)) = (est[p.i], est[p.j]) else {
+            continue;
+        };
+        let d = ej.inverse() * p.rot * ei;
+        if ga < gb {
+            by_pair.entry((ga, gb)).or_default().push((k, d));
+        } else {
+            by_pair.entry((gb, ga)).or_default().push((k, d.inverse()));
+        }
+    }
+    let mut drop = vec![false; results.len()];
+    for list in by_pair.values() {
+        if list.len() < 3 {
+            continue;
+        }
+        let near = |a: &Rotation3<f64>, b: &Rotation3<f64>| {
+            crate::math::UnitQuaternion::from_rotation_matrix(&(a.inverse() * b))
+                .angle()
+                .to_degrees()
+                <= PAIR_VOTE_DEG
+        };
+        let mut best: Option<(usize, f64, Vec<usize>)> = None;
+        for (_, c) in list {
+            let members: Vec<usize> = (0..list.len()).filter(|&m| near(c, &list[m].1)).collect();
+            let w: f64 = members
+                .iter()
+                .map(|&m| results[list[m].0].matches.len() as f64)
+                .sum();
+            if best
+                .as_ref()
+                .is_none_or(|(c0, w0, _)| (members.len(), w) > (*c0, *w0))
+            {
+                best = Some((members.len(), w, members));
+            }
+        }
+        if let Some((count, _, members)) = best {
+            if count >= 2 {
+                for m in 0..list.len() {
+                    if !members.contains(&m) {
+                        drop[list[m].0] = true;
+                    }
+                }
+            }
+        }
+    }
+    results
+        .into_iter()
+        .zip(drop)
+        .filter(|(_, d)| !d)
+        .map(|(p, _)| p)
+        .collect()
+}
+
 pub fn reconstruct(
     inputs: &[SparseInput],
     intrinsics: &[Intrinsics],
@@ -218,6 +319,11 @@ pub fn reconstruct(
             })
         })
         .collect();
+    if results.is_empty() {
+        return Err("검증된 영상 짝 없음".into());
+    }
+
+    let results = vote_cross_camera_pairs(inputs, results);
     if results.is_empty() {
         return Err("검증된 영상 짝 없음".into());
     }
@@ -1136,5 +1242,85 @@ mod tests {
         let m = reconstruct(&inputs, &[k, k, k], &cfg).unwrap();
         assert!(m.preview.is_some());
         assert!(m.gps_fit.is_some());
+    }
+    fn pair(i: usize, j: usize, rot: Rotation3<f64>) -> PairResult {
+        PairResult {
+            i,
+            j,
+            matches: vec![(0, 0); 30],
+            rot,
+            t: None,
+        }
+    }
+
+    /// 카메라 쌍 투표: 틀린 회전을 섞은 F–L 짝에서 틀린 것만 걸러지고, F–R 은 그대로다.
+    #[test]
+    fn cross_camera_vote_drops_only_wrong_rotations() {
+        let rot = |x: f64, y: f64, z: f64| Rotation3::from_euler_angles(x, y, z);
+        let mounts = [
+            Rotation3::identity(),
+            rot(0.0, 0.5, 0.0),
+            rot(0.1, -0.5, 0.05),
+        ];
+        let positions = 9;
+        let body: Vec<Rotation3<f64>> = (0..positions)
+            .map(|p| {
+                let t = p as f64;
+                rot(0.03 * t, 0.2 * t.sin(), 0.1 * t)
+            })
+            .collect();
+        // 영상 번호 = 카메라 * positions + 위치.
+        let inputs: Vec<SparseInput> = (0..3 * positions)
+            .map(|k| SparseInput {
+                name: String::new(),
+                group: k / positions,
+                position: k % positions,
+                image: image::RgbImage::new(1, 1),
+                gps_enu: None,
+            })
+            .collect();
+        let truth = |k: usize| mounts[k / positions] * body[k % positions];
+        let exact = |i: usize, j: usize| truth(j) * truth(i).inverse();
+        let mut results = Vec::new();
+        for c in 0..3 {
+            for p in 0..positions - 1 {
+                let (i, j) = (c * positions + p, c * positions + p + 1);
+                results.push(pair(i, j, exact(i, j)));
+            }
+        }
+        for p in 0..5 {
+            let (i, j) = (p, positions + p + 2);
+            results.push(pair(i, j, exact(i, j)));
+        }
+        // F–L: 위치 0..7 중 4 개는 77~91 도 틀린 해, 3 개는 맞는 해.
+        let wrong_deg = [78.0_f64, 85.0, 91.0, 77.0];
+        let mut wrong_idx = Vec::new();
+        for (n, p) in (0..7).enumerate() {
+            let (i, j) = (p, 2 * positions + p + 1);
+            let mut r = exact(i, j);
+            if n != 3 && n != 5 && n != 6 {
+                let ax = nalgebra::Unit::new_normalize(Vector3::new(1.0, n as f64, 0.5));
+                let off = Rotation3::from_axis_angle(&ax, wrong_deg[wrong_idx.len()].to_radians());
+                r = off * r;
+                wrong_idx.push(results.len());
+            }
+            results.push(pair(i, j, r));
+        }
+        let total = results.len();
+        let kept = vote_cross_camera_pairs(&inputs, results);
+        assert_eq!(kept.len(), total - 4);
+        for p in &kept {
+            let err = crate::math::UnitQuaternion::from_rotation_matrix(
+                &(p.rot * exact(p.i, p.j).inverse()),
+            )
+            .angle()
+            .to_degrees();
+            assert!(err < 0.01, "kept edge {}-{} off by {err} deg", p.i, p.j);
+        }
+        let fl = kept
+            .iter()
+            .filter(|p| p.i < positions && p.j >= 2 * positions)
+            .count();
+        assert_eq!(fl, 3);
     }
 }
