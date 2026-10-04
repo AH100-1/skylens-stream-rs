@@ -1229,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn small_image_upscaled_detects_more_with_original_coords() {
+    fn small_image_upscaled_keeps_original_coords() {
         // 240x160 영상에 부화소 중심의 가우시안 덩어리 6x4 개. 확대 검출 결과 좌표는
         // 원래 영상 범위 안이고, 덩어리 중심(정답)에서 1 px 이내에 점이 있어야 한다.
         let (w, h) = (240usize, 160usize);
@@ -1271,5 +1271,19 @@ mod tests {
             "중심 1 px 이내 {near}/{}",
             centers.len()
         );
+    }
+
+    #[test]
+    fn small_image_upscaled_detects_more_on_textured_scene() {
+        // 합성 장면 한 장(320x240): 확대 검출 수가 끔 검출 수보다 많아야 한다.
+        let img = scene_image(320, 240);
+        let off = DetectorConfig {
+            upscale_below: 0,
+            ..DetectorConfig::default()
+        };
+        let a = detect_and_describe(&img, &off);
+        let b = detect_and_describe(&img, &DetectorConfig::default());
+        eprintln!("scene 320x240 upscale off {} on {}", a.len(), b.len());
+        assert!(b.len() > a.len(), "확대 {} <= 끔 {}", b.len(), a.len());
     }
 }
