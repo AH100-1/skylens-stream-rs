@@ -72,31 +72,41 @@ skylens-stream --help
 
 ### 합성 장면으로 한 번 돌려 보기
 
-`synth` → `run` → `verify` 를 끝까지 잇는다. 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(`--span 48`)으로 잡는다.
-같은 명령을 `crates/cli/tests/pipeline_e2e.rs` 가 프로세스로 돌려 아래 수치에 상한을 건다(`cargo test --release -p skylens-stream --test pipeline_e2e`, 구역 2개 시험 포함 약 3~6 분).
+`synth` → `run` → `verify` 를 끝까지 잇는다. 합성 장면은 SPEC §6 기본 편대 배치(위치 80곳, 위치 간 약 1 m, 3대 × 80 = 240장)이고
+`--stride 1` 로 모든 위치를 쓴다. 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역은 `--span 48`(위치 [0,50), [46,80) 두 구역)로 잡는다.
+같은 설정을 `crates/cli/tests/pipeline_e2e_spec.rs` 가 시드 1·2 로 돌려 verify 7/7 과 정답 대비 오차에 상한을 건다(`cargo test --release -p skylens-stream --test pipeline_e2e_spec`).
 
 ```bash
 skylens-stream synth scene 320 180
-skylens-stream run scene out --stride 2 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
+skylens-stream run scene out --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
 skylens-stream verify out
-# 구역 2개(80위치 전부, 이웃 구역 겹침 항목 판정)
-skylens-stream run scene out2 --stride 1 --span 48 --ovl 2 --max-features 800 --dense-width 96 --hfov 65 --ba-iters 15
-skylens-stream verify out2
 ```
 
-출력 폴더에는 `preview/`·`refined/`·`snapshots/`(와 `snapshots/manifest.json`)·`poses.txt`·`report.json` 이 생긴다. 4코어 기계(부하 약 20)에서 실측:
+위 세 명령을 이 순서로 실제로 돌린 결과(4코어 측정 기계, 다른 작업이 겹쳐 부하 약 20):
 
-| | 단구역 (`out`, 120장) | 구역 2개 (`out2`, 240장) |
-|---|---|---|
-| run 시간 | 약 30 초 (부하 낮을 때) | 332 초 (부하 22), 시험 전체 179 초 (부하 낮을 때) |
-| verify | 7/7, 종료 코드 0 | 6/7, 종료 코드 1 |
-| 미달 항목 | 없음 (preview_vs_refined 최근접 중앙 1.416 m, 높이 차 중앙 1.553 m 통과) | preview_vs_refined (최근접 4.923 m, 높이 차 5.829 m). preview_align 은 통과(점쌍 최소 1221, 스케일 차 0.05%, 잔차 5.130 m) |
-| refined_overlap | 해당 없음 (구역 1개) | PASS, 1쌍 겹침 차 중앙 최대 0.257 m |
-| 재투영 (초벌 → 정밀) | 3.026 → 0.300 px | 3.232 → 0.282 px |
-| 카메라 중심 오차 중앙 / 최대 | 0.329 / 2.912 m | 0.290 / 3.115 m |
-| 정밀 점 → 정답 표면 중앙 / 95% | 0.475 / 1.465 m (점 11054) | 0.494 / 3.022 m (점 19855) |
+| 명령 | 걸린 시간 |
+|---|---|
+| `synth scene 320 180` ("views 240") | 64 초 |
+| `run scene out ...` ("chunks 2", "done regions 2") | 244 초 (4 분 3.6 초) |
+| `verify out` | 1 초 미만, 종료 코드 0 |
 
-오차는 정답 카메라 `truth/cameras.txt`·정답 표면(`Scene::surface_height`, 수직 거리)과 `poses.txt`·`refined/*.ply` 를 비교한 값이다(정답 원점과 첫 GPS 원점 차를 옮겨서). 회전 오차는 `poses.txt` 에 카메라 중심만 있어 재지 못한다.
+`verify out` 출력:
+
+```
+| 항목 | 결과 | 측정값 | 기준 |
+|---|---|---|---|
+| registered | PASS | 초벌 240/240, 정밀 240/240 | 초벌·정밀 모두 전체 등록 (240/240) |
+| region_images | PASS | 2개 구역 모두 일치 | 구역 사진 수 = 3 × 위치 수 |
+| refined_reprojection | PASS | 정밀 0.284 px (초벌 0.673 px) | 정밀 재투영 ≤ 0.7 px |
+| preview_align | PASS | 정렬 기록 2개, 점쌍 최소 1178, 구역 간 스케일 차 0.26%, 잔차 중앙 최대 0.735 m | 점쌍 ≥ 1000, 구역 간 스케일 차(최대/최소 − 1) ≤ 10%, 잔차 중앙 < 6 m |
+| preview_vs_refined | PASS | 2개 구역, 최근접 중앙 최대 0.943 m, 높이 차 중앙 최대 1.048 m | 구역마다 초벌·정밀 있음, 최근접 중앙 < 3 m, 수평 2 m 짝 높이 차 중앙 < 2 m |
+| refined_overlap | PASS | 1쌍, 겹침 차 중앙 최대 0.285 m | 이웃 정밀 구역 겹침(수평 1 m 짝) 높이 차 중앙 < 0.3 m (정밀 0개 FAIL, 구역 1개 해당 없음) |
+| snapshots | PASS | 3단계, PLY 3개, 점 10483→13625, final 20188, 새 영역 최소 2301 | 정수 단계 1..=구역 수 파일 있음, 점 수 단조 증가, 2단계부터 초벌 새 영역 > 0, final = 정밀 점 수 합, NaN 없음 |
+결과: 7/7 통과
+```
+
+출력 폴더에는 `preview/`·`refined/`·`snapshots/`(와 `snapshots/manifest.json`)·`poses.txt`·`report.json`·`timing.json` 이 생긴다.
+`poses.txt` 에는 카메라 중심만 있어 회전 오차는 출력만으로 재지 못한다.
 
 ### 라이브러리: 특징점
 
