@@ -18,6 +18,8 @@ pub struct ReAlign {
     /// 트리밍 뒤 잔차 중앙값(m).
     pub median_m: f64,
     pub scale: f64,
+    /// 수락 검사를 통과해 실제로 적용됐는가(버린 변환은 false).
+    pub applied: bool,
 }
 
 /// 초벌 트랙과 정밀 트랙의 공유 3D 점(같은 사진·같은 특징 번호)으로 닮음 변환을 구한다.

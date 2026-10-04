@@ -1330,34 +1330,61 @@ fn apply_sparse_sim(s: &mut Sparse, sim: &Similarity) {
     }
 }
 
-/// 다음 구역의 정밀 BA 를 직전 정밀 모델 기준으로 시작할지. 3구역 측정(재투영 RMS 0.81/0.51 px 대 0.28/0.32 px)에서
-/// 초벌 기반 닮음 변환의 잔차(1.7~3.1 m)가 커서 오히려 나빠져 기본은 끈다.
-const ANCHOR_NEXT_REGION: bool = false;
+/// 정밀↔정밀 재정렬 수락 여유(m): 점 대응 변환이 공유 카메라 중심 불일치(중앙값)를 이만큼보다 더 키우면 버린다.
+/// 2구역 앵커 장면의 좋은 재정렬은 0.38→0.77 m(공유 점 130 쌍), 3구역 도착 순서 장면의 틀어진 재정렬은 1.8→9.2 m(30 쌍).
+const REALIGN_CAM_SLACK_M: f64 = 1.0;
 
-/// 직전 정밀 모델에 맞춘 시작: 닮음 변환으로 같은 좌표계로 옮기고 공유 사진 포즈를 직전 값으로 고정.
-struct Anchor {
-    sim: Similarity,
-    /// (구역 안 사진 번호, 직전 정밀 포즈)
-    fixed: Vec<(usize, Pose)>,
-}
+/// 정밀 BA 시작점을 최신 정밀 모델에 붙이는 데 필요한 최소 공유 3D 점 쌍 수.
+const ATTACH_MIN_PAIRS: usize = 60;
 
-/// 새 구역 `rec` 의 초벌 희소 모델을 직전 정밀 구역 `prev` 에 맞출 기준을 만든다.
-/// 반환: 기준(닮음 변환 + 고정 포즈), 점 쌍 수, 잔차 중앙값. 겹침이 모자라면 `None`.
-fn make_anchor(rec: &RegionRec, prev: &RegionRec) -> Option<(Anchor, usize, f64)> {
-    if !ANCHOR_NEXT_REGION {
-        return None;
+/// 붙이기 결과: (점 쌍 수, 잔차 중앙 m, 고정 카메라).
+type Attached = (usize, f64, Vec<(usize, Pose)>);
+/// 한 구역을 붙인 기록: (붙은 기준 구역 번호, 점 쌍 수, 잔차 중앙 m, 고정 카메라).
+type AttachRec = (usize, usize, f64, Vec<(usize, Pose)>);
+
+/// 초벌 희소 모델 `s` 를 최신 정밀 구역 `prev` 위에 붙인다(스트림 등록 단계): 공유 3D 점 닮음 변환으로
+/// 같은 좌표계에 옮기고, 겹침 위치 카메라 포즈를 정밀 값으로 고정한 채 번들 조정으로 새 카메라를 맞춘다.
+/// 반환: (점 쌍 수, 변환 잔차 중앙 m, 고정 카메라 목록). 겹침이 모자라면 이유와 함께 `Err`(모델은 그대로).
+#[allow(clippy::too_many_arguments)]
+fn attach_to_refined(
+    s: &mut Sparse,
+    k: &Intrinsics,
+    gps: &[Vector3<f64>],
+    prior_sigma: f64,
+    iters: usize,
+    gids: &[usize],
+    region: &Region,
+    prev: &RegionRec,
+) -> Result<Attached, String> {
+    let flags: Vec<bool> = s.poses.iter().map(|p| p.is_some()).collect();
+    let ta = to_tracks(s, gids);
+    let tb = &prev.refined.as_ref().ok_or("직전 정밀 모델 없음")?.0;
+    let plan = crate::pipeline_stream::plan_anchor(
+        &ta,
+        tb,
+        &prev.rposes,
+        (region, &prev.region),
+        gids,
+        &flags,
+    )?;
+    // 공유 3D 점이 적으면 닮음 변환이 겹침 밖으로 어긋난다: 3구역 도착 순서 장면(공유 점 30 쌍, 잔차 2.2 m)에서
+    // 시작점 배율이 1.4 배 틀어져 정밀 모델이 이웃과 같은 좌표계에 놓이지 못했다(재정렬 잔차 0.93 m, 중심 오차 2.1→5.4 m).
+    // 기준 없이(GPS 정렬) 시작하는 쪽이 낫다. 공유 점 130 쌍인 2구역 앵커 장면은 그대로 붙는다.
+    if plan.pairs < ATTACH_MIN_PAIRS {
+        return Err(format!(
+            "공유 3D 점 {} 쌍 < {ATTACH_MIN_PAIRS}: 붙이기 변환이 불안정함 (겹침 카메라 {} 대)",
+            plan.pairs,
+            plan.fixed.len()
+        ));
     }
-    let tb = &prev.refined.as_ref()?.0;
-    let win = crate::progressive::overlap_window(&rec.region, &prev.region);
-    let (sim, n, med) = crate::progressive::cross_align(&rec.ta, tb, win)?;
-    let fixed: Vec<(usize, Pose)> = rec
-        .gids
-        .iter()
-        .enumerate()
-        .filter(|&(a, _)| rec.reg_flags[a])
-        .filter_map(|(a, g)| prev.rposes.get(g).map(|p| (a, *p)))
-        .collect();
-    Some((Anchor { sim, fixed }, n, med))
+    apply_sparse_sim(s, &plan.sim);
+    let mut fixed = Vec::new();
+    for (i, p) in &plan.fixed {
+        s.poses[*i] = Some(*p);
+        fixed.push(*i);
+    }
+    s.rms = run_ba(s, k, iters, Some(gps), prior_sigma, &fixed);
+    Ok((plan.pairs, plan.median_m, plan.fixed))
 }
 
 /// 번들 조정(`iters == 0` 이면 재투영 오차만 잰다). 반환: 재투영 RMS(px).
@@ -1722,6 +1749,84 @@ fn own_align(
     align_region(r, &pairs)
 }
 
+/// 겹치는 두 구역의 밀집 점군을 최근접 대응 닮음 변환(ICP)으로 한 번 더 맞춘다. `moved` 는 이미 희소 점 닮음 변환으로
+/// 대상 좌표계에 옮겨진 점군. 반환은 그 위에 얹을 보정 변환. 대응 3D 거리 `reach` m 안, 거리 상위 30% 는 버리고,
+/// 대응이 모자라거나 보정이 지나치게 크면(배율 ±5%, 회전 5° 넘음) `None`. 환경 변수 `SKYLENS_DENSE_ICP=0` 이면 끈다.
+fn dense_icp_refine(
+    moved: &PointCloud,
+    target: &PointCloud,
+    reach: f64,
+    iters: usize,
+) -> Option<(Similarity, usize)> {
+    if std::env::var("SKYLENS_DENSE_ICP").as_deref() == Ok("0") {
+        return None;
+    }
+    let v3 = |p: &[f32; 3]| Vector3::new(p[0] as f64, p[1] as f64, p[2] as f64);
+    let step = (moved.points.len() / 20000).max(1);
+    let src0: Vec<Vector3<f64>> = moved
+        .points
+        .iter()
+        .step_by(step)
+        .map(|p| v3(&p.xyz))
+        .collect();
+    let dst: Vec<Vector3<f64>> = target.points.iter().map(|p| v3(&p.xyz)).collect();
+    let cell = |p: &Vector3<f64>| {
+        (
+            (p.x / reach).floor() as i64,
+            (p.y / reach).floor() as i64,
+            (p.z / reach).floor() as i64,
+        )
+    };
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (i, q) in dst.iter().enumerate() {
+        grid.entry(cell(q)).or_default().push(i);
+    }
+    let mut delta = Similarity::identity();
+    let mut npairs = 0;
+    for _ in 0..iters {
+        let mut found: Vec<(f64, Vector3<f64>, Vector3<f64>)> = Vec::new();
+        for p in &src0 {
+            let x = delta.apply_point(p);
+            let c = cell(&x);
+            let mut best: Option<(f64, usize)> = None;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        for &j in grid
+                            .get(&(c.0 + dx, c.1 + dy, c.2 + dz))
+                            .into_iter()
+                            .flatten()
+                        {
+                            let d = (dst[j] - x).norm();
+                            if d < reach && best.is_none_or(|(bd, _)| d < bd) {
+                                best = Some((d, j));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((d, j)) = best {
+                found.push((d, x, dst[j]));
+            }
+        }
+        if found.len() < 300 {
+            return None;
+        }
+        found.sort_by(|a, b| a.0.total_cmp(&b.0));
+        found.truncate(found.len() * 7 / 10);
+        let a: Vec<Vector3<f64>> = found.iter().map(|f| f.1).collect();
+        let b: Vec<Vector3<f64>> = found.iter().map(|f| f.2).collect();
+        let step_sim = crate::align::umeyama(&a, &b)?;
+        delta = step_sim.compose(&delta);
+        npairs = found.len();
+    }
+    let ang = delta.r.angle().to_degrees();
+    if (delta.s - 1.0).abs() > 0.05 || ang > 5.0 {
+        return None;
+    }
+    Some((delta, npairs))
+}
+
 /// 진단: 창 안 이미지 수, 초벌·정밀 트랙·관측 수, 같은 (이미지, 특징 번호) 로 맺어지는 비율.
 fn pair_debug(ta: &[Track], tb: &[Track], region: usize, w: (usize, usize)) {
     let in_win = |img: u32| {
@@ -1797,12 +1902,6 @@ struct RegionRec {
     n_help: usize,
     /// 정밀 모델의 사진별 포즈(다음 구역의 고정 기준).
     rposes: HashMap<usize, Pose>,
-    /// 이 구역 정밀 작업이 직전 구역 정밀 결과를 기다리는 통로.
-    anchor_tx: Option<std::sync::mpsc::Sender<Option<Anchor>>>,
-    /// 기준 구역과의 정렬 기록: (직전 구역 번호, 점 쌍 수, 잔차 중앙 m, 스케일).
-    anchored: Option<(usize, usize, f64, f64)>,
-    /// 등록된 사진 표시(gids 순서).
-    reg_flags: Vec<bool>,
 }
 
 /// 지금까지 내보낸 구역 상태(스냅샷 합성용).
@@ -1824,36 +1923,6 @@ struct RefinedMsg {
     sparse: Sparse,
     cloud: PointCloud,
     secs: f64,
-}
-
-/// 기준을 정밀 작업 스레드에 보내고 기록한다(`None` 이면 기준 없이 시작).
-fn send_anchor(
-    rec: &mut RegionRec,
-    tx: &std::sync::mpsc::Sender<Option<Anchor>>,
-    a: Option<(Anchor, usize, f64)>,
-    prev: usize,
-    secs: f64,
-    events: &mut Vec<String>,
-) {
-    match a {
-        Some((an, n, med)) => {
-            events.push(format!(
-                "{secs:.1}s anchor region {} on refined {prev} pairs {n} median {med:.3} m scale {:.4} fixed {}",
-                rec.region.index,
-                an.sim.s,
-                an.fixed.len()
-            ));
-            rec.anchored = Some((prev, n, med, an.sim.s));
-            let _ = tx.send(Some(an));
-        }
-        None => {
-            events.push(format!(
-                "{secs:.1}s anchor region {} none (overlap too small)",
-                rec.region.index
-            ));
-            let _ = tx.send(None);
-        }
-    }
 }
 
 fn write_decimated(out: &Path, name: &str, cloud: &PointCloud) -> Result<(), String> {
@@ -1963,6 +2032,7 @@ pub fn run_pipeline_with(
                 pairs: ar.pairs,
                 median_m: ar.fit_median_m.unwrap_or(f64::NAN),
                 scale: s.s,
+                applied: true,
             });
             rec.sim = sim;
             rec.target = Some(k);
@@ -1976,20 +2046,13 @@ pub fn run_pipeline_with(
         rec.refined = Some((tb, m.cloud));
         *latest_ref = Some(k);
         live.snapshot(t_now(), "refined_replace", r.index, &live_state(recs))?;
-        // 다음 구역의 정밀 작업이 이 모델을 기다리고 있으면 기준을 보낸다.
-        if k + 1 < recs.len() {
-            if let Some(tx) = recs[k + 1].anchor_tx.take() {
-                let a = make_anchor(&recs[k + 1], &recs[k]);
-                send_anchor(&mut recs[k + 1], &tx, a, k, t_now(), events);
-            }
-        }
         events.push(format!(
             "{:.1}s refined region {} rms {:.3} done",
             t_now(),
             r.index,
             m.sparse.rms
         ));
-        let n_realign0 = realigns.len();
+        let n_realign0 = realigns.iter().filter(|a| a.applied).count();
         // 이미 내보낸, 아직 정밀이 없는 초벌 구역을 새 정밀 모델 좌표로 다시 맞춘다.
         for j in 0..recs.len() {
             if j == k || recs[j].refined.is_some() {
@@ -2007,6 +2070,7 @@ pub fn run_pipeline_with(
                     pairs: n,
                     median_m: med,
                     scale: s.s,
+                    applied: true,
                 });
                 let jr = recs[j].region;
                 write_decimated(
@@ -2035,8 +2099,11 @@ pub fn run_pipeline_with(
                 crate::progressive::chain_realign_with(&items, k, region_align)
             })
         };
+        // 거절한 구역: 이 구역을 거쳐 옮겨지는 구역의 누적 변환도 믿을 수 없으므로 함께 건너뛴다.
+        let mut rejected: Vec<usize> = Vec::new();
         for st in steps {
             let (j, acc) = (st.region, st.total);
+            let ri = realigns.len();
             realigns.push(ReAlign {
                 secs: t_now(),
                 region: j,
@@ -2044,9 +2111,80 @@ pub fn run_pipeline_with(
                 pairs: st.pairs,
                 median_m: st.median_m,
                 scale: acc.s,
+                applied: true,
             });
             let jr = recs[j].region;
-            let moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
+            if rejected.contains(&st.via) {
+                rejected.push(j);
+                realigns[ri].applied = false;
+                events.push(format!(
+                    "{:.1}s realign rejected refined {} to refined {} via {} pairs {} median {:.3} m: via region was rejected",
+                    t_now(),
+                    jr.index,
+                    recs[k].region.index,
+                    recs[st.via].region.index,
+                    st.pairs,
+                    st.median_m
+                ));
+                continue;
+            }
+            let mut acc = acc;
+            let mut moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
+            // 공유 카메라 중심(같은 사진 번호): j 구역 중심 → k 구역 중심(k 의 최신 좌표계).
+            let shared_cams: Vec<(Vector3<f64>, Vector3<f64>)> = recs[j]
+                .centers
+                .iter()
+                .filter_map(|(g, c)| {
+                    let ck = recs[k].centers.get(g)?;
+                    let w = recs[k].rsim.map_or(Vector3::new(ck[0], ck[1], ck[2]), |x| {
+                        x.apply_point(&Vector3::new(ck[0], ck[1], ck[2]))
+                    });
+                    Some((Vector3::new(c[0], c[1], c[2]), w))
+                })
+                .collect();
+            if st.via == k {
+                let tgt = &recs[k].refined.as_ref().unwrap().1;
+                if let Some((d, np)) = dense_icp_refine(&moved, tgt, 1.5, 6) {
+                    events.push(format!(
+                        "{:.1}s dense refine region {} onto refined {} pairs {np} scale {:.4} rotation {:.3} deg shift {:.3} m",
+                        t_now(),
+                        jr.index,
+                        recs[k].region.index,
+                        d.s,
+                        d.r.angle().to_degrees(),
+                        d.t.norm()
+                    ));
+                    acc = d.compose(&acc);
+                    moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
+                }
+            }
+            // 수락 검사: 공유 카메라 중심 불일치(중앙값)가 지금 배치보다 `REALIGN_CAM_SLACK_M` 넘게 나빠지면 이 재정렬을 버린다.
+            // 공유 3D 점이 적을 때(수십 쌍) 점 대응 변환이 점 잔차는 작아도 카메라를 수 m 어긋나게 옮긴다.
+            if shared_cams.len() >= 3 {
+                let med = |f: &dyn Fn(&Vector3<f64>) -> Vector3<f64>| {
+                    let mut d: Vec<f64> =
+                        shared_cams.iter().map(|(v, w)| (f(v) - w).norm()).collect();
+                    d.sort_by(|a, b| a.total_cmp(b));
+                    d[d.len() / 2]
+                };
+                let b = med(&|v| recs[j].rsim.map_or(*v, |x| x.apply_point(v)));
+                let a = med(&|v| acc.apply_point(v));
+                if a > b + REALIGN_CAM_SLACK_M {
+                    rejected.push(j);
+                    realigns[ri].applied = false;
+                    events.push(format!(
+                        "{:.1}s realign rejected refined {} to refined {} via {} pairs {} median {:.3} m: shared cameras {} center disagreement before {b:.3} m after {a:.3} m",
+                        t_now(),
+                        jr.index,
+                        recs[k].region.index,
+                        recs[st.via].region.index,
+                        st.pairs,
+                        st.median_m,
+                        shared_cams.len()
+                    ));
+                    continue;
+                }
+            }
             write_decimated(out, &refined_name(&jr), &moved)?;
             events.push(format!(
                 "{:.1}s realign refined {} to refined {} via {} pairs {} median {:.3} m",
@@ -2057,9 +2195,24 @@ pub fn run_pipeline_with(
                 st.pairs,
                 st.median_m
             ));
+            let truth = |g: usize| ds.positions[g / 3].image_enu[g % 3];
+            let before = crate::pipeline_stream::center_error_median(
+                &recs[j].centers,
+                recs[j].rsim.as_ref(),
+                truth,
+            );
+            let after =
+                crate::pipeline_stream::center_error_median(&recs[j].centers, Some(&acc), truth);
+            if let (Some(b), Some(a)) = (before, after) {
+                events.push(format!(
+                    "{:.1}s realign center error region {} before {b:.3} m after {a:.3} m",
+                    t_now(),
+                    jr.index
+                ));
+            }
             recs[j].rsim = Some(acc);
         }
-        if realigns.len() > n_realign0 {
+        if realigns.iter().filter(|a| a.applied).count() > n_realign0 {
             live.snapshot(t_now(), "realign", r.index, &live_state(recs))?;
         }
         Ok(())
@@ -2235,6 +2388,10 @@ pub fn run_pipeline_with(
         } else {
             coarse_start
         };
+        // 초벌은 앵커(직전 정밀 모델)를 기다리지 않고 그 시점의 최신 모델 위에서 바로 낸다(SPEC 순서 규칙).
+        // 앵커 붙이기는 초벌 출력과 기록 뒤 정밀 BA 시작점(`start`)에만 적용한다.
+        let mut start = start;
+        let mut attach: Option<AttachRec> = None;
         st.secs_sparse = t2.elapsed().as_secs_f64();
         st.registered = init.poses[n_help..].iter().filter(|p| p.is_some()).count();
         st.tracks = init.points.len();
@@ -2285,6 +2442,7 @@ pub fn run_pipeline_with(
                     pairs: n,
                     median_m: med,
                     scale: s.s,
+                    applied: true,
                 });
                 events.push(format!(
                     "{:.1}s coarse region {} aligned to refined {} pairs {n} median {med:.3} m",
@@ -2334,12 +2492,100 @@ pub fn run_pipeline_with(
             registered_prev,
             n_help,
             rposes: HashMap::new(),
-            anchor_tx: None,
-            anchored: None,
-            reg_flags: init.poses.iter().map(|p| p.is_some()).collect(),
         });
-        // 정밀(BA)은 다른 스레드에서: 직전 구역의 정밀 모델이 나오면 그 좌표계·포즈를 기준으로 시작한다.
-        let (anchor_tx, anchor_rx) = mpsc::channel::<Option<Anchor>>();
+        // 스트림 등록: 직전 정밀 모델이 나오면(이미 낸 초벌은 handle 이 공유 3D 점 sim3 로 다시 맞춘다)
+        // 그 좌표계 위에 겹침 카메라를 고정해 정밀 BA 시작점을 붙인다.
+        let mut anchor_note = if !opts.anchor {
+            "anchor 끔".to_string()
+        } else if slot == 0 {
+            "첫 구역(기준 정밀 모델 없음)".to_string()
+        } else {
+            String::new()
+        };
+        if opts.anchor && slot > 0 {
+            let t_wait = Instant::now();
+            while recs[slot - 1].refined.is_none() && in_flight > 0 {
+                let m = rx.recv().map_err(|e| e.to_string())?;
+                in_flight -= 1;
+                handle(
+                    m,
+                    &mut recs,
+                    &mut events,
+                    &mut realigns,
+                    &mut latest_ref,
+                    &mut live,
+                )?;
+            }
+            events.push(format!(
+                "{:.1}s anchor wait region {} {:.2}s after coarse output",
+                t_now(),
+                r.index,
+                t_wait.elapsed().as_secs_f64()
+            ));
+            if let Some(m) = latest_ref {
+                let psig = cfg.prior_sigma();
+                let iters = cfg.ba_iters.min(6);
+                match attach_to_refined(
+                    &mut start,
+                    &k,
+                    &gps,
+                    psig,
+                    iters,
+                    &recs[slot].gids,
+                    r,
+                    &recs[m],
+                ) {
+                    Ok((n, med, fx)) => {
+                        // 사건 줄의 공유 점 수·sim3 잔차는 실제로 정밀 BA 시작점에 적용한 계획의 값이다.
+                        // 이미 낸 초벌 모델에 같은 기준 구역을 다시 푼 값은 `coarse model` 이름으로 따로 남긴다.
+                        let flags: Vec<bool> = init.poses.iter().map(|p| p.is_some()).collect();
+                        let coarse = crate::pipeline_stream::plan_anchor(
+                            &recs[slot].ta,
+                            &recs[m].refined.as_ref().unwrap().0,
+                            &recs[m].rposes,
+                            (r, &recs[m].region),
+                            &recs[slot].gids,
+                            &flags,
+                        )
+                        .map_or("unavailable".to_string(), |p| {
+                            format!("pairs {} median {:.3} m", p.pairs, p.median_m)
+                        });
+                        events.push(format!(
+                            "{:.1}s register region {} on refined {} shared cameras {} shared points {n} sim3 median {med:.3} m (coarse model: {coarse})",
+                            t_now(),
+                            r.index,
+                            recs[m].region.index,
+                            fx.len()
+                        ));
+                        attach = Some((m, n, med, fx));
+                    }
+                    Err(e) => anchor_note = e,
+                }
+            } else {
+                anchor_note = "정밀 모델이 아직 하나도 없음".to_string();
+            }
+        }
+        if attach.is_none() {
+            events.push(format!(
+                "{:.1}s register region {} unanchored: {anchor_note}",
+                t_now(),
+                r.index
+            ));
+        }
+        // 정밀(BA)은 다른 스레드에서. 이미 최신 정밀 좌표계에 붙은 시작점이면 같은 겹침 카메라를 고정한다.
+        let fixed_cams: Vec<usize> = attach
+            .as_ref()
+            .map(|(.., fx)| fx.iter().map(|&(i, _)| i).collect())
+            .unwrap_or_default();
+        let anchored = attach.is_some();
+        if let Some((m, n, med, fx)) = &attach {
+            events.push(format!(
+                "{:.1}s anchor region {} on refined {m} shared cameras {} shared points {n} sim3 median {med:.3} m",
+                t_now(),
+                r.index,
+                fx.len()
+            ));
+        }
         {
             let (tx, init, arcs) = (tx.clone(), start, arcs.clone());
             let (gps, dw, iters, dmethod) =
@@ -2349,22 +2595,14 @@ pub fn run_pipeline_with(
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
             in_flight += 1;
             std::thread::spawn(move || {
-                let anchor = anchor_rx.recv().ok().flatten();
                 let t = Instant::now();
                 let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
                 let mut rs = init;
-                let mut fixed: Vec<usize> = Vec::new();
-                if let Some(an) = &anchor {
-                    apply_sparse_sim(&mut rs, &an.sim);
-                    for (i, p) in &an.fixed {
-                        rs.poses[*i] = Some(*p);
-                        fixed.push(*i);
-                    }
-                }
+                let fixed = fixed_cams;
                 rs.rms = crate::timing::timed("ba_refined", || {
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
-                if anchor.is_none() {
+                if !anchored {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {
@@ -2377,21 +2615,6 @@ pub fn run_pipeline_with(
                     secs: t.elapsed().as_secs_f64(),
                 });
             });
-        }
-        if slot == 0 {
-            let _ = anchor_tx.send(None);
-        } else if recs[slot - 1].refined.is_some() {
-            let a = make_anchor(&recs[slot], &recs[slot - 1]);
-            send_anchor(
-                &mut recs[slot],
-                &anchor_tx,
-                a,
-                slot - 1,
-                t_now(),
-                &mut events,
-            );
-        } else {
-            recs[slot].anchor_tx = Some(anchor_tx);
         }
         if opts.sequential {
             while in_flight > 0 {
@@ -2508,6 +2731,41 @@ pub fn run_pipeline_with(
             diffs.len()
         ));
     }
+    // 이웃 정밀 구역이 겹침 위치에서 낸 카메라의 최종 좌표계 차이(중심 성분별 부호 있는 중앙, 회전 각).
+    for w in recs.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        let mov = |rec: &RegionRec, g: usize| {
+            let p = rec.rposes.get(&g)?;
+            let sim = rec.rsim.unwrap_or_else(crate::align::Similarity::identity);
+            let c = sim.apply_point(&p.center().coords);
+            Some((c, p.rotation * sim.r.inverse()))
+        };
+        let (mut dx, mut dy, mut dz, mut dn, mut da) = (vec![], vec![], vec![], vec![], vec![]);
+        for &g in a.rposes.keys() {
+            if let (Some((ca, ra)), Some((cb, rb))) = (mov(a, g), mov(b, g)) {
+                let d = cb - ca;
+                dx.push(d.x);
+                dy.push(d.y);
+                dz.push(d.z);
+                dn.push(d.norm());
+                da.push((ra.inverse() * rb).angle().to_degrees());
+            }
+        }
+        if let (Some(mx), Some(my), Some(mz), Some(mn), Some(ma)) = (
+            median(dx.clone()),
+            median(dy.clone()),
+            median(dz.clone()),
+            median(dn.clone()),
+            median(da.clone()),
+        ) {
+            events.push(format!(
+                "overlap cameras {}-{} n {} center diff median {mn:.3} m (dx {mx:.3} dy {my:.3} dz {mz:.3}) rotation diff median {ma:.3} deg",
+                a.region.index,
+                b.region.index,
+                dn.len()
+            ));
+        }
+    }
     let mut poses_txt = String::new();
     for (g, c) in &centers {
         poses_txt += &format!("{} {} {} {}\n", name(*g), c[0], c[1], c[2]);
@@ -2554,12 +2812,12 @@ pub fn run_pipeline_with(
             ))
             .collect::<Vec<_>>()
             .join(", "),
-        realigns.len(),
+        realigns.iter().filter(|a| a.applied).count(),
         realigns
             .iter()
             .map(|a| format!(
-                "{{\"secs\": {:.2}, \"region\": {}, \"target\": {}, \"pairs\": {}, \"median_m\": {:.4}, \"scale\": {:.5}}}",
-                a.secs, recs[a.region].region.index, recs[a.target].region.index, a.pairs, a.median_m, a.scale
+                "{{\"secs\": {:.2}, \"region\": {}, \"target\": {}, \"pairs\": {}, \"median_m\": {:.4}, \"scale\": {:.5}, \"applied\": {}}}",
+                a.secs, recs[a.region].region.index, recs[a.target].region.index, a.pairs, a.median_m, a.scale, a.applied
             ))
             .collect::<Vec<_>>()
             .join(", "),

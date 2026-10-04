@@ -95,7 +95,16 @@ struct Run {
 
 fn run(ds: &Dataset, out: &Path, sequential: bool) -> Run {
     let t = std::time::Instant::now();
-    let res = run_pipeline_with(ds, &cfg(), out, StreamOptions { sequential }).unwrap();
+    let res = run_pipeline_with(
+        ds,
+        &cfg(),
+        out,
+        StreamOptions {
+            sequential,
+            ..StreamOptions::default()
+        },
+    )
+    .unwrap();
     let secs = t.elapsed().as_secs_f64();
     let vr = verify_dir(out);
     let pass = vr.items.iter().filter(|i| i.pass).count();
@@ -195,6 +204,9 @@ fn stream_order_events_and_numbers_match_sequential() {
         [count("refined", 0), count("refined", 1)],
     );
     assert_eq!(ev[c0].points, n_pre[0], "구역 0 초벌 직후");
+    // SPEC 순서 규칙: 구역이 차면 초벌을 앵커(직전 정밀)를 기다리지 않고 바로 낸다. 구역 1 초벌 시점에
+    // 구역 0 은 아직 초벌이고, 구역 0 정밀 교체는 그 뒤다(main 과 같은 기대).
+    assert!(c1 < r0, "구역 1 초벌이 구역 0 정밀 교체보다 먼저");
     assert_eq!(ev[c1].points, n_pre[0] + n_pre[1], "구역 1 초벌 직후");
     assert_eq!(ev[r0].points, n_ref[0] + n_pre[1], "구역 0 정밀 교체 직후");
     assert_eq!(ev[r1].points, n_ref[0] + n_ref[1], "구역 1 정밀 교체 직후");
