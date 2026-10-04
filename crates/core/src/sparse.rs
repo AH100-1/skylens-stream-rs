@@ -76,6 +76,14 @@ pub struct BaStages {
 }
 
 impl BaStages {
+    /// 회전 고정 → 공동 3 라운드 + 조이는 거르기(재삼각측량 없음).
+    pub const STAGED: BaStages = BaStages {
+        staged: true,
+        tighten: true,
+        retriangulate: false,
+        rounds: 3,
+    };
+
     /// 단계화 이전 동작: 전체 공동 BA 1회 + 4 px 거르기.
     pub const LEGACY: BaStages = BaStages {
         staged: false,
@@ -86,13 +94,10 @@ impl BaStages {
 }
 
 impl Default for BaStages {
+    /// 기본은 단계식. 형성 장면 시험(위치 80곳)에서 BA 뒤 회전 중앙이 기존 2.75° → 1° 미만이다. 반면 제품 포즈 시험과 같은
+    /// 장면(320x180, 2곳마다)에서는 중심 정렬 회전 중앙이 1.40 → 2.38° 로 나빠진다(중심 무관 지표는 3.12 → 2.60°).
     fn default() -> Self {
-        Self {
-            staged: true,
-            tighten: true,
-            retriangulate: false,
-            rounds: 3,
-        }
+        Self::STAGED
     }
 }
 
@@ -1105,12 +1110,36 @@ mod tests {
     }
 
     fn build(positions: usize, w: u32, h: u32) -> (Scene, Vec<SparseInput>, Intrinsics) {
-        let scene = Scene::new(SceneConfig {
+        build_stride(positions, 1, w, h)
+    }
+
+    /// 위치 `positions` 곳짜리 장면에서 `stride` 곳마다 하나만 남긴다(CLI `--stride` 와 같은 간격, 위치 번호는 다시 매긴다).
+    fn build_stride(
+        positions: usize,
+        stride: usize,
+        w: u32,
+        h: u32,
+    ) -> (Scene, Vec<SparseInput>, Intrinsics) {
+        let mut scene = Scene::new(SceneConfig {
             positions,
             width: w,
             height: h,
             ..SceneConfig::default()
         });
+        if stride > 1 {
+            let keep: Vec<bool> = scene
+                .views
+                .iter()
+                .map(|v| v.position % stride == 0)
+                .collect();
+            let mut it = keep.iter();
+            scene.views.retain(|_| *it.next().unwrap());
+            let mut it = keep.iter();
+            scene.gps_enu.retain(|_| *it.next().unwrap());
+            for v in &mut scene.views {
+                v.position /= stride;
+            }
+        }
         let k = scene.views[0].camera.intrinsics;
         let inputs = scene
             .views
@@ -1432,6 +1461,81 @@ mod tests {
         // 단계화가 회전을 크게 줄이고(기존 대비 절반 이하), 재삼각측량이 중심·점 표면을 줄인다.
         assert!(res[1].0 < 0.5 * res[0].0);
         assert!(res[3].3 < res[1].3 && res[3].5 < res[1].5);
+    }
+
+    /// 정밀 BA 설정 하나로 복원해 (회전 닮음 맞춤 중앙·최대, 중심 무관 중앙·최대, 중심 중앙·최대, 점 표면 중앙, rms, 점 수, 등록).
+    fn measure(
+        scene: &Scene,
+        inputs: &[SparseInput],
+        k: Intrinsics,
+        max_features: usize,
+        bs: BaStages,
+    ) -> [f64; 10] {
+        let m = reconstruct(
+            inputs,
+            &[k, k, k],
+            &SparseConfig {
+                max_features,
+                keep_preview: false,
+                ba_stages: bs,
+                pair_schedule: PairSchedule {
+                    cross: crate::matching::CrossSchedule::Formation {
+                        right_min: 12,
+                        left_min: 16,
+                        max: 40,
+                        step: 1,
+                    },
+                    ..PairSchedule::default()
+                },
+                ..SparseConfig::default()
+            },
+        )
+        .unwrap();
+        let e = cam_errors(&m.cameras, scene);
+        let (rm, rx) = rot_errors(&m.cameras, scene);
+        let (fm, fx) = rot_errors_free(&m.cameras, scene);
+        let pm = point_median(&m.points, scene);
+        [
+            rm,
+            rx,
+            fm,
+            fx,
+            e.2,
+            e.3,
+            pm,
+            m.reproj_rms_px,
+            m.points.len() as f64,
+            m.registered as f64,
+        ]
+    }
+
+    /// 제품 흐름 시험(`pipeline_poses`)과 같은 장면: 80곳 중 2곳마다 = 40곳 120장, 320x180, 특징 800.
+    /// 회전 중심 무관 열이 그 시험의 '정렬 후' 지표(전역 회전 하나를 회전에서 구해 뺌)와 같다.
+    #[test]
+    #[ignore = "수 분 걸리는 측정 시험: cargo test --release -p skylens-core staged_ba_table_stride -- --ignored --nocapture"]
+    fn staged_ba_table_stride() {
+        let (scene, inputs, k) = build_stride(80, 2, 320, 180);
+        assert_eq!(inputs.len(), 120);
+        let stages = |staged, tighten, retriangulate| BaStages {
+            staged,
+            tighten,
+            retriangulate,
+            rounds: 3,
+        };
+        let configs = [
+            ("기존", BaStages::LEGACY),
+            ("2단계+거르기", stages(true, true, false)),
+            ("+재삼각측량", stages(true, true, true)),
+        ];
+        eprintln!("| 설정 | 회전(중심 정렬) 중앙 | 최대 | 회전(중심 무관) 중앙 | 최대 | 중심 중앙(m) | 중심 최대 | 점 표면 중앙(m) | rms(px) | 점 수 | 등록 |");
+        for (name, bs) in configs {
+            let r = measure(&scene, &inputs, k, 800, bs);
+            eprintln!(
+                "| {name} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {} | {} |",
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]
+            );
+            assert_eq!(r[9] as usize, inputs.len());
+        }
     }
 
     #[test]

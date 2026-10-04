@@ -71,6 +71,8 @@ pub struct PipelineConfig {
     pub preview_ba_iters: usize,
     /// 초벌 위치 전용 다듬기 반복 수(회전 고정, 카메라 중심만). 0 이면 끈다. BA 가 아니다.
     pub preview_refine_iters: usize,
+    /// 정밀 BA 앞에 회전 고정(위치·점만) 단계를 한 번 더 둔다. 기본 거짓.
+    pub ba_rotation_first: bool,
 }
 
 impl PipelineConfig {
@@ -106,6 +108,7 @@ impl Default for PipelineConfig {
             gps_sigma_v: 2.0,
             preview_ba_iters: 0,
             preview_refine_iters: 5,
+            ba_rotation_first: false,
         }
     }
 }
@@ -1369,6 +1372,19 @@ fn run_ba(
     prior_sigma: f64,
     fixed: &[usize],
 ) -> f64 {
+    run_ba_mode(s, k, iters, gps, prior_sigma, fixed, false)
+}
+
+/// `fix_rot` 이면 회전을 고정하고 위치·점만 푼다.
+fn run_ba_mode(
+    s: &mut Sparse,
+    k: &Intrinsics,
+    iters: usize,
+    gps: Option<&[Vector3<f64>]>,
+    prior_sigma: f64,
+    fixed: &[usize],
+    fix_rot: bool,
+) -> f64 {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
         .collect();
@@ -1415,6 +1431,7 @@ fn run_ba(
             pr.sigma = prior_sigma;
             pr
         }),
+        fix_rotations: fix_rot,
         ..BaOptions::default()
     };
     let rep = bundle_adjust(&mut prob, &opts);
@@ -2345,6 +2362,7 @@ pub fn run_pipeline_with(
             let (gps, dw, iters, dmethod) =
                 (gps.clone(), cfg.dense_width, cfg.ba_iters, cfg.dense_method);
             let psig = cfg.prior_sigma();
+            let rot_first = cfg.ba_rotation_first;
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
             in_flight += 1;
@@ -2362,6 +2380,9 @@ pub fn run_pipeline_with(
                     }
                 }
                 rs.rms = crate::timing::timed("ba_refined", || {
+                    if rot_first {
+                        run_ba_mode(&mut rs, &k, iters, Some(&gps), psig, &fixed, true);
+                    }
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
                 if anchor.is_none() {
