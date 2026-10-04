@@ -60,6 +60,36 @@ pub enum CrossSchedule {
 }
 
 impl CrossSchedule {
+    /// 위치 간 이동이 `spacing_m` m 일 때의 일정. [`Self::FORMATION`] 의 위치 차는 위치 간 이동 1 m 로
+    /// 잰 값(= 이동 거리 m)이다. 겹침은 위치 차가 아니라 이동 거리로 정해지므로(F–L 은 약 33 m, F–R 은 약 42 m 에서 최대)
+    /// 위치 간격이 넓으면 위치 차를 그만큼 줄인다. `Spec` 은 그대로 둔다.
+    pub fn scaled(self, spacing_m: f64) -> Self {
+        let s = if spacing_m.is_finite() && spacing_m > 1.0 {
+            spacing_m
+        } else {
+            return self;
+        };
+        match self {
+            CrossSchedule::Formation {
+                right_min,
+                left_min,
+                max,
+                step,
+            } => {
+                let up = |v: usize| (v as f64 / s).ceil().max(1.0) as usize;
+                let lo_r = up(right_min);
+                let lo_l = up(left_min);
+                CrossSchedule::Formation {
+                    right_min: lo_r,
+                    left_min: lo_l,
+                    max: ((max as f64 / s).floor() as usize).max(lo_r.max(lo_l)),
+                    step: ((step as f64 / s).round() as usize).max(1),
+                }
+            }
+            other => other,
+        }
+    }
+
     /// 실측 편대 기본값: F–R·F–L +20..=+40, 4칸 간격. 겹침 12% 미만(+12~+16)은 매칭은 되지만
     /// 회전 오차가 5~17° 라 뺀다(연구 노트 experiments/formation-pairs.md).
     pub const FORMATION: CrossSchedule = CrossSchedule::Formation {
