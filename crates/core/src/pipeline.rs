@@ -21,7 +21,7 @@ use crate::dataset::Dataset;
 use crate::dense::{region_cloud, region_cloud_patchmatch, DenseConfig, DenseView};
 use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use crate::fusion::{fuse, FusionConfig, FusionView};
-use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig};
+use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig, CAM_LEFT};
 use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::ply::{PointCloud, PointRecord};
 use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
@@ -396,6 +396,10 @@ fn norm(k: &Intrinsics, f: &Feature) -> Vector2<f64> {
 }
 
 struct PairMatch {
+    /// 두 사진의 카메라가 다른 짝이고 그중 하나가 왼쪽 카메라면 true. 이런 짝은 회전·위치 평균에는 쓰되
+    /// 점 트랙(삼각측량·BA)에는 넣지 않는다: 겹침이 작아 짝 회전 오차가 같은 카메라 짝의 10배쯤이고,
+    /// 넣으면 구역 점 표면 오차 중앙이 0.28 m → 0.49 m 로 는다(experiments/cross-pair-overlap.md).
+    left_cross: bool,
     i: usize,
     j: usize,
     inl: Vec<(usize, usize)>,
@@ -485,6 +489,8 @@ fn match_pairs(
                 .map(|(x, _)| *x)
                 .collect();
             Some(PairMatch {
+                left_cross: views[i].0 != views[j].0
+                    && (views[i].0 == CAM_LEFT || views[j].0 == CAM_LEFT),
                 i,
                 j,
                 inl,
@@ -1300,7 +1306,7 @@ fn sparse_init_with(
     let t_stage = Instant::now();
     let ms: Vec<_> = pm
         .iter()
-        .filter(|p| poses[p.i].is_some() && poses[p.j].is_some())
+        .filter(|p| poses[p.i].is_some() && poses[p.j].is_some() && !p.left_cross)
         .map(|p| (p.i, p.j, p.inl.clone()))
         .collect();
     let tracks = multi_view_tracks(imgs, &ms);

@@ -204,3 +204,55 @@ fn default_args_synth_run_verify() {
     );
     assert!(m.points > 1000, "점 {}", m.points);
 }
+
+/// 진단: 환경 변수 SKY_IN·SKY_OUT 의 결과를 구역(refined/*.ply)별 점 표면 오차로 낸다.
+#[test]
+#[ignore]
+fn diag_surface_by_region() {
+    let (input, output) = (
+        PathBuf::from(std::env::var("SKY_IN").unwrap()),
+        PathBuf::from(std::env::var("SKY_OUT").unwrap()),
+    );
+    let shift = truth_to_output_shift(&input);
+    let scene = Scene::new(SceneConfig {
+        width: 320,
+        height: 180,
+        ..SceneConfig::default()
+    });
+    let mut files: Vec<_> = std::fs::read_dir(output.join("refined"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ply"))
+        .collect();
+    files.sort();
+    let mut all = Vec::new();
+    for f in files {
+        let mut d = Vec::new();
+        for p in read_ply_file(&f).unwrap().points {
+            let (x, y, z) = (
+                p.xyz[0] as f64 - shift[0],
+                p.xyz[1] as f64 - shift[1],
+                p.xyz[2] as f64 - shift[2],
+            );
+            d.push((z - scene.surface_height(x, y)).abs());
+        }
+        all.extend(d.iter().copied());
+        let n = d.len();
+        let m = median(&mut d);
+        let p90 = percentile(&mut d, 0.9);
+        eprintln!(
+            "DIAG {} n {n} med {m:.4} p90 {p90:.4}",
+            f.file_name().unwrap().to_string_lossy()
+        );
+    }
+    let m = measure(&input, &output);
+    eprintln!(
+        "DIAG center med {:.3} max {:.3}",
+        m.center_med, m.center_max
+    );
+    eprintln!(
+        "DIAG all med {:.4} p95 {:.4}",
+        median(&mut all),
+        percentile(&mut all, 0.95)
+    );
+}
