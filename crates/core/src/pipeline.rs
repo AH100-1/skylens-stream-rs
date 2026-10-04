@@ -47,6 +47,10 @@ pub enum DenseMethod {
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
     pub max_features: usize,
+    /// 긴 변 800 미만 사진에서 확대 특징을 상한까지 더한다(기본 끔: 원래 검출이 상한 절반 미만일 때만).
+    pub upscale_fill: bool,
+    /// 회전 평균 전에 카메라 쌍 단위 회전 투표로 간선을 거른다(기본 끔).
+    pub pair_vote: bool,
     /// 밀집 깊이 맵 폭(px).
     pub dense_width: usize,
     /// 밀집 깊이 방식.
@@ -94,6 +98,8 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             max_features: 1500,
+            upscale_fill: false,
+            pair_vote: false,
             dense_width: 160,
             dense_method: DenseMethod::Sweep,
             hfov_deg: 65.0,
@@ -343,7 +349,7 @@ pub mod stand_in {
     }
 }
 
-fn load(path: &Path, max_features: usize) -> Result<ImgData, String> {
+fn load(path: &Path, max_features: usize, upscale_fill: bool) -> Result<ImgData, String> {
     let rgb = image::open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .to_rgb8();
@@ -352,6 +358,7 @@ fn load(path: &Path, max_features: usize) -> Result<ImgData, String> {
         &g,
         &DetectorConfig {
             max_features,
+            upscale_fill,
             ..DetectorConfig::default()
         },
     );
@@ -368,6 +375,8 @@ struct PairMatch {
     inl: Vec<(usize, usize)>,
     rot: Rotation3<f64>,
     t: Option<Vector3<f64>>,
+    /// 두 사진의 (카메라, 위치) 번호.
+    views: ((usize, usize), (usize, usize)),
 }
 
 /// 환경 변수 `SKYLENS_RANSAC_STATS` 가 있으면 짝마다 RANSAC 통계를 표준 오류로 낸다(진단용).
@@ -437,6 +446,7 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                 inl,
                 rot: rp.rotation,
                 t: rp.translation_observable.then_some(rp.translation),
+                views: (views[i], views[j]),
             })
         })
         .collect()
@@ -878,6 +888,8 @@ pub struct PreviewOpts {
     /// 비행 축 둘레 회전을 보는 방향 평균 z 가 가장 작은 각(2° 격자)으로 고른다. 정밀 BA 시작점용:
     /// 정밀 BA 는 이 축 둘레 회전을 15회 안에 다 못 풀어 시작 롤이 정밀 표면 오차에 그대로 남는다.
     pub legacy_roll: bool,
+    /// 회전 평균 전에 카메라 쌍 단위 회전 투표로 간선을 거른다.
+    pub pair_vote: bool,
     /// 위치 전용 다듬기 반복 수(0 이면 끔).
     pub refine_iters: usize,
     /// 다듬기 Huber 문턱(도).
@@ -900,6 +912,7 @@ impl Default for PreviewOpts {
             ray_deg: PREVIEW_MIN_RAY_DEG,
             tri_deg: None,
             legacy_roll: false,
+            pair_vote: false,
             refine_iters: 0,
             refine_huber_deg: 0.3,
             refine_drop_deg: 2.0,
@@ -920,6 +933,7 @@ impl PreviewOpts {
                 Some(("min_inl", v)) => o.min_inl = v.parse().unwrap_or(0),
                 Some(("passes", v)) => o.passes = v.parse().unwrap_or(1),
                 Some(("vfix", v)) => o.vfix = v == "1",
+                Some(("vote", v)) => o.pair_vote = v == "1",
                 Some(("ray", v)) => o.ray_deg = v.parse().unwrap_or(o.ray_deg),
                 Some(("tri", v)) => o.tri_deg = v.parse().ok(),
                 Some(("refine", v)) => o.refine_iters = v.parse().unwrap_or(0),
@@ -946,6 +960,56 @@ pub struct PreviewStages {
 
 type RotsAndKeep = (Vec<Option<Rotation3<f64>>>, Vec<bool>);
 
+/// 카메라 쌍 단위 회전 투표(`sparse::vote_keep`)로 간선을 거른다. 환경 변수 `SKYLENS_VOTE_STATS` 가
+/// 있으면 뺀 간선의 (카메라, 위치)와 상대 회전 행렬을 표준 오류로 낸다(진단용).
+fn vote_pairs(n: usize, pm: &[PairMatch], keep: &mut [bool]) {
+    let mut group = vec![0usize; n];
+    for p in pm {
+        group[p.i] = p.views.0 .0;
+        group[p.j] = p.views.1 .0;
+    }
+    let idx: Vec<usize> = (0..pm.len()).filter(|&k| keep[k]).collect();
+    let edges: Vec<crate::sparse::VoteEdge> = idx
+        .iter()
+        .map(|&k| crate::sparse::VoteEdge {
+            i: pm[k].i,
+            j: pm[k].j,
+            rot: pm[k].rot,
+            weight: pm[k].inl.len() as f64,
+        })
+        .collect();
+    let ok = crate::sparse::vote_keep(&group, &edges);
+    let stats = std::env::var_os("SKYLENS_VOTE_STATS").is_some();
+    let cross = |p: &PairMatch| p.views.0 .0 != p.views.1 .0;
+    if stats {
+        eprintln!(
+            "vote_stat cross_edges {} dropped {}",
+            idx.iter().filter(|&&k| cross(&pm[k])).count(),
+            ok.iter().filter(|&&b| !b).count()
+        );
+    }
+    for (&k, &o) in idx.iter().zip(&ok) {
+        if !o {
+            keep[k] = false;
+        }
+        if stats && cross(&pm[k]) {
+            let r = pm[k].rot.matrix();
+            eprintln!(
+                "vote_edge cam {} pos {} cam {} pos {} kept {} rot {}",
+                pm[k].views.0 .0,
+                pm[k].views.0 .1,
+                pm[k].views.1 .0,
+                pm[k].views.1 .1,
+                o,
+                r.iter()
+                    .map(|x| format!("{x:.6}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+}
+
 /// 회전 평균 + 상대 회전과 어긋나는 간선 제거 뒤 재평균. 반환: 회전, 간선 유지 표시.
 fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<RotsAndKeep, String> {
     let mk = |keep: &[bool]| -> Vec<RelativeRotation> {
@@ -961,6 +1025,9 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
             .collect()
     };
     let mut keep: Vec<bool> = pm.iter().map(|p| p.inl.len() >= opts.min_inl).collect();
+    if opts.pair_vote {
+        vote_pairs(n, pm, &mut keep);
+    }
     let ra = average_rotations(n, &mk(&keep), &AveragingConfig::default())
         .ok_or("회전 평균 실패: 쓸 수 있는 간선 없음")?;
     let mut rots = ra.rotations;
@@ -2133,7 +2200,11 @@ pub fn run_pipeline_with(
                         .map(|&g| {
                             Ok((
                                 g,
-                                load(&ds.positions[g / 3].images[g % 3], cfg.max_features)?,
+                                load(
+                                    &ds.positions[g / 3].images[g % 3],
+                                    cfg.max_features,
+                                    cfg.upscale_fill,
+                                )?,
                             ))
                         })
                         .collect()
@@ -2193,6 +2264,7 @@ pub fn run_pipeline_with(
                     (0, 2.0),
                     &PreviewOpts {
                         refine_iters: cfg.preview_refine_iters,
+                        pair_vote: cfg.pair_vote,
                         ..PreviewOpts::default()
                     },
                 )
@@ -2217,8 +2289,22 @@ pub fn run_pipeline_with(
         };
         // 초벌(미리보기)은 위의 광축 높이 분산 롤을 쓰고, 정밀 BA 시작점만 예전 롤 규칙으로 따로 만든다.
         let coarse_start = start;
-        let start = sparse_init_roll(&imgs, &pm, &gps, &k, cfg.position, &tri, (0, 2.0), true)
-            .unwrap_or_else(|_| coarse_start.clone());
+        let start = sparse_init_with(
+            &imgs,
+            &pm,
+            &gps,
+            &k,
+            cfg.position,
+            &tri,
+            (0, 2.0),
+            &PreviewOpts {
+                legacy_roll: true,
+                pair_vote: cfg.pair_vote,
+                ..PreviewOpts::default()
+            },
+        )
+        .map(|r| r.0)
+        .unwrap_or_else(|_| coarse_start.clone());
         let init = if cfg.preview_ba_iters > 0 {
             let mut p = coarse_start.clone();
             p.rms = crate::timing::timed("ba_preview", || {
@@ -2634,7 +2720,7 @@ mod diag {
         let gids: Vec<usize> = (0..n).collect();
         let data: Vec<ImgData> = gids
             .iter()
-            .map(|g| load(&ds.positions[g / 3].images[g % 3], 800).unwrap())
+            .map(|g| load(&ds.positions[g / 3].images[g % 3], 800, false).unwrap())
             .collect();
         let imgs: Vec<&ImgData> = data.iter().collect();
         let k = Intrinsics::from_hfov(
@@ -2862,7 +2948,7 @@ mod diag {
         let gids: Vec<usize> = (0..n).collect();
         let data: Vec<ImgData> = gids
             .iter()
-            .map(|g| load(&ds.positions[g / 3].images[g % 3], 800).unwrap())
+            .map(|g| load(&ds.positions[g / 3].images[g % 3], 800, false).unwrap())
             .collect();
         let imgs: Vec<&ImgData> = data.iter().collect();
         let k = Intrinsics::from_hfov(
