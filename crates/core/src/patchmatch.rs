@@ -169,6 +169,12 @@ pub struct Config {
     pub fast_iterations: usize,
     /// `estimate_fast` 의 원 해상도 층 전파 후보 수(4 면 가까운 4 만).
     pub fine_prop: usize,
+    /// `estimate_fast` 고운 층에서 이 비용 미만인 화소는 전파·깊이 섭동을 건너뛴다.
+    pub skip_cost: f32,
+    /// 건너뛴 화소에 깊이를 고정하고 법선만 시험하는 횟수(반복마다). 0 이면 시험 없음,
+    /// 1(기본)은 가까운 네 이웃 법선의 평균 한 번만, 2 이상부터 그 뒤에 무작위 법선 섭동
+    /// (`skip_probes - 1` 회, 진폭은 시도마다 절반)을 더한다.
+    pub skip_probes: usize,
 }
 
 impl Default for Config {
@@ -185,14 +191,16 @@ impl Default for Config {
             perturbations: 3,
             refine_perturbations: 1,
             max_neighbors: 8,
-            fine_neighbors: 4,
+            fine_neighbors: 3,
             normal_steps: 5,
             fine_step: 4,
             fine_propagation: 4,
             coarse_neighbors: 4,
             seed: 0x5eed,
-            fast_iterations: 4,
+            fast_iterations: 3,
             fine_prop: 4,
+            skip_cost: 0.08,
+            skip_probes: 1,
         }
     }
 }
@@ -732,7 +740,9 @@ pub struct LevelTime {
     pub run_s: f64,
 }
 
-/// [`estimate`] 와 같고, `profile` 이 있으면 층마다 시간을 거친 층부터 채운다.
+/// [`estimate`] 가 쓰는 빠른 경로(`estimate_fast`)가 아니라 이전 다단계 경로의 층별 시간 측정판이다.
+/// `profile` 이 있으면 층마다 시간을 거친 층부터 채운다. 빠른 경로의 단계별 시간은
+/// [`estimate_fast_profiled`] 를 쓴다.
 pub fn estimate_profiled(
     ref_view: &View,
     neighbors: &[View],
@@ -973,8 +983,6 @@ fn ncc_cost(q: &Vector3<f32>, patch: &RefPatch, h: &Matrix3<f32>, img: &GrayImag
 
 /// 빠른 경로의 상위 k 시점 집계 개수(Shen 2013).
 const FAST_TOP_K: usize = 3;
-/// 고운 층에서 이 비용 미만이면 갱신을 건너뛴다.
-const FAST_SKIP_COST: f32 = 0.0;
 /// 고운 층에서 전파 후보로 삼는 이웃 가설의 비용 상한(1 − NCC).
 const FAST_TAU_KEEP: f32 = 0.9;
 
@@ -1354,7 +1362,56 @@ impl FCtx<'_> {
         tried[0] = (best.d, best.n);
         // 전파: 가까운 4 + 먼 4 표본(반대 색 화소)의 평면을 이 화소 광선으로 옮긴다.
         if best.c < sc.skip_below {
-            return None;
+            // 건너뛴 화소: 깊이는 두고 법선만 작게 흔든다(법선 정확도 유지).
+            // 가까운 네 이웃 법선의 평균을 후보로 한 번 시험(국소 평활).
+            if sc.skip_probes > 0 {
+                let mut sum = Vector3::<f32>::zeros();
+                for (dx, dy) in [(0i32, -1i32), (0, 1), (-1, 0), (1, 0)] {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx >= 0 && ny >= 0 && nx < self.w as i32 && ny < self.h as i32 {
+                        let c = &cur[ny as usize * self.w + nx as usize];
+                        if c.c < sc.prop_max {
+                            sum += c.n;
+                        }
+                    }
+                }
+                let nrm = sum.norm();
+                if nrm > 1e-3 {
+                    let nn = sum / nrm;
+                    if nn.dot(&m) < -0.05 * m.norm() {
+                        let cost = self.agg(&q, &m, best.d, &nn, p, mean, istd, msk, best.c);
+                        if cost < best.c {
+                            best = FHyp {
+                                d: best.d,
+                                n: nn,
+                                c: cost,
+                            };
+                        }
+                    }
+                }
+            }
+            let mut an = sc.amp_n;
+            for _ in 0..sc.skip_probes.saturating_sub(1) {
+                let dn = best.n
+                    + Vector3::new(
+                        an * (2.0 * rng.f() - 1.0),
+                        an * (2.0 * rng.f() - 1.0),
+                        an * (2.0 * rng.f() - 1.0),
+                    );
+                let nn = dn / dn.norm();
+                if nn.dot(&m) < -0.05 * m.norm() && nn.iter().all(|v| v.is_finite()) {
+                    let cost = self.agg(&q, &m, best.d, &nn, p, mean, istd, msk, best.c);
+                    if cost < best.c {
+                        best = FHyp {
+                            d: best.d,
+                            n: nn,
+                            c: cost,
+                        };
+                    }
+                }
+                an *= 0.5;
+            }
+            return (best.c < cur[i].c).then_some(best);
         }
         for &(dx, dy) in &PAT[..sc.n_prop] {
             let (nx, ny) = (x as i32 + dx, y as i32 + dy);
@@ -1442,6 +1499,8 @@ struct FSched {
     skip_below: f32,
     /// 이 비용 이상인 이웃 가설은 전파 후보에서 뺀다.
     prop_max: f32,
+    /// 건너뛴 화소의 법선 전용 섭동 횟수.
+    skip_probes: usize,
 }
 
 struct FLevel {
@@ -1696,7 +1755,8 @@ pub fn estimate_fast_profiled(
                 } else {
                     8
                 },
-                skip_below: if coarsest { 0.0 } else { FAST_SKIP_COST },
+                skip_below: if coarsest { 0.0 } else { cfg.skip_cost },
+                skip_probes: cfg.skip_probes,
                 prop_max: if coarsest { MAX_COST } else { FAST_TAU_KEEP },
             };
             for color in 0..2usize {
@@ -2257,9 +2317,10 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// 960×540, 이웃 8장 한 장 시간(목표 ≤ 0.7 s). cargo test --release -- --ignored timing_960
+    /// 960×540, 이웃 8장 한 장 시간(F-048 목표 ≤ 0.7 s). 기본 경로 `estimate` 를 잰다.
+    /// 부하가 낮은 기계에서만 의미가 있다. cargo test --release -- --ignored timing_960 --nocapture
     #[test]
-    #[ignore = "시간 측정용(4 코어 측정 기계 부하 상태에서 목표 0.7 s 미달, 노트 참조)"]
+    #[ignore = "시간 측정용(부하가 낮은 기계에서만 0.7 s 단언이 의미 있음, 노트 참조)"]
     fn timing_960() {
         let scene = Scene::Slanted {
             z0: 10.0,
@@ -2269,27 +2330,11 @@ mod tests {
         let cams = rig8(960, 540, 1.0, 10.0);
         let (refv, ns, gt) = views(&cams, &scene);
         let hwm0 = peak_rss_kb();
-        let mut prof = Vec::new();
+        let cfg = Config::default();
         let t = std::time::Instant::now();
-        let mut cfg = Config::default();
-        let env = |k: &str, d: usize| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
-        };
-        cfg.coarse_width = env("PM_CW", cfg.coarse_width);
-        cfg.iterations = env("PM_IT", cfg.iterations);
-        cfg.refine_iterations = env("PM_RI", cfg.refine_iterations);
-        let dm = estimate_profiled(&refv, &ns, (5.0, 20.0), &cfg, Some(&mut prof));
+        let dm = estimate(&refv, &ns, (5.0, 20.0), &cfg);
         let el = t.elapsed().as_secs_f64();
         let hwm1 = peak_rss_kb();
-        for p in &prof {
-            eprintln!(
-                "층 너비 {}: 시작 비용 {:.3} s, 전파·정련 {:.3} s",
-                p.width, p.eval_s, p.run_s
-            );
-        }
         eprintln!(
             "최대 상주 메모리: 추정 전 {} kB, 후 {} kB (증가 {} kB)",
             hwm0,
@@ -2602,6 +2647,10 @@ mod tests {
         cfg.refine_iterations = env("PM_RI", cfg.refine_iterations);
         cfg.perturbations = env("PM_PE", cfg.perturbations);
         cfg.fine_neighbors = env("PM_FN", cfg.fine_neighbors);
+        cfg.skip_probes = env("PM_SP", cfg.skip_probes);
+        if let Ok(v) = std::env::var("PM_SK") {
+            cfg.skip_cost = v.parse().unwrap_or(cfg.skip_cost);
+        }
         let load = || std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
         let mut best = f64::INFINITY;
         for round in 0..1 {
@@ -2633,6 +2682,18 @@ mod tests {
             if round == 0 {
                 assert!(s.median_rel < 0.005, "상대오차 중앙값 {}", s.median_rel);
                 assert!(s.within_1pct > 0.90, "1% 이내 비율 {}", s.within_1pct);
+                assert!(
+                    s.median_normal_deg < 5.0,
+                    "법선 중앙값 {:.2}° >= 5°",
+                    s.median_normal_deg
+                );
+                // 부하가 낮은 기계에서만: PM_MAX_S=0.7 처럼 켠다.
+                if let Some(max_s) = std::env::var("PM_MAX_S")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                {
+                    assert!(el <= max_s, "{el:.3} s > {max_s} s");
+                }
             }
         }
         eprintln!("최소 {best:.3} s");
