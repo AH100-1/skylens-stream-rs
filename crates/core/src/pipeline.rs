@@ -722,6 +722,48 @@ fn averaged_centers(
     Some(out)
 }
 
+/// 카메라 중심 정밀화의 정규방정식(당김 항 전)이 받아들이는 최소/최대 고윳값 비 하한.
+/// 점 광선 퍼짐이 약 6° 보다 좁으면 비가 이보다 작다. 합성 흐름의 정상 카메라는 0.05 이상이다.
+const REFINE_MIN_EIG_RATIO: f64 = 3e-3;
+/// 카메라 중심 정밀화에 필요한 최소 제약(점 광선) 수.
+const REFINE_MIN_CONS: usize = 3;
+
+/// 중심 한 걸음. 제약은 (세계 방향 단위 광선, 삼각측량한 점). 현재 중심 `cur` 에서 각 잔차 Huber(`delta`),
+/// 1/깊이² 가중의 3x3 정규방정식을 풀고 `anchor` 쪽으로 약하게(`anchor_w`) 당긴다.
+/// 제약이 `REFINE_MIN_CONS` 개 미만이거나 당김 항을 넣기 전 정규방정식의 최소/최대 고윳값 비가
+/// `REFINE_MIN_EIG_RATIO` 미만(광선이 한쪽으로 몰림)이면 `None`: 호출한 쪽이 이전 중심을 유지한다.
+fn refine_camera_center(
+    cur: &Vector3<f64>,
+    anchor: &Vector3<f64>,
+    cons: &[(Vector3<f64>, Vector3<f64>)],
+    delta: f64,
+    anchor_w: f64,
+) -> Option<Vector3<f64>> {
+    if cons.len() < REFINE_MIN_CONS {
+        return None;
+    }
+    let mut a = Matrix3::zeros();
+    let mut b = Vector3::zeros();
+    for (v, x) in cons {
+        let d = (x - cur).norm().max(1e-5);
+        let pm = Matrix3::identity() - v * v.transpose();
+        let ang = (pm * (x - cur)).norm() / d;
+        let w = if ang <= delta { 1.0 } else { delta / ang } / (d * d);
+        a += w * pm;
+        b += w * pm * x;
+    }
+    let eig = a.symmetric_eigen().eigenvalues;
+    let (lo, hi) = (eig.min(), eig.max());
+    if !(hi > 0.0 && lo >= REFINE_MIN_EIG_RATIO * hi) {
+        return None;
+    }
+    let mu = anchor_w * a.trace() / 3.0;
+    a += Matrix3::identity() * mu;
+    b += mu * anchor;
+    let sol = a.lu().solve(&b)?;
+    sol.iter().all(|v| v.is_finite()).then_some(sol)
+}
+
 /// 초벌 위치 전용 다듬기(번들 조정이 아니다): 회전을 고정하고 카메라 중심만 고친다.
 /// 트랙 점을 현재 중심에서 광선 교차로 삼각측량하고, 카메라마다 점–카메라 광선 제약
 /// (각 잔차 Huber 가중, 3x3 정규방정식)으로 중심을 갱신하는 일을 `iters` 번 번갈아 한다.
@@ -813,26 +855,12 @@ fn refine_centers(
             .into_par_iter()
             .map(|i| {
                 let ci = c[i]?;
-                if by_cam[i].len() < 3 {
-                    return c[i];
-                }
-                let mut a = Matrix3::zeros();
-                let mut b = Vector3::zeros();
-                for &o in &by_cam[i] {
-                    let (_, j, v) = obs[o];
-                    let x = pts[j]?;
-                    let d = (x - ci).norm().max(1e-5);
-                    let pm = proj(&v);
-                    let ang = (pm * (x - ci)).norm() / d;
-                    let w = if ang <= delta { 1.0 } else { delta / ang } / (d * d);
-                    a += w * pm;
-                    b += w * pm * x;
-                }
-                let mu = opts.refine_anchor * a.trace() / 3.0;
+                let cons: Vec<(Vector3<f64>, Vector3<f64>)> = by_cam[i]
+                    .iter()
+                    .filter_map(|&o| Some((obs[o].2, pts[obs[o].1]?)))
+                    .collect();
                 let anchor = c0[i]?;
-                a += Matrix3::identity() * mu;
-                b += mu * anchor;
-                a.lu().solve(&b)
+                refine_camera_center(&ci, &anchor, &cons, delta, opts.refine_anchor).or(Some(ci))
             })
             .collect();
         c = new_c;
@@ -2837,6 +2865,149 @@ mod diag {
         }
     }
 
+    /// 초벌 카메라 중심 오차: 정렬 전 / 점쌍 닮음 뒤 / 중심쌍 닮음 뒤 / 점쌍+중심쌍 닮음 뒤.
+    /// `SKYLENS_STRIDE`(기본 1), `SKYLENS_SPAN`(기본 48), `SKYLENS_CREP`(중심쌍 반복, 기본 3).
+    /// `cargo test --release preview_center_align -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn preview_center_align() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let root = std::env::temp_dir().join(format!("skylens_pca_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let scene = Scene::new(SceneConfig {
+            width: 320,
+            height: 180,
+            ..SceneConfig::default()
+        });
+        scene.write_dataset(&root).unwrap();
+        let ds = load_dataset(
+            &root,
+            DatasetConfig {
+                stride: env("SKYLENS_STRIDE", 1),
+                span: env("SKYLENS_SPAN", 48),
+                ovl: 2,
+                max_skip_run: 2,
+            },
+        )
+        .unwrap();
+        let region = split_regions(ds.positions.len(), ds.config.span, ds.config.ovl)[0];
+        let n_pos = region.hi.min(ds.positions.len());
+        let n = n_pos * 3;
+        let gids: Vec<usize> = (0..n).collect();
+        let data: Vec<ImgData> = gids
+            .iter()
+            .map(|g| load(&ds.positions[g / 3].images[g % 3], 800).unwrap())
+            .collect();
+        let imgs: Vec<&ImgData> = data.iter().collect();
+        let k = Intrinsics::from_hfov(
+            data[0].rgb.width(),
+            data[0].rgb.height(),
+            65f64.to_radians(),
+        );
+        let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
+        let gps: Vec<Vector3<f64>> = gids
+            .iter()
+            .map(|g| ds.positions[g / 3].image_enu[g % 3])
+            .collect();
+        let pm = match_pairs(&imgs, &views, &k);
+        let (init, _) = sparse_init_with(
+            &imgs,
+            &pm,
+            &gps,
+            &k,
+            PipelineConfig::default().position,
+            &TriConfig::from_config(&PipelineConfig::default()),
+            (0, 2.0),
+            &PreviewOpts::default(),
+        )
+        .unwrap();
+        let mut rs = init.clone();
+        run_ba(&mut rs, &k, 10, Some(&gps), 2.0, &[]);
+        gps_align_refined(&mut rs, &gps);
+        let truth: Vec<Vector3<f64>> = gids
+            .iter()
+            .map(|&g| {
+                let name = ds.positions[g / 3].images[g % 3]
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let v = scene.views.iter().find(|v| v.name == name).unwrap();
+                scene.to_first_gps_frame(&v.camera.pose.center()).coords
+            })
+            .collect();
+        let good = well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200);
+        let (ta, tb) = (to_tracks(&good, &gids), to_tracks(&rs, &gids));
+        let win = (region.lo, region.hi);
+        let pairs = point_pairs(&ta, &tb, |i| (i / 3) as usize, win);
+        let (sim_pt, rec) = align_region(&region, &pairs);
+        let cpairs: Vec<(Vector3<f64>, Vector3<f64>)> = (0..n)
+            .filter_map(|i| Some((init.poses[i]?.center().coords, rs.poses[i]?.center().coords)))
+            .collect();
+        let (cs, cd): (Vec<_>, Vec<_>) = cpairs.iter().copied().unzip();
+        let sim_c = crate::stream::robust_fit(&cs, &cd).map(|f| f.0);
+        let rep = env("SKYLENS_CREP", 3);
+        let mut joint = pairs.clone();
+        for _ in 0..rep {
+            joint.extend(cpairs.iter().copied());
+        }
+        let (js, jd): (Vec<_>, Vec<_>) = joint.iter().copied().unzip();
+        let sim_j = crate::stream::robust_fit(&js, &jd).map(|f| f.0);
+        let cerr = |sim: Option<&Similarity>, ps: &Sparse| -> Vec<f64> {
+            (0..n)
+                .filter_map(|i| {
+                    let c = ps.poses[i]?.center().coords;
+                    let c = sim.map_or(c, |m| m.apply_point(&c));
+                    Some((c - truth[i]).norm())
+                })
+                .collect()
+        };
+        let dzm = |sim: Option<&Similarity>, ps: &Sparse| -> f64 {
+            med((0..n)
+                .filter_map(|i| {
+                    let c = ps.poses[i]?.center().coords;
+                    let c = sim.map_or(c, |m| m.apply_point(&c));
+                    Some((c.z - truth[i].z).abs())
+                })
+                .collect())
+        };
+        eprintln!(
+            "PCA refined centers: err med {:.3} dz {:.3} | preview pre-align err med {:.3} dz {:.3}",
+            med(cerr(None, &rs)),
+            dzm(None, &rs),
+            med(cerr(None, &init)),
+            dzm(None, &init)
+        );
+        let inr = vec![true; n];
+        let rc = dense_cloud(&rs, &imgs, &k, &inr, 96, DenseMethod::Sweep);
+        let pc = dense_cloud(&good, &imgs, &k, &inr, 96, DenseMethod::Sweep);
+        let xyz = |c: &PointCloud| -> Vec<[f64; 3]> {
+            c.points
+                .iter()
+                .map(|p| [p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64])
+                .collect()
+        };
+        let rx = xyz(&rc);
+        for (label, sim) in [("points", &sim_pt), ("centers", &sim_c), ("joint", &sim_j)] {
+            let a = sim.as_ref().map(|m| xyz(&apply_cloud(m, &pc)));
+            eprintln!(
+                "PCA {label}: pairs {} centers err med {:.3} dz {:.3} | nn med {:?} dz pair med {:?} | scale {:?}",
+                if label == "centers" { cpairs.len() } else if label == "joint" { joint.len() } else { rec.pairs },
+                med(cerr(sim.as_ref(), &init)),
+                dzm(sim.as_ref(), &init),
+                a.as_ref().and_then(|a| nn_median(a, &rx)),
+                a.as_ref().and_then(|a| height_pair_median(a, &rx, 2.0)),
+                sim.as_ref().map(|m| m.s),
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     #[ignore]
     fn diagnose_preview() {
@@ -3466,5 +3637,83 @@ mod refine_tests {
         refine_centers(&mut poses, &k, &tracks, &opts);
         let after = err(&poses);
         assert!(after < 0.7 * before, "{before} -> {after}");
+    }
+
+    /// 한 카메라의 제약: 정답 중심에서 지면 점으로 가는 광선과 그 점.
+    fn cons_from(truth: &Vector3<f64>, pts: &[Vector3<f64>]) -> Vec<(Vector3<f64>, Vector3<f64>)> {
+        pts.iter().map(|x| ((x - truth).normalize(), *x)).collect()
+    }
+
+    fn spread_points(n: usize, half: f64) -> Vec<Vector3<f64>> {
+        (0..n)
+            .map(|k| {
+                let a = k as f64 * 2.399963;
+                let r = half * (0.3 + 0.7 * ((k * 5) % 7) as f64 / 6.0);
+                Vector3::new(r * a.cos(), r * a.sin(), 0.0)
+            })
+            .collect()
+    }
+
+    /// 정답에서 0.43 m 벗어난 시작 → 한 걸음에 1e-3 m 안으로 돌아온다(움직임을 실제로 검사).
+    #[test]
+    fn refine_camera_center_moves_from_perturbed_start() {
+        let truth = Vector3::new(2.0, -1.0, 60.0);
+        let cons = cons_from(&truth, &spread_points(12, 30.0));
+        let start = truth + Vector3::new(0.3, -0.2, 0.25);
+        let c = refine_camera_center(&start, &start, &cons, 0.3f64.to_radians(), 1e-9)
+            .expect("well constrained");
+        assert!((start - truth).norm() > 0.4);
+        assert!((c - truth).norm() < 1e-3, "{c:?}");
+        // 기본 당김 항에서도 시작보다 정답에 가까워진다.
+        let c = refine_camera_center(&start, &start, &cons, 0.3f64.to_radians(), 0.02).unwrap();
+        assert!((c - truth).norm() < 0.5 * (start - truth).norm(), "{c:?}");
+    }
+
+    /// 제약 0~2개는 None, 3개부터 Some(경계).
+    #[test]
+    fn refine_camera_center_constraint_count_boundary() {
+        let truth = Vector3::new(0.0, 0.0, 60.0);
+        let all = cons_from(
+            &truth,
+            &[
+                Vector3::new(25.0, 0.0, 0.0),
+                Vector3::new(-12.0, 21.0, 0.0),
+                Vector3::new(-12.0, -21.0, 0.0),
+            ],
+        );
+        let start = truth + Vector3::new(0.2, 0.1, -0.2);
+        let run =
+            |n: usize| refine_camera_center(&start, &start, &all[..n], 0.3f64.to_radians(), 1e-9);
+        for n in 0..3 {
+            assert!(run(n).is_none(), "{n} constraints");
+        }
+        let c = run(3).expect("3 constraints");
+        assert!((c - truth).norm() < 1e-3, "{c:?}");
+    }
+
+    /// 광선이 한쪽으로 몰리고(퍼짐 1° 이하) 방향에 1° 잡음이 있으면 해를 받지 않아 중심이 움직이지 않는다.
+    #[test]
+    fn refine_camera_center_rejects_bunched_rays() {
+        let truth = Vector3::new(0.0, 0.0, 60.0);
+        // 지면 반폭 1 m ≈ 광선 퍼짐 1°.
+        let mut cons = cons_from(&truth, &spread_points(8, 1.0));
+        let mut seed = 7u64;
+        let mut rnd = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f64 / (1u64 << 31) as f64) - 0.5
+        };
+        for (v, _) in cons.iter_mut() {
+            let tilt = 1f64.to_radians();
+            *v = (*v + Vector3::new(rnd(), rnd(), 0.0) * 2.0 * tilt).normalize();
+        }
+        let start = truth + Vector3::new(0.1, 0.0, 0.1);
+        let r = refine_camera_center(&start, &start, &cons, 0.3f64.to_radians(), 0.02);
+        assert!(r.is_none(), "{r:?}");
+        // 같은 잡음이라도 퍼짐이 넓으면 1 m 안에서만 움직인다.
+        let wide = cons_from(&truth, &spread_points(8, 30.0));
+        let r = refine_camera_center(&start, &start, &wide, 0.3f64.to_radians(), 0.02).unwrap();
+        assert!((r - start).norm() < 1.0, "{r:?}");
     }
 }
