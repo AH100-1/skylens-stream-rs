@@ -1330,6 +1330,13 @@ fn apply_sparse_sim(s: &mut Sparse, sim: &Similarity) {
     }
 }
 
+/// 정밀↔정밀 재정렬 수락 여유(m): 점 대응 변환이 공유 카메라 중심 불일치(중앙값)를 이만큼보다 더 키우면 버린다.
+/// 2구역 앵커 장면의 좋은 재정렬은 0.38→0.77 m(공유 점 130 쌍), 3구역 도착 순서 장면의 틀어진 재정렬은 1.8→9.2 m(30 쌍).
+const REALIGN_CAM_SLACK_M: f64 = 1.0;
+
+/// 정밀 BA 시작점을 최신 정밀 모델에 붙이는 데 필요한 최소 공유 3D 점 쌍 수.
+const ATTACH_MIN_PAIRS: usize = 60;
+
 /// 붙이기 결과: (점 쌍 수, 잔차 중앙 m, 고정 카메라).
 type Attached = (usize, f64, Vec<(usize, Pose)>);
 /// 한 구역을 붙인 기록: (붙은 기준 구역 번호, 점 쌍 수, 잔차 중앙 m, 고정 카메라).
@@ -1360,6 +1367,16 @@ fn attach_to_refined(
         gids,
         &flags,
     )?;
+    // 공유 3D 점이 적으면 닮음 변환이 겹침 밖으로 어긋난다: 3구역 도착 순서 장면(공유 점 30 쌍, 잔차 2.2 m)에서
+    // 시작점 배율이 1.4 배 틀어져 정밀 모델이 이웃과 같은 좌표계에 놓이지 못했다(재정렬 잔차 0.93 m, 중심 오차 2.1→5.4 m).
+    // 기준 없이(GPS 정렬) 시작하는 쪽이 낫다. 공유 점 130 쌍인 2구역 앵커 장면은 그대로 붙는다.
+    if plan.pairs < ATTACH_MIN_PAIRS {
+        return Err(format!(
+            "공유 3D 점 {} 쌍 < {ATTACH_MIN_PAIRS}: 붙이기 변환이 불안정함 (겹침 카메라 {} 대)",
+            plan.pairs,
+            plan.fixed.len()
+        ));
+    }
     apply_sparse_sim(s, &plan.sim);
     let mut fixed = Vec::new();
     for (i, p) in &plan.fixed {
@@ -1740,8 +1757,6 @@ fn dense_icp_refine(
     target: &PointCloud,
     reach: f64,
     iters: usize,
-    cams: &[(Vector3<f64>, Vector3<f64>)],
-    cam_weight: f64,
 ) -> Option<(Similarity, usize)> {
     if std::env::var("SKYLENS_DENSE_ICP").as_deref() == Ok("0") {
         return None;
@@ -1799,20 +1814,8 @@ fn dense_icp_refine(
         }
         found.sort_by(|a, b| a.0.total_cmp(&b.0));
         found.truncate(found.len() * 7 / 10);
-        let mut a: Vec<Vector3<f64>> = found.iter().map(|f| f.1).collect();
-        let mut b: Vec<Vector3<f64>> = found.iter().map(|f| f.2).collect();
-        // 공유 카메라 중심 대응: 전체 가중치가 점 대응 합의 `cam_weight` 배가 되도록 복제해 같은 닮음 변환 적합에 넣는다.
-        if cam_weight > 0.0 && cams.len() >= 3 {
-            let rep =
-                ((cam_weight * found.len() as f64 / cams.len() as f64).round() as usize).max(1);
-            for (cs, cd) in cams {
-                let x = delta.apply_point(cs);
-                for _ in 0..rep {
-                    a.push(x);
-                    b.push(*cd);
-                }
-            }
-        }
+        let a: Vec<Vector3<f64>> = found.iter().map(|f| f.1).collect();
+        let b: Vec<Vector3<f64>> = found.iter().map(|f| f.2).collect();
         let step_sim = crate::align::umeyama(&a, &b)?;
         delta = step_sim.compose(&delta);
         npairs = found.len();
@@ -2094,6 +2097,8 @@ pub fn run_pipeline_with(
                 crate::progressive::chain_realign_with(&items, k, region_align)
             })
         };
+        // 거절한 구역: 이 구역을 거쳐 옮겨지는 구역의 누적 변환도 믿을 수 없으므로 함께 건너뛴다.
+        let mut rejected: Vec<usize> = Vec::new();
         for st in steps {
             let (j, acc) = (st.region, st.total);
             realigns.push(ReAlign {
@@ -2105,28 +2110,36 @@ pub fn run_pipeline_with(
                 scale: acc.s,
             });
             let jr = recs[j].region;
+            if rejected.contains(&st.via) {
+                rejected.push(j);
+                events.push(format!(
+                    "{:.1}s realign refined {} to refined {} via {} pairs {} median {:.3} m rejected: via region was rejected",
+                    t_now(),
+                    jr.index,
+                    recs[k].region.index,
+                    recs[st.via].region.index,
+                    st.pairs,
+                    st.median_m
+                ));
+                continue;
+            }
             let mut acc = acc;
             let mut moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
+            // 공유 카메라 중심(같은 사진 번호): j 구역 중심 → k 구역 중심(k 의 최신 좌표계).
+            let shared_cams: Vec<(Vector3<f64>, Vector3<f64>)> = recs[j]
+                .centers
+                .iter()
+                .filter_map(|(g, c)| {
+                    let ck = recs[k].centers.get(g)?;
+                    let w = recs[k].rsim.map_or(Vector3::new(ck[0], ck[1], ck[2]), |x| {
+                        x.apply_point(&Vector3::new(ck[0], ck[1], ck[2]))
+                    });
+                    Some((Vector3::new(c[0], c[1], c[2]), w))
+                })
+                .collect();
             if st.via == k {
                 let tgt = &recs[k].refined.as_ref().unwrap().1;
-                // 공유 카메라 중심(같은 사진 번호): 지금까지의 변환 `acc` 로 옮긴 j 구역 중심 → k 구역 중심(k 의 최신 좌표계).
-                let cam_pairs: Vec<(Vector3<f64>, Vector3<f64>)> = recs[j]
-                    .centers
-                    .iter()
-                    .filter_map(|(g, c)| {
-                        let ck = recs[k].centers.get(g)?;
-                        let v = Vector3::new(c[0], c[1], c[2]);
-                        let w = recs[k].rsim.map_or(Vector3::new(ck[0], ck[1], ck[2]), |x| {
-                            x.apply_point(&Vector3::new(ck[0], ck[1], ck[2]))
-                        });
-                        Some((acc.apply_point(&v), w))
-                    })
-                    .collect();
-                let cw = std::env::var("SKYLENS_CAM_W")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                if let Some((d, np)) = dense_icp_refine(&moved, tgt, 1.5, 6, &cam_pairs, cw) {
+                if let Some((d, np)) = dense_icp_refine(&moved, tgt, 1.5, 6) {
                     events.push(format!(
                         "{:.1}s dense refine region {} onto refined {} pairs {np} scale {:.4} rotation {:.3} deg shift {:.3} m",
                         t_now(),
@@ -2138,6 +2151,32 @@ pub fn run_pipeline_with(
                     ));
                     acc = d.compose(&acc);
                     moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
+                }
+            }
+            // 수락 검사: 공유 카메라 중심 불일치(중앙값)가 지금 배치보다 `REALIGN_CAM_SLACK_M` 넘게 나빠지면 이 재정렬을 버린다.
+            // 공유 3D 점이 적을 때(수십 쌍) 점 대응 변환이 점 잔차는 작아도 카메라를 수 m 어긋나게 옮긴다.
+            if shared_cams.len() >= 3 {
+                let med = |f: &dyn Fn(&Vector3<f64>) -> Vector3<f64>| {
+                    let mut d: Vec<f64> =
+                        shared_cams.iter().map(|(v, w)| (f(v) - w).norm()).collect();
+                    d.sort_by(|a, b| a.total_cmp(b));
+                    d[d.len() / 2]
+                };
+                let b = med(&|v| recs[j].rsim.map_or(*v, |x| x.apply_point(v)));
+                let a = med(&|v| acc.apply_point(v));
+                if a > b + REALIGN_CAM_SLACK_M {
+                    rejected.push(j);
+                    events.push(format!(
+                        "{:.1}s realign refined {} to refined {} via {} pairs {} median {:.3} m rejected: shared cameras {} center disagreement before {b:.3} m after {a:.3} m",
+                        t_now(),
+                        jr.index,
+                        recs[k].region.index,
+                        recs[st.via].region.index,
+                        st.pairs,
+                        st.median_m,
+                        shared_cams.len()
+                    ));
+                    continue;
                 }
             }
             write_decimated(out, &refined_name(&jr), &moved)?;
@@ -2490,9 +2529,10 @@ pub fn run_pipeline_with(
                     &recs[m],
                 ) {
                     Ok((n, med, fx)) => {
-                        // 보고하는 공유 점 수·sim3 잔차는 (이미 낸) 초벌 모델 기준으로 잰다.
+                        // 사건 줄의 공유 점 수·sim3 잔차는 실제로 정밀 BA 시작점에 적용한 계획의 값이다.
+                        // 이미 낸 초벌 모델에 같은 기준 구역을 다시 푼 값은 `coarse model` 이름으로 따로 남긴다.
                         let flags: Vec<bool> = init.poses.iter().map(|p| p.is_some()).collect();
-                        let (n, med) = crate::pipeline_stream::plan_anchor(
+                        let coarse = crate::pipeline_stream::plan_anchor(
                             &recs[slot].ta,
                             &recs[m].refined.as_ref().unwrap().0,
                             &recs[m].rposes,
@@ -2500,9 +2540,11 @@ pub fn run_pipeline_with(
                             &recs[slot].gids,
                             &flags,
                         )
-                        .map_or((n, med), |p| (p.pairs, p.median_m));
+                        .map_or("unavailable".to_string(), |p| {
+                            format!("pairs {} median {:.3} m", p.pairs, p.median_m)
+                        });
                         events.push(format!(
-                            "{:.1}s register region {} on refined {} shared cameras {} shared points {n} sim3 median {med:.3} m",
+                            "{:.1}s register region {} on refined {} shared cameras {} shared points {n} sim3 median {med:.3} m (coarse model: {coarse})",
                             t_now(),
                             r.index,
                             recs[m].region.index,
