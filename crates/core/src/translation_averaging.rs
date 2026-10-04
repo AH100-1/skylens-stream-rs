@@ -1053,40 +1053,90 @@ fn gp_solve(
         }
     };
     let first = (0..obs.len()).find(|&k| active[k]);
+    let mut by_point: Vec<Vec<usize>> = vec![Vec::new(); n_pts];
+    for (k, o) in obs.iter().enumerate() {
+        by_point[o.1].push(k);
+    }
     let mut d = vec![1.0; obs.len()];
     let mut irls = vec![1.0; obs.len()];
     let mut prev = f64::INFINITY;
     for it in 0..GP_ITERS {
         // c, X 풀이: Σ w d² |(X_p − c_i) − v/d|² → 정규방정식(좌표 공통 행렬).
-        let mut a = DMatrix::<f64>::zeros(m, m);
-        let mut b = DMatrix::<f64>::zeros(m, 3);
+        // 점 블록은 스칼라 대각이라 점을 소거한 카메라 축소 계통(n_cam × n_cam)만 밀집으로 푼다.
+        let mut s = DMatrix::<f64>::zeros(n_cam, n_cam);
+        let mut bc = DMatrix::<f64>::zeros(n_cam, 3);
+        let mut diag_c = vec![0.0f64; n_cam];
+        let mut app = vec![0.0f64; n_pts];
+        let mut bp = vec![Vector3::<f64>::zeros(); n_pts];
         for (k, &(cam, pt, v, wt)) in obs.iter().enumerate() {
             if !active[k] {
                 continue;
             }
-            let p = n_cam + pt;
             let w = wt * irls[k] * d[k] * d[k];
-            a[(cam, cam)] += w;
-            a[(p, p)] += w;
-            a[(cam, p)] -= w;
-            a[(p, cam)] -= w;
+            diag_c[cam] += w;
+            app[pt] += w;
             // d (X − c) = v 의 최소제곱: 행 (e_p − e_c)·d, 우변 v.
             let rv = v * (wt * irls[k] * d[k]);
+            bp[pt] += rv;
             for q in 0..3 {
-                b[(p, q)] += rv[q];
-                b[(cam, q)] -= rv[q];
+                bc[(cam, q)] -= rv[q];
             }
         }
-        let ridge = 1e-9 * (1.0 + a.diagonal().sum() / m as f64);
-        for i in 0..m {
-            a[(i, i)] += ridge;
+        let trace: f64 = diag_c.iter().sum::<f64>() + app.iter().sum::<f64>();
+        let ridge = 1e-9 * (1.0 + trace / m as f64);
+        for i in 0..n_cam {
+            s[(i, i)] += diag_c[i] + ridge;
         }
-        let Some(ch) = a.cholesky() else {
+        for a in app.iter_mut() {
+            *a += ridge;
+        }
+        // 점별 (카메라, 가중) 목록을 합쳐(같은 카메라 중복 합산) 슈어 보수를 더한다.
+        let mut entries: Vec<(usize, f64)> = Vec::new();
+        for pt in 0..n_pts {
+            entries.clear();
+            for &k in &by_point[pt] {
+                if active[k] {
+                    let (cam, _, _, wt) = obs[k];
+                    entries.push((cam, wt * irls[k] * d[k] * d[k]));
+                }
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            entries.sort_unstable_by_key(|e| e.0);
+            let mut merged: Vec<(usize, f64)> = Vec::with_capacity(entries.len());
+            for &(c, w) in &entries {
+                match merged.last_mut() {
+                    Some(l) if l.0 == c => l.1 += w,
+                    _ => merged.push((c, w)),
+                }
+            }
+            let inv = 1.0 / app[pt];
+            for &(ci, wi) in &merged {
+                for q in 0..3 {
+                    bc[(ci, q)] += wi * inv * bp[pt][q];
+                }
+                for &(cj, wj) in &merged {
+                    s[(ci, cj)] -= wi * wj * inv;
+                }
+            }
+        }
+        let Some(ch) = s.cholesky() else {
             break;
         };
-        let sol = ch.solve(&b);
-        for (i, xi) in x.iter_mut().enumerate() {
-            *xi = Vector3::new(sol[(i, 0)], sol[(i, 1)], sol[(i, 2)]);
+        let sol = ch.solve(&bc);
+        for i in 0..n_cam {
+            x[i] = Vector3::new(sol[(i, 0)], sol[(i, 1)], sol[(i, 2)]);
+        }
+        // 점 역대입: X_p = (b_p + Σ w c_i) / (app).
+        let mut acc = bp.clone();
+        for (k, &(cam, pt, _, wt)) in obs.iter().enumerate() {
+            if active[k] {
+                acc[pt] += x[cam] * (wt * irls[k] * d[k] * d[k]);
+            }
+        }
+        for pt in 0..n_pts {
+            x[n_cam + pt] = acc[pt] / app[pt];
         }
         // d 와 가중 갱신.
         let mut cost = 0.0;
@@ -1159,7 +1209,7 @@ fn global_positioning(
     cfg: &TranslationConfig,
 ) -> Option<TranslationResult> {
     let n_cam = rotations.len();
-    let n_pts = point_observations.iter().map(|o| o.point + 1).max()?;
+    let n_pts_orig = point_observations.iter().map(|o| o.point + 1).max()?;
     let rotations = finite_rotations(rotations);
     let mut obs = Vec::new();
     let mut bad = 0usize;
@@ -1181,6 +1231,14 @@ fn global_positioning(
     }
     if obs.is_empty() {
         return None;
+    }
+    // 쓰인 점 번호만 0.. 으로 압축한다(번호가 성기게 붙어도 비용이 같도록). 결과는 마지막에 원래 번호로 푼다.
+    let mut used: Vec<usize> = obs.iter().map(|o| o.1).collect();
+    used.sort_unstable();
+    used.dedup();
+    let n_pts = used.len();
+    for o in obs.iter_mut() {
+        o.1 = used.binary_search(&o.1).unwrap_or(0);
     }
     // 카메라–점 그래프의 가장 큰 연결 성분만 푼다(성분마다 축척·원점이 따로여서 함께 풀면 의미가 없다).
     {
@@ -1386,9 +1444,13 @@ fn global_positioning(
             inliers[e] = a <= cfg.outlier_threshold_rad;
         }
     }
+    let mut points_full: Vec<Option<Point3<f64>>> = vec![None; n_pts_orig];
+    for (p, v) in points.into_iter().enumerate() {
+        points_full[used[p]] = v;
+    }
     Some(TranslationResult {
         centers,
-        points,
+        points: points_full,
         residuals_rad: residuals,
         inliers,
         rejected,
@@ -2278,5 +2340,83 @@ mod tests {
         est.iter()
             .map(|e| Point3::from(s * r * (e.coords - me) + mt))
             .collect()
+    }
+
+    fn peak_rss_mb() -> f64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find(|l| l.starts_with("VmHWM:"))
+                    .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
+            })
+            .unwrap_or(0.0)
+            / 1024.0
+    }
+
+    /// 240장, 장당 4000 관측(점 5000개, 가시율 80%), 점 번호를 `offset` 만큼 민 입력으로 푼다.
+    /// 반환: (걸린 초, 카메라 중심 RMS 오차(닮음 정렬 뒤), 점 번호 압축 확인용 결과 길이).
+    fn sparse_run(offset: usize) -> (f64, f64, usize) {
+        let (n_cam, n_pts) = (240usize, 5000usize);
+        let mut rng = Rng(7);
+        let centers: Vec<Point3<f64>> = (0..n_cam)
+            .map(|i| {
+                Point3::new((i % 20) as f64 * 4.0, (i / 20) as f64 * 4.0, 30.0) + rng.vec3() * 0.3
+            })
+            .collect();
+        let pts: Vec<Point3<f64>> = (0..n_pts)
+            .map(|_| Point3::new(rng.unit() * 80.0, rng.unit() * 48.0, rng.unit() * 5.0))
+            .collect();
+        let rots: Vec<Option<Rotation3<f64>>> = vec![Some(Rotation3::identity()); n_cam];
+        let mut po = Vec::new();
+        for (i, c) in centers.iter().enumerate() {
+            let mut left = 4000usize;
+            for (p, x) in pts.iter().enumerate() {
+                // 남은 점 수에 비례해 뽑아 정확히 4000 개를 만든다.
+                if rng.unit() * ((n_pts - p) as f64) < left as f64 {
+                    left -= 1;
+                    let v = x - c;
+                    po.push(PointObservation {
+                        camera: i,
+                        point: p + offset,
+                        bearing: v + rng.vec3() * (v.norm() * 1e-4),
+                        weight: 1.0,
+                    });
+                }
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let res = average_translations_with_points(&rots, &[], &po, &TranslationConfig::default());
+        let secs = t0.elapsed().as_secs_f64();
+        let (est, gt): (Vec<_>, Vec<_>) = res
+            .centers
+            .iter()
+            .zip(&centers)
+            .filter_map(|(e, g)| Some(((*e)?, *g)))
+            .unzip();
+        assert!(est.len() >= n_cam * 9 / 10, "등록 {}", est.len());
+        let err = similarity_aligned_errors_pts(&est, &gt);
+        let rms = (err.iter().map(|e| e * e).sum::<f64>() / err.len() as f64).sqrt();
+        (secs, rms, res.points.len())
+    }
+
+    fn similarity_aligned_errors_pts(est: &[Point3<f64>], gt: &[Point3<f64>]) -> Vec<f64> {
+        let e: Vec<Option<Point3<f64>>> = est.iter().map(|p| Some(*p)).collect();
+        similarity_aligned_errors(&e, gt)
+    }
+
+    #[test]
+    #[ignore = "측정 시험(릴리스로 실행): 240장 x 장당 4000 관측"]
+    fn sparse_scaling_240_cameras_4000_obs() {
+        let (t0, rms0, _) = sparse_run(0);
+        let (t1, rms1, len1) = sparse_run(1_000_000);
+        let rss = peak_rss_mb();
+        eprintln!("offset 0: {t0:.2} s rms {rms0:.4}; offset 1e6: {t1:.2} s rms {rms1:.4}; peak {rss:.0} MB");
+        assert!(len1 > 1_000_000, "{len1}");
+        assert!(t0 < 60.0, "{t0}");
+        assert!(rss < 1024.0, "{rss}");
+        assert!((t1 - t0).abs() <= 0.1 * t0.max(1.0), "{t0} vs {t1}");
+        assert!((rms0 - rms1).abs() < 1e-4, "{rms0} vs {rms1}");
+        assert!(rms0 < 0.05, "{rms0}");
     }
 }
