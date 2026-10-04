@@ -71,6 +71,34 @@ pub struct PipelineConfig {
     pub preview_ba_iters: usize,
     /// 초벌 위치 전용 다듬기 반복 수(회전 고정, 카메라 중심만). 0 이면 끈다. BA 가 아니다.
     pub preview_refine_iters: usize,
+    /// 구역 복원에만 넣는 보조 사진 범위(출력·점수·등록 집계에서 제외).
+    pub helper: HelperConfig,
+}
+
+/// 구역 복원용 보조 사진 규칙. 구역의 소유 위치·출력 대상은 바꾸지 않고, 다른 카메라 짝(F-197)이
+/// 구역 창 밖의 사진과만 겹치는 문제를 메운다. 보조 사진은 등록·BA 에만 쓰이고 밀집·출력 대상이 아니다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HelperConfig {
+    /// 구역 앞쪽 F 보조 범위: 위치 [lo-front_span, lo-1]. 0 이면 끈다.
+    pub front_span: usize,
+    /// 구역 뒤쪽 R·L 보조 범위: 위치 [hi, lo+back_span] (구역 시작 기준 위치 차 최대 back_span). 0 이면 끈다.
+    pub back_span: usize,
+    /// 뒤쪽 보조 위치 간격(1 이면 모든 위치).
+    pub back_step: usize,
+}
+
+impl Default for HelperConfig {
+    /// 기본: 앞쪽 F 40위치, 뒤쪽 R·L [hi, lo+40] 전부(간격 1).
+    /// 짝 일정 F(p)–R/L(p+20..=p+40, 4칸 간격)이 구역 [lo,hi) 밖으로 닿는 범위다. 구역이 41위치 이상이면 뒤쪽 보조는 없다.
+    /// 간격을 4 로 두면 F(p) 는 p 와 4 로 나눈 나머지가 같은 위치의 R·L 하고만 짝이 되어, 구역 끝 위치 hi 와
+    /// 나머지가 다른 F 는 다른 카메라 짝이 없다. 그래서 간격 1 이 기본이다.
+    fn default() -> Self {
+        Self {
+            front_span: HELPER_SPAN,
+            back_span: HELPER_SPAN,
+            back_step: 1,
+        }
+    }
 }
 
 impl PipelineConfig {
@@ -106,6 +134,7 @@ impl Default for PipelineConfig {
             gps_sigma_v: 2.0,
             preview_ba_iters: 0,
             preview_refine_iters: 5,
+            helper: HelperConfig::default(),
         }
     }
 }
@@ -1871,6 +1900,34 @@ fn write_decimated(out: &Path, name: &str, cloud: &PointCloud) -> Result<(), Str
 const HELPER_SPAN: usize = 40;
 const HELPER_MIN: usize = 1;
 
+/// 구역 사진 목록: 보조 사진(앞쪽 F, 뒤쪽 R·L)이 앞에, 소유 위치 사진(위치 순, 카메라 F·R·L)이 뒤에 온다.
+/// 반환: (전역 사진 번호 3·위치+카메라, 보조 사진 수).
+///
+/// 구역 뒤쪽 R·L 은 F(p+20..) 쪽 짝을 위해 구역 밖 뒤 위치 사진을 보조로 넣는다(F(p)–R/L(p+20..=p+40)).
+fn region_gids(r: &Region, n_pos: usize, hc: &HelperConfig) -> (Vec<usize>, usize) {
+    let helper_lo = r.lo.saturating_sub(hc.front_span);
+    let helper_hi = if r.lo >= HELPER_MIN {
+        r.lo - HELPER_MIN + 1
+    } else {
+        0
+    };
+    // 뒤쪽 보조는 구역 시작 위치 기준 위치 차 +back_span 까지만: 구역이 이미 그보다 길면(span 48) 필요 없다.
+    let back_hi = (r.hi + hc.back_span)
+        .min(r.lo + hc.back_span + 1)
+        .min(n_pos);
+    let back_pos = (r.hi..back_hi).step_by(hc.back_step.max(1));
+    let helpers: Vec<usize> = (helper_lo..helper_hi.max(helper_lo))
+        .map(|p| 3 * p)
+        .chain(back_pos.flat_map(|p| [3 * p + 1, 3 * p + 2]))
+        .collect();
+    let n_help = helpers.len();
+    let gids = helpers
+        .into_iter()
+        .chain((r.lo..r.hi).flat_map(|p| (0..3).map(move |c| 3 * p + c)))
+        .collect();
+    (gids, n_help)
+}
+
 /// 끝까지 돌린다. 출력 폴더에 preview·refined·snapshots·manifest.json·report.json·poses.txt 를 쓴다.
 ///
 /// 구역은 위치 순서로 하나씩 도착한다: 사진 읽기 → 짝 맞춤 → 등록(초벌 희소 모델) → 초벌 점군을 곧바로
@@ -2100,20 +2157,15 @@ pub fn run_pipeline_with(
         events.push(format!("{:.1}s arrive region {}", t_now(), r.index));
         // 구역 시작 쪽 R·L 은 F(p-40..=p-20) 와만 겹친다(F-197). 구역 밖 앞쪽 F 사진을 보조로 넣어
         // 구역 첫 위치들의 카메라 간 짝이 끊기지 않게 한다. 보조 사진은 출력·점수에 넣지 않는다.
-        let helper_lo = r.lo.saturating_sub(HELPER_SPAN);
-        let helper_hi = if r.lo >= HELPER_MIN {
-            r.lo - HELPER_MIN + 1
-        } else {
-            0
-        };
-        let helpers: Vec<usize> = (helper_lo..helper_hi.max(helper_lo))
-            .map(|p| 3 * p)
-            .collect();
-        let n_help = helpers.len();
-        let gids: Vec<usize> = helpers
-            .into_iter()
-            .chain((r.lo..r.hi).flat_map(|p| (0..3).map(move |c| 3 * p + c)))
-            .collect();
+        let (gids, n_help) = region_gids(r, n_pos, &cfg.helper);
+        events.push(format!(
+            "{:.1}s region {} images {} (own {} + helper {})",
+            t_now(),
+            r.index,
+            gids.len(),
+            gids.len() - n_help,
+            n_help
+        ));
         let t0 = Instant::now();
         let need: Vec<usize> = gids
             .iter()
@@ -2146,8 +2198,10 @@ pub fn run_pipeline_with(
                     Err(e) => load_err = Some(e),
                 }
             }
-            if *p >= r.lo {
+            if r.contains(*p) {
                 live.note(t_now(), "arrive_position", *p);
+            } else if *p >= r.hi {
+                live.note(t_now(), "arrive_helper", *p);
             }
         }
         if let Some(e) = load_err {
@@ -2178,7 +2232,7 @@ pub fn run_pipeline_with(
         let own_pairs: Vec<(usize, usize)> = pair_ids
             .iter()
             .copied()
-            .filter(|&(i, j)| gids[i] / 3 >= r.lo && gids[j] / 3 >= r.lo)
+            .filter(|&(i, j)| i >= n_help && j >= n_help)
             .collect();
         let own_registered = |s: &Sparse| s.poses[n_help..].iter().filter(|p| p.is_some()).count();
         let start = match check_motion(&gps, &views, &own_pairs)
@@ -3466,5 +3520,39 @@ mod refine_tests {
         refine_centers(&mut poses, &k, &tracks, &opts);
         let after = err(&poses);
         assert!(after < 0.7 * before, "{before} -> {after}");
+    }
+
+    #[test]
+    fn region_pair_schedule_has_cross_camera_pairs() {
+        // 기본 장면 27위치·span 12·ovl 2: 장면 전체 일정에서 다른 카메라 짝이 있는 사진은
+        // 구역 안 일정에서도 다른 카메라 짝이 하나 이상 있어야 한다(보조 사진을 끄면 그렇지 않다).
+        let n_pos = 27;
+        let sched = PairSchedule::default();
+        let scene: Vec<(usize, usize)> = (0..3 * n_pos).map(|g| (g % 3, g / 3)).collect();
+        let scene_pairs = scheduled_pairs(&scene, &sched);
+        let has_cross = |pairs: &[(usize, usize)], views: &[(usize, usize)], a: usize| {
+            pairs
+                .iter()
+                .any(|&(i, j)| (i == a || j == a) && views[i].0 != views[j].0)
+        };
+        let on = HelperConfig::default();
+        let off = HelperConfig { back_span: 0, ..on };
+        for (hc, expect_all) in [(on, true), (off, false)] {
+            let mut all = true;
+            for r in split_regions(n_pos, 12, 2) {
+                let (gids, n_help) = region_gids(&r, n_pos, &hc);
+                let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
+                let pairs = scheduled_pairs(&views, &sched);
+                // 소유 사진은 3 × 위치 수, 보조 사진은 소유 위치 밖에만 있다.
+                assert_eq!(gids.len() - n_help, 3 * (r.hi - r.lo));
+                assert!(gids[..n_help].iter().all(|g| !r.contains(g / 3)));
+                for (a, g) in gids.iter().enumerate().skip(n_help) {
+                    if has_cross(&scene_pairs, &scene, *g) {
+                        all &= has_cross(&pairs, &views, a);
+                    }
+                }
+            }
+            assert_eq!(all, expect_all);
+        }
     }
 }
