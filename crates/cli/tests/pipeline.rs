@@ -273,25 +273,20 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         ov.measured
     );
-    // 미달: 높이 차 중앙 최대 5.829 m, 최근접 4.923 m (목표 높이 차 < 2 m, 최근접 < 3 m).
-    check_item(&c, "preview_vs_refined", false);
+    // 통과(초벌 중심 다듬기 5회): 높이 차 중앙 최대 1.048 m, 최근접 0.943 m (목표 높이 차 < 2 m, 최근접 < 3 m).
+    check_item(&c, "preview_vs_refined", true);
     let pr = c.report.item("preview_vs_refined").unwrap();
-    eprintln!(
-        "SPEC 목표 preview_vs_refined 높이 차 < 2 m, 현재: {}",
-        pr.measured
-    );
     assert!(
-        number_after(&pr.measured, "높이 차 중앙 최대 ") > 2.0
-            && number_after(&pr.measured, "높이 차 중앙 최대 ") < 8.0,
+        number_after(&pr.measured, "높이 차 중앙 최대 ") < 2.0,
         "{}",
         pr.measured
     );
-    // 통과: 구역 간 대응을 구역의 모든 이미지 관측으로 만들어 점쌍 최소 1221 (창 안 12장만 쓰면 324),
-    // 구역 간 스케일 차 0.05%, 잔차 중앙 최대 5.130 m (< 6 m).
+    // 통과: 구역 간 대응을 구역의 모든 이미지 관측으로 만들어 점쌍 최소 1178 (창 안 12장만 쓰면 324),
+    // 구역 간 스케일 차 0.26%, 잔차 중앙 최대 0.735 m (< 6 m). 점쌍 하한은 SPEC §4 의 1000.
     check_item(&c, "preview_align", true);
     let pa = c.report.item("preview_align").unwrap();
     assert!(
-        number_after(&pa.measured, "점쌍 최소 ") >= 1200.0,
+        number_after(&pa.measured, "점쌍 최소 ") >= 1000.0,
         "{}",
         pa.measured
     );
