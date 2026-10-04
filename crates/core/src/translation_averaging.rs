@@ -2371,11 +2371,11 @@ mod tests {
         let mut po = Vec::new();
         for (i, c) in centers.iter().enumerate() {
             let mut left = 4000usize;
-            for p in 0..n_pts {
+            for (p, x) in pts.iter().enumerate() {
                 // 남은 점 수에 비례해 뽑아 정확히 4000 개를 만든다.
                 if rng.unit() * ((n_pts - p) as f64) < left as f64 {
                     left -= 1;
-                    let v = pts[p] - c;
+                    let v = x - c;
                     po.push(PointObservation {
                         camera: i,
                         point: p + offset,
