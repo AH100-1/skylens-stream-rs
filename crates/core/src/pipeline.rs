@@ -1360,6 +1360,46 @@ fn make_anchor(rec: &RegionRec, prev: &RegionRec) -> Option<(Anchor, usize, f64)
     Some((Anchor { sim, fixed }, n, med))
 }
 
+/// 붙이기 결과: (점 쌍 수, 잔차 중앙 m, 고정 카메라).
+type Attached = (usize, f64, Vec<(usize, Pose)>);
+/// 한 구역을 붙인 기록: (붙은 기준 구역 번호, 점 쌍 수, 잔차 중앙 m, 고정 카메라).
+type AttachRec = (usize, usize, f64, Vec<(usize, Pose)>);
+
+/// 초벌 희소 모델 `s` 를 최신 정밀 구역 `prev` 위에 붙인다(스트림 등록 단계): 공유 3D 점 닮음 변환으로
+/// 같은 좌표계에 옮기고, 겹침 위치 카메라 포즈를 정밀 값으로 고정한 채 번들 조정으로 새 카메라를 맞춘다.
+/// 반환: (점 쌍 수, 변환 잔차 중앙 m, 고정 카메라 목록). 겹침이 모자라면 `None`(모델은 그대로).
+#[allow(clippy::too_many_arguments)]
+fn attach_to_refined(
+    s: &mut Sparse,
+    k: &Intrinsics,
+    gps: &[Vector3<f64>],
+    prior_sigma: f64,
+    iters: usize,
+    gids: &[usize],
+    region: &Region,
+    prev: &RegionRec,
+) -> Option<Attached> {
+    let flags: Vec<bool> = s.poses.iter().map(|p| p.is_some()).collect();
+    let ta = to_tracks(s, gids);
+    let tb = &prev.refined.as_ref()?.0;
+    let plan = crate::pipeline_stream::plan_anchor(
+        &ta,
+        tb,
+        &prev.rposes,
+        (region, &prev.region),
+        gids,
+        &flags,
+    )?;
+    apply_sparse_sim(s, &plan.sim);
+    let mut fixed = Vec::new();
+    for (i, p) in &plan.fixed {
+        s.poses[*i] = Some(*p);
+        fixed.push(*i);
+    }
+    s.rms = run_ba(s, k, iters, Some(gps), prior_sigma, &fixed);
+    Some((plan.pairs, plan.median_m, plan.fixed))
+}
+
 /// 번들 조정(`iters == 0` 이면 재투영 오차만 잰다). 반환: 재투영 RMS(px).
 fn run_ba(
     s: &mut Sparse,
@@ -2057,6 +2097,21 @@ pub fn run_pipeline_with(
                 st.pairs,
                 st.median_m
             ));
+            let truth = |g: usize| ds.positions[g / 3].image_enu[g % 3];
+            let before = crate::pipeline_stream::center_error_median(
+                &recs[j].centers,
+                recs[j].rsim.as_ref(),
+                truth,
+            );
+            let after =
+                crate::pipeline_stream::center_error_median(&recs[j].centers, Some(&acc), truth);
+            if let (Some(b), Some(a)) = (before, after) {
+                events.push(format!(
+                    "{:.1}s realign center error region {} before {b:.3} m after {a:.3} m",
+                    t_now(),
+                    jr.index
+                ));
+            }
             recs[j].rsim = Some(acc);
         }
         if realigns.len() > n_realign0 {
@@ -2235,6 +2290,59 @@ pub fn run_pipeline_with(
         } else {
             coarse_start
         };
+        // 스트림 등록: 직전 정밀 모델이 나올 때까지 기다린 뒤(특징·짝 맞춤·희소 초기화는 이미 끝났다)
+        // 그 좌표계 위에 겹침 카메라를 고정해 붙인다.
+        let mut init = init;
+        let mut start = start;
+        let mut attach: Option<AttachRec> = None;
+        if opts.anchor && !recs.is_empty() {
+            while recs.last().is_some_and(|x| x.refined.is_none()) && in_flight > 0 {
+                let m = rx.recv().map_err(|e| e.to_string())?;
+                in_flight -= 1;
+                handle(
+                    m,
+                    &mut recs,
+                    &mut events,
+                    &mut realigns,
+                    &mut latest_ref,
+                    &mut live,
+                )?;
+            }
+            if let Some(m) = latest_ref {
+                let psig = cfg.prior_sigma();
+                let a = attach_to_refined(
+                    &mut init,
+                    &k,
+                    &gps,
+                    psig,
+                    cfg.ba_iters.min(6),
+                    &gids,
+                    r,
+                    &recs[m],
+                );
+                if let Some((n, med, _)) = &a {
+                    events.push(format!(
+                        "{:.1}s register region {} on refined {} pairs {n} median {med:.3} m",
+                        t_now(),
+                        r.index,
+                        recs[m].region.index
+                    ));
+                }
+                let b = attach_to_refined(
+                    &mut start,
+                    &k,
+                    &gps,
+                    psig,
+                    cfg.ba_iters.min(6),
+                    &gids,
+                    r,
+                    &recs[m],
+                );
+                if let (Some((n, med, _)), Some((_, _, fx))) = (a, b) {
+                    attach = Some((m, n, med, fx));
+                }
+            }
+        }
         st.secs_sparse = t2.elapsed().as_secs_f64();
         st.registered = init.poses[n_help..].iter().filter(|p| p.is_some()).count();
         st.tracks = init.points.len();
@@ -2273,7 +2381,9 @@ pub fn run_pipeline_with(
         st.preview_points = coarse.len();
         let ta = to_tracks(&init, &gids);
         let (mut sim, mut target) = (None, None);
-        if let Some(m) = latest_ref {
+        if let Some((m, ..)) = &attach {
+            target = Some(*m);
+        } else if let Some(m) = latest_ref {
             let tbm = &recs[m].refined.as_ref().unwrap().0;
             let ca =
                 crate::timing::timed("align_ghost", || region_align(&ta, tbm, r, &recs[m].region));
@@ -2378,7 +2488,21 @@ pub fn run_pipeline_with(
                 });
             });
         }
-        if slot == 0 {
+        if let Some((m, n, med, fixed)) = attach {
+            // 이미 최신 정밀 좌표계에 붙은 시작점: 정밀 BA 도 같은 겹침 카메라를 고정한다.
+            let an = Anchor {
+                sim: Similarity::identity(),
+                fixed,
+            };
+            send_anchor(
+                &mut recs[slot],
+                &anchor_tx,
+                Some((an, n, med)),
+                m,
+                t_now(),
+                &mut events,
+            );
+        } else if slot == 0 {
             let _ = anchor_tx.send(None);
         } else if recs[slot - 1].refined.is_some() {
             let a = make_anchor(&recs[slot], &recs[slot - 1]);

@@ -95,7 +95,16 @@ struct Run {
 
 fn run(ds: &Dataset, out: &Path, sequential: bool) -> Run {
     let t = std::time::Instant::now();
-    let res = run_pipeline_with(ds, &cfg(), out, StreamOptions { sequential }).unwrap();
+    let res = run_pipeline_with(
+        ds,
+        &cfg(),
+        out,
+        StreamOptions {
+            sequential,
+            ..StreamOptions::default()
+        },
+    )
+    .unwrap();
     let secs = t.elapsed().as_secs_f64();
     let vr = verify_dir(out);
     let pass = vr.items.iter().filter(|i| i.pass).count();
