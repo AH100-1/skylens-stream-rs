@@ -4,7 +4,7 @@
 //!
 //! | 인자 | 기본값 | 뜻 |
 //! |---|---|---|
-//! | `--positions N` | 8 | 촬영 위치 수(영상 수 = 3N). `ba-scale` 에서는 지정하지 않으면 80 |
+//! | `--positions N` | 40 | 촬영 위치 수(영상 수 = 3N). `ba-scale` 에서는 지정하지 않으면 80 |
 //! | `--width W` `--height H` | 480 270 | 렌더 해상도 |
 //! | `--repeat R` | 3 | 같은 입력으로 구간마다 반복하는 횟수(중앙·최소 보고) |
 //! | `--threads T` | 0 | rayon 스레드 수(0 = rayon 기본 = 논리 코어 수) |
@@ -21,7 +21,7 @@
 //! | `--ba-tracks N` | 100000 | `ba-scale` 의 트랙(점) 수 |
 //! | `--ba-iters K` | 3 | `ba-scale` 의 LM 반복 수(조기 종료 없이 K 회) |
 //!
-//! 예상 시간(4 코어 측정 기계, 부하 없음 기준 어림): 인자 없음(24장, 480×270) 약 1 분 안,
+//! 예상 시간(4 코어 측정 기계, 부하 없음 기준 어림): 인자 없음(120장, 480×270, 편대 짝 일정) 수 분,
 //! `--full`(240장, 960×540, 짝 3663 전부, 반복 3) 수십 분 — 짝을 줄이려면 `--max-pairs` 를 함께 준다,
 //! `--full --width 320 --height 180` 약 5 분, `--mode ba-scale --ba-iters 2 --repeat 1` 약 1~2 분(최대 메모리 약 2.5 GB),
 //! `--mode detect` 수 초.
@@ -49,8 +49,7 @@ use skylens_core::camera::Pose;
 use skylens_core::distortion::Distortion;
 use skylens_core::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use skylens_core::matching::{
-    candidate_pairs, ransac_fundamental, ratio_match, RansacConfig, PAIR_CROSS, PAIR_POW2_MAX,
-    PAIR_TEMPORAL,
+    ransac_fundamental, ratio_match, scheduled_pairs, PairSchedule, RansacConfig,
 };
 use skylens_core::math::{Point3, Rotation3, Vector2, Vector3};
 use skylens_core::rotation_averaging::{
@@ -224,7 +223,7 @@ fn pipeline(args: &Args) -> Vec<Row> {
         .map(|v| (cam_index(v.cam), v.position))
         .collect();
     let (t, pairs) = measure(args.repeat, || {
-        candidate_pairs(&keys, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX)
+        scheduled_pairs(&keys, &PairSchedule::default())
     });
     rows.push(Row {
         name: "짝 생성",
@@ -410,6 +409,104 @@ fn pipeline(args: &Args) -> Vec<Row> {
         measured.len(),
         100.0 * bad_edges as f64 / measured.len().max(1) as f64
     );
+    // 짝 종류별 E 성공(같은 카메라는 간격별, 다른 카메라는 위치 차별)과 연결 성분·틀린 간선 비율.
+    {
+        let kind = |i: usize, j: usize| -> (bool, usize) {
+            let (a, b) = (&scene.views[i], &scene.views[j]);
+            (a.cam == b.cam, a.position.abs_diff(b.position))
+        };
+        let mut same: std::collections::BTreeMap<usize, (usize, usize)> = Default::default();
+        let mut cross: std::collections::BTreeMap<usize, (usize, usize, usize)> =
+            Default::default();
+        let mut parent: Vec<usize> = (0..nv).collect();
+        fn find(p: &mut [usize], mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        let (mut bad_cross, mut n_cross) = (0usize, 0usize);
+        for ((&(i, j), p), e) in chosen.iter().zip(&poses).zip(&eres) {
+            let (is_same, d) = kind(i, j);
+            let ok = e.is_some() && p.is_some();
+            let bad = p.as_ref().is_some_and(|p| {
+                let t = truth[j] * truth[i].inverse();
+                (p.rotation * t.inverse()).angle().to_degrees() > 2.0
+            });
+            if is_same {
+                let c = same.entry(d).or_default();
+                c.0 += 1;
+                c.1 += usize::from(ok);
+            } else {
+                let c = cross.entry(d).or_default();
+                c.0 += 1;
+                c.1 += usize::from(ok);
+                c.2 += usize::from(bad);
+                if ok {
+                    n_cross += 1;
+                    bad_cross += usize::from(bad);
+                }
+            }
+            if ok {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                parent[ri] = rj;
+            }
+        }
+        let comps = (0..nv).filter(|&x| find(&mut parent, x) == x).count();
+        let fmt_same: Vec<String> = same
+            .iter()
+            .map(|(d, (n, k))| format!("{d}:{k}/{n}"))
+            .collect();
+        let fmt_cross: Vec<String> = cross
+            .iter()
+            .map(|(d, (n, k, b))| format!("+{d}:{k}/{n}(>2° {b})"))
+            .collect();
+        eprintln!(
+            "짝 종류별 E 성공 같은 카메라(간격:성공/짝) {}",
+            fmt_same.join(" ")
+        );
+        eprintln!(
+            "짝 종류별 E 성공 다른 카메라(위치 차:성공/짝) {}",
+            fmt_cross.join(" ")
+        );
+        // 카메라 간 간선의 정상 대응 수: 틀린(>2°)·맞는 간선의 중앙값과, 문턱별로 남기는 간선의 틀린 비율.
+        let mut good_n: Vec<usize> = vec![];
+        let mut bad_n: Vec<usize> = vec![];
+        for ((&(i, j), p), e) in chosen.iter().zip(&poses).zip(&eres) {
+            if kind(i, j).0 {
+                continue;
+            }
+            let (Some(p), Some((_, inl))) = (p, e) else {
+                continue;
+            };
+            let n = inl.iter().filter(|&&x| x).count();
+            let t = truth[j] * truth[i].inverse();
+            if (p.rotation * t.inverse()).angle().to_degrees() > 2.0 {
+                bad_n.push(n);
+            } else {
+                good_n.push(n);
+            }
+        }
+        good_n.sort_unstable();
+        bad_n.sort_unstable();
+        eprintln!(
+            "카메라 간 정상 대응 수 중앙: 맞는 {:?} 틀린 {:?} (최소 {:?}/{:?})",
+            good_n.get(good_n.len() / 2),
+            bad_n.get(bad_n.len() / 2),
+            good_n.first(),
+            bad_n.first()
+        );
+        for th in [30usize, 60, 100, 150, 200] {
+            let g = good_n.iter().filter(|&&n| n >= th).count();
+            let b = bad_n.iter().filter(|&&n| n >= th).count();
+            eprintln!("  정상 대응 >= {th}: 남는 간선 {} 중 틀린 {b}", g + b);
+        }
+        eprintln!(
+            "연결 성분 {comps}, 다른 카메라 간선 오차>2° {bad_cross}/{n_cross} ({:.1}%)",
+            100.0 * bad_cross as f64 / n_cross.max(1) as f64
+        );
+    }
     let note = match &avg_m {
         Some(r) => {
             let returned = r.rotations.iter().filter(|x| x.is_some()).count();

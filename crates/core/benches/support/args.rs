@@ -23,10 +23,10 @@ pub struct Args {
 }
 
 impl Default for Args {
-    /// 인자 없는 실행: 24장(위치 8)·480×270·반복 3·번들 조정 점 3000.
+    /// 인자 없는 실행: 120장(위치 40, 편대 짝 일정으로 카메라 간 겹침이 생기는 규모)·480×270·반복 3·번들 조정 점 3000.
     fn default() -> Self {
         Args {
-            positions: 8,
+            positions: 40,
             width: 480,
             height: 270,
             repeat: 3,

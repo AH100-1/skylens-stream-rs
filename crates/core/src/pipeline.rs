@@ -1867,8 +1867,8 @@ fn write_decimated(out: &Path, name: &str, cloud: &PointCloud) -> Result<(), Str
 }
 
 /// 구역 앞쪽 보조 F 사진 범위: 위치 [lo-HELPER_SPAN, lo-HELPER_MIN].
-/// 짝 규칙상 R(p)·L(p) 는 F(p-40..=p-12) 와 겹치므로 구역 첫 12 위치의 R·L 은 구역 바로 앞 F 까지 필요하다.
-const HELPER_SPAN: usize = 40;
+/// 짝 규칙상 R(p)·L(p) 는 F(p-48..=p-28) 와 겹치므로 구역 첫 12 위치의 R·L 은 구역 바로 앞 F 까지 필요하다.
+const HELPER_SPAN: usize = 48;
 const HELPER_MIN: usize = 1;
 
 /// 끝까지 돌린다. 출력 폴더에 preview·refined·snapshots·manifest.json·report.json·poses.txt 를 쓴다.
@@ -2098,7 +2098,7 @@ pub fn run_pipeline_with(
             ..Default::default()
         };
         events.push(format!("{:.1}s arrive region {}", t_now(), r.index));
-        // 구역 시작 쪽 R·L 은 F(p-40..=p-20) 와만 겹친다(F-197). 구역 밖 앞쪽 F 사진을 보조로 넣어
+        // 구역 시작 쪽 R·L 은 F(p-48..=p-28) 와만 겹친다(F-197). 구역 밖 앞쪽 F 사진을 보조로 넣어
         // 구역 첫 위치들의 카메라 간 짝이 끊기지 않게 한다. 보조 사진은 출력·점수에 넣지 않는다.
         let helper_lo = r.lo.saturating_sub(HELPER_SPAN);
         let helper_hi = if r.lo >= HELPER_MIN {

@@ -60,12 +60,12 @@ pub enum CrossSchedule {
 }
 
 impl CrossSchedule {
-    /// 실측 편대 기본값: F–R·F–L +20..=+40, 4칸 간격. 겹침 12% 미만(+12~+16)은 매칭은 되지만
-    /// 회전 오차가 5~17° 라 뺀다(연구 노트 experiments/formation-pairs.md).
+    /// 실측 편대 기본값: F–R·F–L +28..=+48, 4칸 간격. +20 시작은 회전 오차 2° 초과가 80%(32/40),
+    /// +24 는 34%(11/32) 라 뺀다(위치 40·시드 1 측정). +28 부터 8% 이하로 내려간다.
     pub const FORMATION: CrossSchedule = CrossSchedule::Formation {
-        right_min: 20,
-        left_min: 20,
-        max: 40,
+        right_min: 28,
+        left_min: 28,
+        max: 48,
         step: 4,
     };
 }
@@ -2685,7 +2685,7 @@ mod tests {
                 } else {
                     ((cb, pb), (ca, pa))
                 };
-                assert!(po >= pf + 20 && po <= pf + 40 && (po - pf) % 4 == 0);
+                assert!(po >= pf + 28 && po <= pf + 48 && (po - pf) % 4 == 0);
                 kinds.insert(co);
             }
         }
@@ -2693,13 +2693,13 @@ mod tests {
             kinds.into_iter().collect::<Vec<_>>(),
             vec![CAM_RIGHT, CAM_LEFT]
         );
-        // 위치 30 개: F(p)–R(p+20..=+40, 4칸) 은 p ≤ 9 에서 3·2·1 개 등. 같은 카메라 짝은 SPEC 과 같다.
+        // 위치 30 개: F(p)–R(p+28..=+48, 4칸) 은 p ≤ 1 에서 5·4·… 개 등. 같은 카메라 짝은 SPEC 과 같다.
         let same =
             |v: &Vec<(usize, usize)>| v.iter().filter(|&&(i, j)| views[i].0 == views[j].0).count();
         assert_eq!(same(&f), same(&spec));
     }
 
-    /// 편대 합성 장면(480×270, 시드 1)의 기본 짝 일정(카메라 간 F–R·F–L +20..=+40)으로 F 8·R 13·L 13 시점을
+    /// 편대 합성 장면(480×270, 시드 1)의 기본 짝 일정(카메라 간 F–R·F–L +28..=+48)으로 F 8·R 13·L 13 시점을
     /// 매칭·5점 RANSAC 검증한다. 검증된 카메라 간 짝의 회전 오차 중앙 ≤ 1°, 검증 짝 그래프가 한 연결 성분.
     #[test]
     fn formation_default_schedule_verifies_and_connects() {
@@ -2717,7 +2717,7 @@ mod tests {
         for p in (0..=28).step_by(4) {
             sel.push((CAM_FRONT, p));
         }
-        for p in (20..=68).step_by(4) {
+        for p in (28..=76).step_by(4) {
             sel.push((CAM_RIGHT, p));
             sel.push((CAM_LEFT, p));
         }
@@ -2756,6 +2756,7 @@ mod tests {
             r
         }
         let (mut cross_err, mut cross_n, mut verified) = (Vec::new(), 0usize, 0usize);
+        let mut cross_bad = 0usize;
         for &(i, j) in &pairs {
             let (a, b) = (&views[i].camera, &views[j].camera);
             let m = ratio_match(&feats[i], &feats[j], 0.8, true);
@@ -2785,6 +2786,7 @@ mod tests {
                 let err = crate::two_view::recover_pose(e, &s1, &s2)
                     .map(|p| (p.rotation * truth.inverse()).angle().to_degrees())
                     .unwrap_or(180.0);
+                cross_bad += usize::from(err > 2.0);
                 cross_err.push(err);
             }
         }
@@ -2798,9 +2800,44 @@ mod tests {
             pairs.len(),
             cross_err.last().unwrap()
         );
+        eprintln!("카메라 간 2° 초과 {cross_bad}/{cross_n}");
         assert!(cross_n >= 10, "카메라 간 검증 {cross_n}");
+        assert!(
+            cross_bad as f64 <= 0.10 * cross_n as f64,
+            "카메라 간 2° 초과 {cross_bad}/{cross_n}"
+        );
         assert!(med <= 1.0, "회전 오차 중앙 {med}");
         assert_eq!(comps, 1);
+    }
+
+    /// 기본 일정은 위치 40 곳 편대에서 F·R·L 120 시점을 한 연결 성분으로 잇고, R–L 직접 짝은 없다.
+    #[test]
+    fn formation_default_schedule_connects_forty_positions() {
+        let views: Vec<(usize, usize)> =
+            (0..40).flat_map(|p| (0..3).map(move |c| (c, p))).collect();
+        let pairs = scheduled_pairs(&views, &PairSchedule::default());
+        let mut parent: Vec<usize> = (0..views.len()).collect();
+        fn find(p: &mut [usize], mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        let mut cross = 0;
+        for &(i, j) in &pairs {
+            let (ci, cj) = (views[i].0, views[j].0);
+            assert!(!(ci != cj && ci != CAM_FRONT && cj != CAM_FRONT), "R–L 짝");
+            cross += usize::from(ci != cj);
+            let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+            parent[a] = b;
+        }
+        let comps = (0..views.len())
+            .filter(|&x| find(&mut parent, x) == x)
+            .count();
+        assert_eq!(comps, 1);
+        // F(p)–R/L(p+28, +32, +36): p ≤ 11, 7, 3 → (12+8+4)·2 = 48.
+        assert_eq!(cross, 48);
     }
 
     #[test]

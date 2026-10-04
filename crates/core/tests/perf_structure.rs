@@ -162,11 +162,11 @@ fn bench_args_preset_order_does_not_matter() {
 
     let e = bench_args::parse(&argv("--ba-points 500 --quick"));
     assert_eq!(e.ba_points, 500);
-    assert_eq!(e.positions, 8);
+    assert_eq!(e.positions, 40);
 
     // 묶음끼리는 뒤의 것이 이긴다.
     assert_eq!(bench_args::parse(&argv("--quick --full")).positions, 80);
-    assert_eq!(bench_args::parse(&argv("--full --quick")).positions, 8);
+    assert_eq!(bench_args::parse(&argv("--full --quick")).positions, 40);
 }
 
 /// 인자 없는 실행은 빠른 규모(24장·480×270)이고, 240장은 `--full` 을 줄 때만이다.
