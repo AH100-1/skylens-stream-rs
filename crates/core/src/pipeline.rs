@@ -1732,6 +1732,84 @@ fn own_align(
     align_region(r, &pairs)
 }
 
+/// 겹치는 두 구역의 밀집 점군을 최근접 대응 닮음 변환(ICP)으로 한 번 더 맞춘다. `moved` 는 이미 희소 점 닮음 변환으로
+/// 대상 좌표계에 옮겨진 점군. 반환은 그 위에 얹을 보정 변환. 대응 3D 거리 `reach` m 안, 거리 상위 30% 는 버리고,
+/// 대응이 모자라거나 보정이 지나치게 크면(배율 ±5%, 회전 5° 넘음) `None`. 환경 변수 `SKYLENS_DENSE_ICP=0` 이면 끈다.
+fn dense_icp_refine(
+    moved: &PointCloud,
+    target: &PointCloud,
+    reach: f64,
+    iters: usize,
+) -> Option<(Similarity, usize)> {
+    if std::env::var("SKYLENS_DENSE_ICP").as_deref() == Ok("0") {
+        return None;
+    }
+    let v3 = |p: &[f32; 3]| Vector3::new(p[0] as f64, p[1] as f64, p[2] as f64);
+    let step = (moved.points.len() / 20000).max(1);
+    let src0: Vec<Vector3<f64>> = moved
+        .points
+        .iter()
+        .step_by(step)
+        .map(|p| v3(&p.xyz))
+        .collect();
+    let dst: Vec<Vector3<f64>> = target.points.iter().map(|p| v3(&p.xyz)).collect();
+    let cell = |p: &Vector3<f64>| {
+        (
+            (p.x / reach).floor() as i64,
+            (p.y / reach).floor() as i64,
+            (p.z / reach).floor() as i64,
+        )
+    };
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (i, q) in dst.iter().enumerate() {
+        grid.entry(cell(q)).or_default().push(i);
+    }
+    let mut delta = Similarity::identity();
+    let mut npairs = 0;
+    for _ in 0..iters {
+        let mut found: Vec<(f64, Vector3<f64>, Vector3<f64>)> = Vec::new();
+        for p in &src0 {
+            let x = delta.apply_point(p);
+            let c = cell(&x);
+            let mut best: Option<(f64, usize)> = None;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        for &j in grid
+                            .get(&(c.0 + dx, c.1 + dy, c.2 + dz))
+                            .into_iter()
+                            .flatten()
+                        {
+                            let d = (dst[j] - x).norm();
+                            if d < reach && best.is_none_or(|(bd, _)| d < bd) {
+                                best = Some((d, j));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((d, j)) = best {
+                found.push((d, x, dst[j]));
+            }
+        }
+        if found.len() < 300 {
+            return None;
+        }
+        found.sort_by(|a, b| a.0.total_cmp(&b.0));
+        found.truncate(found.len() * 7 / 10);
+        let a: Vec<Vector3<f64>> = found.iter().map(|f| f.1).collect();
+        let b: Vec<Vector3<f64>> = found.iter().map(|f| f.2).collect();
+        let step_sim = crate::align::umeyama(&a, &b)?;
+        delta = step_sim.compose(&delta);
+        npairs = found.len();
+    }
+    let ang = delta.r.angle().to_degrees();
+    if (delta.s - 1.0).abs() > 0.05 || ang > 5.0 {
+        return None;
+    }
+    Some((delta, npairs))
+}
+
 /// 진단: 창 안 이미지 수, 초벌·정밀 트랙·관측 수, 같은 (이미지, 특징 번호) 로 맺어지는 비율.
 fn pair_debug(ta: &[Track], tb: &[Track], region: usize, w: (usize, usize)) {
     let in_win = |img: u32| {
@@ -2013,7 +2091,24 @@ pub fn run_pipeline_with(
                 scale: acc.s,
             });
             let jr = recs[j].region;
-            let moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
+            let mut acc = acc;
+            let mut moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
+            if st.via == k {
+                let tgt = &recs[k].refined.as_ref().unwrap().1;
+                if let Some((d, np)) = dense_icp_refine(&moved, tgt, 1.5, 6) {
+                    events.push(format!(
+                        "{:.1}s dense refine region {} onto refined {} pairs {np} scale {:.4} rotation {:.3} deg shift {:.3} m",
+                        t_now(),
+                        jr.index,
+                        recs[k].region.index,
+                        d.s,
+                        d.r.angle().to_degrees(),
+                        d.t.norm()
+                    ));
+                    acc = d.compose(&acc);
+                    moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
+                }
+            }
             write_decimated(out, &refined_name(&jr), &moved)?;
             events.push(format!(
                 "{:.1}s realign refined {} to refined {} via {} pairs {} median {:.3} m",
