@@ -365,6 +365,10 @@ struct PairMatch {
     inl: Vec<(usize, usize)>,
     rot: Rotation3<f64>,
     t: Option<Vector3<f64>>,
+    /// 같은 카메라 짝의 촬영 위치 간격(카메라 간 짝은 None).
+    gap: Option<usize>,
+    /// 정상 대응의 시차 각 중앙값(도): 회전을 걷어낸 뒤 두 시선이 이루는 각.
+    parallax_deg: f64,
 }
 
 /// 환경 변수 `SKYLENS_RANSAC_STATS` 가 있으면 짝마다 RANSAC 통계를 표준 오류로 낸다(진단용).
@@ -422,6 +426,17 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                 return None;
             }
             let rp = recover_pose(&e, &s1, &s2)?;
+            let mut par: Vec<f64> = s1
+                .iter()
+                .zip(&s2)
+                .map(|(a, b)| {
+                    let a = rp.rotation * Vector3::new(a.x, a.y, 1.0).normalize();
+                    let b = Vector3::new(b.x, b.y, 1.0).normalize();
+                    a.dot(&b).clamp(-1.0, 1.0).acos().to_degrees()
+                })
+                .collect();
+            par.sort_by(f64::total_cmp);
+            let parallax_deg = par[par.len() / 2];
             let inl: Vec<(usize, usize)> = m
                 .iter()
                 .zip(&inl)
@@ -434,6 +449,8 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                 inl,
                 rot: rp.rotation,
                 t: rp.translation_observable.then_some(rp.translation),
+                gap: (views[i].0 == views[j].0).then(|| views[i].1.abs_diff(views[j].1)),
+                parallax_deg,
             })
         })
         .collect()
@@ -741,6 +758,25 @@ pub struct PreviewOpts {
     /// 비행 축 둘레 회전을 보는 방향 평균 z 가 가장 작은 각(2° 격자)으로 고른다. 정밀 BA 시작점용:
     /// 정밀 BA 는 이 축 둘레 회전을 15회 안에 다 못 풀어 시작 롤이 정밀 표면 오차에 그대로 남는다.
     pub legacy_roll: bool,
+    /// 회전 평균에서 뺄 같은 카메라 시간 간격 묶음(비트 g = 위치 간격 g, 0..32).
+    pub drop_gaps: u32,
+    /// 회전 평균에서 카메라 간 짝을 뺀다.
+    pub drop_cross: bool,
+    /// 정상 대응 시차 각 중앙값이 이 각(도) 미만인 간선은 회전 평균에 넣지 않는다(0 이면 끔).
+    pub min_parallax_deg: f64,
+    /// 회전 평균 간선 가중.
+    pub weight: RotWeight,
+    /// 같은 카메라 한 칸 간격 간선의 가중 배율(1 이면 그대로).
+    pub gap1_weight: f64,
+}
+
+/// 회전 평균 간선 가중 방식.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RotWeight {
+    /// 정상 대응 수.
+    Inliers,
+    /// 정상 대응 수 × min(1, 시차 각 / 2°)².
+    Parallax,
 }
 
 impl Default for PreviewOpts {
@@ -755,6 +791,11 @@ impl Default for PreviewOpts {
             ray_deg: PREVIEW_MIN_RAY_DEG,
             tri_deg: None,
             legacy_roll: false,
+            drop_gaps: 0,
+            drop_cross: false,
+            min_parallax_deg: 0.0,
+            weight: RotWeight::Inliers,
+            gap1_weight: 1.0,
         }
     }
 }
@@ -773,6 +814,24 @@ impl PreviewOpts {
                 Some(("vfix", v)) => o.vfix = v == "1",
                 Some(("ray", v)) => o.ray_deg = v.parse().unwrap_or(o.ray_deg),
                 Some(("tri", v)) => o.tri_deg = v.parse().ok(),
+                // `dropgap=1+2` 처럼 + 로 이은 위치 간격의 같은 카메라 짝을 회전 평균에서 뺀다.
+                Some(("dropgap", v)) => {
+                    o.drop_gaps = v
+                        .split('+')
+                        .filter_map(|g| g.parse::<u32>().ok())
+                        .filter(|&g| g < 32)
+                        .fold(0, |m, g| m | (1 << g))
+                }
+                Some(("gap1w", v)) => o.gap1_weight = v.parse().unwrap_or(1.0),
+                Some(("nocross", v)) => o.drop_cross = v == "1",
+                Some(("minpar", v)) => o.min_parallax_deg = v.parse().unwrap_or(0.0),
+                Some(("w", v)) => {
+                    o.weight = if v == "par" {
+                        RotWeight::Parallax
+                    } else {
+                        RotWeight::Inliers
+                    }
+                }
                 _ => {}
             }
         }
@@ -793,6 +852,16 @@ pub struct PreviewStages {
 
 type RotsAndKeep = (Vec<Option<Rotation3<f64>>>, Vec<bool>);
 
+/// 간선이 회전 평균 입력에 들어가는지(정상 대응 수·종류·시차 각 기준).
+fn rotation_edge_used(p: &PairMatch, opts: &PreviewOpts) -> bool {
+    p.inl.len() >= opts.min_inl
+        && p.parallax_deg >= opts.min_parallax_deg
+        && match p.gap {
+            Some(g) => g >= 32 || opts.drop_gaps >> g & 1 == 0,
+            None => !opts.drop_cross,
+        }
+}
+
 /// 회전 평균 + 상대 회전과 어긋나는 간선 제거 뒤 재평균. 반환: 회전, 간선 유지 표시.
 fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<RotsAndKeep, String> {
     let mk = |keep: &[bool]| -> Vec<RelativeRotation> {
@@ -803,11 +872,20 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
                 i: p.i,
                 j: p.j,
                 rotation: p.rot,
-                weight: p.inl.len() as f64,
+                weight: p.inl.len() as f64
+                    * match opts.weight {
+                        RotWeight::Inliers => 1.0,
+                        RotWeight::Parallax => (p.parallax_deg / 2.0).min(1.0).powi(2),
+                    }
+                    * if p.gap == Some(1) {
+                        opts.gap1_weight
+                    } else {
+                        1.0
+                    },
             })
             .collect()
     };
-    let mut keep: Vec<bool> = pm.iter().map(|p| p.inl.len() >= opts.min_inl).collect();
+    let mut keep: Vec<bool> = pm.iter().map(|p| rotation_edge_used(p, opts)).collect();
     let ra = average_rotations(n, &mk(&keep), &AveragingConfig::default())
         .ok_or("회전 평균 실패: 쓸 수 있는 간선 없음")?;
     let mut rots = ra.rotations;
@@ -2403,6 +2481,91 @@ pub fn run_pipeline_with(
     )
     .map_err(|e| e.to_string())?;
     Ok(res)
+}
+
+/// 회전 평균 입력 간선 하나(진단용).
+#[derive(Clone, Debug)]
+pub struct RotEdgeDiag {
+    /// 구역 안 사진 번호(`gids` 색인).
+    pub i: usize,
+    pub j: usize,
+    /// 같은 카메라 짝의 위치 간격, 카메라 간 짝은 None.
+    pub gap: Option<usize>,
+    pub inliers: usize,
+    pub parallax_deg: f64,
+    /// 검증된 상대 회전 R_j R_iᵀ.
+    pub rot: Rotation3<f64>,
+}
+
+/// 옵션 하나로 돌린 회전 평균·초벌 포즈(진단용).
+#[derive(Clone, Debug)]
+pub struct RotRunDiag {
+    /// 회전 평균 직후 회전(모델 좌표계).
+    pub rots: Vec<Option<Rotation3<f64>>>,
+    /// 좌표계 맞춤·위치 단계 뒤 초벌 포즈(첫 GPS 기준 좌표).
+    pub poses: Vec<Option<Pose>>,
+}
+
+/// (사진 번호 목록, 간선, 옵션별 결과).
+pub type RotDiag = (Vec<usize>, Vec<RotEdgeDiag>, Vec<RotRunDiag>);
+
+/// 위치 `lo..hi` 의 사진으로 매칭 → 회전 평균(옵션 목록마다) → 초벌 포즈를 돌려 중간 결과를 낸다(진단용).
+/// 반환 `gids` 는 사진 번호(위치 × 3 + 카메라), 간선·결과의 사진 번호는 이 목록의 색인이다.
+pub fn preview_rotation_diag(
+    ds: &Dataset,
+    lo: usize,
+    hi: usize,
+    max_features: usize,
+    hfov_deg: f64,
+    list: &[PreviewOpts],
+) -> Result<RotDiag, String> {
+    let gids: Vec<usize> = (lo * 3..hi * 3).collect();
+    let data: Vec<ImgData> = gids
+        .iter()
+        .map(|g| load(&ds.positions[g / 3].images[g % 3], max_features))
+        .collect::<Result<_, _>>()?;
+    let imgs: Vec<&ImgData> = data.iter().collect();
+    let k = Intrinsics::from_hfov(
+        data[0].rgb.width(),
+        data[0].rgb.height(),
+        hfov_deg.to_radians(),
+    );
+    let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
+    let gps: Vec<Vector3<f64>> = gids
+        .iter()
+        .map(|g| ds.positions[g / 3].image_enu[g % 3])
+        .collect();
+    let pm = match_pairs(&imgs, &views, &k);
+    let edges = pm
+        .iter()
+        .map(|p| RotEdgeDiag {
+            i: p.i,
+            j: p.j,
+            gap: p.gap,
+            inliers: p.inl.len(),
+            parallax_deg: p.parallax_deg,
+            rot: p.rot,
+        })
+        .collect();
+    let tri = TriConfig::from_config(&PipelineConfig::default());
+    let mut runs = Vec::new();
+    for opts in list {
+        let (sp, st) = sparse_init_with(
+            &imgs,
+            &pm,
+            &gps,
+            &k,
+            PipelineConfig::default().position,
+            &tri,
+            (0, 2.0),
+            opts,
+        )?;
+        runs.push(RotRunDiag {
+            rots: st.rots,
+            poses: sp.poses,
+        });
+    }
+    Ok((gids, edges, runs))
 }
 
 #[cfg(test)]
