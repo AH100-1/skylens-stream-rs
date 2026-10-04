@@ -443,7 +443,16 @@ fn displacement_outliers(
     }
     let tol = DISPLACEMENT_TOLERANCE * size;
     // 칸당 평균 8 점쯤 되도록 격자 칸을 정한다(점 분포 범위 기준).
-    let area = ((max_x - min_x) * (max_y - min_y)).max(1e-12);
+    // 범위는 5~95% 분위로 잡는다: 대부분이 좁은 곳에 몰리고 몇 개만 멀어도 칸이 커져 이차 시간이 되지 않게.
+    let q_range = |sel: fn(&Vector2<f64>) -> f64| {
+        let mut v: Vec<f64> = pos.iter().map(|q| sel(&q.0)).collect();
+        let (lo, hi) = (v.len() / 20, v.len() - 1 - v.len() / 20);
+        let a = *v.select_nth_unstable_by(lo, |a, b| a.total_cmp(b)).1;
+        let b = *v.select_nth_unstable_by(hi, |a, b| a.total_cmp(b)).1;
+        (b - a).max(0.0)
+    };
+    let _ = (min_x, min_y);
+    let area = (q_range(|p| p.x) * q_range(|p| p.y) / 0.81).max(1e-12);
     let cell = (area * 8.0 / pos.len() as f64)
         .sqrt()
         .max(size * 4.0)
@@ -1616,5 +1625,203 @@ mod tests {
             eprintln!("keep {keep}: overlap {frac:.4} expected {want:.4} of {total}");
             assert!((frac - want).abs() <= 0.05, "{frac} vs {want}");
         }
+    }
+
+    /// 에피폴라 선 근처 오대응 추가: 짝마다 대응의 `per_mille`(천분율) 을 골라, 영상 a 광선 위 깊이
+    /// 0.7~1.3 배 점의 영상 b 투영 `near_px`(960 폭 기준 화소, 폭에 비례) 안 특징으로 바꿔 잇는다.
+    fn add_epipolar_mismatches(s: &mut Synthetic, opts: &SceneOpts, per_mille: u64, near_px: f64) {
+        let scene = Scene::new(SceneConfig {
+            positions: opts.positions,
+            width: opts.width,
+            height: opts.height,
+            ..SceneConfig::default()
+        });
+        let x_end = 40.0 + opts.positions.saturating_sub(12) as f64;
+        let mut points = Vec::new();
+        let mut x = -10.0;
+        while x <= x_end {
+            let mut y = -30.0;
+            while y <= 30.0 {
+                points.push(Point3::new(x, y, scene.surface_height(x, y)));
+                y += 1.5;
+            }
+            x += 1.5;
+        }
+        let tol = near_px * opts.width as f64 / 960.0;
+        for pi in 0..s.pairs.len() {
+            let (a, b) = (s.pairs[pi].image_a, s.pairs[pi].image_b);
+            let (ca, cb) = (&scene.views[a].camera, &scene.views[b].camera);
+            let n = s.pairs[pi].matches.len();
+            let k = (n as u64 * per_mille / 1000) as usize;
+            for t in 0..k {
+                let h = hash((a as u64) << 40 ^ (b as u64) << 20 ^ t as u64 ^ 0xE91);
+                let mi = (h % n as u64) as usize;
+                let (fa, fb) = s.pairs[pi].matches[mi];
+                if s.gt[a][fa] != s.gt[b][fb] {
+                    continue;
+                }
+                let depth = ca.pose.transform(&points[s.gt[a][fa]]).z;
+                // 광선 위 깊이 0.7~1.3 배 점들의 영상 b 투영(선분) 에서 `tol` 안 특징 중 해시로 하나를 고른다.
+                let proj: Vec<Vector2<f64>> = (0..13)
+                    .filter_map(|d| {
+                        let q = ca.unproject(&s.keypoints[a][fa], depth * (0.7 + 0.05 * d as f64));
+                        cb.project(&q)
+                    })
+                    .collect();
+                let cands: Vec<usize> = (0..s.keypoints[b].len())
+                    .filter(|&j| {
+                        s.gt[b][j] != s.gt[b][fb]
+                            && proj.iter().any(|q| (s.keypoints[b][j] - q).norm() <= tol)
+                    })
+                    .collect();
+                let best =
+                    (!cands.is_empty()).then(|| (0.0, cands[(h >> 24) as usize % cands.len()]));
+                if let Some((_, j)) = best {
+                    if s.gt[b][j] != s.gt[b][fb] {
+                        s.pairs[pi].matches[mi] = (fa, j);
+                        s.outliers += 1;
+                        s.inliers -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 같은 카메라 / 카메라 간 짝의 참 대응 손실: (손실, 전체) 쌍. 참 대응 = 두 끝의 정답 점이 같은 것.
+    fn pair_kind_loss(s: &Synthetic, tracks: &[Track]) -> [(usize, usize); 2] {
+        let mut track_of: HashMap<(usize, usize), usize> = HashMap::new();
+        for (ti, t) in tracks.iter().enumerate() {
+            for o in &t.observations {
+                track_of.insert((o.image, o.feature), ti);
+            }
+        }
+        let mut r = [(0usize, 0usize); 2];
+        for p in &s.pairs {
+            let kind = (p.image_a % 3 != p.image_b % 3) as usize;
+            for &(fa, fb) in &p.matches {
+                if s.gt[p.image_a][fa] != s.gt[p.image_b][fb] {
+                    continue;
+                }
+                r[kind].1 += 1;
+                let (x, y) = (
+                    track_of.get(&(p.image_a, fa)),
+                    track_of.get(&(p.image_b, fb)),
+                );
+                if x.is_none() || x != y {
+                    r[kind].0 += 1;
+                }
+            }
+        }
+        r
+    }
+
+    /// 잘못 합친 비율: 서로 다른 정답 점의 관측 쌍을 한 트랙에 둔 트랙 수 / 전체 트랙 수.
+    fn wrong_merge_rate(s: &Synthetic, tracks: &[Track]) -> f64 {
+        let bad = tracks
+            .iter()
+            .filter(|t| {
+                let mut c: HashMap<usize, usize> = HashMap::new();
+                for o in &t.observations {
+                    *c.entry(s.gt[o.image][o.feature]).or_default() += 1;
+                }
+                let top = c.values().max().copied().unwrap_or(0);
+                // 다수 정답 점이 아닌 관측이 둘 이상이면 잘못 합친 것으로 센다.
+                t.observations.len() - top >= 1
+            })
+            .count();
+        bad as f64 / tracks.len().max(1) as f64
+    }
+
+    /// F-263/F-125/F-265: 편대 기본 장면(44 위치, SceneConfig::default 배치) 에서 에피폴라 근처 오대응과
+    /// 일관된 바꿈 오대응, 유지 30·50% 의 순도·완전도·잘못 합친 비율·짝 종류별 참 대응 손실.
+    #[test]
+    fn epipolar_near_and_repeated_pattern_mismatches() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        let mut failures = Vec::new();
+        for (mode, keep, seed) in [
+            ("epi", 30u64, 1u64),
+            ("epi", 50, 1),
+            ("swap", 30, 1),
+            ("swap", 50, 1),
+        ] {
+            let mut s = if mode == "swap" {
+                synthetic_scene(0, keep, 1, seed, &opts)
+            } else {
+                synthetic_scene(0, keep, 0, seed, &opts)
+            };
+            if mode == "epi" {
+                add_epipolar_mismatches(&mut s, &opts, 20, 2.0);
+            }
+            let cfg = TrackConfig::default();
+            let (tracks, st) = build_tracks(&s.pairs, &s.keypoints, &cfg);
+            let (pu, co) = purity_completeness(&s, &tracks);
+            let wm = wrong_merge_rate(&s, &tracks);
+            let [same, cross] = pair_kind_loss(&s, &tracks);
+            let (ls, lc) = (
+                same.0 as f64 / same.1.max(1) as f64,
+                cross.0 as f64 / cross.1.max(1) as f64,
+            );
+            eprintln!(
+                "{mode} keep {keep}: outliers {} inconsistent {} purity {pu:.4} completeness {co:.4} wrong-merge {wm:.4} loss same {}/{} ({ls:.4}) cross {}/{} ({lc:.4})",
+                s.outliers, st.inconsistent, same.0, same.1, cross.0, cross.1
+            );
+            assert!(s.outliers > 0);
+            let (pmin, wmax) = if mode == "swap" {
+                (0.97, 0.03)
+            } else {
+                (0.99, 0.01)
+            };
+            if pu < pmin || co < 0.95 || wm > wmax || lc > 0.015 {
+                failures.push(format!(
+                    "{mode} keep {keep}: pu {pu} co {co} wm {wm} cross {lc}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// F-264: 대응이 한 곳에 몰린 짝의 시간이 고르게 퍼진 짝의 몇 배 이내(이전 21 배).
+    #[test]
+    fn clumped_pair_time_is_near_uniform() {
+        let n = 8000usize;
+        let kp = |clump: bool| -> Vec<Vector2<f64>> {
+            (0..n)
+                .map(|i| {
+                    let h = hash(i as u64 + 77);
+                    let (u, v) = (
+                        (h & 0xFFFF) as f64 / 65536.0,
+                        (h >> 16 & 0xFFFF) as f64 / 65536.0,
+                    );
+                    if clump && i != 0 {
+                        Vector2::new(100.0 + 40.0 * u, 100.0 + 40.0 * v)
+                    } else if clump {
+                        Vector2::new(1900.0, 1000.0)
+                    } else {
+                        Vector2::new(1920.0 * u, 1080.0 * v)
+                    }
+                })
+                .collect()
+        };
+        let m: Vec<(usize, usize)> = (0..n).map(|i| (i, i)).collect();
+        let mut times = [0.0f64; 2];
+        for (i, clump) in [false, true].into_iter().enumerate() {
+            let a = kp(clump);
+            let b: Vec<Vector2<f64>> = a.iter().map(|p| p + Vector2::new(5.0, 3.0)).collect();
+            let best = (0..3)
+                .map(|_| {
+                    let t0 = std::time::Instant::now();
+                    let out = displacement_outliers(&m, &a, &b);
+                    assert_eq!(out.iter().filter(|&&x| x).count(), 0);
+                    t0.elapsed().as_secs_f64()
+                })
+                .fold(f64::MAX, f64::min);
+            times[i] = best;
+        }
+        eprintln!("uniform {:.4} s clumped {:.4} s", times[0], times[1]);
+        assert!(times[1] <= 6.0 * times[0] + 0.02, "{times:?}");
     }
 }
