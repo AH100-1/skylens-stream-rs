@@ -7,7 +7,7 @@ use skylens_core::dataset::{load_dataset, DatasetConfig};
 use skylens_core::pipeline::{run_pipeline, DenseMethod, PipelineConfig, PositionMethod};
 
 pub const USAGE: &str =
-    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N] [--max-features N] [--dense-width N] [--hfov DEG] [--ba-iters N] [--dense-method sweep|patchmatch] [--position gps|translation-averaging] [--preview-ba-iters N] [--preview-refine-iters N] [--helper-front N] [--helper-back N] [--helper-back-step N] [--coarse-back on|off] [--gps-sigma-h M] [--gps-sigma-v M] [--tri-loose-frac F] [--tri-median-k K] [--tri-min-px PX] [--list-only]";
+    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N] [--max-features N] [--upscale-fill] [--pair-vote] [--dense-width N] [--hfov DEG] [--ba-iters N] [--dense-method sweep|patchmatch] [--position gps|translation-averaging] [--preview-ba-iters N] [--preview-refine-iters N] [--helper-front N] [--helper-back N] [--helper-back-step N] [--coarse-back on|off] [--gps-sigma-h M] [--gps-sigma-v M] [--tri-loose-frac F] [--tri-median-k K] [--tri-min-px PX] [--list-only]";
 
 /// 출력 폴더 아래에 만드는 하위 폴더.
 pub const OUTPUT_DIRS: [&str; 3] = ["preview", "refined", "snapshots"];
@@ -20,6 +20,14 @@ fn parse_options(rest: &[&str]) -> Result<(DatasetConfig, PipelineConfig, bool),
     while let Some(&key) = it.next() {
         if key == "--list-only" {
             list_only = true;
+            continue;
+        }
+        if key == "--upscale-fill" {
+            pc.upscale_fill = true;
+            continue;
+        }
+        if key == "--pair-vote" {
+            pc.pair_vote = true;
             continue;
         }
         if key == "--hfov" {
