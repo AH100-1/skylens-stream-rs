@@ -2647,6 +2647,158 @@ mod diag {
         assert!(new.placed_rot_med < 0.6 * old.placed_rot_med);
     }
 
+    /// 평면 맞춤(주성분) 법선과 중심.
+    fn plane_normal(p: &[Vector3<f64>]) -> Vector3<f64> {
+        let c = p.iter().sum::<Vector3<f64>>() / p.len() as f64;
+        let mut m = Matrix3::zeros();
+        for q in p {
+            let d = q - c;
+            m += d * d.transpose();
+        }
+        let e = nalgebra::SymmetricEigen::new(m);
+        let i = e.eigenvalues.imin();
+        let n: Vector3<f64> = e.eigenvectors.column(i).into_owned();
+        if n.z < 0.0 {
+            -n
+        } else {
+            n
+        }
+    }
+
+    /// 구역별 초벌 롤 오차(정답 대비)와 초벌 점군 기울기(정답 지면 대비) 측정.
+    /// `cargo test --release preview_roll_tilt_measure -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn preview_roll_tilt_measure() {
+        let root = std::env::temp_dir().join(format!("skylens_rt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let scene = Scene::new(SceneConfig {
+            positions: 80,
+            width: 320,
+            height: 180,
+            seed: 1,
+            ..SceneConfig::default()
+        });
+        scene.write_dataset(&root).unwrap();
+        let ds = load_dataset(
+            &root,
+            DatasetConfig {
+                stride: 1,
+                span: 48,
+                ovl: 2,
+                max_skip_run: 2,
+            },
+        )
+        .unwrap();
+        let n_pos = ds.positions.len();
+        let origin = scene.to_first_gps_frame(&Point3::new(0.0, 0.0, 0.0)).coords;
+        for r in split_regions(n_pos, ds.config.span, ds.config.ovl) {
+            let helper_lo = r.lo.saturating_sub(HELPER_SPAN);
+            let helper_hi = if r.lo >= HELPER_MIN {
+                r.lo - HELPER_MIN + 1
+            } else {
+                0
+            };
+            let gids: Vec<usize> = (helper_lo..helper_hi.max(helper_lo))
+                .map(|p| 3 * p)
+                .chain((r.lo..r.hi).flat_map(|p| (0..3).map(move |c| 3 * p + c)))
+                .collect();
+            let data: Vec<ImgData> = gids
+                .iter()
+                .map(|g| load(&ds.positions[g / 3].images[g % 3], 800).unwrap())
+                .collect();
+            let imgs: Vec<&ImgData> = data.iter().collect();
+            let k = Intrinsics::from_hfov(
+                data[0].rgb.width(),
+                data[0].rgb.height(),
+                65f64.to_radians(),
+            );
+            let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
+            let gps: Vec<Vector3<f64>> = gids
+                .iter()
+                .map(|g| ds.positions[g / 3].image_enu[g % 3])
+                .collect();
+            let pm = match_pairs(&imgs, &views, &k);
+            let tp: Vec<Pose> = gids
+                .iter()
+                .map(|&g| {
+                    let name = ds.positions[g / 3].images[g % 3]
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                    let v = scene.views.iter().find(|v| v.name == name).unwrap();
+                    let c = scene.to_first_gps_frame(&v.camera.pose.center());
+                    Pose::from_center(v.camera.pose.rotation, &c)
+                })
+                .collect();
+            for legacy in [false, true] {
+                let opts = PreviewOpts {
+                    legacy_roll: legacy,
+                    ..PreviewOpts::default()
+                };
+                let (init, _) = sparse_init_with(
+                    &imgs,
+                    &pm,
+                    &gps,
+                    &k,
+                    PipelineConfig::default().position,
+                    &TriConfig::from_config(&PipelineConfig::default()),
+                    (0, 2.0),
+                    &opts,
+                )
+                .unwrap();
+                // 추정 세계 → 정답 세계 회전 W_i = R_est^T R_true 의 합에서 극분해.
+                let mut m = Matrix3::zeros();
+                for (p, t) in init.poses.iter().zip(&tp) {
+                    if let Some(p) = p {
+                        m += p.rotation.matrix().transpose() * t.rotation.matrix();
+                    }
+                }
+                let sv = m.svd(true, true);
+                let w = Rotation3::from_matrix_unchecked(sv.u.unwrap() * sv.v_t.unwrap());
+                let tilt_g = (w * Vector3::z()).angle(&Vector3::z()).to_degrees();
+                // 비행 축 둘레 성분(축은 GPS 첫-끝 방향).
+                let a = (gps[gps.len() - 1] - gps[0]).normalize();
+                let rv = w.scaled_axis();
+                let roll_about_axis = rv.dot(&a).to_degrees();
+                let rot_med = med(init
+                    .poses
+                    .iter()
+                    .zip(&tp)
+                    .filter_map(|(p, t)| {
+                        Some(
+                            (p.as_ref()?.rotation * t.rotation.inverse())
+                                .angle()
+                                .to_degrees(),
+                        )
+                    })
+                    .collect());
+                // 점군 기울기: 초벌 점(광선 각 필터) 평면 법선 대 같은 (x,y) 의 정답 지면 평면 법선.
+                let good = well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200);
+                let pts: Vec<Vector3<f64>> = good.points.clone();
+                let truth: Vec<Vector3<f64>> = pts
+                    .iter()
+                    .map(|p| {
+                        let q = p - origin;
+                        Vector3::new(p.x, p.y, scene.surface_height(q.x, q.y) + origin.z)
+                    })
+                    .collect();
+                let (ne, nt) = (plane_normal(&pts), plane_normal(&truth));
+                let tilt_cloud = ne.angle(&nt).to_degrees();
+                let tilt_cloud_world = ne.angle(&Vector3::z()).to_degrees();
+                // 점군 평면 높이 편향: 점 − 정답 지면 높이 중앙값.
+                let dzm = med(pts.iter().zip(&truth).map(|(p, t)| p.z - t.z).collect());
+                eprintln!(
+                    "RT region {} legacy {legacy} | gauge err {:.3} deg (tilt of z {:.3}, about axis {:+.3}) rot_med {:.3} | cloud n {} tilt vs truth {:.3} (vs z {:.3}) dz med {:+.2} m",
+                    r.index, w.angle().to_degrees(), tilt_g, roll_about_axis, rot_med, pts.len(),
+                    tilt_cloud, tilt_cloud_world, dzm
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     #[ignore]
     fn preview_candidates() {
