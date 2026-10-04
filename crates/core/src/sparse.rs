@@ -57,6 +57,43 @@ pub struct SparseConfig {
     /// 번들 조정에 쓰는 트랙 상한(기본 100_000).
     pub max_ba_tracks: usize,
     pub align_gps: bool,
+    /// 정밀 번들 조정 단계화.
+    pub ba_stages: BaStages,
+}
+
+/// 정밀 번들 조정 1회의 내부 구성(SPEC §3.4 의 "번들 조정" 한 번을 여러 라운드로 나눈다).
+#[derive(Clone, Copy, Debug)]
+pub struct BaStages {
+    /// 라운드마다 회전 고정(위치·점만) → 전체 공동 두 단계로 푼다. 거짓이면 전체 공동 1회.
+    pub staged: bool,
+    /// 라운드 사이 재투영 문턱을 초점 1000 px 기준 30 → 20 → 10 으로 조이고, 마지막에 4 px·삼각측량 각 1.5° 로 정리한다.
+    pub tighten: bool,
+    /// BA 뒤 재투영 정제(포즈 고정, 점만 다시 삼각측량·최적화, 버려진 관측 복귀)와 전체 BA 2회. SPEC 은 BA 뒤 재삼각측량을
+    /// 하지 않으므로 기본 끔.
+    pub retriangulate: bool,
+    /// 라운드 수(`staged` 또는 `tighten` 일 때).
+    pub rounds: usize,
+}
+
+impl BaStages {
+    /// 단계화 이전 동작: 전체 공동 BA 1회 + 4 px 거르기.
+    pub const LEGACY: BaStages = BaStages {
+        staged: false,
+        tighten: false,
+        retriangulate: false,
+        rounds: 1,
+    };
+}
+
+impl Default for BaStages {
+    fn default() -> Self {
+        Self {
+            staged: true,
+            tighten: true,
+            retriangulate: false,
+            rounds: 3,
+        }
+    }
 }
 
 impl Default for SparseConfig {
@@ -69,6 +106,7 @@ impl Default for SparseConfig {
             bundle_adjust: true,
             max_ba_tracks: 100_000,
             align_gps: true,
+            ba_stages: BaStages::default(),
         }
     }
 }
@@ -110,6 +148,15 @@ const RATIO: f32 = 0.8;
 const MAX_REPROJ_PX: f64 = 4.0;
 /// 삼각측량 최소 시선 각(도).
 const MIN_TRI_ANGLE_DEG: f64 = 1.0;
+/// 단계화 문턱을 정규화하는 기준 초점(px).
+const REF_FOCAL: f64 = 1000.0;
+/// 조이는 거르기 문턱(초점 1000 px 기준)과 마지막 정리 문턱.
+const TIGHTEN_PX: [f64; 3] = [30.0, 20.0, 10.0];
+const FINAL_PX: f64 = 4.0;
+const FINAL_ANGLE_DEG: f64 = 1.5;
+/// 재삼각측량 정제를 멈추는 바뀐 관측 비율과 최대 반복.
+const RETRI_STOP_FRAC: f64 = 5e-4;
+const RETRI_MAX_ITERS: usize = 8;
 /// GPS 대응 제외 문턱(m, SPEC §3.4).
 const GPS_MAX_M: f64 = 3.0;
 /// 위치 교대 최소제곱에 쓰는 트랙 수 상한.
@@ -337,7 +384,14 @@ pub fn reconstruct(
 
     // 6. 다시점 삼각측량.
     let mut cams = make_cams(&centers);
-    let mut pts = triangulate_tracks(&tracks, &cams, &keypoints, &norm);
+    let mut pts = triangulate_tracks(
+        &tracks,
+        &cams,
+        &keypoints,
+        &norm,
+        MAX_REPROJ_PX,
+        MIN_TRI_ANGLE_DEG,
+    );
     let preview = cfg.keep_preview.then(|| PreviewModel {
         cameras: cams.clone(),
         points: export_points(&pts, inputs, &keypoints),
@@ -346,16 +400,9 @@ pub fn reconstruct(
 
     // 7. 번들 조정.
     if cfg.bundle_adjust && pts.len() >= 8 {
-        run_ba(
-            &mut cams,
-            &mut pts,
-            &keypoints,
-            inputs,
-            intrinsics,
-            cfg.max_ba_tracks,
-            &gps,
+        staged_ba(
+            &mut cams, &mut pts, &tracks, &keypoints, &norm, inputs, intrinsics, cfg, &gps,
         );
-        prune(&mut pts, &cams, &keypoints, MAX_REPROJ_PX);
     }
     if cfg.record_stages {
         stages.push(("번들 조정", cams.clone()));
@@ -761,6 +808,8 @@ fn triangulate_tracks(
     cams: &[Option<Camera>],
     kp: &[Vec<[f64; 2]>],
     norm: &[Vec<Vector2<f64>>],
+    th: f64,
+    min_angle: f64,
 ) -> Vec<TriPoint> {
     tracks
         .par_iter()
@@ -779,7 +828,8 @@ fn triangulate_tracks(
                     .filter(|&(im, f)| {
                         let c = cams[im].as_ref().unwrap();
                         c.pose.transform(&Point3::from(p)).z > 0.0
-                            && reproj_err(c, &p, &kp[im][f]).is_some_and(|e| e <= MAX_REPROJ_PX)
+                            && reproj_err(c, &p, &kp[im][f])
+                                .is_some_and(|e| e <= th * c.intrinsics.fx / REF_FOCAL)
                     })
                     .collect();
                 x = Some(p);
@@ -790,19 +840,36 @@ fn triangulate_tracks(
                 x = None;
             }
             let x = x?;
-            (max_angle_deg(&x, &obs, cams) >= MIN_TRI_ANGLE_DEG).then_some(TriPoint { xyz: x, obs })
+            (max_angle_deg(&x, &obs, cams) >= min_angle).then_some(TriPoint { xyz: x, obs })
         })
         .collect()
 }
 
 /// 재투영 오차가 `th` 를 넘는 관측(과 카메라 뒤 관측)을 떼고, 관측 2개 미만 점을 버린다.
 fn prune(pts: &mut Vec<TriPoint>, cams: &[Option<Camera>], kp: &[Vec<[f64; 2]>], th: f64) {
+    prune_scaled(pts, cams, kp, th, false);
+}
+
+/// `scaled` 이면 `th` 는 초점 1000 px 기준이라 카메라 초점에 비례해 줄인다.
+fn prune_scaled(
+    pts: &mut Vec<TriPoint>,
+    cams: &[Option<Camera>],
+    kp: &[Vec<[f64; 2]>],
+    th: f64,
+    scaled: bool,
+) {
     for p in pts.iter_mut() {
         let x = p.xyz;
         p.obs.retain(|&(im, f)| {
             cams[im].as_ref().is_some_and(|c| {
                 c.pose.transform(&Point3::from(x)).z > 0.0
-                    && reproj_err(c, &x, &kp[im][f]).is_some_and(|e| e <= th)
+                    && reproj_err(c, &x, &kp[im][f]).is_some_and(|e| {
+                        e <= if scaled {
+                            th * c.intrinsics.fx / REF_FOCAL
+                        } else {
+                            th
+                        }
+                    })
             })
         });
     }
@@ -848,6 +915,104 @@ fn color_of(inputs: &[SparseInput], kp: &[Vec<[f64; 2]>], obs: &[(usize, usize)]
 // ---------------------------------------------------------------------------------------------
 // 번들 조정·정렬
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BaMode {
+    /// 포즈·점 공동.
+    Joint,
+    /// 회전 고정(위치·점만).
+    PositionsOnly,
+    /// 포즈 고정(점만).
+    PointsOnly,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn staged_ba(
+    cams: &mut [Option<Camera>],
+    pts: &mut Vec<TriPoint>,
+    tracks: &[Vec<(usize, usize)>],
+    kp: &[Vec<[f64; 2]>],
+    norm: &[Vec<Vector2<f64>>],
+    inputs: &[SparseInput],
+    intrinsics: &[Intrinsics],
+    cfg: &SparseConfig,
+    gps: &[Option<Vector3<f64>>],
+) {
+    let st = cfg.ba_stages;
+    let mt = cfg.max_ba_tracks;
+    if !st.staged && !st.tighten && !st.retriangulate {
+        run_ba(cams, pts, kp, inputs, intrinsics, mt, gps, BaMode::Joint);
+        prune(pts, cams, kp, MAX_REPROJ_PX);
+        return;
+    }
+    let rounds = st.rounds.max(1);
+    for r in 0..rounds {
+        if st.staged {
+            run_ba(
+                cams,
+                pts,
+                kp,
+                inputs,
+                intrinsics,
+                mt,
+                gps,
+                BaMode::PositionsOnly,
+            );
+        }
+        run_ba(cams, pts, kp, inputs, intrinsics, mt, gps, BaMode::Joint);
+        if st.tighten {
+            let th = if r + 1 == rounds {
+                FINAL_PX
+            } else {
+                TIGHTEN_PX[r.min(TIGHTEN_PX.len() - 1)]
+            };
+            prune_scaled(pts, cams, kp, th, true);
+        } else {
+            prune(pts, cams, kp, MAX_REPROJ_PX);
+        }
+    }
+    if st.retriangulate {
+        let obs_set = |pts: &[TriPoint]| -> std::collections::HashSet<(usize, usize)> {
+            pts.iter().flat_map(|p| p.obs.iter().copied()).collect()
+        };
+        for _ in 0..RETRI_MAX_ITERS {
+            let before = obs_set(pts);
+            let mut np = triangulate_tracks(tracks, cams, kp, norm, FINAL_PX, FINAL_ANGLE_DEG);
+            if np.len() < 8 {
+                break;
+            }
+            run_ba(
+                cams,
+                &mut np,
+                kp,
+                inputs,
+                intrinsics,
+                mt,
+                gps,
+                BaMode::PointsOnly,
+            );
+            prune_scaled(&mut np, cams, kp, FINAL_PX, true);
+            let after = obs_set(&np);
+            let changed = before.symmetric_difference(&after).count() as f64;
+            let frac = changed / before.len().max(1) as f64;
+            *pts = np;
+            if frac < RETRI_STOP_FRAC {
+                break;
+            }
+        }
+        for _ in 0..2 {
+            run_ba(cams, pts, kp, inputs, intrinsics, mt, gps, BaMode::Joint);
+        }
+    }
+    if st.tighten {
+        prune_scaled(pts, cams, kp, FINAL_PX, true);
+        // 삼각측량 각이 작은 점은 깊이가 불안정하니 거른다(재투영 거르기를 먼저 했다).
+        pts.retain(|p| max_angle_deg(&p.xyz, &p.obs, cams) >= FINAL_ANGLE_DEG);
+    } else {
+        prune(pts, cams, kp, MAX_REPROJ_PX);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_ba(
     cams: &mut [Option<Camera>],
     pts: &mut [TriPoint],
@@ -856,6 +1021,7 @@ fn run_ba(
     intrinsics: &[Intrinsics],
     max_tracks: usize,
     gps: &[Option<Vector3<f64>>],
+    mode: BaMode,
 ) {
     let reg: Vec<usize> = (0..cams.len()).filter(|&k| cams[k].is_some()).collect();
     let mut map = vec![usize::MAX; cams.len()];
@@ -885,11 +1051,20 @@ fn run_ba(
         loss: crate::ba::Loss::Huber(1.0),
         max_tracks,
         default_free_intrinsics: [false; 8],
-        fixed_cameras: vec![0],
+        fixed_cameras: if mode == BaMode::PointsOnly {
+            (0..reg.len()).collect()
+        } else {
+            vec![0]
+        },
         // 모델은 위치 단계에서 이미 GPS 좌표계(m)다. GPS 사전항으로 게이지를 묶어 회전 이탈을 막는다.
-        position_prior: (gps.iter().flatten().count() >= 3).then(|| {
-            crate::ba::PositionPrior::new(reg.iter().map(|&k| gps[k].map(Point3::from)).collect())
-        }),
+        position_prior: (mode != BaMode::PointsOnly && gps.iter().flatten().count() >= 3).then(
+            || {
+                crate::ba::PositionPrior::new(
+                    reg.iter().map(|&k| gps[k].map(Point3::from)).collect(),
+                )
+            },
+        ),
+        fix_rotations: mode == BaMode::PositionsOnly,
         ..Default::default()
     };
     bundle_adjust(&mut prob, &opts);
@@ -1124,6 +1299,139 @@ mod tests {
         assert!(e.4 < 1.0, "BA 뒤 회전 중앙 {}", e.4);
         assert!(pm <= 1.1, "점 {pm}");
         assert!(pv.points.len() > 100);
+    }
+
+    /// 닮음 맞춤 뒤 (회전 오차 중앙, 최대)(도).
+    fn rot_errors(cams: &[Option<Camera>], scene: &Scene) -> (f64, f64) {
+        let idx: Vec<usize> = (0..cams.len()).filter(|&k| cams[k].is_some()).collect();
+        let src: Vec<Vector3<f64>> = idx
+            .iter()
+            .map(|&k| cams[k].unwrap().pose.center().coords)
+            .collect();
+        let dst: Vec<Vector3<f64>> = idx
+            .iter()
+            .map(|&k| scene.views[k].camera.pose.center().coords)
+            .collect();
+        let (sim, _, _) = robust_similarity(&src, &dst, 3, 1e6).unwrap();
+        let mut rot: Vec<f64> = idx
+            .iter()
+            .map(|&k| {
+                let r = cams[k].unwrap().pose.rotation * sim.r.inverse();
+                (scene.views[k].camera.pose.rotation * r.inverse())
+                    .angle()
+                    .to_degrees()
+            })
+            .collect();
+        let mx = rot.iter().copied().fold(0.0, f64::max);
+        (median(&mut rot), mx)
+    }
+
+    /// 중심 정렬과 무관한 회전 오차: 정답 대비 전역 회전 하나를 회전 자체에서 구해 뺀 뒤 (중앙, 최대)(도).
+    /// 위치 40곳이 한 줄이라 중심 닮음 맞춤은 줄 축 둘레 회전이 불안정해 `rot_errors` 에 그 오차가 섞인다.
+    fn rot_errors_free(cams: &[Option<Camera>], scene: &Scene) -> (f64, f64) {
+        let mut m = Matrix3::<f64>::zeros();
+        for (k, c) in cams.iter().enumerate() {
+            if let Some(c) = c {
+                m += scene.views[k].camera.pose.rotation.inverse().matrix()
+                    * c.pose.rotation.matrix();
+            }
+        }
+        let svd = m.svd(true, true);
+        let (u, vt) = (svd.u.unwrap(), svd.v_t.unwrap());
+        let mut d = Matrix3::<f64>::identity();
+        if (u * vt).determinant() < 0.0 {
+            d[(2, 2)] = -1.0;
+        }
+        let g = Rotation3::from_matrix_unchecked(u * d * vt);
+        let mut rot: Vec<f64> = cams
+            .iter()
+            .enumerate()
+            .filter_map(|(k, c)| {
+                c.map(|c| {
+                    (g.inverse() * scene.views[k].camera.pose.rotation.inverse() * c.pose.rotation)
+                        .angle()
+                        .to_degrees()
+                })
+            })
+            .collect();
+        let mx = rot.iter().copied().fold(0.0, f64::max);
+        (median(&mut rot), mx)
+    }
+
+    /// 단구역(위치 40곳 = 120장) 합성 편대에서 BA 단계화 설정별 정밀 포즈 오차 표.
+    #[test]
+    #[ignore = "수 분 걸리는 측정 시험: cargo test --release -p skylens-core staged_ba_table -- --ignored --nocapture"]
+    fn staged_ba_table() {
+        let (scene, inputs, k) = build(40, 480, 270);
+        let stages = |staged, tighten, retriangulate| BaStages {
+            staged,
+            tighten,
+            retriangulate,
+            rounds: 3,
+        };
+        let configs = [
+            ("기존", BaStages::LEGACY),
+            ("2단계만", stages(true, false, false)),
+            ("2단계+거르기", stages(true, true, false)),
+            ("+재삼각측량", stages(true, true, true)),
+        ];
+        eprintln!("| 설정 | 회전 중앙(도) | 회전 최대 | 회전(중심 무관) 중앙 | 최대 | 중심 중앙(m) | 중심 최대 | 점 표면 중앙(m) | 재투영 rms(px) | 점 수 | 등록 | 시간(s) |");
+        let mut res = Vec::new();
+        for (name, bs) in configs {
+            let t0 = std::time::Instant::now();
+            let m = reconstruct(
+                &inputs,
+                &[k, k, k],
+                &SparseConfig {
+                    max_features: 1200,
+                    keep_preview: false,
+                    ba_stages: bs,
+                    pair_schedule: PairSchedule {
+                        cross: crate::matching::CrossSchedule::Formation {
+                            right_min: 12,
+                            left_min: 16,
+                            max: 40,
+                            step: 1,
+                        },
+                        ..PairSchedule::default()
+                    },
+                    ..SparseConfig::default()
+                },
+            )
+            .unwrap();
+            let dt = t0.elapsed().as_secs_f64();
+            let e = cam_errors(&m.cameras, &scene);
+            let (rm, rx) = rot_errors(&m.cameras, &scene);
+            let (fm, fx) = rot_errors_free(&m.cameras, &scene);
+            let pm = point_median(&m.points, &scene);
+            eprintln!(
+                "| {name} | {rm:.3} | {rx:.3} | {fm:.3} | {fx:.3} | {:.3} | {:.3} | {pm:.3} | {:.3} | {} | {}/{} | {dt:.1} |",
+                e.2,
+                e.3,
+                m.reproj_rms_px,
+                m.points.len(),
+                m.registered,
+                inputs.len()
+            );
+            res.push((rm, rx, fm, e.2, e.3, pm, m.reproj_rms_px, m.registered));
+        }
+        // 상한 = 실측 × 1.2 (회전 중앙, 회전 최대, 중심 무관 회전 중앙, 중심 중앙, 중심 최대, 점 표면 중앙, rms).
+        let caps = [
+            [5.88, 10.15, 7.84, 0.618, 1.252, 2.307, 0.214],
+            [2.11, 2.25, 1.50, 0.432, 1.239, 1.456, 0.214],
+            [2.11, 2.25, 1.50, 0.432, 1.239, 1.442, 0.203],
+            [3.89, 4.43, 0.89, 0.222, 0.525, 0.545, 0.248],
+        ];
+        for (r, c) in res.iter().zip(&caps) {
+            assert_eq!(r.7, inputs.len());
+            let v = [r.0, r.1, r.2, r.3, r.4, r.5, r.6];
+            for (x, cap) in v.iter().zip(c) {
+                assert!(x <= cap, "{v:?} 상한 {c:?}");
+            }
+        }
+        // 단계화가 회전을 크게 줄이고(기존 대비 절반 이하), 재삼각측량이 중심·점 표면을 줄인다.
+        assert!(res[1].0 < 0.5 * res[0].0);
+        assert!(res[3].3 < res[1].3 && res[3].5 < res[1].5);
     }
 
     #[test]

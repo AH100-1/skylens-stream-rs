@@ -150,6 +150,8 @@ pub struct BaOptions {
     pub function_tolerance: f64,
     /// 카메라 중심 위치 사전항. 기본 None(끔).
     pub position_prior: Option<PositionPrior>,
+    /// 참이면 모든 카메라의 회전을 고정하고 위치(평행이동)·점만 푼다. 기본 거짓.
+    pub fix_rotations: bool,
 }
 
 impl Default for BaOptions {
@@ -164,6 +166,7 @@ impl Default for BaOptions {
             initial_lambda: 1e-4,
             function_tolerance: 1e-10,
             position_prior: None,
+            fix_rotations: false,
         }
     }
 }
@@ -341,7 +344,7 @@ fn layout(problem: &BaProblem, opts: &BaOptions) -> Layout {
         let mut idx = [None; 6];
         if !fixed.contains(&c) {
             for (k, slot) in idx.iter_mut().enumerate() {
-                if k >= 3 && scale_fix == Some((c, k - 3)) {
+                if (k < 3 && opts.fix_rotations) || (k >= 3 && scale_fix == Some((c, k - 3))) {
                     continue;
                 }
                 *slot = Some(n);
