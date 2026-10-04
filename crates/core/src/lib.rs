@@ -15,6 +15,7 @@ pub mod patchmatch;
 pub mod pipeline;
 pub mod pipeline_stream;
 pub mod ply;
+pub mod poses_io;
 pub mod progressive;
 pub mod rotation_averaging;
 pub mod sparse;
