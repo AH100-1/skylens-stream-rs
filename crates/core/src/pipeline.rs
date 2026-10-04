@@ -1740,6 +1740,8 @@ fn dense_icp_refine(
     target: &PointCloud,
     reach: f64,
     iters: usize,
+    cams: &[(Vector3<f64>, Vector3<f64>)],
+    cam_weight: f64,
 ) -> Option<(Similarity, usize)> {
     if std::env::var("SKYLENS_DENSE_ICP").as_deref() == Ok("0") {
         return None;
@@ -1797,8 +1799,20 @@ fn dense_icp_refine(
         }
         found.sort_by(|a, b| a.0.total_cmp(&b.0));
         found.truncate(found.len() * 7 / 10);
-        let a: Vec<Vector3<f64>> = found.iter().map(|f| f.1).collect();
-        let b: Vec<Vector3<f64>> = found.iter().map(|f| f.2).collect();
+        let mut a: Vec<Vector3<f64>> = found.iter().map(|f| f.1).collect();
+        let mut b: Vec<Vector3<f64>> = found.iter().map(|f| f.2).collect();
+        // 공유 카메라 중심 대응: 전체 가중치가 점 대응 합의 `cam_weight` 배가 되도록 복제해 같은 닮음 변환 적합에 넣는다.
+        if cam_weight > 0.0 && cams.len() >= 3 {
+            let rep =
+                ((cam_weight * found.len() as f64 / cams.len() as f64).round() as usize).max(1);
+            for (cs, cd) in cams {
+                let x = delta.apply_point(cs);
+                for _ in 0..rep {
+                    a.push(x);
+                    b.push(*cd);
+                }
+            }
+        }
         let step_sim = crate::align::umeyama(&a, &b)?;
         delta = step_sim.compose(&delta);
         npairs = found.len();
@@ -2095,7 +2109,24 @@ pub fn run_pipeline_with(
             let mut moved = crate::stream::apply_cloud(&acc, &recs[j].refined.as_ref().unwrap().1);
             if st.via == k {
                 let tgt = &recs[k].refined.as_ref().unwrap().1;
-                if let Some((d, np)) = dense_icp_refine(&moved, tgt, 1.5, 6) {
+                // 공유 카메라 중심(같은 사진 번호): 지금까지의 변환 `acc` 로 옮긴 j 구역 중심 → k 구역 중심(k 의 최신 좌표계).
+                let cam_pairs: Vec<(Vector3<f64>, Vector3<f64>)> = recs[j]
+                    .centers
+                    .iter()
+                    .filter_map(|(g, c)| {
+                        let ck = recs[k].centers.get(g)?;
+                        let v = Vector3::new(c[0], c[1], c[2]);
+                        let w = recs[k].rsim.map_or(Vector3::new(ck[0], ck[1], ck[2]), |x| {
+                            x.apply_point(&Vector3::new(ck[0], ck[1], ck[2]))
+                        });
+                        Some((acc.apply_point(&v), w))
+                    })
+                    .collect();
+                let cw = std::env::var("SKYLENS_CAM_W")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                if let Some((d, np)) = dense_icp_refine(&moved, tgt, 1.5, 6, &cam_pairs, cw) {
                     events.push(format!(
                         "{:.1}s dense refine region {} onto refined {} pairs {np} scale {:.4} rotation {:.3} deg shift {:.3} m",
                         t_now(),
