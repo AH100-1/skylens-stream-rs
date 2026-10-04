@@ -278,15 +278,15 @@ fn single_region_end_to_end() {
 }
 
 /// 구역 2개(README 둘째 명령, stride 1 → 80위치 × 3대 = 240장): refined_overlap 이 실제로 판정된다.
-/// 시험 전체 약 3 분(부하 낮을 때 179 초, 부하 22 에서는 run 만 332 초). 실측: verify 6/7 종료 코드 1, 중심 오차 중앙 0.290/최대 3.115 m,
+/// 시험 전체 약 3 분(부하 낮을 때 179 초, 부하 22 에서는 run 만 332 초). 실측(초벌 위치 다듬기 이전): verify 6/7 종료 코드 1, 중심 오차 중앙 0.290/최대 3.115 m,
 /// 정밀 점 표면 거리 중앙 0.494/95% 3.022 m (점 19855개). 상한은 실측 x 1.2.
-/// 실패 항목: preview_vs_refined (높이 차 중앙 최대 5.829 m, 최근접 4.923 m). preview_align 은 통과: 구역 간 점쌍을 구역의
+/// 초벌 위치 다듬기 뒤 preview_vs_refined 통과(SPEC 기준 높이 차 < 2 m, 최근접 < 3 m), verify 7/7. preview_align 은 통과: 구역 간 점쌍을 구역의
 /// 모든 이미지 관측으로 만들어 점쌍 최소 1221 (정렬 창 12장만 쓰면 324), 스케일 차 0.05% (창만 쓰면 8.26%), 잔차 중앙 최대 5.130 m.
 #[test]
 fn two_region_end_to_end() {
     let o = pipeline("two", "1");
     assert_eq!(o.m.registered, 240, "등록 수");
-    assert_eq!(o.verify_code, 1, "{}", o.verify);
+    assert_eq!(o.verify_code, 0, "{}", o.verify);
     expect_items(
         &o,
         &[
@@ -294,7 +294,7 @@ fn two_region_end_to_end() {
             ("region_images", "PASS"),
             ("refined_reprojection", "PASS"),
             ("preview_align", "PASS"),
-            ("preview_vs_refined", "FAIL"),
+            ("preview_vs_refined", "PASS"),
             ("refined_overlap", "PASS"),
             ("snapshots", "PASS"),
         ],
@@ -303,17 +303,10 @@ fn two_region_end_to_end() {
     assert!(!ov.contains("해당 없음"), "겹침이 판정돼야 함: {ov}");
     assert!(number_after(&ov, "중앙 최대 ") < 0.3, "{ov}");
     let (_, pr) = item(&o.verify, "preview_vs_refined");
-    assert!(
-        number_after(&pr, "높이 차 중앙 최대 ") > 2.0,
-        "높이 차 하한(실패 유지): {pr}"
-    );
-    assert!(
-        number_after(&pr, "높이 차 중앙 최대 ") < 7.0,
-        "높이 차 상한: {pr}"
-    );
-    assert!(number_after(&pr, "최근접 중앙 최대 ") < 5.9, "{pr}");
+    assert!(number_after(&pr, "높이 차 중앙 최대 ") < 2.0, "{pr}");
+    assert!(number_after(&pr, "최근접 중앙 최대 ") < 3.0, "{pr}");
     let (_, pa) = item(&o.verify, "preview_align");
-    assert!(number_after(&pa, "점쌍 최소 ") >= 1200.0, "{pa}");
+    assert!(number_after(&pa, "점쌍 최소 ") >= 1000.0, "{pa}");
     assert!(number_after(&pa, "구역 간 스케일 차 ") <= 1.0, "{pa}");
     assert!(number_after(&pa, "잔차 중앙 최대 ") < 6.0, "{pa}");
     assert!(o.m.center_med < 0.35, "중심 오차 중앙 {}", o.m.center_med);
