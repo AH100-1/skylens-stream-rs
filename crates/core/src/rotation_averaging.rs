@@ -735,6 +735,147 @@ fn largest_component(n: usize, edges: &[RelativeRotation], ids: &[usize]) -> Opt
     )
 }
 
+/// 시점 그래프 정리 설정.
+#[derive(Clone, Debug)]
+pub struct ViewGraphConfig {
+    /// 평균 뒤 전역 회전과 상대 회전의 차가 이를 넘는 간선을 뺀다(rad). 0 이하면 이 단계를 건너뛴다.
+    pub mismatch_rad: f64,
+    /// 평균 → 불일치 간선 제거 → 가장 큰 성분 되풀이 최대 횟수(제거가 없으면 일찍 멈춘다).
+    pub max_rounds: usize,
+    /// 간선 가중치(정상 대응 수)의 하한. 이보다 작은 간선은 처음부터 쓰지 않는다.
+    pub min_weight: f64,
+    /// 카메라 간 간선의 정상 대응 삼각측량각 중앙 하한(rad). 0 이하면 건너뛴다.
+    pub min_triangulation_rad: f64,
+}
+
+impl Default for ViewGraphConfig {
+    fn default() -> Self {
+        Self {
+            mismatch_rad: 4f64.to_radians(),
+            max_rounds: 4,
+            min_weight: 30.0,
+            min_triangulation_rad: 0.0,
+        }
+    }
+}
+
+/// 시점 그래프 정리 + 회전 평균 결과.
+#[derive(Clone, Debug)]
+pub struct PrunedAveraging {
+    /// 마지막 평균 결과(입력 간선 번호 기준).
+    pub result: AveragingResult,
+    /// 입력 간선별 마지막까지 남은 표시.
+    pub kept: Vec<bool>,
+    /// 단계별로 빠진 간선 수: 가중치·삼각측량각, 불일치(라운드 합), 가장 큰 성분 밖.
+    pub removed_prefilter: usize,
+    pub removed_mismatch: usize,
+    pub removed_component: usize,
+    /// 평균을 푼 횟수.
+    pub rounds: usize,
+}
+
+/// 간선의 정상 대응으로 계산한 삼각측량각(rad)의 중앙값. 카메라 1 = [I|0], 카메라 2 = [R|t].
+/// 이동 방향을 알 수 없거나 삼각측량되는 점이 없으면 0.
+pub fn median_triangulation_angle(
+    pose: &crate::two_view::RelativePose,
+    n1: &[crate::math::Vector2<f64>],
+    n2: &[crate::math::Vector2<f64>],
+) -> f64 {
+    if !pose.translation_observable {
+        return 0.0;
+    }
+    let c2 = -(pose.rotation.inverse() * pose.translation);
+    let mut v: Vec<f64> = n1
+        .iter()
+        .zip(n2)
+        .filter_map(|(a, b)| crate::two_view::triangulate(&pose.rotation, &pose.translation, a, b))
+        .filter_map(|x| {
+            let (u, w) = (-x.coords, c2 - x.coords);
+            let a = u.cross(&w).norm().atan2(u.dot(&w));
+            a.is_finite().then_some(a)
+        })
+        .collect();
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// 시점 그래프를 정리하며 회전을 평균한다.
+///
+/// 1. 가중치가 `min_weight` 미만이거나, `cross[k]` 인 간선의 삼각측량각 `tri_rad[k]` 가
+///    `min_triangulation_rad` 미만이면 뺀다(`cross`·`tri_rad` 가 비면 그 검사는 건너뛴다).
+/// 2. 평균 → 전역 회전과 상대 회전 차가 `mismatch_rad` 넘는 간선 제거 → 가장 큰 연결 성분만 유지 →
+///    다시 평균. 제거가 없을 때까지 최대 `max_rounds` 번 푼다.
+///
+/// None: 쓸 수 있는 간선이 없거나 입력이 틀렸을 때.
+pub fn average_rotations_pruned(
+    n: usize,
+    edges: &[RelativeRotation],
+    cross: &[bool],
+    tri_rad: &[f64],
+    gcfg: &ViewGraphConfig,
+    cfg: &AveragingConfig,
+) -> Option<PrunedAveraging> {
+    let mut alive: Vec<bool> = (0..edges.len())
+        .map(|k| {
+            let tri_ok = gcfg.min_triangulation_rad <= 0.0
+                || !cross.get(k).copied().unwrap_or(false)
+                || tri_rad
+                    .get(k)
+                    .is_some_and(|&a| a >= gcfg.min_triangulation_rad);
+            edges[k].weight >= gcfg.min_weight && tri_ok
+        })
+        .collect();
+    let removed_prefilter = alive.iter().filter(|&&a| !a).count();
+    let (mut removed_mismatch, mut removed_component, mut rounds) = (0, 0, 0);
+    loop {
+        let sub: Vec<RelativeRotation> = (0..edges.len())
+            .map(|k| {
+                let mut e = edges[k].clone();
+                if !alive[k] {
+                    e.weight = 0.0;
+                }
+                e
+            })
+            .collect();
+        let result = average_rotations(n, &sub, cfg)?;
+        rounds += 1;
+        let mut changed = false;
+        for k in 0..edges.len().min(alive.len()) {
+            if !alive[k] {
+                continue;
+            }
+            let e = &edges[k];
+            let (Some(ri), Some(rj)) = (result.rotations[e.i], result.rotations[e.j]) else {
+                alive[k] = false;
+                removed_component += 1;
+                changed = true;
+                continue;
+            };
+            if gcfg.mismatch_rad > 0.0
+                && angle(&(e.rotation.inverse() * rj * ri.inverse())) > gcfg.mismatch_rad
+                && rounds <= gcfg.max_rounds
+            {
+                alive[k] = false;
+                removed_mismatch += 1;
+                changed = true;
+            }
+        }
+        if !changed || rounds > gcfg.max_rounds {
+            return Some(PrunedAveraging {
+                result,
+                kept: alive,
+                removed_prefilter,
+                removed_mismatch,
+                removed_component,
+                rounds,
+            });
+        }
+    }
+}
+
 /// 추정 회전을 정답 회전에 맞추는 세계 회전 G(R_est G ≈ R_gt)를 구하고, 정점별 각 오차(rad)를 돌려준다.
 /// 둘 중 하나라도 None 인 정점은 건너뛴다.
 pub fn aligned_errors(estimated: &[Option<Rotation3<f64>>], truth: &[Rotation3<f64>]) -> Vec<f64> {
@@ -1509,5 +1650,43 @@ mod tests {
 
     fn rotation_angle(r: &Rotation3<f64>) -> f64 {
         angle(r)
+    }
+
+    /// 시점 그래프 정리: 3° 넘게 틀린 간선은 빠지고 정렬 오차가 줄며, 가중치 미달 간선은 처음부터 빠진다.
+    #[test]
+    fn pruning_drops_mismatched_and_light_edges() {
+        let n = 12;
+        let truth: Vec<Rotation3<f64>> = (0..n)
+            .map(|k| Rotation3::from_euler_angles(0.1 * k as f64, 0.05 * (k * k % 7) as f64, 0.2))
+            .collect();
+        let mut edges = Vec::new();
+        for i in 0..n {
+            for d in 1..=3 {
+                let j = (i + d) % n;
+                edges.push(RelativeRotation {
+                    i,
+                    j,
+                    rotation: truth[j] * truth[i].inverse(),
+                    weight: 100.0,
+                });
+            }
+        }
+        // 4° 틀린 간선 하나, 가중치 10 인 간선 하나.
+        let bad = Rotation3::from_axis_angle(&Vector3::z_axis(), 4f64.to_radians());
+        edges[5].rotation = bad * edges[5].rotation;
+        edges[9].weight = 10.0;
+        let g = ViewGraphConfig {
+            mismatch_rad: 2f64.to_radians(),
+            ..ViewGraphConfig::default()
+        };
+        let p =
+            average_rotations_pruned(n, &edges, &[], &[], &g, &AveragingConfig::default()).unwrap();
+        assert!(!p.kept[5] && !p.kept[9]);
+        assert_eq!(p.removed_prefilter, 1);
+        assert_eq!(p.removed_mismatch, 1);
+        assert_eq!(p.kept.iter().filter(|&&k| k).count(), edges.len() - 2);
+        let err = aligned_errors(&p.result.rotations, &truth);
+        assert_eq!(err.len(), n);
+        assert!(err.iter().all(|&e| e < 0.01f64.to_radians()));
     }
 }

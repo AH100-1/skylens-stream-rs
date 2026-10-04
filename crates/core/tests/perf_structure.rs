@@ -3,10 +3,19 @@
 //! 고정해 성능 회귀를 잡는다. 시간 측정 자체는 `benches/pipeline.rs` 가 맡는다.
 //! 검출 결과 해시 회귀 시험은 `features.rs` 시험 모듈 한 곳에서만 고정한다(여기에 두지 않는다).
 
-use skylens_core::features::{detect, DetectorConfig, GrayImage, Keypoint};
-use skylens_core::matching::{candidate_pairs, PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL};
+use rayon::prelude::*;
+use skylens_core::features::{detect, detect_and_describe, DetectorConfig, GrayImage, Keypoint};
+use skylens_core::matching::{
+    candidate_pairs, ratio_match, scheduled_pairs, PairSchedule, RansacConfig, PAIR_CROSS,
+    PAIR_POW2_MAX, PAIR_TEMPORAL,
+};
+use skylens_core::math::Vector2;
+use skylens_core::rotation_averaging::{
+    aligned_errors, average_rotations_pruned, median_triangulation_angle, AveragingConfig,
+    RelativeRotation, ViewGraphConfig,
+};
 use skylens_core::synth::{CamId, Scene, SceneConfig};
-use skylens_core::two_view::ESSENTIAL_MIN_ITERS;
+use skylens_core::two_view::{ransac_essential, recover_pose, ESSENTIAL_MIN_ITERS};
 
 #[path = "../benches/support/args.rs"]
 #[allow(dead_code)]
@@ -169,12 +178,17 @@ fn bench_args_preset_order_does_not_matter() {
     assert_eq!(bench_args::parse(&argv("--full --quick")).positions, 40);
 }
 
-/// 인자 없는 실행은 빠른 규모(24장·480×270)이고, 240장은 `--full` 을 줄 때만이다.
+/// 인자 없는 실행은 기본 규모(120장·480×270)이고, 240장은 `--full` 을 줄 때만이다.
 #[test]
 fn bench_args_default_is_quick_scale() {
     let a = bench_args::parse(&[]);
     assert_eq!(a, bench_args::parse(&argv("--quick")));
-    assert_eq!((a.positions, a.width, a.height), (8, 480, 270));
+    assert_eq!((a.positions, a.width, a.height), (40, 480, 270));
+    assert_eq!(a.mismatch_deg, 4.0);
+    assert_eq!(
+        bench_args::parse(&argv("--mismatch-deg 2.5")).mismatch_deg,
+        2.5
+    );
     assert_eq!(bench_args::parse(&argv("--full")).positions, 80);
     // ba-scale 은 위치를 따로 주지 않으면 80, 주면 그 값(묶음 인자도 위치를 준 것으로 본다).
     assert_eq!(bench_args::parse(&argv("--mode ba-scale")).positions, 80);
@@ -184,6 +198,111 @@ fn bench_args_default_is_quick_scale() {
     );
     assert_eq!(
         bench_args::parse(&argv("--mode ba-scale --quick")).positions,
-        8
+        40
+    );
+}
+
+/// bench 기본 조건(위치 40·120장·480×270·기본 짝 일정·비율 0.8·5점 RANSAC)의 검증 간선에 시점 그래프 정리를
+/// 적용한다. 정리 전 카메라 간 간선에 2° 넘게 틀린 것이 섞여 있고, 정리 뒤에는 120/120 시점이 반환되며
+/// 정답 대비 정렬 오차 중앙이 1° 이하(측정 0.35°)다.
+#[test]
+fn formation_view_graph_pruning_bench_conditions() {
+    let scene = Scene::new(SceneConfig {
+        positions: 40,
+        width: 480,
+        height: 270,
+        ..SceneConfig::default()
+    });
+    let nv = scene.views.len();
+    assert_eq!(nv, 120);
+    let det = DetectorConfig::default();
+    let feats: Vec<_> = scene
+        .views
+        .par_iter()
+        .map(|v| {
+            let (img, _) = scene.render(v);
+            detect_and_describe(
+                &GrayImage::from_rgb(img.width as usize, img.height as usize, &img.data),
+                &det,
+            )
+        })
+        .collect();
+    let cam_index = |c: CamId| CamId::ALL.iter().position(|&x| x == c).unwrap_or(0);
+    let keys: Vec<(usize, usize)> = scene
+        .views
+        .iter()
+        .map(|v| (cam_index(v.cam), v.position))
+        .collect();
+    let pairs = scheduled_pairs(&keys, &PairSchedule::default());
+    let truth: Vec<_> = scene.views.iter().map(|v| v.camera.pose.rotation).collect();
+    let focal = scene.views[0].camera.intrinsics.fx;
+    let rcfg = RansacConfig::default();
+    let data: Vec<(RelativeRotation, bool, f64, f64)> = pairs
+        .par_iter()
+        .filter_map(|&(i, j)| {
+            let m = ratio_match(&feats[i], &feats[j], 0.8, true);
+            let (ki, kj) = (
+                &scene.views[i].camera.intrinsics,
+                &scene.views[j].camera.intrinsics,
+            );
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for &(x, y) in &m {
+                let (pa, pb) = (feats[i][x].kp, feats[j][y].kp);
+                a.push(ki.index_to_normalized(&Vector2::new(pa.x as f64, pa.y as f64)));
+                b.push(kj.index_to_normalized(&Vector2::new(pb.x as f64, pb.y as f64)));
+            }
+            let (e, inl) = ransac_essential(&a, &b, focal, &rcfg)?;
+            let (sa, sb): (Vec<_>, Vec<_>) = (0..a.len())
+                .filter(|&k| inl[k])
+                .map(|k| (a[k], b[k]))
+                .unzip();
+            let p = recover_pose(&e, &sa, &sb)?;
+            let t = truth[j] * truth[i].inverse();
+            let err = (p.rotation * t.inverse()).angle().to_degrees();
+            Some((
+                RelativeRotation {
+                    i,
+                    j,
+                    rotation: p.rotation,
+                    weight: sa.len() as f64,
+                },
+                scene.views[i].cam != scene.views[j].cam,
+                median_triangulation_angle(&p, &sa, &sb),
+                err,
+            ))
+        })
+        .collect();
+    let edges: Vec<_> = data.iter().map(|d| d.0.clone()).collect();
+    let cross: Vec<_> = data.iter().map(|d| d.1).collect();
+    let tri: Vec<_> = data.iter().map(|d| d.2).collect();
+    let n_cross = cross.iter().filter(|&&c| c).count();
+    let bad_before = data.iter().filter(|d| d.1 && d.3 > 2.0).count();
+    let g = ViewGraphConfig {
+        mismatch_rad: bench_args::MISMATCH_DEG.to_radians(),
+        ..ViewGraphConfig::default()
+    };
+    let p = average_rotations_pruned(nv, &edges, &cross, &tri, &g, &AveragingConfig::default())
+        .expect("회전 평균");
+    let returned = p.result.rotations.iter().filter(|r| r.is_some()).count();
+    let mut err: Vec<f64> = aligned_errors(&p.result.rotations, &truth);
+    err.sort_by(f64::total_cmp);
+    let med = err[err.len() / 2].to_degrees();
+    let bad_after = data
+        .iter()
+        .zip(&p.kept)
+        .filter(|(d, &k)| k && d.1 && d.3 > 2.0)
+        .count();
+    let n_cross_after = data.iter().zip(&p.kept).filter(|(d, &k)| k && d.1).count();
+    eprintln!(
+        "간선 {} 카메라 간 {n_cross} (2° 초과 {bad_before}) -> 남은 카메라 간 {n_cross_after} (2° 초과 {bad_after}), 반환 {returned}/{nv}, 정렬 오차 중앙 {med:.3}°",
+        edges.len()
+    );
+    assert!(n_cross >= 40, "카메라 간 간선 {n_cross}");
+    assert!(bad_before >= 1, "정리 전 틀린 카메라 간 간선 {bad_before}");
+    assert_eq!(returned, 120);
+    assert!(med <= 1.0, "정렬 오차 중앙 {med}");
+    assert!(
+        bad_after as f64 <= 0.05 * n_cross_after as f64,
+        "정리 뒤 2° 초과 {bad_after}/{n_cross_after}"
     );
 }

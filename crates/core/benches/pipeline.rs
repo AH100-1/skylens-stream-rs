@@ -53,7 +53,8 @@ use skylens_core::matching::{
 };
 use skylens_core::math::{Point3, Rotation3, Vector2, Vector3};
 use skylens_core::rotation_averaging::{
-    aligned_errors, average_rotations, AveragingConfig, RelativeRotation,
+    aligned_errors, average_rotations, average_rotations_pruned, median_triangulation_angle,
+    AveragingConfig, RelativeRotation, ViewGraphConfig,
 };
 use skylens_core::synth::{CamId, Scene, SceneConfig};
 use skylens_core::two_view::{ransac_essential, recover_pose};
@@ -377,13 +378,21 @@ fn pipeline(args: &Args) -> Vec<Row> {
     });
 
     // 7b. 회전 평균: 이 실행의 두 시점 자세 결과(정상 대응 수 가중)를 입력으로.
+    let (mut cross_of, mut tri_of) = (Vec::new(), Vec::new());
     let measured: Vec<RelativeRotation> = chosen
         .iter()
         .zip(&poses)
         .zip(&eres)
-        .filter_map(|((&(i, j), p), e)| {
+        .zip(&coords)
+        .filter_map(|(((&(i, j), p), e), c)| {
             let p = p.as_ref()?;
-            let w = e.as_ref()?.1.iter().filter(|&&ok| ok).count();
+            let inl = &e.as_ref()?.1;
+            let w = inl.iter().filter(|&&ok| ok).count();
+            let pick = |v: &[Vector2<f64>]| -> Vec<Vector2<f64>> {
+                (0..v.len()).filter(|&k| inl[k]).map(|k| v[k]).collect()
+            };
+            cross_of.push(scene.views[i].cam != scene.views[j].cam);
+            tri_of.push(median_triangulation_angle(p, &pick(&c.2), &pick(&c.3)));
             Some(RelativeRotation {
                 i,
                 j,
@@ -392,7 +401,27 @@ fn pipeline(args: &Args) -> Vec<Row> {
             })
         })
         .collect();
-    let (t, avg_m) = measure(args.repeat, || average_rotations(nv, &measured, &acfg));
+    let gcfg = ViewGraphConfig {
+        mismatch_rad: args.mismatch_deg.to_radians(),
+        min_triangulation_rad: args.min_tri_deg.to_radians(),
+        ..ViewGraphConfig::default()
+    };
+    let (t, pruned) = measure(args.repeat, || {
+        average_rotations_pruned(nv, &measured, &cross_of, &tri_of, &gcfg, &acfg)
+    });
+    let avg_m = pruned.as_ref().map(|p| p.result.clone());
+    if let Some(p) = &pruned {
+        eprintln!(
+            "시점 그래프 정리: 가중치·삼각측량각 -{} 불일치({:.1}°) -{} 성분 밖 -{}, 평균 {}번, 남은 간선 {}/{}",
+            p.removed_prefilter,
+            args.mismatch_deg,
+            p.removed_mismatch,
+            p.removed_component,
+            p.rounds,
+            p.kept.iter().filter(|&&k| k).count(),
+            measured.len()
+        );
+    }
     let truth: Vec<Rotation3<f64>> = scene.views.iter().map(|v| v.camera.pose.rotation).collect();
     // 입력 간선 가운데 정답 상대 회전(R_j R_iᵀ)과 2° 넘게 다른 것의 비율. 회전 평균이 무너질 때 원인이
     // 입력(틀린 간선)인지 평균 쪽인지 가르는 값이다.

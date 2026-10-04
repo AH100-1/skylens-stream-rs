@@ -6,6 +6,9 @@
 //! `--full --positions 20` 은 같은 규모(위치 20, 나머지는 `--full`)가 된다. 묶음 인자를 둘 다 주면
 //! 뒤에 준 것이 이긴다.
 
+/// 시점 그래프 정리 기본 불일치 문턱(도).
+pub const MISMATCH_DEG: f64 = 4.0;
+
 /// bench 실행 인자.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Args {
@@ -20,6 +23,10 @@ pub struct Args {
     pub mode: String,
     pub ba_tracks: usize,
     pub ba_iters: usize,
+    /// 시점 그래프 정리: 평균 뒤 전역 회전과 상대 회전 차가 이를 넘는 간선을 뺀다(도).
+    pub mismatch_deg: f64,
+    /// 카메라 간 간선의 정상 대응 삼각측량각 중앙 하한(도). 0 이면 쓰지 않는다.
+    pub min_tri_deg: f64,
 }
 
 impl Default for Args {
@@ -37,6 +44,8 @@ impl Default for Args {
             mode: "pipeline".to_string(),
             ba_tracks: 100_000,
             ba_iters: 3,
+            mismatch_deg: MISMATCH_DEG,
+            min_tri_deg: 0.0,
         }
     }
 }
@@ -97,6 +106,16 @@ pub fn parse(argv: &[String]) -> Args {
             "--max-pairs" => a.max_pairs = num(next, "--max-pairs"),
             "--ba-points" => a.ba_points = num(next, "--ba-points"),
             "--ba-tracks" => a.ba_tracks = num(next, "--ba-tracks"),
+            "--mismatch-deg" => {
+                a.mismatch_deg = next
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| panic!("--mismatch-deg 뒤에 숫자가 필요하다"))
+            }
+            "--min-tri-deg" => {
+                a.min_tri_deg = next
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| panic!("--min-tri-deg 뒤에 숫자가 필요하다"))
+            }
             "--ba-iters" => a.ba_iters = num(next, "--ba-iters").max(1),
             "--json" => {
                 a.json = Some(
