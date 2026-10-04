@@ -2803,6 +2803,184 @@ mod tests {
         assert_eq!(comps, 1);
     }
 
+    /// 시점 `sel`(카메라, 위치)을 `sch` 일정 짝으로 매칭·5점 RANSAC·자세 복원하고 회전 평균까지 돌린 결과.
+    struct ScheduleRun {
+        pairs: usize,
+        verified: usize,
+        /// 짝 종류(같은/F–R/F–L/R–L)별 (일정 짝, 통과, 통과 중 정답 대비 2° 초과).
+        kinds: [(usize, usize, usize); 4],
+        passed: usize,
+        bad: usize,
+        comps: usize,
+        returned: usize,
+        align_median_deg: f64,
+    }
+
+    fn run_schedule(sel: &[(usize, usize)], sch: &PairSchedule) -> ScheduleRun {
+        use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
+        use crate::rotation_averaging::{
+            aligned_errors, average_rotations, AveragingConfig, RelativeRotation,
+        };
+        use crate::synth::{CamId, Scene, SceneConfig};
+        let (w, h) = (480usize, 270usize);
+        let scene = Scene::new(SceneConfig {
+            width: w as u32,
+            height: h as u32,
+            seed: 1,
+            ..SceneConfig::default()
+        });
+        let cfg = DetectorConfig::default();
+        let views: Vec<_> = sel
+            .iter()
+            .map(|&(c, p)| {
+                scene
+                    .views
+                    .iter()
+                    .find(|v| v.cam == CamId::ALL[c] && v.position == p)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        let feats: Vec<Vec<Feature>> = views
+            .iter()
+            .map(|v| {
+                let (img, _) = scene.render(v);
+                detect_and_describe(&GrayImage::from_rgb(w, h, &img.data), &cfg)
+            })
+            .collect();
+        let pairs = scheduled_pairs(sel, sch);
+        let kind = |a: usize, b: usize| match (a.min(b), a.max(b)) {
+            _ if a == b => 0,
+            (CAM_FRONT, CAM_RIGHT) => 1,
+            (CAM_FRONT, CAM_LEFT) => 2,
+            _ => 3,
+        };
+        let mut kinds = [(0usize, 0usize, 0usize); 4];
+        let mut edges = Vec::new();
+        let mut verified = 0;
+        for &(i, j) in &pairs {
+            let kd = kind(sel[i].0, sel[j].0);
+            kinds[kd].0 += 1;
+            let (a, b) = (&views[i].camera, &views[j].camera);
+            let m = ratio_match(&feats[i], &feats[j], 0.8, true);
+            let nrm = |c: &Camera, f: &Feature| {
+                c.intrinsics
+                    .index_to_normalized(&Vector2::new(f.kp.x as f64, f.kp.y as f64))
+            };
+            let n1: Vec<_> = m.iter().map(|&(x, _)| nrm(a, &feats[i][x])).collect();
+            let n2: Vec<_> = m.iter().map(|&(_, y)| nrm(b, &feats[j][y])).collect();
+            let cands = crate::two_view::ransac_essential_candidates(
+                &n1,
+                &n2,
+                a.intrinsics.fx,
+                &RansacConfig::default(),
+            );
+            let Some((e, inl)) = cands.first() else {
+                continue;
+            };
+            verified += 1;
+            let s1: Vec<_> = (0..n1.len()).filter(|&k| inl[k]).map(|k| n1[k]).collect();
+            let s2: Vec<_> = (0..n1.len()).filter(|&k| inl[k]).map(|k| n2[k]).collect();
+            let Some(p) = crate::two_view::recover_pose(e, &s1, &s2) else {
+                continue;
+            };
+            kinds[kd].1 += 1;
+            let truth = b.pose.rotation * a.pose.rotation.inverse();
+            if (p.rotation * truth.inverse()).angle().to_degrees() > 2.0 {
+                kinds[kd].2 += 1;
+            }
+            edges.push(RelativeRotation {
+                i,
+                j,
+                rotation: p.rotation,
+                weight: s1.len() as f64,
+            });
+        }
+        let mut parent: Vec<usize> = (0..sel.len()).collect();
+        fn find(p: &mut [usize], mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        for e in &edges {
+            let (a, b) = (find(&mut parent, e.i), find(&mut parent, e.j));
+            parent[a] = b;
+        }
+        let comps = (0..sel.len())
+            .filter(|&x| find(&mut parent, x) == x)
+            .count();
+        let truth: Vec<Rotation3<f64>> = views.iter().map(|v| v.camera.pose.rotation).collect();
+        let avg = average_rotations(sel.len(), &edges, &AveragingConfig::default())
+            .expect("회전 평균 결과");
+        let returned = avg.rotations.iter().filter(|r| r.is_some()).count();
+        let mut err: Vec<f64> = aligned_errors(&avg.rotations, &truth)
+            .into_iter()
+            .filter(|x| x.is_finite())
+            .collect();
+        err.sort_by(f64::total_cmp);
+        ScheduleRun {
+            pairs: pairs.len(),
+            verified,
+            kinds,
+            passed: edges.len(),
+            bad: kinds.iter().map(|k| k.2).sum(),
+            comps,
+            returned,
+            align_median_deg: err[err.len() / 2].to_degrees(),
+        }
+    }
+
+    /// 기본 bench 와 같은 시점(세 카메라 × 위치 0·4·…·28, 24장, 480×270, 시드 1)에서 F–R·F–L 시작 위치 차
+    /// +24·+20 일정을 비교한다. +24 는 반환 시점 전체·정렬 오차 중앙 < 1°·2° 초과 < 5%·다른 카메라 간선 ≥ 1·한 연결 성분.
+    #[test]
+    fn bench_views_formation_schedule_averages_all_views() {
+        let sel: Vec<(usize, usize)> = (0..8)
+            .flat_map(|k| (0..3).map(move |c| (c, 4 * k)))
+            .collect();
+        let sched = |start: usize| PairSchedule {
+            cross: CrossSchedule::Formation {
+                right_min: start,
+                left_min: start,
+                max: 40,
+                step: 4,
+            },
+            ..PairSchedule::default()
+        };
+        let names = ["같은 카메라", "F–R", "F–L", "R–L"];
+        let mut runs = Vec::new();
+        for start in [24usize, 20] {
+            let r = run_schedule(&sel, &sched(start));
+            eprintln!(
+                "시작 +{start}: 짝 {} E통과 {} 자세 {} 연결 성분 {} 반환 {}/{} 정렬 오차 중앙 {:.3}° 2° 초과 {}/{} ({:.1}%)",
+                r.pairs, r.verified, r.passed, r.comps, r.returned, sel.len(),
+                r.align_median_deg, r.bad, r.passed,
+                100.0 * r.bad as f64 / r.passed.max(1) as f64
+            );
+            for (n, k) in names.iter().zip(&r.kinds) {
+                eprintln!("  {n}: 일정 {} 성공 {} 2° 초과 {}", k.0, k.1, k.2);
+            }
+            runs.push(r);
+        }
+        let r = &runs[0];
+        assert_eq!(r.returned, sel.len(), "반환 시점");
+        assert!(
+            r.align_median_deg < 1.0,
+            "정렬 오차 중앙 {}",
+            r.align_median_deg
+        );
+        assert!(
+            (r.bad as f64) < 0.05 * r.passed as f64,
+            "2° 초과 {}/{}",
+            r.bad,
+            r.passed
+        );
+        assert!(r.kinds[1].1 + r.kinds[2].1 >= 1, "다른 카메라 확정 간선 0");
+        assert_eq!(r.kinds[3].0, 0, "R–L 짝은 일정에 없다");
+        assert_eq!(r.comps, 1, "연결 성분");
+    }
+
     #[test]
     fn parallax_needed_values() {
         let v: Vec<_> = [50usize, 200, 300, 1000]

@@ -12,6 +12,12 @@
 //! | `--ba-points M` | 3000 | 번들 조정 문제의 점 수 |
 //! | `--full` | | SPEC 기준 규모: `--positions 80 --width 960 --height 540 --repeat 3 --ba-points 20000` 과 같다 |
 //! | `--quick` | | 기본값과 같다(예전 이름, 그대로 받는다) |
+//! | `--schedule S` | `formation` | 짝 일정. `formation`: 같은 카메라 SPEC + F–R·F–L 양의 위치 차 일정(`scheduled_pairs`), `spec`: SPEC §3.2 전체 짝 |
+//! | `--pos-step K` | 4(`spec` 이면 1) | 선택한 위치 사이의 실제 위치 번호 간격. `--positions N` 은 고른 위치 수라 장면은 위치 번호 0..=(N-1)·K 를 쓴다 |
+//! | `--cross-min M` | 24 | `formation` 일정에서 F–R·F–L 위치 차 시작값(끝은 +40, 4칸 간격). 20 이면 main 기본 일정 |
+//!
+//! 기본 실행(위치 8, 간격 4 → 위치 번호 0·4·…·28, 24장)은 F–R·F–L 위치 차 +24·+28 이 있어 다른 카메라 확정 간선이 생긴다.
+//! 위치 간격 1 로 8곳만 찍으면(`--pos-step 1`) 다른 카메라 짝이 겹치지 않아 F·R·L 세 덩어리로 갈라진다.
 //!
 //! 순서 규칙: `--full`·`--quick` 은 어디에 두든 먼저 적용하고, 개별 인자(`--positions` 등)가 그 위에 덮어쓴다.
 //! `--positions 20 --full` 과 `--full --positions 20` 은 모두 위치 20·960×540 이다. 둘 다 주면 뒤에 준 묶음이 이긴다.
@@ -49,8 +55,8 @@ use skylens_core::camera::Pose;
 use skylens_core::distortion::Distortion;
 use skylens_core::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use skylens_core::matching::{
-    candidate_pairs, ransac_fundamental, ratio_match, RansacConfig, PAIR_CROSS, PAIR_POW2_MAX,
-    PAIR_TEMPORAL,
+    candidate_pairs, ransac_fundamental, ratio_match, scheduled_pairs, CrossSchedule, PairSchedule,
+    RansacConfig, CAM_FRONT, CAM_LEFT, CAM_RIGHT, PAIR_CROSS, PAIR_POW2_MAX, PAIR_TEMPORAL,
 };
 use skylens_core::math::{Point3, Rotation3, Vector2, Vector3};
 use skylens_core::rotation_averaging::{
@@ -130,6 +136,108 @@ impl Rng {
     }
 }
 
+/// 짝 일정 인자(`args::parse` 가 모르는 것이라 먼저 떼어 낸다).
+struct Sched {
+    /// `formation` | `spec`.
+    schedule: String,
+    /// 선택한 위치 사이의 위치 번호 간격.
+    step: usize,
+    /// F–R·F–L 위치 차 시작값.
+    cross_min: usize,
+}
+
+impl Sched {
+    fn extract(argv: &[String]) -> (Sched, Vec<String>) {
+        let mut schedule = "formation".to_string();
+        let (mut step, mut cross_min) = (None, 24usize);
+        let mut rest = Vec::new();
+        let mut i = 0;
+        let val = |i: usize, name: &str| -> String {
+            argv.get(i + 1)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} 뒤에 값이 필요하다"))
+        };
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--schedule" => {
+                    schedule = val(i, "--schedule");
+                    assert!(
+                        schedule == "formation" || schedule == "spec",
+                        "--schedule 은 formation | spec"
+                    );
+                    i += 2;
+                }
+                "--pos-step" => {
+                    step = Some(
+                        val(i, "--pos-step")
+                            .parse::<usize>()
+                            .expect("--pos-step 정수")
+                            .max(1),
+                    );
+                    i += 2;
+                }
+                "--cross-min" => {
+                    cross_min = val(i, "--cross-min").parse().expect("--cross-min 정수");
+                    i += 2;
+                }
+                _ => {
+                    rest.push(argv[i].clone());
+                    i += 1;
+                }
+            }
+        }
+        let step = step.unwrap_or(if schedule == "spec" { 1 } else { 4 });
+        (
+            Sched {
+                schedule,
+                step,
+                cross_min,
+            },
+            rest,
+        )
+    }
+
+    fn pair_schedule(&self) -> PairSchedule {
+        PairSchedule {
+            cross: CrossSchedule::Formation {
+                right_min: self.cross_min,
+                left_min: self.cross_min,
+                max: 40,
+                step: 4,
+            },
+            ..PairSchedule::default()
+        }
+    }
+}
+
+/// 연결 성분 수(간선 `(i, j)`, 정점 `n`).
+fn components(n: usize, edges: &[(usize, usize)]) -> usize {
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    for &(i, j) in edges {
+        let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+        parent[a] = b;
+    }
+    (0..n).filter(|&x| find(&mut parent, x) == x).count()
+}
+
+/// 짝 종류 이름: 같은 카메라 / F–R / F–L / R–L.
+fn kind_of(a: usize, b: usize) -> usize {
+    match (a.min(b), a.max(b)) {
+        _ if a == b => 0,
+        (CAM_FRONT, CAM_RIGHT) => 1,
+        (CAM_FRONT, CAM_LEFT) => 2,
+        _ => 3,
+    }
+}
+const KIND_NAMES: [&str; 4] = ["같은", "F–R", "F–L", "R–L"];
+
 /// `n` 개 중 `k` 개를 고르게 뽑은 번호(k = 0 이거나 k ≥ n 이면 전부).
 fn spread(n: usize, k: usize) -> Vec<usize> {
     if k == 0 || k >= n {
@@ -140,6 +248,7 @@ fn spread(n: usize, k: usize) -> Vec<usize> {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    let (sched, argv) = Sched::extract(&argv);
     let args = args::parse(&argv);
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -160,7 +269,7 @@ fn main() {
         args.repeat
     );
     let rows = match args.mode.as_str() {
-        "pipeline" => pipeline(&args),
+        "pipeline" => pipeline(&args, &sched),
         "ba-scale" => ba_scale(&args),
         "detect" => detect(&args),
         other => panic!("알 수 없는 --mode: {other} (pipeline | ba-scale | detect)"),
@@ -168,17 +277,30 @@ fn main() {
     report(&rows, &args, cores);
 }
 
-fn pipeline(args: &Args) -> Vec<Row> {
+fn pipeline(args: &Args, sch: &Sched) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
 
     // 1. 장면 생성 + 렌더.
+    // 위치 번호 0, K, 2K, … 만 고른다(K = --pos-step). 장면은 마지막 위치 번호까지 만들고 나머지 영상은 버린다.
+    let step = sch.step;
     let config = SceneConfig {
-        positions: args.positions,
+        positions: (args.positions.max(1) - 1) * step + 1,
         width: args.width,
         height: args.height,
         ..SceneConfig::default()
     };
-    let scene = Scene::new(config);
+    let mut scene = Scene::new(config);
+    let keep: Vec<bool> = scene.views.iter().map(|v| v.position % step == 0).collect();
+    let mut k = 0;
+    scene.views.retain(|_| {
+        k += 1;
+        keep[k - 1]
+    });
+    let mut k = 0;
+    scene.gps_enu.retain(|_| {
+        k += 1;
+        keep[k - 1]
+    });
     let nv = scene.views.len();
     let (t, renders) = measure(args.repeat, || {
         scene
@@ -223,15 +345,24 @@ fn pipeline(args: &Args) -> Vec<Row> {
         .iter()
         .map(|v| (cam_index(v.cam), v.position))
         .collect();
+    let psch = sch.pair_schedule();
     let (t, pairs) = measure(args.repeat, || {
-        candidate_pairs(&keys, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX)
+        if sch.schedule == "spec" {
+            candidate_pairs(&keys, PAIR_TEMPORAL, PAIR_CROSS, PAIR_POW2_MAX)
+        } else {
+            scheduled_pairs(&keys, &psch)
+        }
     });
     rows.push(Row {
         name: "짝 생성",
         items: pairs.len(),
         unit: "짝",
         times: t,
-        note: String::new(),
+        note: if sch.schedule == "spec" {
+            format!("일정 spec 위치 간격 {step}")
+        } else {
+            format!("일정 formation 위치 간격 {step} 시작 +{}", sch.cross_min)
+        },
     });
     let chosen: Vec<(usize, usize)> = spread(pairs.len(), args.max_pairs)
         .into_iter()
@@ -242,6 +373,23 @@ fn pipeline(args: &Args) -> Vec<Row> {
         format!("짝 {np}/{} 만 잼", pairs.len())
     } else {
         String::new()
+    };
+
+    let kind_counts = |ok: &dyn Fn(usize) -> bool| -> String {
+        let mut c = [(0usize, 0usize); 4];
+        for (k, &(i, j)) in chosen.iter().enumerate() {
+            let kd = kind_of(keys[i].0, keys[j].0);
+            c[kd].1 += 1;
+            if ok(k) {
+                c[kd].0 += 1;
+            }
+        }
+        c.iter()
+            .enumerate()
+            .filter(|(_, v)| v.1 > 0)
+            .map(|(kd, v)| format!("{} {}/{}", KIND_NAMES[kd], v.0, v.1))
+            .collect::<Vec<_>>()
+            .join(" ")
     };
 
     // 4. 비율 매칭(짝 안에서 병렬, 짝은 차례로 — 제품 구현과 같은 병렬 단위).
@@ -318,8 +466,9 @@ fn pipeline(args: &Args) -> Vec<Row> {
         unit: "짝",
         times: t,
         note: format!(
-            "성공 {}/{np} {pair_note}",
-            eres.iter().filter(|e| e.is_some()).count()
+            "성공 {}/{np} ({}) {pair_note}",
+            eres.iter().filter(|e| e.is_some()).count(),
+            kind_counts(&|k| eres[k].is_some())
         ),
     });
 
@@ -345,8 +494,9 @@ fn pipeline(args: &Args) -> Vec<Row> {
         unit: "짝",
         times: t,
         note: format!(
-            "성공 {}/{np} {pair_note}",
-            poses.iter().filter(|p| p.is_some()).count()
+            "성공 {}/{np} ({}) {pair_note}",
+            poses.iter().filter(|p| p.is_some()).count(),
+            kind_counts(&|k| poses[k].is_some())
         ),
     });
 
@@ -404,8 +554,13 @@ fn pipeline(args: &Args) -> Vec<Row> {
             (e.rotation * t.inverse()).angle().to_degrees() > 2.0
         })
         .count();
+    let cross_edges = measured
+        .iter()
+        .filter(|e| keys[e.i].0 != keys[e.j].0)
+        .count();
+    let comps = components(nv, &measured.iter().map(|e| (e.i, e.j)).collect::<Vec<_>>());
     let bad_note = format!(
-        "간선 오차>2° {}/{} ({:.1}%)",
+        "다른 카메라 확정 간선 {cross_edges}, 연결 성분 {comps}, 간선 오차>2° {}/{} ({:.1}%)",
         bad_edges,
         measured.len(),
         100.0 * bad_edges as f64 / measured.len().max(1) as f64
