@@ -2013,6 +2013,7 @@ pub fn run_pipeline_with(
                 rec.rposes.insert(*g, p);
             }
         }
+        crate::pipeline_stream::tap_poses(rec.region.index, &rec.rposes);
         rec.stats.refined_rms = m.sparse.rms;
         rec.stats.refined_points = m.cloud.len();
         rec.stats.secs_ba = m.secs;
@@ -2124,6 +2125,7 @@ pub fn run_pipeline_with(
                 st.pairs,
                 st.median_m
             ));
+            crate::pipeline_stream::tap_sim(jr.index, &acc);
             recs[j].rsim = Some(acc);
         }
         if realigns.len() > n_realign0 {

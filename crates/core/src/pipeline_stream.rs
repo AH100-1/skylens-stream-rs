@@ -1,9 +1,11 @@
 //! 구역 순서 처리의 보조 논리: 이미 내보낸 정밀 구역을 최신 정밀 모델 좌표계로 다시 맞추는
 //! 닮음 변환(공유 3D 점 대응)과 등록 현황 표.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::align::Similarity;
+use crate::camera::Pose;
 use crate::ply::{write_ply_file, PointCloud};
 use crate::progressive::{cross_align, overlap_window};
 use crate::stream::{
@@ -160,6 +162,38 @@ pub fn realign_refined(
     newest: (&Region, &[Track]),
 ) -> Option<(Similarity, usize, f64)> {
     cross_align(old.1, newest.1, overlap_window(old.0, newest.0))
+}
+
+/// 진단용 자세 수집(기본 꺼짐). 켜면 구역별 정밀 자세와 구역 연쇄 변환을 쌓아 둔다. 제품 동작은 바꾸지 않는다.
+pub static TAP_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+type PoseTap = Vec<(usize, Vec<(usize, Pose)>)>;
+static POSE_TAP: std::sync::Mutex<PoseTap> = std::sync::Mutex::new(Vec::new());
+static SIM_TAP: std::sync::Mutex<Vec<(usize, Similarity)>> = std::sync::Mutex::new(Vec::new());
+
+/// 구역 `region` 의 정밀 자세(전역 사진 번호 → 자세, 구역 좌표계)를 기록한다.
+pub fn tap_poses(region: usize, poses: &HashMap<usize, Pose>) {
+    if TAP_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        let v: Vec<(usize, Pose)> = poses.iter().map(|(g, p)| (*g, *p)).collect();
+        let mut t = POSE_TAP.lock().unwrap();
+        t.retain(|(r, _)| *r != region);
+        t.push((region, v));
+    }
+}
+
+/// 구역 `region` 을 최신 구역 좌표계로 옮기는 누적 변환을 기록한다(나중 값이 이긴다).
+pub fn tap_sim(region: usize, sim: &Similarity) {
+    if TAP_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut t = SIM_TAP.lock().unwrap();
+        t.retain(|(r, _)| *r != region);
+        t.push((region, *sim));
+    }
+}
+
+/// 수집한 것을 꺼내고 비운다: (구역별 자세, 구역별 누적 변환).
+pub fn take_tap() -> (PoseTap, Vec<(usize, Similarity)>) {
+    let p = std::mem::take(&mut *POSE_TAP.lock().unwrap());
+    let s = std::mem::take(&mut *SIM_TAP.lock().unwrap());
+    (p, s)
 }
 
 /// 카메라(0..3)마다 등록된 사진 수와 빠진 위치 목록. `gids[a]` = 전역 사진 번호(3·위치+카메라).
