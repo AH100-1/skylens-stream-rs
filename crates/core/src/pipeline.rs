@@ -1436,13 +1436,15 @@ fn sparse_init_with(
 const COLLINEAR_SPREAD_RATIO: f64 = 0.25;
 
 /// GPS 중심이 거의 한 직선이면 닮음 변환의 비행 축 둘레 회전이 GPS 로 정해지지 않는다.
-/// 이때 정렬 전 모델의 연직(모델 z)이 정렬 뒤에도 연직에 가깝도록 비행 축 둘레 회전만 다시 고르고,
-/// 이동은 정상 대응 무게중심으로 다시 맞춘다. 직선이 아니면 입력을 그대로 돌려준다.
+/// 이때 초기 정렬과 같은 규칙(`roll_by_level_spread`: 카메라 광축 높이 분산 최소)으로 비행 축 둘레 회전만
+/// 다시 고르고, 이동은 정상 대응 무게중심으로 다시 맞춘다. `rots` 는 정렬 전 모델의 (세계→카메라) 회전.
+/// 직선이 아니면 입력을 그대로 돌려준다.
 fn level_collinear_roll(
     sim: &Similarity,
     src: &[Vector3<f64>],
     dst: &[Vector3<f64>],
     inl: &[bool],
+    rots: &[Rotation3<f64>],
 ) -> (Similarity, bool) {
     let pts: Vec<Vector3<f64>> = dst
         .iter()
@@ -1450,7 +1452,7 @@ fn level_collinear_roll(
         .filter(|(_, &b)| b)
         .map(|(p, _)| *p)
         .collect();
-    if pts.len() < 3 {
+    if pts.len() < 3 || rots.is_empty() {
         return (*sim, false);
     }
     let n = pts.len() as f64;
@@ -1470,17 +1472,16 @@ fn level_collinear_roll(
     if l1 <= 1e-12 || l2.sqrt() / l1.sqrt() >= COLLINEAR_SPREAD_RATIO {
         return (*sim, false);
     }
-    let axis = eig.eigenvectors.column(order[0]).into_owned();
-    let z = Vector3::z();
-    let up = sim.r * z;
-    let (vp, zp) = (up - axis * up.dot(&axis), z - axis * z.dot(&axis));
+    let axis = nalgebra::Unit::new_normalize(eig.eigenvectors.column(order[0]).into_owned());
     // 비행 축이 연직에 가까우면 둘레 회전이 곧 방위라 손대지 않는다.
-    if vp.norm() < 0.2 || zp.norm() < 0.2 {
+    if axis.z.abs() > 0.98 {
         return (*sim, true);
     }
-    let ang = axis.dot(&vp.cross(&zp)).atan2(vp.dot(&zp));
-    let fix = Rotation3::from_axis_angle(&nalgebra::Unit::new_normalize(axis), ang);
-    let r = fix * sim.r;
+    let g = *sim.r.matrix();
+    let Some(theta) = roll_by_level_spread(&axis, &g, rots) else {
+        return (*sim, true);
+    };
+    let r = Rotation3::from_axis_angle(&axis, theta) * sim.r;
     let (mut cs, mut cd, mut m) = (Vector3::zeros(), Vector3::zeros(), 0.0);
     for ((a, b), &ok) in src.iter().zip(dst).zip(inl) {
         if ok {
@@ -1512,7 +1513,8 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
         .collect();
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
     let (sim, inl, med) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
-    let (sim, collinear) = level_collinear_roll(&sim, &src, &dst, &inl);
+    let rots: Vec<Rotation3<f64>> = ids.iter().map(|&i| s.poses[i].unwrap().rotation).collect();
+    let (sim, collinear) = level_collinear_roll(&sim, &src, &dst, &inl, &rots);
     if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
         eprintln!(
             "diag gps_align collinear {collinear} n {} inliers {} scale {:.4} inlier_med {:.3}",
@@ -4124,6 +4126,21 @@ mod collinear_roll_tests {
             .collect()
     }
 
+    /// 같은 장착(아래 보기)에 광축이 비행 축 수직 방향으로만 흩어진 모델 회전(세계→카메라).
+    fn mount_rots() -> Vec<Rotation3<f64>> {
+        (0..24)
+            .map(|i| {
+                let b = ((i % 5) as f64 - 2.0) * 3f64.to_radians();
+                let optical = Vector3::new(0.0, b.sin(), -b.cos());
+                // 광축 optical 이 카메라 z 가 되는 회전의 역(카메라→세계)을 만든다.
+                let zc = optical;
+                let xc = Vector3::x();
+                let yc = zc.cross(&xc);
+                Rotation3::from_matrix_unchecked(Matrix3::from_columns(&[xc, yc, zc])).inverse()
+            })
+            .collect()
+    }
+
     fn grid_points() -> Vec<Vector3<f64>> {
         (0..24)
             .map(|i| {
@@ -4146,13 +4163,13 @@ mod collinear_roll_tests {
         };
         let inl = vec![true; pts.len()];
         assert!(tilt_deg(&tilted) > 12.0);
-        let (fixed, col) = level_collinear_roll(&tilted, &pts, &pts, &inl);
+        let (fixed, col) = level_collinear_roll(&tilted, &pts, &pts, &inl, &mount_rots());
         assert!(col);
         assert!(tilt_deg(&fixed) < 1.0, "tilt {}", tilt_deg(&fixed));
-        // 정상 대응 무게중심은 그대로 대응한다.
+        // 원점·대응이 같은 점집합이라 정상 대응 무게중심은 제자리에 대응한다.
         let n = pts.len() as f64;
         let c = pts.iter().sum::<Vector3<f64>>() / n;
-        assert!((fixed.apply_point(&c) - tilted.apply_point(&c)).norm() < 1e-9);
+        assert!((fixed.apply_point(&c) - c).norm() < 1e-9);
     }
 
     #[test]
@@ -4164,7 +4181,7 @@ mod collinear_roll_tests {
             t: Vector3::new(1.0, 2.0, 3.0),
         };
         let inl = vec![true; pts.len()];
-        let (out, col) = level_collinear_roll(&sim, &pts, &pts, &inl);
+        let (out, col) = level_collinear_roll(&sim, &pts, &pts, &inl, &mount_rots());
         assert!(!col);
         assert_eq!(out, sim);
     }
