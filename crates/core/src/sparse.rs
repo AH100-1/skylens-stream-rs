@@ -34,6 +34,28 @@ pub struct SparseInput {
     pub gps_enu: Option<[f64; 3]>,
 }
 
+/// 위치 한 칸 사이 이동 거리(m) 추정: 카메라마다 첫·끝 위치 GPS 거리 / 위치 번호 차, 중앙값.
+/// GPS 가 없거나 위치가 둘 미만이면 `None`.
+pub fn position_spacing(inputs: &[SparseInput]) -> Option<f64> {
+    let mut v: Vec<f64> = Vec::new();
+    for g in 0..3 {
+        let mut it = inputs
+            .iter()
+            .filter(|x| x.group == g && x.gps_enu.is_some());
+        let first = it.clone().min_by_key(|x| x.position)?;
+        let last = it.by_ref().max_by_key(|x| x.position)?;
+        let dp = last
+            .position
+            .checked_sub(first.position)
+            .filter(|&d| d > 0)?;
+        let (a, b) = (first.gps_enu?, last.gps_enu?);
+        let d = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+        v.push(d / dp as f64);
+    }
+    v.sort_by(f64::total_cmp);
+    v.get(v.len() / 2).copied()
+}
+
 /// 짝 그래프가 하나의 연결 성분인지(영상 번호 0..n).
 pub fn is_connected(n: usize, pairs: &[(usize, usize)]) -> bool {
     let mut uf: Vec<usize> = (0..n).collect();
@@ -308,7 +330,11 @@ pub fn reconstruct(
 
     // 2. 짝 일정·매칭·기하 검증.
     let views: Vec<(usize, usize)> = inputs.iter().map(|x| (x.group, x.position)).collect();
-    let pairs = scheduled_pairs(&views, &cfg.pair_schedule);
+    let mut schedule = cfg.pair_schedule;
+    if let Some(sp) = position_spacing(inputs) {
+        schedule.cross = schedule.cross.scaled(sp);
+    }
+    let pairs = scheduled_pairs(&views, &schedule);
     let results: Vec<PairResult> = pairs
         .par_iter()
         .enumerate()
