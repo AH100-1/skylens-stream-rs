@@ -78,7 +78,11 @@ fn default_path_region_tilt() {
     let extra = std::env::var("SKYLENS_TILT_RUN_ARGS").unwrap_or_default();
     let mut args = vec!["run", i, o];
     args.extend(extra.split_whitespace());
-    let (code, stdout, stderr) = cli(&args);
+    // SKYLENS_TILT_REANALYZE=<저장한 표준 오류 파일> 이면 다시 돌리지 않고 그 파일만 정답과 비교한다.
+    let (code, stdout, stderr) = match std::env::var_os("SKYLENS_TILT_REANALYZE") {
+        Some(f) => (0, String::new(), std::fs::read_to_string(f).unwrap()),
+        None => cli(&args),
+    };
     assert_eq!(code, 0, "{stderr}");
     if let Some(path) = std::env::var_os("SKYLENS_TILT_STDERR_FILE") {
         std::fs::write(path, &stderr).unwrap();
@@ -86,8 +90,10 @@ fn default_path_region_tilt() {
     for l in stdout.lines().filter(|l| l.starts_with("region ")) {
         eprintln!("{l}");
     }
-    let (vcode, vout, _) = cli(&["verify", o]);
-    eprintln!("verify exit {vcode}\n{vout}");
+    if std::env::var_os("SKYLENS_TILT_REANALYZE").is_none() {
+        let (vcode, vout, _) = cli(&["verify", o]);
+        eprintln!("verify exit {vcode}\n{vout}");
+    }
     let truth = truth_rotations(&input);
     // 구역마다 마지막으로 출력된 진단(정밀 모델 완성 직후)만 쓴다.
     let mut rots: HashMap<usize, HashMap<usize, (bool, Matrix3<f64>)>> = HashMap::new();
@@ -211,7 +217,12 @@ fn default_path_region_tilt() {
         );
     }
     stage_report(&stderr, &truth, &tc);
-    let _ = std::fs::remove_dir_all(&root);
+    cloud_height_report(&scene, &output);
+    if std::env::var_os("SKYLENS_TILT_KEEP").is_none() {
+        let _ = std::fs::remove_dir_all(&root);
+    } else {
+        eprintln!("kept {}", root.display());
+    }
 }
 
 /// 닮음 변환(Umeyama)을 추정 중심에 맞춘 뒤 정답과 비교: (척도, 잔차 중앙, 잔차 rms).
@@ -321,6 +332,10 @@ fn stage_report(
             let t: Vec<Vector3<f64>> = rows.iter().map(|r| tc(&image_name(r.0))).collect();
             let (sc, med, rms) = center_fit(&e, &t);
             line += &format!(" fit_scale {sc:.4} fit_resid_med {med:.3} rms {rms:.3}");
+            // 정렬 없이 정답 좌표계(ENU)에서 본 중심 오프셋 평균: 수평 크기, 높이.
+            let n = e.len() as f64;
+            let d: Vector3<f64> = e.iter().zip(&t).map(|(a, b)| a - b).sum::<Vector3<f64>>() / n;
+            line += &format!(" abs_dxy {:.3} abs_dz {:.3}", d.xy().norm(), d.z);
         }
         eprintln!("{line}");
     }
@@ -367,5 +382,45 @@ fn pair_report(stderr: &str, truth: &HashMap<String, Matrix3<f64>>) {
             bi.get(bi.len() / 2),
             gi.get(gi.len() / 2)
         );
+    }
+}
+
+/// 구역마다 초벌·정밀 점군의 (z - 정답 표면 높이) 평균·중앙과 둘의 평균 높이 차를 낸다.
+/// 출력 좌표는 첫 GPS 기준이므로 정답 좌표로 옮길 때 원점 이동(`to_first_gps_frame(0)`)을 뺀다.
+fn cloud_height_report(scene: &Scene, output: &Path) {
+    use skylens_core::nalgebra::Point3;
+    let shift = scene.to_first_gps_frame(&Point3::new(0.0, 0.0, 0.0)).coords;
+    let stat = |path: &Path| -> Option<(usize, f64, f64)> {
+        let c = skylens_core::ply::read_ply_file(path).ok()?;
+        let mut d: Vec<f64> = c
+            .points
+            .iter()
+            .map(|p| {
+                let (x, y, z) = (
+                    p.xyz[0] as f64 - shift.x,
+                    p.xyz[1] as f64 - shift.y,
+                    p.xyz[2] as f64 - shift.z,
+                );
+                z - scene.surface_height(x, y)
+            })
+            .collect();
+        d.sort_by(f64::total_cmp);
+        let mean = d.iter().sum::<f64>() / d.len() as f64;
+        Some((d.len(), mean, d[d.len() / 2]))
+    };
+    for sub in ["preview", "refined"] {
+        let mut files: Vec<_> = std::fs::read_dir(output.join(sub))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        files.sort();
+        for f in files {
+            if let Some((n, mean, med)) = stat(&f) {
+                eprintln!(
+                    "cloud_dz {sub} {} n {n} mean {mean:.3} median {med:.3}",
+                    f.file_name().unwrap().to_string_lossy()
+                );
+            }
+        }
     }
 }
