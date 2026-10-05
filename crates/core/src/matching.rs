@@ -168,6 +168,26 @@ pub struct GuidedConfig {
     pub loose_th_px: f64,
     /// 느슨한 모델이 받아들여지는 최소 정상 수(이보다 적으면 유도 매칭을 쓰지 않는다).
     pub min_loose_inliers: usize,
+    /// 띠 안 후보가 많을수록 비율 문턱을 낮춘다: 실효 문턱 = `band_ratio - crowd * ln(후보 수)`(후보 2개 이상, 0.5 아래로는 안 내려감). 0 이면 끔.
+    pub crowd: f32,
+    /// 띠 매칭 뒤 그 대응으로 본질 행렬을 한 번 다시 추정하고 새 모델의 띠로 다시 매칭한다.
+    pub refit: bool,
+    /// 재추정 RANSAC 문턱(px)과 반복 수.
+    pub refit_th_px: f64,
+    pub refit_iters: usize,
+}
+
+impl GuidedConfig {
+    /// 정밀도를 높인 설정(띠 좁게, 비율 강하게, 후보 수 보정, 재추정).
+    pub fn precise() -> Self {
+        Self {
+            band_px: 1.5,
+            band_ratio: 0.8,
+            crowd: 0.03,
+            refit: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for GuidedConfig {
@@ -179,6 +199,10 @@ impl Default for GuidedConfig {
             loose_iters: 4000,
             loose_th_px: 2.0,
             min_loose_inliers: 8,
+            crowd: 0.0,
+            refit: false,
+            refit_th_px: 1.0,
+            refit_iters: 1000,
         }
     }
 }
@@ -223,7 +247,11 @@ pub fn epipolar_band_match(
                 d2 = d;
             }
         }
-        if j1 == usize::MAX || !d2.is_finite() || d1 >= cfg.band_ratio * cfg.band_ratio * d2 {
+        let mut ratio = cfg.band_ratio;
+        if cfg.crowd > 0.0 && r.len() >= 2 {
+            ratio = (ratio - cfg.crowd * (r.len() as f32).ln()).max(0.5);
+        }
+        if j1 == usize::MAX || !d2.is_finite() || d1 >= ratio * ratio * d2 {
             continue;
         }
         if col[j1].1 == i {
@@ -263,6 +291,7 @@ pub fn guided_cross_match(
         ..RansacConfig::default()
     };
     let cands = crate::two_view::ransac_essential_candidates(&l1, &l2, focal, &rc);
+    let base_len = base.len();
     let mut best = base;
     for (e, inl) in cands.iter().take(3) {
         if inl.iter().filter(|&&v| v).count() < cfg.min_loose_inliers {
@@ -271,6 +300,25 @@ pub fn guided_cross_match(
         let m = epipolar_band_match(a, b, na, nb, e, focal, cfg);
         if m.len() > best.len() {
             best = m;
+        }
+    }
+    if cfg.refit && best.len() >= 12 && best.len() > base_len {
+        let r1: Vec<_> = best.iter().map(|&(i, _)| na[i]).collect();
+        let r2: Vec<_> = best.iter().map(|&(_, j)| nb[j]).collect();
+        let rc2 = RansacConfig {
+            threshold_px: cfg.refit_th_px,
+            max_iters: cfg.refit_iters,
+            min_inliers: 12,
+            ..rc
+        };
+        if let Some((e2, _)) = crate::two_view::ransac_essential_candidates(&r1, &r2, focal, &rc2)
+            .into_iter()
+            .next()
+        {
+            let m2 = epipolar_band_match(a, b, na, nb, &e2, focal, cfg);
+            if m2.len() > base_len {
+                best = m2;
+            }
         }
     }
     best
@@ -2840,15 +2888,64 @@ mod tests {
                 detect_and_describe(&GrayImage::from_rgb(w, h, &img.data), &cfg),
             )
         };
-        let gcfg = GuidedConfig::default();
-        let (mut tb, mut gb, mut tg, mut gg) = (0, 0, 0, 0);
+        let d = GuidedConfig::default();
+        let p = GuidedConfig::precise();
+        let cfgs: Vec<(&str, GuidedConfig)> = vec![
+            ("띠3 비율.85 (현재)", d),
+            ("띠1.5 비율.85", GuidedConfig { band_px: 1.5, ..d }),
+            ("띠1 비율.85", GuidedConfig { band_px: 1.0, ..d }),
+            (
+                "띠3 비율.8",
+                GuidedConfig {
+                    band_ratio: 0.8,
+                    ..d
+                },
+            ),
+            (
+                "띠3 비율.75",
+                GuidedConfig {
+                    band_ratio: 0.75,
+                    ..d
+                },
+            ),
+            (
+                "띠1.5 비율.8",
+                GuidedConfig {
+                    band_px: 1.5,
+                    band_ratio: 0.8,
+                    ..d
+                },
+            ),
+            (
+                "띠1.5 비율.75",
+                GuidedConfig {
+                    band_px: 1.5,
+                    band_ratio: 0.75,
+                    ..d
+                },
+            ),
+            ("띠3 보정.03", GuidedConfig { crowd: 0.03, ..d }),
+            ("띠3 재추정", GuidedConfig { refit: true, ..d }),
+            ("정밀(띠1.5 비율.8 보정.03 재추정)", p),
+            (
+                "정밀, 비율.85",
+                GuidedConfig {
+                    band_ratio: 0.85,
+                    ..p
+                },
+            ),
+            ("정밀, 띠1", GuidedConfig { band_px: 1.0, ..p }),
+            ("정밀, 띠2", GuidedConfig { band_px: 2.0, ..p }),
+            ("정밀, 보정.06", GuidedConfig { crowd: 0.06, ..p }),
+        ];
+        // [기본, 설정들...] 의 (대응 합, 정답 합), F–L 짝만.
+        let mut tot = vec![(0usize, 0usize); cfgs.len() + 1];
         for (pa, cb, pb) in [
             (4, CamId::L, 24),
             (8, CamId::L, 28),
             (12, CamId::L, 32),
             (16, CamId::L, 36),
             (20, CamId::L, 40),
-            (8, CamId::R, 28),
         ] {
             let (va, fa) = get(CamId::F, pa);
             let (vb, fb) = get(cb, pb);
@@ -2863,26 +2960,33 @@ mod tests {
                     .collect()
             };
             let (na, nb) = (norm(ca, &fa), norm(cbm, &fb));
-            let base = ratio_match(&fa, &fb, 0.8, true);
-            let t0 = std::time::Instant::now();
-            let g = guided_cross_match(&fa, &fb, &na, &nb, ka.fx, 0.8, &gcfg);
-            let secs = t0.elapsed().as_secs_f64();
             let good = |m: &[(usize, usize)]| {
                 m.iter()
                     .filter(|&&(i, j)| is_true_match(&scene, ca, cbm, &fa[i], &fb[j]))
                     .count()
             };
-            let (gb0, gg0) = (good(&base), good(&g));
-            if cb == CamId::L {
-                (tb, gb, tg, gg) = (tb + base.len(), gb + gb0, tg + g.len(), gg + gg0);
+            let base = ratio_match(&fa, &fb, 0.8, true);
+            tot[0].0 += base.len();
+            tot[0].1 += good(&base);
+            for (k, (_, c)) in cfgs.iter().enumerate() {
+                let g = guided_cross_match(&fa, &fb, &na, &nb, ka.fx, 0.8, c);
+                tot[k + 1].0 += g.len();
+                tot[k + 1].1 += good(&g);
             }
-            eprintln!(
-                "seed {seed} F{pa}-{cb:?}{pb}: 기본 {} (정답 {gb0}) 유도 {} (정답 {gg0}) {secs:.2}s",
-                base.len(),
-                g.len()
-            );
+            eprintln!("seed {seed} F{pa}-{cb:?}{pb} 끝");
         }
-        eprintln!("F–L 합계: 기본 {tb} 정답 {gb} / 유도 {tg} 정답 {gg}");
+        eprintln!("설정 | 대응 | 정답 | 정답 비율 (seed {seed}, F–L 5짝)");
+        let r = |g: usize, n: usize| g as f64 / n.max(1) as f64;
+        eprintln!(
+            "기본(비율 0.8 상호) | {} | {} | {:.3}",
+            tot[0].0,
+            tot[0].1,
+            r(tot[0].1, tot[0].0)
+        );
+        for (k, (name, _)) in cfgs.iter().enumerate() {
+            let (n, g) = tot[k + 1];
+            eprintln!("{name} | {n} | {g} | {:.3}", r(g, n));
+        }
     }
 
     /// 같은 무리(비슷한 무늬)의 지점이 많아 기본 비율 검사가 대응을 많이 버리는 다른 카메라 짝을 만든다.
@@ -2999,6 +3103,23 @@ mod tests {
             assert!(go as f64 >= 0.9 * g.len() as f64, "정확도 {go}/{}", g.len());
             assert!(2 * go >= 3 * bo, "유도 정답 {go} 기본 정답 {bo}");
             assert!(go >= 300, "유도 정답 {go}");
+        }
+    }
+
+    /// 정밀 설정: 군집 짝에서 정답 비율 0.9 이상이고 기본 비율 매칭보다 정답이 많아야 한다.
+    /// 합성 장면 F–L(시드 5)에서 측정한 기준값은 대응 587, 정답 540, 비율 0.920(기본 535/472/0.882, 현재 설정 883/573/0.649).
+    #[test]
+    fn precise_guided_match_precision_floor() {
+        for seed in 1..=3u64 {
+            let (fa, fb, na, nb, ia, ib, focal) = clustered_pair(seed);
+            let base = ratio_match(&fa, &fb, 0.8, true);
+            let g = guided_cross_match(&fa, &fb, &na, &nb, focal, 0.8, &GuidedConfig::precise());
+            let ok = |m: &[(usize, usize)]| m.iter().filter(|&&(i, j)| ia[i] == ib[j]).count();
+            let (bo, go) = (ok(&base), ok(&g));
+            eprintln!("seed {seed}: 기본 정답 {bo} 정밀 {} (정답 {go})", g.len());
+            assert!(go as f64 >= 0.9 * g.len() as f64, "정확도 {go}/{}", g.len());
+            assert!(go > bo, "정밀 정답 {go} 기본 정답 {bo}");
+            assert!(go >= 300, "정밀 정답 {go}");
         }
     }
 

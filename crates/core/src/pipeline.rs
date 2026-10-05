@@ -420,6 +420,12 @@ fn ransac_stats_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("SKYLENS_RANSAC_STATS").is_some())
 }
 
+/// 환경 변수 `SKYLENS_GUIDED_PRECISE` 가 있으면 다른 카메라 짝 안내 매칭에 정밀 설정을 쓴다(옵션, 기본 꺼짐).
+fn guided_precise() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SKYLENS_GUIDED_PRECISE").is_some())
+}
+
 fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> Vec<PairMatch> {
     let pairs = scheduled_pairs(views, &PairSchedule::default());
     pairs
@@ -434,7 +440,12 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                     fa.iter().map(|f| norm(k, f)).collect(),
                     fb.iter().map(|f| norm(k, f)).collect(),
                 );
-                guided_cross_match(fa, fb, &na, &nb, k.fx, 0.8, &GuidedConfig::default())
+                let gcfg = if guided_precise() {
+                    GuidedConfig::precise()
+                } else {
+                    GuidedConfig::default()
+                };
+                guided_cross_match(fa, fb, &na, &nb, k.fx, 0.8, &gcfg)
             } else {
                 ratio_match(fa, fb, 0.8, true)
             };
