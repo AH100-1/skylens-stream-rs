@@ -1435,13 +1435,16 @@ fn region_diag(
         let p = rs.poses[i].unwrap();
         let m = p.rotation.matrix();
         eprintln!(
-            "diag rot region {region} gid {} own {} {}",
+            "diag rot region {region} gid {} own {} {} {:.4} {:.4} {:.4}",
             gids[i],
             u8::from(in_region[i]),
             m.iter()
                 .map(|v| format!("{v:.9}"))
                 .collect::<Vec<_>>()
-                .join(" ")
+                .join(" "),
+            p.center().x,
+            p.center().y,
+            p.center().z
         );
         res.push((p.center().coords - gps[i]).norm());
         pts.push(gps[i]);
