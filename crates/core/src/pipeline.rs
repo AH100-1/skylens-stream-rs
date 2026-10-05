@@ -1993,6 +1993,18 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
     let (sim, inl, med) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
     let rots: Vec<Rotation3<f64>> = ids.iter().map(|&i| s.poses[i].unwrap().rotation).collect();
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        if let Some(c) = roll_candidates(&sim, &src, &dst, &inl, &rots) {
+            let n = s.poses.len();
+            for (tag, cand) in [("cand_gps", &sim), ("cand_spread", &c.rolled)] {
+                let mut v: Vec<Option<Rotation3<f64>>> = vec![None; n];
+                for (a, &i) in ids.iter().enumerate() {
+                    v[i] = Some(rots[a] * cand.r.inverse());
+                }
+                diag_stage(tag, &v, None);
+            }
+        }
+    }
     let (sim, rolled) = choose_roll(&sim, &src, &dst, &inl, &rots);
     if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
         eprintln!(
@@ -3106,7 +3118,7 @@ pub fn run_pipeline_with(
             &tri,
             (0, 2.0),
             &PreviewOpts {
-                legacy_roll: true,
+                legacy_roll: false,
                 pair_vote: cfg.pair_vote,
                 ..PreviewOpts::default()
             },
@@ -3298,7 +3310,7 @@ pub fn run_pipeline_with(
                             position,
                             &tri_t,
                             (0, 2.0),
-                            true,
+                            false,
                         ) {
                             in_region = gf.iter().map(|g| region.contains(g / 3)).collect();
                             rs = sf;
