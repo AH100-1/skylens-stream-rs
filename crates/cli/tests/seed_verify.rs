@@ -21,6 +21,11 @@ fn default_path_seed_verify() {
     })
     .write_dataset(&input)
     .unwrap();
+    if let Ok(keep) = std::env::var("SKYLENS_SEED_KEEP") {
+        let _ = std::fs::remove_dir_all(&keep);
+        std::fs::rename(&input, &keep).unwrap();
+        return;
+    }
     let exe = env!("CARGO_BIN_EXE_skylens-stream");
     let run = Command::new(exe)
         .args(["run", input.to_str().unwrap(), output.to_str().unwrap()])
