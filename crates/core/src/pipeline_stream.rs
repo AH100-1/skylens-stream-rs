@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::align::Similarity;
 use crate::camera::Pose;
+use crate::math::Vector3;
 use crate::ply::{write_ply_file, PointCloud};
 use crate::progressive::{cross_align, overlap_window};
 use crate::stream::{
@@ -187,6 +188,24 @@ pub fn tap_sim(region: usize, sim: &Similarity) {
         t.retain(|(r, _)| *r != region);
         t.push((region, *sim));
     }
+}
+
+/// 진단용: GPS 정렬 직전 (구역 슬롯, [(사진 번호, 자세, GPS)]).
+type PreTap = Vec<(usize, Vec<(usize, Pose, Vector3<f64>)>)>;
+static PRE_TAP: std::sync::Mutex<PreTap> = std::sync::Mutex::new(Vec::new());
+
+/// GPS 정렬 직전의 자세와 GPS 를 기록한다(진단 훅이 켜졌을 때만).
+pub fn tap_pre(slot: usize, items: Vec<(usize, Pose, Vector3<f64>)>) {
+    if TAP_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut t = PRE_TAP.lock().unwrap();
+        t.retain(|(r, _)| *r != slot);
+        t.push((slot, items));
+    }
+}
+
+/// 기록한 정렬 직전 자세를 꺼내고 비운다.
+pub fn take_pre_tap() -> PreTap {
+    std::mem::take(&mut *PRE_TAP.lock().unwrap())
 }
 
 /// 수집한 것을 꺼내고 비운다: (구역별 자세, 구역별 누적 변환).
