@@ -80,6 +80,9 @@ fn default_path_region_tilt() {
     args.extend(extra.split_whitespace());
     let (code, stdout, stderr) = cli(&args);
     assert_eq!(code, 0, "{stderr}");
+    if let Some(path) = std::env::var_os("SKYLENS_TILT_STDERR_FILE") {
+        std::fs::write(path, &stderr).unwrap();
+    }
     for l in stdout.lines().filter(|l| l.starts_with("region ")) {
         eprintln!("{l}");
     }
