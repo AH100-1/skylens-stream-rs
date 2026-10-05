@@ -1431,6 +1431,75 @@ fn sparse_init_with(
     Ok((s, stages))
 }
 
+/// GPS 중심 퍼짐의 둘째/첫째 주성분 표준편차 비가 이 값 미만이면 거의 한 직선으로 본다.
+/// 기울어진 구역 실측은 3.3/22.9 = 0.14, 1.35/22.9 = 0.06 이고, 격자형 비행은 0.5 이상이다.
+const COLLINEAR_SPREAD_RATIO: f64 = 0.25;
+
+/// GPS 중심이 거의 한 직선이면 닮음 변환의 비행 축 둘레 회전이 GPS 로 정해지지 않는다.
+/// 이때 정렬 전 모델의 연직(모델 z)이 정렬 뒤에도 연직에 가깝도록 비행 축 둘레 회전만 다시 고르고,
+/// 이동은 정상 대응 무게중심으로 다시 맞춘다. 직선이 아니면 입력을 그대로 돌려준다.
+fn level_collinear_roll(
+    sim: &Similarity,
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    inl: &[bool],
+) -> (Similarity, bool) {
+    let pts: Vec<Vector3<f64>> = dst
+        .iter()
+        .zip(inl)
+        .filter(|(_, &b)| b)
+        .map(|(p, _)| *p)
+        .collect();
+    if pts.len() < 3 {
+        return (*sim, false);
+    }
+    let n = pts.len() as f64;
+    let mean = pts.iter().sum::<Vector3<f64>>() / n;
+    let mut cov = Matrix3::zeros();
+    for p in &pts {
+        let d = p - mean;
+        cov += d * d.transpose();
+    }
+    let eig = nalgebra::SymmetricEigen::new(cov / n);
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&a, &b| eig.eigenvalues[b].total_cmp(&eig.eigenvalues[a]));
+    let (l1, l2) = (
+        eig.eigenvalues[order[0]].max(0.0),
+        eig.eigenvalues[order[1]].max(0.0),
+    );
+    if l1 <= 1e-12 || l2.sqrt() / l1.sqrt() >= COLLINEAR_SPREAD_RATIO {
+        return (*sim, false);
+    }
+    let axis = eig.eigenvectors.column(order[0]).into_owned();
+    let z = Vector3::z();
+    let up = sim.r * z;
+    let (vp, zp) = (up - axis * up.dot(&axis), z - axis * z.dot(&axis));
+    // 비행 축이 연직에 가까우면 둘레 회전이 곧 방위라 손대지 않는다.
+    if vp.norm() < 0.2 || zp.norm() < 0.2 {
+        return (*sim, true);
+    }
+    let ang = axis.dot(&vp.cross(&zp)).atan2(vp.dot(&zp));
+    let fix = Rotation3::from_axis_angle(&nalgebra::Unit::new_normalize(axis), ang);
+    let r = fix * sim.r;
+    let (mut cs, mut cd, mut m) = (Vector3::zeros(), Vector3::zeros(), 0.0);
+    for ((a, b), &ok) in src.iter().zip(dst).zip(inl) {
+        if ok {
+            cs += a;
+            cd += b;
+            m += 1.0;
+        }
+    }
+    let (cs, cd) = (cs / m, cd / m);
+    (
+        Similarity {
+            s: sim.s,
+            r,
+            t: cd - sim.s * (r * cs),
+        },
+        true,
+    )
+}
+
 /// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
 /// BA 는 자유 좌표계에서 움직이므로 정밀 모델을 다시 GPS 좌표계로 돌려놓는다.
 fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity> {
@@ -1443,9 +1512,10 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
         .collect();
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
     let (sim, inl, med) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    let (sim, collinear) = level_collinear_roll(&sim, &src, &dst, &inl);
     if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
         eprintln!(
-            "diag gps_align n {} inliers {} scale {:.4} inlier_med {:.3}",
+            "diag gps_align collinear {collinear} n {} inliers {} scale {:.4} inlier_med {:.3}",
             src.len(),
             inl.iter().filter(|&&b| b).count(),
             sim.s,
@@ -4026,5 +4096,76 @@ mod refit_anchor_tests {
         let line: Vec<Vector3<f64>> = (0..4).map(|i| Vector3::new(i as f64, 0.0, 0.0)).collect();
         assert!(mk(&[0, 1, 2, 3], &line).is_none());
         assert!(mk(&[0, 1, 2], &cs).is_some());
+    }
+}
+
+#[cfg(test)]
+mod collinear_roll_tests {
+    use super::*;
+
+    fn tilt_deg(sim: &Similarity) -> f64 {
+        (sim.r * Vector3::z())
+            .dot(&Vector3::z())
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees()
+    }
+
+    fn line_points() -> Vec<Vector3<f64>> {
+        (0..24)
+            .map(|i| {
+                let t = i as f64;
+                Vector3::new(
+                    t * 4.0,
+                    ((i * 7) % 5) as f64 * 0.5 - 1.0,
+                    ((i * 3) % 4) as f64 * 0.3 - 0.45,
+                )
+            })
+            .collect()
+    }
+
+    fn grid_points() -> Vec<Vector3<f64>> {
+        (0..24)
+            .map(|i| {
+                Vector3::new(
+                    (i % 6) as f64 * 12.0,
+                    (i / 6) as f64 * 12.0,
+                    (i % 3) as f64 * 0.4,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collinear_gps_keeps_vertical() {
+        let pts = line_points();
+        let tilted = Similarity {
+            s: 1.0,
+            r: Rotation3::from_axis_angle(&Vector3::x_axis(), 13f64.to_radians()),
+            t: Vector3::zeros(),
+        };
+        let inl = vec![true; pts.len()];
+        assert!(tilt_deg(&tilted) > 12.0);
+        let (fixed, col) = level_collinear_roll(&tilted, &pts, &pts, &inl);
+        assert!(col);
+        assert!(tilt_deg(&fixed) < 1.0, "tilt {}", tilt_deg(&fixed));
+        // 정상 대응 무게중심은 그대로 대응한다.
+        let n = pts.len() as f64;
+        let c = pts.iter().sum::<Vector3<f64>>() / n;
+        assert!((fixed.apply_point(&c) - tilted.apply_point(&c)).norm() < 1e-9);
+    }
+
+    #[test]
+    fn spread_gps_is_unchanged() {
+        let pts = grid_points();
+        let sim = Similarity {
+            s: 1.0,
+            r: Rotation3::from_axis_angle(&Vector3::x_axis(), 13f64.to_radians()),
+            t: Vector3::new(1.0, 2.0, 3.0),
+        };
+        let inl = vec![true; pts.len()];
+        let (out, col) = level_collinear_roll(&sim, &pts, &pts, &inl);
+        assert!(!col);
+        assert_eq!(out, sim);
     }
 }
