@@ -428,6 +428,9 @@ const RIG_AGREE_DEG: f64 = 3.0;
 /// 5개가 우연히 모일 가능성은 무시할 수 있다.
 const RIG_MIN_AGREE: usize = 5;
 
+/// 비행 전체에서 모은 약한 짝 후보 (카메라 묶음 번호, 묶음 간 상수 회전).
+pub(crate) type RigPool = Vec<(usize, Rotation3<f64>)>;
+
 /// 카메라 묶음 `g` 안 간선만으로 회전을 평균한다(묶음 자체 좌표계, 가장 큰 연결 성분만).
 fn group_rotations(n: usize, strong: &[&PairMatch], g: usize) -> Vec<Option<Rotation3<f64>>> {
     let edges: Vec<RelativeRotation> = strong
@@ -474,7 +477,7 @@ fn rotation_consensus(cands: &[Rotation3<f64>], deg: f64) -> Option<(Rotation3<f
 /// 약한 카메라 간 짝(`rig`)을 리그 합의로 거른다. 기준 카메라(가장 많이 등록된 묶음)와 다른 카메라 묶음 `g`
 /// 마다, 두 묶음의 자체 좌표계 회전으로 짝 하나가 말하는 묶음 사이 좌표 회전 S 를 구해 모으고, 한 묶음에
 /// 5개 이상이 3° 안에 모일 때만 그 구성원 짝을 간선으로 남긴다. 합의가 없으면 약한 짝은 모두 버린다.
-fn rig_consensus_filter(n: usize, all: Vec<PairMatch>) -> Vec<PairMatch> {
+fn rig_consensus_filter(n: usize, all: Vec<PairMatch>, pool: &mut RigPool) -> Vec<PairMatch> {
     if !all.iter().any(|p| p.rig) {
         return all;
     }
@@ -513,20 +516,50 @@ fn rig_consensus_filter(n: usize, all: Vec<PairMatch>) -> Vec<PairMatch> {
                 cand.push((k, rj.inverse() * rot * *ri));
             }
         }
-        let rs: Vec<Rotation3<f64>> = cand.iter().map(|c| c.1).collect();
-        if let Some((s, mem)) = rotation_consensus(&rs, RIG_AGREE_DEG) {
+        // 앞 구역에서 모은 후보와 합쳐 비행 전체에서 합의를 본다. 도우미 사진 때문에 같은 짝이 구역마다
+        // 다시 나오므로 0.05° 안에서 같은 후보는 한 번만 센다.
+        let mut all_c: Vec<Rotation3<f64>> = pool
+            .iter()
+            .filter(|(c, _)| *c == g)
+            .map(|(_, r)| *r)
+            .collect();
+        let dup_lim = 0.05_f64.to_radians();
+        let n_old = all_c.len();
+        let mut fresh: Vec<bool> = Vec::new();
+        for c in &cand {
+            let seen = all_c[..n_old]
+                .iter()
+                .any(|o| safe_angle(&(o.inverse() * c.1)) <= dup_lim);
+            fresh.push(!seen);
+        }
+        all_c.extend(
+            cand.iter()
+                .zip(&fresh)
+                .filter(|(_, &f)| f)
+                .map(|(c, _)| c.1),
+        );
+        if let Some((s, mem)) = rotation_consensus(&all_c, RIG_AGREE_DEG) {
             if std::env::var_os("SKYLENS_RIG_DIAG").is_some() {
                 eprintln!(
-                    "rig_diag cam {g} candidates {} agree {} angle {:.3}",
-                    rs.len(),
+                    "rig_diag cam {g} candidates {} pooled {} agree {} angle {:.3}",
+                    cand.len(),
+                    all_c.len(),
                     mem.len(),
                     safe_angle(&s).to_degrees()
                 );
             }
             if mem.len() >= RIG_MIN_AGREE {
-                for m in mem {
-                    accept[cand[m].0] = true;
+                let lim = RIG_AGREE_DEG.to_radians();
+                for c in &cand {
+                    if safe_angle(&(s.inverse() * c.1)) <= lim {
+                        accept[c.0] = true;
+                    }
                 }
+            }
+        }
+        for (c, f) in cand.iter().zip(&fresh) {
+            if *f {
+                pool.push((g, c.1));
             }
         }
     }
@@ -538,6 +571,15 @@ fn rig_consensus_filter(n: usize, all: Vec<PairMatch>) -> Vec<PairMatch> {
 }
 
 fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> Vec<PairMatch> {
+    match_pairs_pooled(imgs, views, k, &mut RigPool::new())
+}
+
+fn match_pairs_pooled(
+    imgs: &[&ImgData],
+    views: &[(usize, usize)],
+    k: &Intrinsics,
+    pool: &mut RigPool,
+) -> Vec<PairMatch> {
     let pairs = scheduled_pairs(views, &PairSchedule::default());
     let all: Vec<PairMatch> = pairs
         .par_iter()
@@ -645,7 +687,7 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
             })
         })
         .collect();
-    rig_consensus_filter(views.len(), all)
+    rig_consensus_filter(views.len(), all, pool)
 }
 
 /// 검증된 짝 대응을 `tracks::build_tracks` 로 다시점 트랙으로 묶는다. 반환은 성분별 (사진, 특징) 목록.
@@ -2495,6 +2537,7 @@ pub fn run_pipeline_with(
     crate::timing::reset();
     let mut cache: HashMap<usize, Arc<ImgData>> = HashMap::new();
     let mut k_opt: Option<Intrinsics> = None;
+    let mut rig_pool = RigPool::new();
     let mut res = PipelineResult::default();
     let mut recs: Vec<RegionRec> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
@@ -2787,7 +2830,9 @@ pub fn run_pipeline_with(
             .map(|g| ds.positions[g / 3].image_enu[g % 3])
             .collect();
         let t1 = Instant::now();
-        let pm = crate::timing::timed("matching", || match_pairs(&imgs, &views, &k));
+        let pm = crate::timing::timed("matching", || {
+            match_pairs_pooled(&imgs, &views, &k, &mut rig_pool)
+        });
         st.secs_matching = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
         let pair_ids: Vec<(usize, usize)> = pm.iter().map(|p| (p.i, p.j)).collect();
@@ -4614,7 +4659,7 @@ mod rig_consensus_tests {
                 }
             }
         }
-        let out = rig_consensus_filter(n, pm);
+        let out = rig_consensus_filter(n, pm, &mut RigPool::new());
         let weak: Vec<&PairMatch> = out.iter().filter(|p| p.rig).collect();
         assert_eq!(weak.len(), good);
         for p in weak {
@@ -4655,7 +4700,97 @@ mod rig_consensus_tests {
                 rig: true,
             });
         }
-        let out = rig_consensus_filter(n, pm);
+        let out = rig_consensus_filter(n, pm, &mut RigPool::new());
         assert!(out.iter().all(|p| !p.rig));
+    }
+
+    /// 구역마다 후보가 3개뿐이어도 풀에 누적되면 합의가 선다.
+    #[test]
+    fn rig_pool_accumulates_candidates_across_regions() {
+        let n_per = 4;
+        let n = 2 * n_per;
+        let rel = rot(10.0, -40.0, 15.0);
+        let views: Vec<(usize, usize)> = (0..n).map(|i| (i / n_per, i % n_per)).collect();
+        let truth: Vec<Rotation3<f64>> = (0..n)
+            .map(|i| {
+                let b = rot(0.0, 4.0 * (i % n_per) as f64, 1.5 * (i % n_per) as f64);
+                if i < n_per {
+                    b
+                } else {
+                    rel * b
+                }
+            })
+            .collect();
+        let mut pool = RigPool::new();
+        let mut kept = Vec::new();
+        for region in 0..3 {
+            let mk = |i: usize, j: usize, r: Rotation3<f64>, inl: usize, rig: bool| PairMatch {
+                i,
+                j,
+                inl: vec![(0, 0); inl],
+                rot: r,
+                t: None,
+                views: (views[i], views[j]),
+                rig,
+            };
+            let mut pm = Vec::new();
+            for g in 0..2 {
+                for a in 0..n_per - 1 {
+                    let (i, j) = (g * n_per + a, g * n_per + a + 1);
+                    pm.push(mk(i, j, truth[j] * truth[i].inverse(), 40, false));
+                }
+            }
+            for b in 0..3 {
+                let (i, j) = (region, n_per + b);
+                let noise = rot(0.3 * (region * 3 + b) as f64 - 1.0, 0.4, -0.3);
+                pm.push(mk(i, j, noise * truth[j] * truth[i].inverse(), 12, true));
+            }
+            let out = rig_consensus_filter(n, pm, &mut pool);
+            kept.push(out.iter().filter(|p| p.rig).count());
+        }
+        // 구역마다 후보 3개(5개 미만)라 첫 두 구역은 합의 불가, 셋째 구역에서 풀이 9개가 되어 섰다.
+        assert_eq!(kept[0], 0);
+        assert_eq!(kept[2], 3, "kept {kept:?}");
+    }
+
+    /// 누적된 후보가 모두 오대응이면 풀이 아무리 커져도 전부 버린다.
+    #[test]
+    fn rig_pool_rejects_accumulated_wrong_candidates() {
+        let n_per = 6;
+        let n = 2 * n_per;
+        let views: Vec<(usize, usize)> = (0..n).map(|i| (i / n_per, i % n_per)).collect();
+        let mut pool = RigPool::new();
+        for region in 0..5 {
+            let mut pm = Vec::new();
+            for g in 0..2 {
+                for a in 0..n_per - 1 {
+                    let (i, j) = (g * n_per + a, g * n_per + a + 1);
+                    pm.push(PairMatch {
+                        i,
+                        j,
+                        inl: vec![(0, 0); 40],
+                        rot: rot(0.0, 3.0, 0.0),
+                        t: None,
+                        views: (views[i], views[j]),
+                        rig: false,
+                    });
+                }
+            }
+            for k in 0..4 {
+                let (i, j) = (k % n_per, n_per + (k * 5) % n_per);
+                pm.push(PairMatch {
+                    i,
+                    j,
+                    inl: vec![(0, 0); 12],
+                    rot: scatter(region * 7 + k),
+                    t: None,
+                    views: (views[i], views[j]),
+                    rig: true,
+                });
+            }
+            let out = rig_consensus_filter(n, pm, &mut pool);
+            assert!(out.iter().all(|p| !p.rig));
+        }
+        assert!(pool.len() >= 10);
     }
 }
