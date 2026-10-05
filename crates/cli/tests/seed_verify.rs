@@ -28,6 +28,11 @@ fn default_path_seed_verify() {
         .output()
         .unwrap();
     assert_eq!(run.status.code(), Some(0));
+    for l in String::from_utf8_lossy(&run.stderr).lines() {
+        if l.starts_with("diag gps_align") || l.starts_with("diag align region") {
+            eprintln!("{l}");
+        }
+    }
     let v = Command::new(exe)
         .args(["verify", output.to_str().unwrap()])
         .output()

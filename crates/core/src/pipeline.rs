@@ -1469,6 +1469,9 @@ fn level_collinear_roll(
         eig.eigenvalues[order[0]].max(0.0),
         eig.eigenvalues[order[1]].max(0.0),
     );
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() && l1 > 1e-12 {
+        eprintln!("diag gps_align spread_ratio {:.4}", l2.sqrt() / l1.sqrt());
+    }
     if l1 <= 1e-12 || l2.sqrt() / l1.sqrt() >= COLLINEAR_SPREAD_RATIO {
         return (*sim, false);
     }
