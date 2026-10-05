@@ -1873,7 +1873,7 @@ struct RegionRec {
 }
 
 /// 구역 기울기 보정(기본 켬). 환경 변수 `SKYLENS_TILT`: 0 끔, 1 구역 등록 때 공유 사진 자세로 회전 보정만,
-/// 2 마지막에 전 구역 중심을 GPS 에 한 번 더 정렬만, 3 둘 다(기본).
+/// 2 마지막에 전 구역 중심을 GPS 에 한 번 더 정렬만, 3 둘 다(기본), 4 를 더하면 회전 보정의 GPS 잔차 문턱을 끈다(진단용: 5, 7).
 fn tilt_mode() -> u8 {
     std::env::var("SKYLENS_TILT")
         .ok()
@@ -1933,6 +1933,24 @@ fn tilt_fix(
     apply_sparse_sim(s, &sim);
     Some((shared.len(), ang, res[res.len() / 2]))
 }
+
+/// 등록된 사진 중심과 GPS 위치 거리의 중앙값(m). 등록이 없으면 무한대.
+fn gps_resid_median(s: &Sparse, gps: &[Vector3<f64>]) -> f64 {
+    let mut v: Vec<f64> = (0..s.poses.len())
+        .filter_map(|i| Some((s.poses[i]?.center().coords - gps[i]).norm()))
+        .collect();
+    if v.is_empty() {
+        return f64::INFINITY;
+    }
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// 회전 보정을 받아들이는 GPS 잔차 감소 비율(보정 뒤 잔차 <= 이 값 x 보정 전 잔차). GPS 잡음 수준의 작은 감소는 지지로 치지 않는다.
+const TILT_GATE_GAIN: f64 = 0.9;
+
+/// 전 구역 GPS 재정렬을 받아들이는 최소 등록 비율. 등록이 모자란 경로(기본 경로 61/81)에서는 회귀해서 건너뛴다.
+const GLOBAL_ALIGN_MIN_REG: f64 = 0.95;
 
 /// 지금까지 내보낸 구역 상태(스냅샷 합성용).
 fn live_state(recs: &[RegionRec]) -> Vec<crate::pipeline_stream::LiveRegion<'_>> {
@@ -2523,7 +2541,22 @@ pub fn run_pipeline_with(
                 if slot > 0 && tilt_mode() & 1 > 0 {
                     let prev = ref_poses.lock().unwrap().get(&(slot - 1)).cloned();
                     if let Some(prev) = prev {
-                        match tilt_fix(&mut rs, &gids_t, &prev) {
+                        // 보정 전후 GPS 잔차(구역 카메라 중심 중앙값)를 재서 줄어들 때만 받아들인다.
+                        let before = rs.clone();
+                        let r0 = gps_resid_median(&rs, &gps);
+                        let fixed_res = tilt_fix(&mut rs, &gids_t, &prev);
+                        let r1 = gps_resid_median(&rs, &gps);
+                        let keep = fixed_res.is_some()
+                            && (tilt_mode() & 4 > 0 || r1 <= TILT_GATE_GAIN * r0);
+                        if std::env::var("PIPE_DEBUG").is_ok() {
+                            eprintln!(
+                                "tilt_gate region {region_idx} gps resid {r0:.3} -> {r1:.3} keep {keep}"
+                            );
+                        }
+                        if !keep {
+                            rs = before;
+                        }
+                        match fixed_res.filter(|_| keep) {
                             Some((n, ang, res)) => {
                                 if std::env::var("PIPE_DEBUG").is_ok() {
                                     eprintln!(
@@ -2638,7 +2671,12 @@ pub fn run_pipeline_with(
             .keys()
             .map(|g| ds.positions[g / 3].image_enu[g % 3])
             .collect();
-        gsim = crate::align::robust_similarity(&src, &dst, 3, 3.0).map(|r| r.0);
+        let frac = cm.len() as f64 / (ds.positions.len() * 3).max(1) as f64;
+        if frac >= GLOBAL_ALIGN_MIN_REG {
+            gsim = crate::align::robust_similarity(&src, &dst, 3, 3.0).map(|r| r.0);
+        } else if std::env::var("PIPE_DEBUG").is_ok() {
+            eprintln!("global_gps_align skipped registered fraction {frac:.3}");
+        }
         if let (Some(g), true) = (&gsim, std::env::var("PIPE_DEBUG").is_ok()) {
             eprintln!(
                 "global_gps_align cams {} rot {:.3} deg scale {:.4} t {:?}",
