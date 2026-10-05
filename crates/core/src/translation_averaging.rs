@@ -83,6 +83,24 @@ pub struct TranslationConfig {
     pub point_gate_rad: f64,
     /// 점 단계 IRLS 의 코시 가중 각 척도(rad): 가중 × 1 / (1 + (각 잔차 / 척도)²).
     pub robust_sigma_rad: f64,
+    /// 선택형 약한 GPS 사전. None 이면 동작이 이전과 같다.
+    pub gps: Option<GpsPrior>,
+}
+
+/// 카메라 중심에 대한 약한 GPS 사전. 회전 평균의 세계 축과 같은 방향으로 돌려 둔 좌표를 준다
+/// (축척·원점만 미지수: gps ≈ s·c + t).
+#[derive(Clone, Debug)]
+pub struct GpsPrior {
+    /// 카메라별 GPS 위치(m, 모델 세계 축 방향). 없으면 None.
+    pub positions: Vec<Option<Vector3<f64>>>,
+    /// 사전 가중. 짝 간선 평균 신뢰도에 대한 비율(각 잔차 환산 후). 0 이하면 끈다.
+    pub weight: f64,
+    /// 강건 손실(코시)의 척도(m).
+    pub sigma_m: f64,
+    /// 닮음 정렬(축척·원점) 뒤 GPS 에서 이보다 먼 카메라는 사전에서 뺀다(m).
+    pub gate_m: f64,
+    /// 정밀화 IRLS 횟수.
+    pub iterations: usize,
 }
 
 impl Default for TranslationConfig {
@@ -98,6 +116,7 @@ impl Default for TranslationConfig {
             dense_max_vertices: 400,
             point_gate_rad: 10f64.to_radians(),
             robust_sigma_rad: 2f64.to_radians(),
+            gps: None,
         }
     }
 }
@@ -446,13 +465,192 @@ pub fn average_translations_with_points(
     point_observations: &[PointObservation],
     cfg: &TranslationConfig,
 ) -> TranslationResult {
-    average_translations_with_points_rule(
+    let res = average_translations_with_points_rule(
         rotations,
         observations,
         point_observations,
         cfg,
         GP_RELOCATE_RULE,
-    )
+    );
+    match &cfg.gps {
+        Some(g) if g.weight > 0.0 => {
+            gps_refine(res, rotations, observations, point_observations, cfg, g)
+        }
+        _ => res,
+    }
+}
+
+/// 약한 GPS 사전 정밀화: 결과 중심을 GPS 에 축척·원점만 강건 정렬한 뒤, 짝·점 방향 간선(정상 표시된 것)과
+/// 고정 가중 코시 GPS 항을 함께 IRLS 로 다시 푼다(선형화: 간선 길이는 직전 해로 고정). 쓸 수 없으면 입력 그대로.
+fn gps_refine(
+    mut res: TranslationResult,
+    rotations: &[Option<Rotation3<f64>>],
+    observations: &[RelativeTranslation],
+    point_observations: &[PointObservation],
+    cfg: &TranslationConfig,
+    g: &GpsPrior,
+) -> TranslationResult {
+    let n_cam = rotations.len();
+    let rotations = finite_rotations(rotations);
+    // 정점 번호: 등록된 카메라와 점.
+    let mut pos: Vec<Option<Vector3<f64>>> =
+        res.centers.iter().map(|c| c.map(|c| c.coords)).collect();
+    pos.truncate(n_cam);
+    pos.resize(n_cam, None);
+    let nv = pos.len();
+    let local: Vec<usize> = (0..nv).filter(|&v| pos[v].is_some()).collect();
+    let mut loc = vec![usize::MAX; nv];
+    for (a, &v) in local.iter().enumerate() {
+        loc[v] = a;
+    }
+    let m = local.len();
+    if m < 3 || m > cfg.dense_max_vertices {
+        return res;
+    }
+    // 간선: (정점 i, 정점 j, 세계 방향 d ∝ c_j − c_i, 가중).
+    let mut edges: Vec<(usize, usize, Vector3<f64>, f64)> = Vec::new();
+    for (k, o) in observations.iter().enumerate() {
+        if !res.inliers.get(k).copied().unwrap_or(false) || o.i >= n_cam || o.j >= n_cam {
+            continue;
+        }
+        let (Some(_), Some(rj)) = (rotations[o.i], rotations[o.j]) else {
+            continue;
+        };
+        if loc[o.i] == usize::MAX || loc[o.j] == usize::MAX {
+            continue;
+        }
+        edges.push((o.i, o.j, (rj.inverse() * o.direction).normalize(), o.weight));
+    }
+    for o in point_observations {
+        if o.camera >= n_cam || o.weight <= 0.0 || o.weight.is_nan() || o.bearing.norm() < 1e-12 {
+            continue;
+        }
+        let (Some(r), v) = (rotations[o.camera], n_cam + o.point) else {
+            continue;
+        };
+        if v >= nv || loc[v] == usize::MAX || loc[o.camera] == usize::MAX {
+            continue;
+        }
+        let d = (r.inverse() * o.bearing).normalize();
+        let (xp, xc) = (pos[v].unwrap(), pos[o.camera].unwrap());
+        if angle_between(&(xp - xc), &d) > cfg.point_gate_rad {
+            continue;
+        }
+        edges.push((v, o.camera, d, o.weight));
+    }
+    if edges.is_empty() {
+        return res;
+    }
+    let mean_w = edges.iter().map(|e| e.3).sum::<f64>() / edges.len() as f64;
+    // 축척·원점 강건 정렬(회전은 이미 같은 축).
+    let cams: Vec<usize> = (0..n_cam)
+        .filter(|&i| pos[i].is_some() && g.positions.get(i).copied().flatten().is_some())
+        .collect();
+    if cams.len() < 3 {
+        return res;
+    }
+    let src: Vec<Vector3<f64>> = cams.iter().map(|&i| pos[i].unwrap()).collect();
+    let dst: Vec<Vector3<f64>> = cams.iter().map(|&i| g.positions[i].unwrap()).collect();
+    let mut keep = vec![true; cams.len()];
+    let (mut s, mut t) = (1.0, Vector3::zeros());
+    for _ in 0..8 {
+        let w: Vec<usize> = (0..cams.len()).filter(|&a| keep[a]).collect();
+        if w.len() < 3 {
+            return res;
+        }
+        let cnt = w.len() as f64;
+        let ms = w.iter().map(|&a| src[a]).sum::<Vector3<f64>>() / cnt;
+        let md = w.iter().map(|&a| dst[a]).sum::<Vector3<f64>>() / cnt;
+        let num: f64 = w.iter().map(|&a| (src[a] - ms).dot(&(dst[a] - md))).sum();
+        let den: f64 = w.iter().map(|&a| (src[a] - ms).norm_squared()).sum();
+        if !(den > 1e-18 && num > 0.0) {
+            return res;
+        }
+        s = num / den;
+        t = md - s * ms;
+        let mut r: Vec<f64> = (0..cams.len())
+            .map(|a| (s * src[a] + t - dst[a]).norm())
+            .collect();
+        let mut sorted = r.clone();
+        sorted.sort_by(f64::total_cmp);
+        let thr = (3.0 * sorted[sorted.len() / 2]).max(g.gate_m);
+        for (a, v) in r.drain(..).enumerate() {
+            keep[a] = v <= thr;
+        }
+    }
+    // 사전 목표(모델 단위)와 척도.
+    let mut target: Vec<Option<Vector3<f64>>> = vec![None; nv];
+    for (a, &i) in cams.iter().enumerate() {
+        if keep[a] {
+            target[i] = Some((dst[a] - t) / s);
+        }
+    }
+    let tau = (g.sigma_m / s).max(1e-12);
+    let mut lens: Vec<f64> = edges
+        .iter()
+        .map(|e| (pos[e.1].unwrap() - pos[e.0].unwrap()).norm())
+        .filter(|l| *l > 1e-12)
+        .collect();
+    if lens.is_empty() {
+        return res;
+    }
+    lens.sort_by(f64::total_cmp);
+    let l_med = lens[lens.len() / 2];
+    let big_w = g.weight * mean_w / (l_med * l_med);
+    let sig2 = cfg.robust_sigma_rad * cfg.robust_sigma_rad;
+    let mut x: Vec<Vector3<f64>> = local.iter().map(|&v| pos[v].unwrap()).collect();
+    for _ in 0..g.iterations.max(1) {
+        let mut h = DMatrix::<f64>::zeros(3 * m, 3 * m);
+        let mut b = DVector::<f64>::zeros(3 * m);
+        for &(i, j, d, w) in &edges {
+            let (a, c) = (loc[i], loc[j]);
+            let df = x[c] - x[a];
+            let l = df.norm().max(1e-9 * l_med);
+            let proj = df - d * d.dot(&df);
+            let ang2 = proj.norm_squared() / (l * l);
+            let k = w / (l * l) / (1.0 + ang2 / sig2);
+            let pm = Matrix3::identity() - d * d.transpose();
+            for r in 0..3 {
+                for q in 0..3 {
+                    let v = k * pm[(r, q)];
+                    h[(3 * a + r, 3 * a + q)] += v;
+                    h[(3 * c + r, 3 * c + q)] += v;
+                    h[(3 * a + r, 3 * c + q)] -= v;
+                    h[(3 * c + r, 3 * a + q)] -= v;
+                }
+            }
+        }
+        for (a, &v) in local.iter().enumerate() {
+            let Some(tg) = target[v] else { continue };
+            let e2 = (x[a] - tg).norm_squared() / (tau * tau);
+            let k = big_w / (1.0 + e2);
+            for r in 0..3 {
+                h[(3 * a + r, 3 * a + r)] += k;
+                b[3 * a + r] += k * tg[r];
+            }
+        }
+        for q in 0..3 * m {
+            h[(q, q)] += 1e-12 * big_w;
+        }
+        let Some(sol) = h.lu().solve(&b) else {
+            return res;
+        };
+        for a in 0..m {
+            let nx = Vector3::new(sol[3 * a], sol[3 * a + 1], sol[3 * a + 2]);
+            if !nx.iter().all(|v| v.is_finite()) {
+                return res;
+            }
+            x[a] = nx;
+        }
+    }
+    for (a, &v) in local.iter().enumerate() {
+        if v < n_cam {
+            res.centers[v] = Some(Point3::from(x[a]));
+        } else {
+            res.points[v - n_cam] = Some(Point3::from(x[a]));
+        }
+    }
+    res
 }
 
 /// [`average_translations_with_points`] 와 같되 퇴화 카메라 재배치 판정 규칙을 고를 수 있다(시험용 매개변수).

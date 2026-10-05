@@ -369,6 +369,7 @@ fn norm(k: &Intrinsics, f: &Feature) -> Vector2<f64> {
     k.index_to_normalized(&Vector2::new(f.kp.x as f64, f.kp.y as f64))
 }
 
+#[derive(Clone)]
 struct PairMatch {
     i: usize,
     j: usize,
@@ -650,6 +651,7 @@ fn averaged_centers(
     k: &Intrinsics,
     rots: &[Option<Rotation3<f64>>],
     g: &Matrix3<f64>,
+    gps_prior: Option<(f64, f64)>,
 ) -> Option<Vec<Option<Vector3<f64>>>> {
     let n = imgs.len();
     let rel: Vec<RelativeTranslation> = pm
@@ -687,7 +689,19 @@ fn averaged_centers(
             });
         }
     }
-    let res = average_translations_with_points(rots, &rel, &pts, &TranslationConfig::default());
+    let mut tcfg = TranslationConfig::default();
+    if let Some((weight, sigma_m)) = gps_prior {
+        // GPS(ENU)를 모델 세계 축으로 돌려 준다: 모델 축 b → g·b = ENU.
+        let gt = g.transpose();
+        tcfg.gps = Some(crate::translation_averaging::GpsPrior {
+            positions: gps.iter().map(|p| Some(gt * p)).collect(),
+            weight,
+            sigma_m,
+            gate_m: 3.0,
+            iterations: 10,
+        });
+    }
+    let res = average_translations_with_points(rots, &rel, &pts, &tcfg);
     if res.registered() < 2 {
         return None;
     }
@@ -898,6 +912,8 @@ pub struct PreviewOpts {
     pub refine_drop_deg: f64,
     /// 다듬기: 시작 위치로 당기는 약한 항의 상대 가중.
     pub refine_anchor: f64,
+    /// 위치 평균(`PositionMethod::TranslationAveraging`)의 약한 GPS 사전: (가중, 코시 척도 m). None 이면 끔.
+    pub ta_gps: Option<(f64, f64)>,
 }
 
 impl Default for PreviewOpts {
@@ -917,6 +933,7 @@ impl Default for PreviewOpts {
             refine_huber_deg: 0.3,
             refine_drop_deg: 2.0,
             refine_anchor: 0.02,
+            ta_gps: None,
         }
     }
 }
@@ -940,6 +957,9 @@ impl PreviewOpts {
                 Some(("huber", v)) => o.refine_huber_deg = v.parse().unwrap_or(o.refine_huber_deg),
                 Some(("drop", v)) => o.refine_drop_deg = v.parse().unwrap_or(o.refine_drop_deg),
                 Some(("anchor", v)) => o.refine_anchor = v.parse().unwrap_or(o.refine_anchor),
+                Some(("tagps", v)) => {
+                    o.ta_gps = v.parse().ok().filter(|w: &f64| *w > 0.0).map(|w| (w, 5.0));
+                }
                 _ => {}
             }
         }
@@ -1260,7 +1280,7 @@ fn sparse_init_with(
     let gl: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
     let mut placed: Option<Vec<Option<Vector3<f64>>>> = None;
     if method == PositionMethod::TranslationAveraging {
-        placed = averaged_centers(imgs, pm, gps, k, &rots, &g);
+        placed = averaged_centers(imgs, pm, gps, k, &rots, &g, opts.ta_gps);
         if placed.is_none() && std::env::var("PIPE_DEBUG").is_ok() {
             eprintln!("debug translation averaging failed, GPS least squares instead");
         }
@@ -3100,6 +3120,133 @@ mod diag {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 파이프라인 경로(GPS 있음) 위치 평균: 약한 GPS 사전 끔/켬 비교(짝 이상치 0·10·20%). 표를 표준 오류로 낸다.
+    /// `TAGPS_SEEDS=1,2,3`, `TAGPS_WEIGHTS=0.02,0.1` 로 바꾼다.
+    #[test]
+    #[ignore = "측정 시험(릴리스로 실행)"]
+    fn ta_gps_comparison() {
+        let seeds: Vec<u64> = std::env::var("TAGPS_SEEDS")
+            .unwrap_or_else(|_| "1,2,3".into())
+            .split(',')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let weights: Vec<f64> = std::env::var("TAGPS_WEIGHTS")
+            .unwrap_or_else(|_| "0.05".into())
+            .split(',')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        for seed in seeds {
+            let root =
+                std::env::temp_dir().join(format!("skylens_tagps_{}_{seed}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let scene = Scene::new(SceneConfig {
+                width: 320,
+                height: 180,
+                seed,
+                ..SceneConfig::default()
+            });
+            scene.write_dataset(&root).unwrap();
+            let ds = load_dataset(
+                &root,
+                DatasetConfig {
+                    stride: 2,
+                    span: 48,
+                    ovl: 2,
+                    max_skip_run: 2,
+                },
+            )
+            .unwrap();
+            let n = ds.positions.len() * 3;
+            let gids: Vec<usize> = (0..n).collect();
+            let data: Vec<ImgData> = gids
+                .iter()
+                .map(|g| load(&ds.positions[g / 3].images[g % 3], 800, false).unwrap())
+                .collect();
+            let imgs: Vec<&ImgData> = data.iter().collect();
+            let k = Intrinsics::from_hfov(
+                data[0].rgb.width(),
+                data[0].rgb.height(),
+                65f64.to_radians(),
+            );
+            let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
+            let gps: Vec<Vector3<f64>> = gids
+                .iter()
+                .map(|g| ds.positions[g / 3].image_enu[g % 3])
+                .collect();
+            let pm0 = match_pairs(&imgs, &views, &k);
+            let truth: Vec<Point3<f64>> = gids
+                .iter()
+                .map(|&g| {
+                    let name = ds.positions[g / 3].images[g % 3]
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                    let v = scene.views.iter().find(|v| v.name == name).unwrap();
+                    scene.to_first_gps_frame(&v.camera.pose.center())
+                })
+                .collect();
+            for rate in [0.0, 0.1, 0.2] {
+                let mut pm = pm0.clone();
+                let mut st = 0x9E37_79B9_7F4A_7C15u64 ^ seed.wrapping_mul(0x1000_0000_01B3);
+                let mut u = || {
+                    st ^= st << 13;
+                    st ^= st >> 7;
+                    st ^= st << 17;
+                    (st >> 11) as f64 / (1u64 << 53) as f64
+                };
+                for p in pm.iter_mut() {
+                    if p.t.is_some() && u() < rate {
+                        let (z, a) = (2.0 * u() - 1.0, std::f64::consts::TAU * u());
+                        let r = (1.0 - z * z).sqrt();
+                        p.t = Some(Vector3::new(r * a.cos(), r * a.sin(), z));
+                    }
+                }
+                let mut variants: Vec<(String, Option<(f64, f64)>)> = vec![("off".into(), None)];
+                for w in &weights {
+                    variants.push((format!("w={w}"), Some((*w, 5.0))));
+                }
+                for (name, ta_gps) in variants {
+                    let opts = PreviewOpts {
+                        ta_gps,
+                        ..PreviewOpts::default()
+                    };
+                    let r = sparse_init_with(
+                        &imgs,
+                        &pm,
+                        &gps,
+                        &k,
+                        PositionMethod::TranslationAveraging,
+                        &TriConfig::from_config(&PipelineConfig::default()),
+                        (0, 2.0),
+                        &opts,
+                    );
+                    let Ok((init, st)) = r else {
+                        eprintln!("TAGPS seed {seed} rate {rate} {name}: failed");
+                        continue;
+                    };
+                    let reg = |ps: &[Option<Pose>]| ps.iter().flatten().count();
+                    let errs = |ps: &[Option<Pose>]| -> (f64, f64, f64) {
+                        let e: Vec<Vector3<f64>> = (0..n)
+                            .filter_map(|i| Some(ps[i]?.center().coords - truth[i].coords))
+                            .collect();
+                        let m = e.len().max(1) as f64;
+                        let rms = (e.iter().map(|v| v.norm_squared()).sum::<f64>() / m).sqrt();
+                        let mx = e.iter().map(|v| v.norm()).fold(0.0, f64::max);
+                        (rms, mx, e.iter().map(|v| v.z).sum::<f64>() / m)
+                    };
+                    let (a, b, c) = errs(&st.placed);
+                    let (d, e, f) = errs(&init.poses);
+                    eprintln!(
+                        "TAGPS seed {seed} rate {rate:.1} {name:<8} reg {}/{n} | placed rms {a:.3} max {b:.3} dz {c:+.3} | final reg {} rms {d:.3} max {e:.3} dz {f:+.3}",
+                        reg(&st.placed),
+                        reg(&init.poses)
+                    );
+                }
+            }
+        }
     }
 }
 
