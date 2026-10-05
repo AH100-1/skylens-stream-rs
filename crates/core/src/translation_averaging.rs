@@ -115,6 +115,8 @@ pub struct TranslationResult {
     pub inliers: Vec<bool>,
     /// 거르기 단계별로 버린 간선 수: [무효·회전 불일치, 삼각형 불일치].
     pub rejected: [usize; 2],
+    /// 퇴화 카메라 재배치로 중심이 바뀐 카메라 수(지지 조건을 통과한 경우만).
+    pub relocated: usize,
 }
 
 impl TranslationResult {
@@ -806,6 +808,7 @@ fn average_core(
             residuals_rad,
             inliers,
             rejected,
+            relocated: 0,
         };
     }
 
@@ -962,6 +965,7 @@ fn average_core(
             residuals_rad,
             inliers,
             rejected,
+            relocated: 0,
         };
     }
     // 등록 판정: 정상 간선 중 서로 평행하지 않은 것이 둘 이상.
@@ -995,6 +999,7 @@ fn average_core(
         residuals_rad,
         inliers,
         rejected,
+        relocated: 0,
     }
 }
 
@@ -1016,6 +1021,9 @@ const GP_MIN_POINT_VIEWS: usize = 3;
 const GP_MIN_EIG_RATIO: f64 = 1e-4;
 /// 보충 단계에서 카메라를 놓는 데 필요한 직선 지지 수.
 const GP_SUPPLEMENT_SUPPORT: usize = 3;
+/// 퇴화 카메라 재배치에서 새 위치의 점 광선 지지가 현재보다 이만큼까지 적어도 받아들인다.
+/// 퇴화 카메라는 깊이 방향 지지가 평탄해 1개 차이는 구별되지 않는다.
+const GP_RELOCATE_SLACK: usize = 1;
 /// 이웃 방향 산포(정규화 방향의 평균 2차 모멘트)의 둘째 고윳값이 이보다 작으면 퇴화 카메라로 본다.
 const GP_WEAK_EIG: f64 = 0.03;
 
@@ -1515,6 +1523,7 @@ fn global_positioning(
     }
     // 퇴화 카메라(이웃 방향이 거의 한 직선) 재배치: 정밀화가 약한 방향을 시작값 근처에 두므로,
     // 점 광선과 퇴화하지 않은 이웃의 짝 직선을 함께 쓴 강건 교차로 다시 놓는다.
+    let mut relocated = 0usize;
     {
         let reg = centers.clone();
         for cam in 0..n_cam {
@@ -1525,13 +1534,29 @@ fn global_positioning(
                 .iter()
                 .filter_map(|&k| Some((points[obs[k].1]?.coords, -obs[k].2)))
                 .collect();
+            let n_point_lines = lines.len();
             for &(other, d) in &cam_pairs[cam] {
                 if let (Some(co), false) = (reg[other], weak[other]) {
                     lines.push((co.coords, d));
                 }
             }
-            if let Some(c) = robust_ray_point(&lines, GP_FINAL_GATE_RAD) {
-                centers[cam] = Some(Point3::from(c));
+            // 새 위치의 점 광선 지지(같은 문턱)가 GP_SUPPLEMENT_SUPPORT 이상이고 현재 위치보다 GP_RELOCATE_SLACK 넘게 적지 않을 때만 받아들인다.
+            let support = |c: &Vector3<f64>| {
+                lines[..n_point_lines]
+                    .iter()
+                    .filter(|(o, d)| {
+                        (c - o).dot(d) > 0.0 && angle_between(&(c - o), d) <= GP_FINAL_GATE_RAD
+                    })
+                    .count()
+            };
+            if let (Some(c), Some(cur)) = (robust_ray_point(&lines, GP_FINAL_GATE_RAD), reg[cam]) {
+                let s_new = support(&c);
+                if s_new >= GP_SUPPLEMENT_SUPPORT
+                    && s_new + GP_RELOCATE_SLACK >= support(&cur.coords)
+                {
+                    centers[cam] = Some(Point3::from(c));
+                    relocated += 1;
+                }
             }
         }
     }
@@ -1607,6 +1632,7 @@ fn global_positioning(
         residuals_rad: residuals,
         inliers,
         rejected,
+        relocated,
     })
 }
 
@@ -1905,7 +1931,13 @@ mod tests {
         let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
         let errs = similarity_aligned_errors(&res.centers, &truth);
         let (rms, max) = stats(&errs);
+        RELOCATED.with(|r| r.set(res.relocated));
         (res.registered(), rms, max)
+    }
+
+    thread_local! {
+        /// 마지막 실행에서 재배치된 카메라 수(진단 출력용).
+        static RELOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// 진단: 점 제약 유무별 등록 수·RMS (잡음 1°, 이상치 10·20%, 시드 1~5).
@@ -2154,7 +2186,8 @@ mod tests {
                     };
                     let (reg, rms, max) = run_with(seed, &case, pfrac);
                     println!(
-                        "GRID point {pfrac} pair {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m"
+                        "GRID point {pfrac} pair {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m relocated {}",
+                        RELOCATED.with(|r| r.get())
                     );
                     if reg < 238 || rms > 0.3 || max > 1.0 {
                         fails.push((pfrac, frac, seed, reg, rms, max));
@@ -2200,9 +2233,27 @@ mod tests {
     }
 
     #[test]
+    fn relocation_reduces_error_seed7_point5pct() {
+        let case = Case {
+            noise_deg: 1.0,
+            outlier_frac: 0.10,
+            unobservable_frac: 0.05,
+        };
+        let (reg, rms, max) = run_with(7, &case, 0.05);
+        println!(
+            "seed 7 point 5% pair 10%: reg {reg} rms {rms:.4} max {max:.4} relocated {}",
+            RELOCATED.with(|r| r.get())
+        );
+        assert!(max <= 1.0, "max {max:.4} m (before relocation 1.78 m)");
+    }
+
+    #[test]
     #[ignore = "진단 출력용"]
     fn diag_fail_cases() {
         let cases = std::env::var("DIAG_CASES").unwrap_or_default();
+        if cases.trim().is_empty() {
+            return;
+        }
         let (mut worst_rms, mut worst_max, mut nfail) = (0.0f64, 0.0f64, 0);
         for spec in cases.split(',') {
             let v: Vec<&str> = spec.split(':').collect();
