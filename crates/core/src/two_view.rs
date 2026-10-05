@@ -778,8 +778,20 @@ pub fn ransac_essential_candidates_stats(
     cfg: &RansacConfig,
 ) -> (EssentialCandidates, RansacStats) {
     let mut stats = RansacStats::default();
-    let r = ransac_essential_inner(n1, n2, focal_px, cfg, &mut stats);
+    let r = ransac_essential_inner(n1, n2, focal_px, cfg, &mut stats, false);
     (r, stats)
+}
+
+/// [`ransac_essential_candidates`] 에서 우연 방지 검사(최소 정상 수)만 뺀 판. 약한 짝의 회전을
+/// 여러 짝 합의로 따로 검증할 때만 쓴다. 단독 결과는 믿을 수 없다.
+pub fn ransac_essential_loose(
+    n1: &[Vector2<f64>],
+    n2: &[Vector2<f64>],
+    focal_px: f64,
+    cfg: &RansacConfig,
+) -> EssentialCandidates {
+    let mut stats = RansacStats::default();
+    ransac_essential_inner(n1, n2, focal_px, cfg, &mut stats, true)
 }
 
 fn ransac_essential_inner(
@@ -788,6 +800,7 @@ fn ransac_essential_inner(
     focal_px: f64,
     cfg: &RansacConfig,
     stats: &mut RansacStats,
+    loose: bool,
 ) -> Vec<(Matrix3<f64>, Vec<bool>)> {
     let n = n1.len();
     stats.n = n;
@@ -1001,7 +1014,7 @@ fn ransac_essential_inner(
     let lambda = (n - 5) as f64 * p_hit;
     let needed = (5.0 + lambda + 6.0 * lambda.sqrt() + 2.0).ceil() as usize;
     let needed = needed.max(MIN_ESSENTIAL_INLIERS);
-    if top < needed {
+    if top < needed && !loose {
         return vec![];
     }
     // 같은 골짜기의 두 해(평면의 얕은 골짜기에서 이동 방향만 다르게 멈춘 해)는 E 거리로는 갈리지만

@@ -25,11 +25,15 @@ fn default_path_seed_verify() {
     let run = Command::new(exe)
         .args(["run", input.to_str().unwrap(), output.to_str().unwrap()])
         .env("SKYLENS_REGION_DIAG", "1")
+        .env("SKYLENS_RIG_DIAG", "1")
         .output()
         .unwrap();
     assert_eq!(run.status.code(), Some(0));
     for l in String::from_utf8_lossy(&run.stderr).lines() {
-        if l.starts_with("diag gps_align") || l.starts_with("diag align region") {
+        if l.starts_with("diag gps_align")
+            || l.starts_with("rig_diag")
+            || l.starts_with("diag align region")
+        {
             eprintln!("{l}");
         }
     }

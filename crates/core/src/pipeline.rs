@@ -410,6 +410,8 @@ struct PairMatch {
     t: Option<Vector3<f64>>,
     /// 두 사진의 (카메라, 위치) 번호.
     views: ((usize, usize), (usize, usize)),
+    /// 리그 합의로 받아들인 약한 카메라 간 짝(정상 수가 하한 미만이어도 간선으로 쓴다).
+    rig: bool,
 }
 
 /// 환경 변수 `SKYLENS_RANSAC_STATS` 가 있으면 짝마다 RANSAC 통계를 표준 오류로 낸다(진단용).
@@ -418,17 +420,172 @@ fn ransac_stats_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("SKYLENS_RANSAC_STATS").is_some())
 }
 
+/// 리그 합의에 쓰는 약한 짝의 최소 비율 검사 통과 대응 수.
+const RIG_MIN_MATCHES: usize = 8;
+/// 합의 묶음에 드는 회전 차 문턱(도).
+const RIG_AGREE_DEG: f64 = 3.0;
+/// 합의가 성립하려면 묶음에 든 짝이 이만큼은 있어야 한다. 무작위 회전이 3° 안에 들 확률은 1e-5 대라
+/// 5개가 우연히 모일 가능성은 무시할 수 있다.
+const RIG_MIN_AGREE: usize = 5;
+
+/// 카메라 묶음 `g` 안 간선만으로 회전을 평균한다(묶음 자체 좌표계, 가장 큰 연결 성분만).
+fn group_rotations(n: usize, strong: &[&PairMatch], g: usize) -> Vec<Option<Rotation3<f64>>> {
+    let edges: Vec<RelativeRotation> = strong
+        .iter()
+        .filter(|p| p.views.0 .0 == g && p.views.1 .0 == g)
+        .map(|p| RelativeRotation {
+            i: p.i,
+            j: p.j,
+            rotation: p.rot,
+            weight: p.inl.len() as f64,
+        })
+        .collect();
+    average_rotations(n, &edges, &AveragingConfig::default())
+        .map_or_else(|| vec![None; n], |r| r.rotations)
+}
+
+/// 회전각(rad). 반올림으로 대각합이 살짝 벗어나도 NaN 이 되지 않는다.
+fn safe_angle(r: &Rotation3<f64>) -> f64 {
+    ((r.matrix().trace() - 1.0) / 2.0).clamp(-1.0, 1.0).acos()
+}
+
+/// 회전 후보 목록에서 가장 많은 후보가 `deg` 안에 모이는 묶음을 찾는다. (묶음 평균 회전, 구성원 번호).
+fn rotation_consensus(cands: &[Rotation3<f64>], deg: f64) -> Option<(Rotation3<f64>, Vec<usize>)> {
+    let lim = deg.to_radians();
+    let members = |c: &Rotation3<f64>| -> Vec<usize> {
+        (0..cands.len())
+            .filter(|&k| safe_angle(&(c.inverse() * cands[k])) <= lim)
+            .collect()
+    };
+    let best = cands
+        .iter()
+        .map(members)
+        .max_by_key(|m| m.len())
+        .filter(|m| !m.is_empty())?;
+    let mut sum = Matrix3::zeros();
+    for &k in &best {
+        sum += cands[k].matrix();
+    }
+    let mean = crate::rotation_averaging::project_to_rotation(&sum)?;
+    let m2 = members(&mean);
+    Some((mean, m2))
+}
+
+/// 약한 카메라 간 짝(`rig`)을 리그 합의로 거른다. 기준 카메라(가장 많이 등록된 묶음)와 다른 카메라 묶음 `g`
+/// 마다, 두 묶음의 자체 좌표계 회전으로 짝 하나가 말하는 묶음 사이 좌표 회전 S 를 구해 모으고, 한 묶음에
+/// 5개 이상이 3° 안에 모일 때만 그 구성원 짝을 간선으로 남긴다. 합의가 없으면 약한 짝은 모두 버린다.
+fn rig_consensus_filter(n: usize, all: Vec<PairMatch>) -> Vec<PairMatch> {
+    if !all.iter().any(|p| p.rig) {
+        return all;
+    }
+    let strong: Vec<&PairMatch> = all.iter().filter(|p| !p.rig).collect();
+    let mut cams: Vec<usize> = all
+        .iter()
+        .flat_map(|p| [p.views.0 .0, p.views.1 .0])
+        .collect();
+    cams.sort_unstable();
+    cams.dedup();
+    let rots: Vec<Vec<Option<Rotation3<f64>>>> = cams
+        .iter()
+        .map(|&g| group_rotations(n, &strong, g))
+        .collect();
+    let reg = |v: &Vec<Option<Rotation3<f64>>>| v.iter().flatten().count();
+    let Some(ref_idx) = (0..cams.len()).max_by_key(|&c| reg(&rots[c])) else {
+        return all;
+    };
+    let mut accept = vec![false; all.len()];
+    for (ci, &g) in cams.iter().enumerate() {
+        if ci == ref_idx {
+            continue;
+        }
+        // R_j = R'_j Sᵀ (j 는 g, 기준 묶음은 자체 좌표계가 곧 기준) 이므로 Sᵀ = R'_jᵀ · R_ij · R'_i.
+        let mut cand: Vec<(usize, Rotation3<f64>)> = Vec::new();
+        for (k, p) in all.iter().enumerate().filter(|(_, p)| p.rig) {
+            let (a, b) = (p.views.0 .0, p.views.1 .0);
+            let (ri, rj, rot) = if a == cams[ref_idx] && b == g {
+                (&rots[ref_idx][p.i], &rots[ci][p.j], p.rot)
+            } else if b == cams[ref_idx] && a == g {
+                (&rots[ref_idx][p.j], &rots[ci][p.i], p.rot.inverse())
+            } else {
+                continue;
+            };
+            if let (Some(ri), Some(rj)) = (ri, rj) {
+                cand.push((k, rj.inverse() * rot * *ri));
+            }
+        }
+        let rs: Vec<Rotation3<f64>> = cand.iter().map(|c| c.1).collect();
+        if let Some((s, mem)) = rotation_consensus(&rs, RIG_AGREE_DEG) {
+            if std::env::var_os("SKYLENS_RIG_DIAG").is_some() {
+                eprintln!(
+                    "rig_diag cam {g} candidates {} agree {} angle {:.3}",
+                    rs.len(),
+                    mem.len(),
+                    safe_angle(&s).to_degrees()
+                );
+            }
+            if mem.len() >= RIG_MIN_AGREE {
+                for m in mem {
+                    accept[cand[m].0] = true;
+                }
+            }
+        }
+    }
+    all.into_iter()
+        .zip(accept)
+        .filter(|(p, a)| !p.rig || *a)
+        .map(|(p, _)| p)
+        .collect()
+}
+
 fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> Vec<PairMatch> {
     let pairs = scheduled_pairs(views, &PairSchedule::default());
-    pairs
+    let all: Vec<PairMatch> = pairs
         .par_iter()
         .filter_map(|&(i, j)| {
             let (fa, fb) = (&imgs[i].feats, &imgs[j].feats);
             let t_pair = Instant::now();
             let m = ratio_match(fa, fb, 0.8, true);
             crate::timing::add("matching_ratio_cpu", t_pair.elapsed().as_secs_f64());
+            let weak = |m: &[(usize, usize)]| -> Option<PairMatch> {
+                if views[i].0 == views[j].0 || m.len() < RIG_MIN_MATCHES {
+                    return None;
+                }
+                let n1: Vec<_> = m.iter().map(|&(a, _)| norm(k, &fa[a])).collect();
+                let n2: Vec<_> = m.iter().map(|&(_, b)| norm(k, &fb[b])).collect();
+                let cfg = RansacConfig {
+                    max_iters: 500,
+                    min_inlier_ratio: 0.0,
+                    ..RansacConfig::default()
+                };
+                let (e, inl) = crate::two_view::ransac_essential_loose(&n1, &n2, k.fx, &cfg)
+                    .into_iter()
+                    .next()?;
+                let sel = |n: &[Vector2<f64>]| -> Vec<Vector2<f64>> {
+                    n.iter()
+                        .zip(&inl)
+                        .filter(|(_, &b)| b)
+                        .map(|(x, _)| *x)
+                        .collect()
+                };
+                let rp = recover_pose(&e, &sel(&n1), &sel(&n2))?;
+                let inl: Vec<(usize, usize)> = m
+                    .iter()
+                    .zip(&inl)
+                    .filter(|(_, &b)| b)
+                    .map(|(x, _)| *x)
+                    .collect();
+                Some(PairMatch {
+                    i,
+                    j,
+                    inl,
+                    rot: rp.rotation,
+                    t: None,
+                    views: (views[i], views[j]),
+                    rig: true,
+                })
+            };
             if m.len() < 20 {
-                return None;
+                return weak(&m);
             }
             let n1: Vec<_> = m.iter().map(|&(a, _)| norm(k, &fa[a])).collect();
             let n2: Vec<_> = m.iter().map(|&(_, b)| norm(k, &fb[b])).collect();
@@ -454,7 +611,9 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                     ransac.is_some()
                 );
             }
-            let (e, inl) = ransac?;
+            let Some((e, inl)) = ransac else {
+                return weak(&m);
+            };
             let sel = |n: &[Vector2<f64>]| -> Vec<Vector2<f64>> {
                 n.iter()
                     .zip(&inl)
@@ -464,9 +623,11 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
             };
             let (s1, s2) = (sel(&n1), sel(&n2));
             if s1.len() < 20 {
-                return None;
+                return weak(&m);
             }
-            let rp = recover_pose(&e, &s1, &s2)?;
+            let Some(rp) = recover_pose(&e, &s1, &s2) else {
+                return weak(&m);
+            };
             let inl: Vec<(usize, usize)> = m
                 .iter()
                 .zip(&inl)
@@ -480,9 +641,11 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                 rot: rp.rotation,
                 t: rp.translation_observable.then_some(rp.translation),
                 views: (views[i], views[j]),
+                rig: false,
             })
         })
-        .collect()
+        .collect();
+    rig_consensus_filter(views.len(), all)
 }
 
 /// 검증된 짝 대응을 `tracks::build_tracks` 로 다시점 트랙으로 묶는다. 반환은 성분별 (사진, 특징) 목록.
@@ -1057,7 +1220,10 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
             })
             .collect()
     };
-    let mut keep: Vec<bool> = pm.iter().map(|p| p.inl.len() >= opts.min_inl).collect();
+    let mut keep: Vec<bool> = pm
+        .iter()
+        .map(|p| p.rig || p.inl.len() >= opts.min_inl)
+        .collect();
     if opts.pair_vote {
         vote_pairs(n, pm, &mut keep);
     }
@@ -4224,5 +4390,127 @@ mod choose_roll_tests {
         let (out, rolled) = choose_roll(&sim, &pts, &pts, &inl, &mount_rots());
         assert!(rolled);
         assert!(tilt_deg(&out) < 1.0, "tilt {}", tilt_deg(&out));
+    }
+}
+
+#[cfg(test)]
+mod rig_consensus_tests {
+    use super::*;
+
+    fn rot(ax: f64, ay: f64, az: f64) -> Rotation3<f64> {
+        Rotation3::from_euler_angles(ax.to_radians(), ay.to_radians(), az.to_radians())
+    }
+
+    /// 무작위처럼 흩어진 회전(결정적 수열).
+    fn scatter(k: usize) -> Rotation3<f64> {
+        let f = |m: f64| ((k as f64 + 1.0) * m).sin() * 90.0;
+        rot(f(12.9898), f(78.233), f(37.719))
+    }
+
+    #[test]
+    fn consensus_recovers_rotation_with_outliers() {
+        let truth = rot(5.0, -20.0, 33.0);
+        let mut cands = Vec::new();
+        for k in 0..30 {
+            if k % 3 == 0 {
+                cands.push(scatter(k));
+            } else {
+                cands.push(rot(0.2 * (k % 4) as f64 - 0.3, 0.2, -0.2) * truth);
+            }
+        }
+        let (est, mem) = rotation_consensus(&cands, 3.0).unwrap();
+        assert!(mem.len() >= 18, "구성원 {}", mem.len());
+        assert!(safe_angle(&(est.inverse() * truth)).to_degrees() < 0.5);
+    }
+
+    /// 카메라 0(기준)·1 이 각자 연결된 짝 사슬을 이루고, 둘 사이는 약한 짝뿐이다. 맞는 약한 짝만 남는다.
+    #[test]
+    fn rig_filter_keeps_only_agreeing_cross_pairs() {
+        let n_per = 8;
+        let n = 2 * n_per;
+        let rel = rot(10.0, -40.0, 15.0); // 카메라 1 의 고정 상대 회전
+        let truth: Vec<Rotation3<f64>> = (0..n)
+            .map(|i| {
+                let t = (i % n_per) as f64;
+                let base = rot(0.0, 4.0 * t, 1.5 * t);
+                if i < n_per {
+                    base
+                } else {
+                    rel * base
+                }
+            })
+            .collect();
+        let views: Vec<(usize, usize)> = (0..n).map(|i| (i / n_per, i % n_per)).collect();
+        let mk = |i: usize, j: usize, r: Rotation3<f64>, inl: usize, rig: bool| PairMatch {
+            i,
+            j,
+            inl: vec![(0, 0); inl],
+            rot: r,
+            t: None,
+            views: (views[i], views[j]),
+            rig,
+        };
+        let mut pm = Vec::new();
+        for g in 0..2 {
+            for a in 0..n_per - 1 {
+                let (i, j) = (g * n_per + a, g * n_per + a + 1);
+                pm.push(mk(i, j, truth[j] * truth[i].inverse(), 40, false));
+            }
+        }
+        let mut good = 0;
+        for a in 0..n_per {
+            for b in 0..n_per {
+                let (i, j) = (a, n_per + b);
+                if (a + b) % 3 == 0 {
+                    pm.push(mk(i, j, scatter(a * 11 + b), 12, true));
+                } else {
+                    pm.push(mk(i, j, truth[j] * truth[i].inverse(), 12, true));
+                    good += 1;
+                }
+            }
+        }
+        let out = rig_consensus_filter(n, pm);
+        let weak: Vec<&PairMatch> = out.iter().filter(|p| p.rig).collect();
+        assert_eq!(weak.len(), good);
+        for p in weak {
+            let err = safe_angle(&(p.rot * truth[p.i] * truth[p.j].inverse()));
+            assert!(err.to_degrees() < 0.5);
+        }
+    }
+
+    #[test]
+    fn rig_filter_drops_weak_pairs_without_consensus() {
+        let n_per = 6;
+        let n = 2 * n_per;
+        let views: Vec<(usize, usize)> = (0..n).map(|i| (i / n_per, i % n_per)).collect();
+        let mut pm = Vec::new();
+        for g in 0..2 {
+            for a in 0..n_per - 1 {
+                let (i, j) = (g * n_per + a, g * n_per + a + 1);
+                pm.push(PairMatch {
+                    i,
+                    j,
+                    inl: vec![(0, 0); 40],
+                    rot: rot(0.0, 3.0, 0.0),
+                    t: None,
+                    views: (views[i], views[j]),
+                    rig: false,
+                });
+            }
+        }
+        for k in 0..12 {
+            let (i, j) = (k % n_per, n_per + (k * 5) % n_per);
+            pm.push(PairMatch {
+                i,
+                j,
+                inl: vec![(0, 0); 12],
+                rot: scatter(k),
+                t: None,
+                views: (views[i], views[j]),
+                rig: true,
+            });
+        }
+        let out = rig_consensus_filter(n, pm);
+        assert!(out.iter().all(|p| !p.rig));
     }
 }
