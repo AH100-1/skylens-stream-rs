@@ -1431,7 +1431,15 @@ fn prefer_fixed_up(
 ) -> Similarity {
     let rb = similarity_residual_median(&base, src, dst);
     let rf = similarity_residual_median(&fixed, src, dst);
-    if rf > rb * FIXED_UP_RESIDUAL_RATIO {
+    let fall_back = rf > rb * FIXED_UP_RESIDUAL_RATIO;
+    if std::env::var_os("SKYLENS_GPS_UP_DIAG").is_some() {
+        eprintln!(
+            "gps-up diag: plain median {rb:.4} m, fixed-up median {rf:.4} m, ratio {:.3}, used {}",
+            if rb > 0.0 { rf / rb } else { f64::NAN },
+            if fall_back { "plain" } else { "fixed-up" }
+        );
+    }
+    if fall_back {
         base
     } else {
         fixed

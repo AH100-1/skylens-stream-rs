@@ -202,6 +202,9 @@ fn run_case(tag: &str, scene: &Path, extra: &[&str]) -> (i32, String, Metrics) {
     args.extend(extra);
     let (code, so, se) = cli(&args);
     assert_eq!(code, 0, "{so}{se}");
+    for l in se.lines().filter(|l| l.starts_with("gps-up diag")) {
+        eprintln!("{tag}: {l}");
+    }
     let (vcode, table, se) = cli(&["verify", out_s]);
     eprintln!("{tag}\n{table}verify exit {vcode} {se}");
     let m = measure(scene, &out);
@@ -297,4 +300,34 @@ fn gps_fixed_up_with_roll_noise_does_not_regress() {
         on.center_med,
         off.center_med
     );
+}
+
+/// 수동 측정용(기본 건너뜀): 환경 변수 GPSUP_ROLL(도), GPSUP_SEED, GPSUP_POSITIONS 로 장면을 정해
+/// 끔/켬 지표와(SKYLENS_GPS_UP_DIAG 를 주면) 구역별 잔차 비율·물러남 여부를 찍는다.
+#[test]
+#[ignore]
+fn gps_fixed_up_ratio_sweep() {
+    let var = |k: &str, d: f64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let t = TempDir::new("gpsupratio");
+    let scene_dir = t.0.join("scene");
+    let mut cfg = SceneConfig {
+        width: 320,
+        height: 180,
+        roll_sigma_deg: var("GPSUP_ROLL", 2.0),
+        seed: var("GPSUP_SEED", 1.0) as u64,
+        ..SceneConfig::default()
+    };
+    cfg.positions = var("GPSUP_POSITIONS", cfg.positions as f64) as usize;
+    let scene = Scene::new(cfg);
+    scene.write_dataset(&scene_dir).unwrap();
+    let (_, t0, off) = run_case("sweep_off", &scene_dir, &[]);
+    let (_, t1, on) = run_case("sweep_on", &scene_dir, &["--gps-fixed-up"]);
+    eprintln!("{t0}{t1}");
+    let m = |m: &Metrics| (m.registered, m.center_med, m.center_max, m.surface_med);
+    eprintln!("SWEEP off {:?} on {:?}", m(&off), m(&on));
 }
