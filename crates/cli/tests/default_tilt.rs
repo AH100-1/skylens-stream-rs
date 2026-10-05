@@ -309,8 +309,11 @@ fn stage_report(
         }
         let mean = errs.iter().sum::<f64>() / errs.len() as f64;
         let max = errs.iter().cloned().fold(0.0, f64::max);
+        // 전역 회전 Q 자체: 각과 연직(z) 기울기. 맞춘 뒤 오차에는 안 보이는 단계 간 전역 기울기를 본다.
+        let q_angle = Rotation3::from_matrix_unchecked(q).angle().to_degrees();
+        let q_tilt = (q * Vector3::z()).z.clamp(-1.0, 1.0).acos().to_degrees();
         let mut line = format!(
-            "stage region {region} {tag} {phase} n {} rot_err_mean {mean:.3} max {max:.3}",
+            "stage region {region} {tag} {phase} n {} rot_err_mean {mean:.3} max {max:.3} q_angle {q_angle:.2} q_up_tilt {q_tilt:.2}",
             rows.len()
         );
         if phase != "rots" {

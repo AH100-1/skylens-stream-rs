@@ -2809,6 +2809,8 @@ pub fn run_pipeline_with(
                 }
                 if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
                     let g = full.as_ref().map_or(&gids_t, |f| &f.0);
+                    diag_set(region.index, g, "refined");
+                    diag_poses("aligned", &rs.poses);
                     region_diag(region.index, &rs, &gps, g, &in_region, gps_aligned);
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {
