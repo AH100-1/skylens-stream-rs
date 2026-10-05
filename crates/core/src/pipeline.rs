@@ -1304,6 +1304,34 @@ fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Opt
             t,
         },
     );
+    // 닮음 보정: 주 모델 점과의 최근접 겹침 + GPS 중심(약하게)으로 규모·회전·이동을 함께 다시 맞춘다.
+    let cen: Vec<Vector3<f64>> = ids
+        .iter()
+        .map(|&i| sub.poses[i].unwrap().center().coords)
+        .collect();
+    let g_ok: Vec<(Vector3<f64>, Vector3<f64>)> = (0..ids.len())
+        .filter(|&a| (cen[a] - gps[ids[a]]).norm() <= DETACHED_GPS_OK_M)
+        .map(|a| (cen[a], gps[ids[a]]))
+        .collect();
+    if let Some(sim) = icp_similarity(&sub.points, &s.points, &g_ok) {
+        let after: Vec<f64> = g_ok
+            .iter()
+            .map(|(c, g)| (sim.apply_point(c) - g).norm())
+            .collect();
+        let n_ok = after.iter().filter(|&&d| d <= DETACHED_GPS_OK_M).count();
+        if sim_ok(&sim) && n_ok >= DETACHED_MIN_GPS_OK && n_ok * 10 >= g_ok.len() * 8 {
+            apply_sparse_sim(&mut sub, &sim);
+        }
+    }
+    let mut res: Vec<f64> = ids
+        .iter()
+        .map(|&i| (sub.poses[i].unwrap().center().coords - gps[i]).norm())
+        .filter(|&r| r <= DETACHED_GPS_OK_M)
+        .collect();
+    res.sort_by(f64::total_cmp);
+    if res.len() < DETACHED_MIN_GPS_OK {
+        return None;
+    }
     for &i in &ids {
         s.poses[i] = sub.poses[i];
     }
@@ -1311,6 +1339,98 @@ fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Opt
     s.obs.extend(sub.obs);
     s.ba_only.extend(sub.ba_only);
     Some((res.len(), res[res.len() / 2]))
+}
+
+/// 보정 닮음 변환의 허용 범위: 규모 0.85~1.18, 회전 변화 20° 이내.
+fn sim_ok(sim: &Similarity) -> bool {
+    (0.85..=1.18).contains(&sim.s) && sim.r.angle() <= 20f64.to_radians()
+}
+
+/// `src`(부분 모델 점, 대략 맞춘 상태)를 `dst`(주 모델 점)에 ICP 식으로 맞추는 닮음 변환(`dst ≈ s·R·src + t`).
+/// 가까운 점쌍(거리 문턱 3 m 에서 1 m 로 줄임)의 Umeyama 에 GPS 중심 쌍 `anchors`(약한 사전항: 점쌍 수의 약 1/4
+/// 가중)를 더해 되풀이한다. 점쌍이 50 개 미만이면 None.
+fn icp_similarity(
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    anchors: &[(Vector3<f64>, Vector3<f64>)],
+) -> Option<Similarity> {
+    const CELL: f64 = 3.0;
+    if src.len() < 50 || dst.len() < 50 || anchors.is_empty() {
+        return None;
+    }
+    let key = |p: &Vector3<f64>| {
+        (
+            (p.x / CELL).floor() as i64,
+            (p.y / CELL).floor() as i64,
+            (p.z / CELL).floor() as i64,
+        )
+    };
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (j, p) in dst.iter().enumerate() {
+        grid.entry(key(p)).or_default().push(j);
+    }
+    let step = (src.len() / 4000).max(1);
+    let src: Vec<Vector3<f64>> = src.iter().step_by(step).copied().collect();
+    let mut sim = Similarity {
+        s: 1.0,
+        r: Rotation3::identity(),
+        t: Vector3::zeros(),
+    };
+    let mut ok = false;
+    for it in 0..60 {
+        let thr = match it {
+            0..=9 => 3.0,
+            10..=24 => 1.5,
+            25..=44 => 0.8,
+            _ => 0.4,
+        };
+        let mut a: Vec<Vector3<f64>> = Vec::new();
+        let mut b: Vec<Vector3<f64>> = Vec::new();
+        for p in &src {
+            let q = sim.apply_point(p);
+            let (kx, ky, kz) = key(&q);
+            let mut best = (thr * thr, usize::MAX);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(v) = grid.get(&(kx + dx, ky + dy, kz + dz)) {
+                            for &j in v {
+                                let d = (dst[j] - q).norm_squared();
+                                if d < best.0 {
+                                    best = (d, j);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if best.1 != usize::MAX {
+                a.push(*p);
+                b.push(dst[best.1]);
+            }
+        }
+        if a.len() < 50 {
+            return if ok { Some(sim) } else { None };
+        }
+        let rep = (a.len() / 4 / anchors.len()).max(1);
+        for (c, g) in anchors {
+            // 앵커는 점 쌍의 같은 좌표계(보정 전 부분 모델 좌표)에 있어야 하므로 현재 닮음 변환의 역으로 되돌리지 않고
+            // 원래 좌표 `c` 그대로 쓴다.
+            for _ in 0..rep {
+                a.push(*c);
+                b.push(*g);
+            }
+        }
+        let Some(next) = crate::align::umeyama(&a, &b) else {
+            break;
+        };
+        if !(0.5..=2.0).contains(&next.s) {
+            break;
+        }
+        sim = next;
+        ok = true;
+    }
+    ok.then_some(sim)
 }
 
 /// 회전 평균 주 성분에 붙지 못한 연결 성분(사진 6장 이상)마다 따로 부분 모델을 풀어 `attach_detached` 로 붙인다.
@@ -4764,5 +4884,73 @@ mod detached_tests {
         assert!(attach_detached(&mut main, sub, &gps).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
         assert_eq!(main.points.len(), 30);
+    }
+
+    fn relief(x: f64, y: f64) -> f64 {
+        3.0 * (x / 9.0).sin() + 2.0 * (y / 6.0).cos() + 0.04 * x
+    }
+
+    /// 기복 있는 바닥 점(격자 간격 0.6 m).
+    fn relief_points(x0: f64, x1: f64) -> Vec<Vector3<f64>> {
+        let mut v = Vec::new();
+        let mut x = x0;
+        while x < x1 {
+            for k in 0..100 {
+                let y = k as f64 * 0.6;
+                v.push(Vector3::new(x, y, relief(x, y)));
+            }
+            x += 0.6;
+        }
+        v
+    }
+
+    #[test]
+    fn scaled_rotated_component_recovers_similarity() {
+        let total = 10 + 12;
+        let center = |i: usize| Vector3::new(i as f64 * 3.0, 28.0, 30.0);
+        let mut main = Sparse {
+            poses: vec![None; total],
+            points: relief_points(0.0, 50.0),
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        };
+        for i in 0..10 {
+            main.poses[i] = Some(Pose::from_center(truth_rot(), &Point3::from(center(i))));
+        }
+        let mut sub = Sparse {
+            poses: vec![None; total],
+            points: relief_points(30.0, 60.0),
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        };
+        for i in 10..total {
+            sub.poses[i] = Some(Pose::from_center(truth_rot(), &Point3::from(center(i))));
+        }
+        // 정답에서 규모 1/1.08, 임의 축 4° 회전, 이동을 줘 어긋나게 만든다.
+        let mean = (10..total).map(center).sum::<Vector3<f64>>() / 12.0;
+        let axis = nalgebra::Unit::new_normalize(Vector3::new(1.0, 1.0, 0.5));
+        let r = Rotation3::from_axis_angle(&axis, 4f64.to_radians());
+        apply_sparse_sim(
+            &mut sub,
+            &Similarity {
+                s: 1.0 / 1.08,
+                r,
+                t: mean - r * mean / 1.08 + Vector3::new(1.5, -1.0, 0.5),
+            },
+        );
+        let gps: Vec<Vector3<f64>> = (0..total).map(center).collect();
+        attach_detached(&mut main, sub, &gps).expect("attached");
+        let c = |i: usize| main.poses[i].unwrap().center().coords;
+        let scale = (c(21) - c(10)).norm() / (center(21) - center(10)).norm();
+        assert!((scale - 1.0).abs() < 0.02, "scale {scale}");
+        for i in 10..total {
+            let p = main.poses[i].unwrap();
+            let dc = (p.center().coords - center(i)).norm();
+            let da = (p.rotation * truth_rot().inverse()).angle().to_degrees();
+            // 점 겹침이 20 m 폭뿐인 약한 형상이라 회전은 4° 안(실측 약 2.9°)으로만 확인한다.
+            assert!(dc < 1.0 && da < 4.0, "photo {i}: {dc} m {da} deg");
+        }
     }
 }
