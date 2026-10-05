@@ -1945,6 +1945,68 @@ struct RegionRec {
     reg_flags: Vec<bool>,
 }
 
+/// 구역 기울기 보정(기본 켬). 환경 변수 `SKYLENS_TILT`: 0 끔, 1 구역 등록 때 공유 사진 자세로 회전 보정만,
+/// 2 마지막에 전 구역 중심을 GPS 에 한 번 더 정렬만, 3 둘 다(기본).
+fn tilt_mode() -> u8 {
+    std::env::var("SKYLENS_TILT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+}
+
+/// 직전 정밀 구역과 공유하는 사진의 자세로 구역 모델의 좌표계 기울기를 바로잡는다.
+/// 공유 카메라 회전 R_a, 직전 R_p 에 대해 R_a Qᵀ ≈ R_p 인 Q 를 극분해로 구하고(회전 평균),
+/// 축척은 그대로 두고 이동은 공유 카메라 중심의 무게중심을 맞춘다.
+/// 반환: (공유 수, 보정 회전 각(도), 보정 뒤 공유 중심 잔차 중앙(m)). 공유가 4 미만이거나 보정이 5° 넘으면 None.
+fn tilt_fix(
+    s: &mut Sparse,
+    gids: &[usize],
+    prev: &HashMap<usize, Pose>,
+) -> Option<(usize, f64, f64)> {
+    let shared: Vec<(usize, Pose)> = gids
+        .iter()
+        .enumerate()
+        .filter_map(|(a, g)| Some((a, *prev.get(g)?)))
+        .filter(|(a, _)| s.poses[*a].is_some())
+        .collect();
+    if shared.len() < 4 {
+        return None;
+    }
+    let mut m = Matrix3::zeros();
+    for (a, pp) in &shared {
+        m += s.poses[*a].unwrap().rotation.matrix().transpose() * pp.rotation.matrix();
+    }
+    let sv = m.svd(true, true);
+    let qt = sv.u? * sv.v_t?;
+    let q = Rotation3::from_matrix_unchecked(qt.transpose());
+    let ang = q.angle().to_degrees();
+    if ang > 5.0 {
+        return None;
+    }
+    let n = shared.len() as f64;
+    let ca = shared.iter().fold(Vector3::zeros(), |acc, (a, _)| {
+        acc + s.poses[*a].unwrap().center().coords
+    }) / n;
+    let cp = shared
+        .iter()
+        .fold(Vector3::zeros(), |acc, (_, p)| acc + p.center().coords)
+        / n;
+    let sim = Similarity {
+        s: 1.0,
+        r: q,
+        t: cp - q * ca,
+    };
+    let mut res: Vec<f64> = shared
+        .iter()
+        .map(|(a, p)| {
+            (sim.apply_point(&s.poses[*a].unwrap().center().coords) - p.center().coords).norm()
+        })
+        .collect();
+    res.sort_by(f64::total_cmp);
+    apply_sparse_sim(s, &sim);
+    Some((shared.len(), ang, res[res.len() / 2]))
+}
+
 /// 지금까지 내보낸 구역 상태(스냅샷 합성용).
 fn live_state(recs: &[RegionRec]) -> Vec<crate::pipeline_stream::LiveRegion<'_>> {
     recs.iter()
@@ -2092,6 +2154,8 @@ pub fn run_pipeline_with(
     let mut latest_ref: Option<usize> = None; // recs 번호
     let mut in_flight = 0usize;
     let (tx, rx) = mpsc::channel::<RefinedMsg>();
+    let ref_poses: Arc<std::sync::Mutex<BTreeMap<usize, HashMap<usize, Pose>>>> =
+        Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let t_now = || t_start.elapsed().as_secs_f64();
     let mut live = crate::pipeline_stream::LiveLog::new(out).map_err(|e| e.to_string())?;
 
@@ -2121,6 +2185,7 @@ pub fn run_pipeline_with(
                 rec.rposes.insert(*g, p);
             }
         }
+        ref_poses.lock().unwrap().insert(k, rec.rposes.clone());
         rec.stats.refined_rms = m.sparse.rms;
         rec.stats.refined_points = m.cloud.len();
         rec.stats.secs_ba = m.secs;
@@ -2590,6 +2655,7 @@ pub fn run_pipeline_with(
             let (maxf, upscale, position, region) =
                 (cfg.max_features, cfg.upscale_fill, cfg.position, *r);
             let tri_t = TriConfig::from_config(cfg);
+            let ref_poses = ref_poses.clone();
             let mut cached: HashMap<usize, Arc<ImgData>> =
                 gids_t.iter().copied().zip(arcs.iter().cloned()).collect();
             in_flight += 1;
@@ -2674,6 +2740,30 @@ pub fn run_pipeline_with(
                 if !anchored && (anchor.is_none() || full.is_some()) {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
                 }
+                if slot > 0 && tilt_mode() & 1 > 0 {
+                    let prev = ref_poses.lock().unwrap().get(&(slot - 1)).cloned();
+                    if let Some(prev) = prev {
+                        let g_now: &[usize] = match &full {
+                            Some((gf, _)) => gf,
+                            None => &gids_t,
+                        };
+                        match tilt_fix(&mut rs, g_now, &prev) {
+                            Some((n, ang, res)) => {
+                                if std::env::var("PIPE_DEBUG").is_ok() {
+                                    eprintln!(
+                                        "tilt_fix region {} shared {n} rot {ang:.3} deg center resid {res:.3} m",
+                                        region.index
+                                    );
+                                }
+                            }
+                            None => {
+                                if std::env::var("PIPE_DEBUG").is_ok() {
+                                    eprintln!("tilt_fix region {} skipped", region.index);
+                                }
+                            }
+                        }
+                    }
+                }
                 let cloud = crate::timing::timed("refined_dense_total", || {
                     dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod)
                 });
@@ -2753,13 +2843,55 @@ pub fn run_pipeline_with(
         .iter()
         .map(|r| r.own.as_ref().unwrap().1.clone())
         .collect();
+    // 전 구역 사진 중심을 GPS 에 한 번 더 닮음 정렬(경로 전체 기준선이라 구역 하나보다 회전 잡음이 작다).
+    let mut gsim: Option<Similarity> = None;
+    if tilt_mode() & 2 > 0 {
+        let mut cm: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
+        for rec in &recs {
+            let (olo, ohi) = owns[rec.region.index];
+            for (&g, c) in &rec.centers {
+                if g / 3 >= olo && g / 3 < ohi {
+                    cm.insert(g, *c);
+                }
+            }
+        }
+        let src: Vec<Vector3<f64>> = cm
+            .values()
+            .map(|c| Vector3::new(c[0], c[1], c[2]))
+            .collect();
+        let dst: Vec<Vector3<f64>> = cm
+            .keys()
+            .map(|g| ds.positions[g / 3].image_enu[g % 3])
+            .collect();
+        gsim = crate::align::robust_similarity(&src, &dst, 3, 3.0).map(|r| r.0);
+        if let (Some(g), true) = (&gsim, std::env::var("PIPE_DEBUG").is_ok()) {
+            eprintln!(
+                "global_gps_align cams {} rot {:.3} deg scale {:.4} t {:?}",
+                src.len(),
+                g.r.angle().to_degrees(),
+                g.s,
+                g.t
+            );
+        }
+    }
+    let gcompose = |s: Option<&Similarity>| -> Option<Similarity> {
+        match (&gsim, s) {
+            (Some(g), Some(s)) => Some(g.compose(s)),
+            (Some(g), None) => Some(*g),
+            (None, s) => s.copied(),
+        }
+    };
+    let sims: Vec<Option<Similarity>> = sims
+        .iter()
+        .map(|s| s.as_ref().and_then(|s| gcompose(Some(s))))
+        .collect();
     let prelim: Vec<PointCloud> = recs.iter().map(|r| r.coarse.clone()).collect();
     let refined: Vec<PointCloud> = recs
         .iter()
         .map(|r| {
             let c = &r.refined.as_ref().unwrap().1;
-            match &r.rsim {
-                Some(s) => crate::stream::apply_cloud(s, c),
+            match gcompose(r.rsim.as_ref()) {
+                Some(s) => crate::stream::apply_cloud(&s, c),
                 None => c.clone(),
             }
         })
@@ -2795,6 +2927,12 @@ pub fn run_pipeline_with(
             } else {
                 centers.entry(g).or_insert(*c);
             }
+        }
+    }
+    if let Some(g) = &gsim {
+        for c in centers.values_mut() {
+            let q = g.apply_point(&Vector3::new(c[0], c[1], c[2]));
+            *c = [q.x, q.y, q.z];
         }
     }
     for rec in &recs {

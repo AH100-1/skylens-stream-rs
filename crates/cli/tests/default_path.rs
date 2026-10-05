@@ -146,6 +146,41 @@ fn measure(input: &Path, output: &Path) -> Metrics {
     }
 }
 
+/// 구역(refined/*.ply)별 점 표면 오차 중앙(파일 이름 순서 = 구역 순서).
+fn region_surface_medians(input: &Path, output: &Path) -> Vec<f64> {
+    let shift = truth_to_output_shift(input);
+    let scene = Scene::new(SceneConfig {
+        width: 320,
+        height: 180,
+        ..SceneConfig::default()
+    });
+    let mut files: Vec<_> = std::fs::read_dir(output.join("refined"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ply"))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|f| {
+            let mut d: Vec<f64> = read_ply_file(f)
+                .unwrap()
+                .points
+                .iter()
+                .map(|p| {
+                    let (x, y, z) = (
+                        p.xyz[0] as f64 - shift[0],
+                        p.xyz[1] as f64 - shift[1],
+                        p.xyz[2] as f64 - shift[2],
+                    );
+                    (z - scene.surface_height(x, y)).abs()
+                })
+                .collect();
+            median(&mut d)
+        })
+        .collect()
+}
+
 /// verify 표의 한 항목 (판정, 측정값).
 fn item(table: &str, name: &str) -> (String, String) {
     let line = table
@@ -203,6 +238,19 @@ fn default_args_synth_run_verify() {
         m.surface_med
     );
     assert!(m.points > 1000, "점 {}", m.points);
+    // 구역 기울기 보정(공유 사진 자세 + 전체 GPS 정렬) 뒤 실측: 구역별 중앙 0.239 / 0.260 / 0.438 m, p95 1.19 m
+    // (보정 전 0.232 / 0.231 / 0.792, p95 1.60). 마지막 구역(위치 5 곳)이 경로 끝의 기울기를 받지 않아야 한다.
+    let per_region = region_surface_medians(&input, &output);
+    eprintln!("region surface medians {per_region:?}");
+    assert_eq!(per_region.len(), chunks, "구역 수");
+    for (i, r) in per_region.iter().enumerate() {
+        assert!(*r < 0.6, "구역 {i} 점 표면 오차 중앙 {r:.3} m (한계 0.6)");
+    }
+    assert!(
+        m.surface_p95 < 1.4,
+        "점 표면 오차 p95 {:.3} m",
+        m.surface_p95
+    );
 }
 
 /// 진단: 환경 변수 SKY_IN·SKY_OUT 의 결과를 구역(refined/*.ply)별 점 표면 오차로 낸다.
