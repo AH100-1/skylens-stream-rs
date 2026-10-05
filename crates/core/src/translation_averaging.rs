@@ -480,6 +480,90 @@ pub fn average_translations_with_points(
     }
 }
 
+/// 사전 풀이에 쓰는 GPS 와 해 좌표계 사이의 고정 닮음에서 나온 값.
+#[derive(Clone)]
+struct GpsFrame {
+    /// 축척(해 좌표 1 단위 = s m).
+    s: f64,
+    /// 정점별 해 좌표계 목표.
+    target: Vec<Option<Vector3<f64>>>,
+    /// 해 좌표계의 높이 축(단위 벡터).
+    up: Vector3<f64>,
+    /// 마할라노비스 문턱 안이라 사전을 쓰는 정점.
+    active: Vec<bool>,
+}
+
+/// 점 간선 문턱 판정의 부호. 시험 전용 TAGPS_SIGNBUG=1 은 이전 판의 뒤집힌 부호(모든 점 간선이 탈락)를 재현한다.
+#[cfg(test)]
+fn gps_gate_sign() -> f64 {
+    if std::env::var("TAGPS_SIGNBUG").is_ok() {
+        -1.0
+    } else {
+        1.0
+    }
+}
+#[cfg(not(test))]
+fn gps_gate_sign() -> f64 {
+    1.0
+}
+
+/// 허버 손실의 꺾임(표준화 잔차).
+const GPS_HUBER_K: f64 = 1.345;
+/// 사전 잔차가 이 값(σ)을 넘는 GPS 항은 끈다.
+const GPS_GATE_SIGMA: f64 = 2.8;
+/// 직전 해 근접 항의 세기(정점 광선 강성에 대한 비율).
+#[cfg(not(test))]
+fn gps_anchor() -> f64 {
+    1e-5
+}
+#[cfg(test)]
+fn gps_anchor() -> f64 {
+    gps_env("TAGPS_ANCHOR", 1e-5)
+}
+/// 높이 σ / 수평 σ.
+const GPS_VERT_SIGMA_RATIO: f64 = 2.0;
+
+/// 해 좌표 단위의 (수평 σ, 높이 σ).
+fn gps_sigmas(g: &GpsPrior, s: f64) -> (f64, f64) {
+    let h = (g.sigma_m / s).max(1e-12);
+    #[cfg(test)]
+    let h = h * gps_env("TAGPS_SIGMA_SCALE", 1.0);
+    #[cfg(test)]
+    let ratio = gps_env("TAGPS_VRATIO", GPS_VERT_SIGMA_RATIO);
+    #[cfg(not(test))]
+    let ratio = GPS_VERT_SIGMA_RATIO;
+    (h, h * ratio)
+}
+
+/// 표준화(수평 σh, 높이 σv) 잔차 크기.
+fn gps_mahalanobis(r: &Vector3<f64>, up: &Vector3<f64>, sh: f64, sv: f64) -> f64 {
+    let rv = r.dot(up);
+    let rh2 = (r.norm_squared() - rv * rv).max(0.0);
+    (rh2 / (sh * sh) + rv * rv / (sv * sv)).sqrt()
+}
+
+#[cfg(test)]
+fn gps_env(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// 시험 전용: 매 반복 닮음을 다시 구하는 이전 되먹임 방식(TAGPS_MODE=feedback)과 진단 출력(TAGPS_DIAG=1).
+#[cfg(test)]
+fn gps_feedback_mode() -> bool {
+    std::env::var("TAGPS_MODE").is_ok_and(|v| v == "feedback")
+}
+#[cfg(not(test))]
+fn gps_feedback_mode() -> bool {
+    false
+}
+#[cfg(test)]
+fn gps_diag() -> bool {
+    std::env::var("TAGPS_DIAG").is_ok()
+}
+
 /// 약한 GPS 사전 정밀화(전역 위치 풀이 안에 사전 항을 함께 넣는다): 카메라 중심과 점을 한 연립에 놓고
 /// 짝·점 방향 간선의 코시 각 잔차와 코시 GPS 항(c_i − (GPS_i − t)/s)을 IRLS 로 함께 푼다(간선 길이는 직전 해로 고정,
 /// 연립은 블록 야코비 선조건 켤레 기울기). 닮음(축척 s·원점 t; 회전은 같은 축)은 매 외부 반복마다 현재 해와 GPS
@@ -528,6 +612,8 @@ fn gps_refine(
             o.weight,
         ));
     }
+    #[cfg(test)]
+    let mut n_point_edges = 0usize;
     for o in point_observations {
         if o.camera >= n_cam || o.weight <= 0.0 || o.weight.is_nan() || o.bearing.norm() < 1e-12 {
             continue;
@@ -540,10 +626,24 @@ fn gps_refine(
         }
         let d = (r.inverse() * o.bearing).normalize();
         let (xp, xc) = (pos[v].unwrap(), pos[o.camera].unwrap());
-        if angle_between(&(xc - xp), &d) > cfg.point_gate_rad {
+        // 간선 방향 규약: d ∝ x_점 − x_카메라 (카메라→점 광선).
+        if angle_between(&(gps_gate_sign() * (xp - xc)), &d) > cfg.point_gate_rad {
             continue;
         }
+        #[cfg(test)]
+        {
+            n_point_edges += 1;
+        }
         edges.push((loc[v], loc[o.camera], d, o.weight));
+    }
+    #[cfg(test)]
+    if gps_diag() {
+        eprintln!(
+            "GPSDIAG edges total {} point {} pair {}",
+            edges.len(),
+            n_point_edges,
+            edges.len() - n_point_edges
+        );
     }
     if edges.is_empty() {
         return res;
@@ -570,71 +670,136 @@ fn gps_refine(
     let dot = |a: &[Vector3<f64>], b: &[Vector3<f64>]| {
         a.iter().zip(b).map(|(p, q)| p.dot(q)).sum::<f64>()
     };
-    for _ in 0..g.iterations.max(1) {
-        // 닮음(s, t) 강건 정렬: 현재 카메라 중심 → GPS.
-        let src: Vec<Vector3<f64>> = cams.iter().map(|&i| x[loc[i]]).collect();
-        let mut keep = vec![true; cams.len()];
-        let (mut s, mut t) = (1.0, Vector3::zeros());
-        let mut rot = Matrix3::<f64>::identity();
-        for _ in 0..8 {
-            let w: Vec<usize> = (0..cams.len()).filter(|&a| keep[a]).collect();
-            if w.len() < 3 {
-                return res;
-            }
-            let cnt = w.len() as f64;
-            let ms = w.iter().map(|&a| src[a]).sum::<Vector3<f64>>() / cnt;
-            let md = w.iter().map(|&a| dst[a]).sum::<Vector3<f64>>() / cnt;
-            // 공분산 고윳값 비로 공선 판정: 퇴화면 회전은 항등으로 두고 축척·평행이동만.
-            let cov = w
-                .iter()
-                .map(|&a| (src[a] - ms) * (src[a] - ms).transpose())
-                .sum::<Matrix3<f64>>();
-            let ev = cov.symmetric_eigen().eigenvalues;
-            let mut e: Vec<f64> = ev.iter().copied().collect();
-            e.sort_by(f64::total_cmp);
-            let planar_ok = e[1] > 0.02 * e[2];
-            rot = Matrix3::identity();
-            if planar_ok {
-                let h = w
+    let feedback = gps_feedback_mode();
+    #[cfg(test)]
+    let x0 = x.clone();
+    let mut fixed: Option<GpsFrame> = None;
+    for _it in 0..g.iterations.max(1) {
+        // 닮음(s, t) 강건 정렬: 현재 카메라 중심 → GPS. 되먹임 방식이 아니면 첫 반복(사전 없는 해)에서 한 번만 구한다.
+        let frame = if let (false, Some(f)) = (feedback, fixed.as_ref()) {
+            f.clone()
+        } else {
+            let src: Vec<Vector3<f64>> = cams.iter().map(|&i| x[loc[i]]).collect();
+            let mut keep = vec![true; cams.len()];
+            let (mut s, mut t) = (1.0, Vector3::zeros());
+            let mut rot = Matrix3::<f64>::identity();
+            for _ in 0..8 {
+                let w: Vec<usize> = (0..cams.len()).filter(|&a| keep[a]).collect();
+                if w.len() < 3 {
+                    return res;
+                }
+                let cnt = w.len() as f64;
+                let ms = w.iter().map(|&a| src[a]).sum::<Vector3<f64>>() / cnt;
+                let md = w.iter().map(|&a| dst[a]).sum::<Vector3<f64>>() / cnt;
+                // 공분산 고윳값 비로 공선 판정: 퇴화면 회전은 항등으로 두고 축척·평행이동만.
+                let cov = w
                     .iter()
-                    .map(|&a| (src[a] - ms) * (dst[a] - md).transpose())
+                    .map(|&a| (src[a] - ms) * (src[a] - ms).transpose())
                     .sum::<Matrix3<f64>>();
-                let svd = h.svd(true, true);
-                if let (Some(u), Some(vt)) = (svd.u, svd.v_t) {
-                    let mut dmat = Matrix3::identity();
-                    if (vt.transpose() * u.transpose()).determinant() < 0.0 {
-                        dmat[(2, 2)] = -1.0;
+                let ev = cov.symmetric_eigen().eigenvalues;
+                let mut e: Vec<f64> = ev.iter().copied().collect();
+                e.sort_by(f64::total_cmp);
+                let planar_ok = e[1] > 0.02 * e[2];
+                rot = Matrix3::identity();
+                if planar_ok {
+                    let h = w
+                        .iter()
+                        .map(|&a| (src[a] - ms) * (dst[a] - md).transpose())
+                        .sum::<Matrix3<f64>>();
+                    let svd = h.svd(true, true);
+                    if let (Some(u), Some(vt)) = (svd.u, svd.v_t) {
+                        let mut dmat = Matrix3::identity();
+                        if (vt.transpose() * u.transpose()).determinant() < 0.0 {
+                            dmat[(2, 2)] = -1.0;
+                        }
+                        rot = vt.transpose() * dmat * u.transpose();
                     }
-                    rot = vt.transpose() * dmat * u.transpose();
+                }
+                let num: f64 = w
+                    .iter()
+                    .map(|&a| (rot * (src[a] - ms)).dot(&(dst[a] - md)))
+                    .sum();
+                let den: f64 = w.iter().map(|&a| (src[a] - ms).norm_squared()).sum();
+                if !(den > 1e-18 && num > 0.0) {
+                    return res;
+                }
+                s = num / den;
+                t = md - s * rot * ms;
+                let r: Vec<f64> = (0..cams.len())
+                    .map(|a| (s * rot * src[a] + t - dst[a]).norm())
+                    .collect();
+                let mut sorted = r.clone();
+                sorted.sort_by(f64::total_cmp);
+                let thr = (3.0 * sorted[sorted.len() / 2]).max(g.gate_m);
+                for (a, v) in r.into_iter().enumerate() {
+                    keep[a] = v <= thr;
                 }
             }
-            let num: f64 = w
+            let mut target: Vec<Option<Vector3<f64>>> = vec![None; m];
+            for (a, &i) in cams.iter().enumerate() {
+                if keep[a] {
+                    target[loc[i]] = Some(rot.transpose() * (dst[a] - t) / s);
+                }
+            }
+            // 높이 축: GPS 점들의 공분산 최소 고유 방향(편대는 거의 고도가 일정하다)을 해 좌표계로 돌린 것.
+            let md = dst.iter().sum::<Vector3<f64>>() / dst.len() as f64;
+            let cov = dst
                 .iter()
-                .map(|&a| (rot * (src[a] - ms)).dot(&(dst[a] - md)))
-                .sum();
-            let den: f64 = w.iter().map(|&a| (src[a] - ms).norm_squared()).sum();
-            if !(den > 1e-18 && num > 0.0) {
-                return res;
+                .map(|p| (p - md) * (p - md).transpose())
+                .sum::<Matrix3<f64>>();
+            let se = cov.symmetric_eigen();
+            let kmin = (0..3)
+                .min_by(|&a, &b| se.eigenvalues[a].total_cmp(&se.eigenvalues[b]))
+                .unwrap_or(2);
+            let up = (rot.transpose() * se.eigenvectors.column(kmin).into_owned()).normalize();
+            let mut f = GpsFrame {
+                s,
+                target,
+                up,
+                active: vec![true; m],
+            };
+            if !feedback {
+                // 사전 없는 해에서 마할라노비스 거리가 문턱을 넘는 GPS 는 끈다(한 번만 판정).
+                let (sh, sv) = gps_sigmas(g, s);
+                for (a, tg) in f.target.iter().enumerate() {
+                    if let Some(tg) = tg {
+                        f.active[a] = gps_mahalanobis(&(x[a] - tg), &up, sh, sv) <= GPS_GATE_SIGMA;
+                    }
+                }
             }
-            s = num / den;
-            t = md - s * rot * ms;
-            let r: Vec<f64> = (0..cams.len())
-                .map(|a| (s * rot * src[a] + t - dst[a]).norm())
-                .collect();
-            let mut sorted = r.clone();
-            sorted.sort_by(f64::total_cmp);
-            let thr = (3.0 * sorted[sorted.len() / 2]).max(g.gate_m);
-            for (a, v) in r.into_iter().enumerate() {
-                keep[a] = v <= thr;
+            #[cfg(test)]
+            if gps_diag() {
+                let med = |v: &mut Vec<f64>| {
+                    v.sort_by(f64::total_cmp);
+                    v[v.len() / 2]
+                };
+                let mut rs: Vec<f64> = (0..m)
+                    .filter_map(|a| f.target[a].map(|tg| (x[a] - tg).norm() * s))
+                    .collect();
+                let nact = f
+                    .active
+                    .iter()
+                    .zip(&f.target)
+                    .filter(|(a, t)| **a && t.is_some())
+                    .count();
+                eprintln!(
+                    "GPSDIAG it {_it} s {s:.5} kept {}/{} active {nact} med sim-resid {:.3} m",
+                    rs.len(),
+                    cams.len(),
+                    med(&mut rs)
+                );
             }
-        }
-        let mut target: Vec<Option<Vector3<f64>>> = vec![None; m];
-        for (a, &i) in cams.iter().enumerate() {
-            if keep[a] {
-                target[loc[i]] = Some(rot.transpose() * (dst[a] - t) / s);
-            }
-        }
-        let tau2 = (g.sigma_m / s).max(1e-12).powi(2);
+            fixed = Some(f.clone());
+            f
+        };
+        let GpsFrame {
+            s,
+            target,
+            up,
+            active,
+        } = frame;
+        let (sh, sv) = gps_sigmas(g, s);
+        let tau2 = sh.max(1e-12).powi(2);
         // 이번 선형화의 블록: 간선 3×3, 사전 스칼라.
         let ps: Vec<Matrix3<f64>> = edges
             .iter()
@@ -661,15 +826,31 @@ fn gps_refine(
             }
         }
         let big_w = g.weight * tsum / tcnt.max(1) as f64;
-        let kp: Vec<f64> = (0..m)
+        let kp: Vec<Matrix3<f64>> = (0..m)
             .map(|a| match target[a] {
-                Some(tg) => big_w / (1.0 + (x[a] - tg).norm_squared() / tau2),
-                None => 0.0,
+                Some(tg) if feedback => {
+                    Matrix3::identity() * (big_w / (1.0 + (x[a] - tg).norm_squared() / tau2))
+                }
+                Some(tg) if active[a] => {
+                    // 허버 가중 × 수평·높이 따로 정규화한 강성(수평 단위 = big_w).
+                    let e = gps_mahalanobis(&(x[a] - tg), &up, sh, sv);
+                    let w = if e <= GPS_HUBER_K {
+                        1.0
+                    } else {
+                        GPS_HUBER_K / e
+                    };
+                    let vv = up * up.transpose();
+                    ((Matrix3::identity() - vv) + vv * (sh * sh) / (sv * sv)) * (big_w * w)
+                }
+                _ => Matrix3::zeros(),
             })
             .collect();
+        // 게이지 고정: 방향만 있는 연립은 축척·평행이동 영(零)공간이 있어 사전이 약하면 구조가 쪼그라든다
+        // (간선 길이 l 이 줄면 강성 1/l² 이 커져 더 줄어든다). 직전 해에 대한 아주 약한 근접 항으로 막는다.
+        let anchor: Vec<f64> = ray_tr.iter().map(|t| gps_anchor() * t).collect();
         let apply = |v: &[Vector3<f64>], y: &mut Vec<Vector3<f64>>| {
             for (a, o) in y.iter_mut().enumerate() {
-                *o = v[a] * kp[a];
+                *o = kp[a] * v[a] + v[a] * anchor[a];
             }
             for (&(a, c, _, _), p) in edges.iter().zip(&ps) {
                 let q = p * (v[a] - v[c]);
@@ -680,9 +861,11 @@ fn gps_refine(
         let mut b = vec![Vector3::zeros(); m];
         let mut diag = vec![Matrix3::zeros(); m];
         for a in 0..m {
+            b[a] = x[a] * anchor[a];
+            diag[a] += Matrix3::identity() * anchor[a];
             if let Some(tg) = target[a] {
-                b[a] = tg * kp[a];
-                diag[a] += Matrix3::identity() * kp[a];
+                b[a] += kp[a] * tg;
+                diag[a] += kp[a];
             }
         }
         for (&(a, c, _, _), p) in edges.iter().zip(&ps) {
@@ -731,6 +914,69 @@ fn gps_refine(
         }
         if !y.iter().all(|v| v.iter().all(|c| c.is_finite())) {
             return res;
+        }
+        #[cfg(test)]
+        if gps_diag() {
+            let n_e = edges.len() as f64;
+            let big = |x: &[Vector3<f64>]| {
+                edges
+                    .iter()
+                    .filter(|&&(a, c, d, _)| {
+                        angle_between(&(x[c] - x[a]), &d) > cfg.robust_sigma_rad
+                    })
+                    .count() as f64
+                    / n_e
+            };
+            let drift = |u: &[Vector3<f64>]| {
+                (u.iter()
+                    .zip(&x0)
+                    .map(|(p, q)| (p - q).norm_squared())
+                    .sum::<f64>()
+                    / m as f64)
+                    .sqrt()
+                    * s
+            };
+            let step = (y
+                .iter()
+                .zip(&x)
+                .map(|(p, q)| (p - q).norm_squared())
+                .sum::<f64>()
+                / m as f64)
+                .sqrt()
+                * s;
+            let mean_fac = ps.iter().map(|p| p.trace()).sum::<f64>() / n_e;
+            if _it == 0 {
+                let ang = |e: &(usize, usize, Vector3<f64>, f64), x: &[Vector3<f64>]| {
+                    let t = angle_between(&(x[e.1] - x[e.0]), &e.2);
+                    t.min(std::f64::consts::PI - t).to_degrees()
+                };
+                let npair = edges.len() - n_point_edges;
+                let mut pa: Vec<f64> = edges[..npair].iter().map(|e| ang(e, &x)).collect();
+                let mut pt: Vec<f64> = edges[npair..].iter().map(|e| ang(e, &x)).collect();
+                pa.sort_by(f64::total_cmp);
+                pt.sort_by(f64::total_cmp);
+                eprintln!(
+                    "GPSDIAG   x(before it0) edge angle med pair {:.3} deg point {:.3} deg; after it0: pair {:.3} point {:.3}",
+                    pa[pa.len() / 2],
+                    pt[pt.len() / 2],
+                    {
+                        let mut v: Vec<f64> = edges[..npair].iter().map(|e| ang(e, &y)).collect();
+                        v.sort_by(f64::total_cmp);
+                        v[v.len() / 2]
+                    },
+                    {
+                        let mut v: Vec<f64> = edges[npair..].iter().map(|e| ang(e, &y)).collect();
+                        v.sort_by(f64::total_cmp);
+                        v[v.len() / 2]
+                    }
+                );
+            }
+            eprintln!(
+                "GPSDIAG   it {_it} step-rms {step:.3} m drift-from-x0 {:.3} m edges>2deg before {:.3} after {:.3} edge-stiff {mean_fac:.3e} big_w {big_w:.3e}",
+                drift(&y),
+                big(&x),
+                big(&y)
+            );
         }
         x = y;
     }
@@ -2621,6 +2867,23 @@ mod tests {
                 "SUMMARY {name}: fails {nfail} worst max {worst_max:.4} m worst rms {worst_rms:.4} m moved total {moved_total}"
             );
         }
+    }
+
+    #[test]
+    fn gps_prior_is_off_by_default() {
+        assert!(TranslationConfig::default().gps.is_none());
+    }
+
+    #[test]
+    fn gps_residual_separates_height_and_horizontal() {
+        let up = Vector3::z();
+        // 수평 σ 1, 높이 σ 2: 수평 2.8 과 높이 5.6 은 같은 표준화 크기 2.8.
+        let h = gps_mahalanobis(&Vector3::new(2.8, 0.0, 0.0), &up, 1.0, 2.0);
+        let v = gps_mahalanobis(&Vector3::new(0.0, 0.0, 5.6), &up, 1.0, 2.0);
+        assert!(
+            (h - 2.8).abs() < 1e-12 && (v - 2.8).abs() < 1e-12,
+            "{h} {v}"
+        );
     }
 
     #[test]
