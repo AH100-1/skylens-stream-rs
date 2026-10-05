@@ -1400,12 +1400,42 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>], fixed_up: bool) -> Op
         };
         if let Some(up) = crate::align::up_from_rotations(&rots) {
             if let Some(fixed) = crate::align::similarity_fixed_up(&pick(&src), &pick(&dst), &up) {
-                sim = fixed;
+                sim = prefer_fixed_up(sim, fixed, &pick(&src), &pick(&dst));
             }
         }
     }
     apply_sparse_sim(s, &sim);
     Some(sim)
+}
+
+/// 연직 고정 해가 기존 해보다 GPS 잔차 중앙값이 이 배율을 넘게 나쁘면 기존 해로 물러난다(짐벌 가정이 깨진 경우).
+const FIXED_UP_RESIDUAL_RATIO: f64 = 1.2;
+
+/// 대응점(`src` → `dst`)에 대한 닮음 변환의 잔차 중앙값.
+fn similarity_residual_median(sim: &Similarity, src: &[Vector3<f64>], dst: &[Vector3<f64>]) -> f64 {
+    let mut r: Vec<f64> = src
+        .iter()
+        .zip(dst)
+        .map(|(a, b)| (sim.apply_point(a) - b).norm())
+        .collect();
+    r.sort_by(f64::total_cmp);
+    r.get(r.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// 연직 고정 해 `fixed` 를 쓰되, GPS 잔차 중앙값이 기존 해 `base` 의 1.2 배를 넘으면 `base` 를 쓴다.
+fn prefer_fixed_up(
+    base: Similarity,
+    fixed: Similarity,
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+) -> Similarity {
+    let rb = similarity_residual_median(&base, src, dst);
+    let rf = similarity_residual_median(&fixed, src, dst);
+    if rf > rb * FIXED_UP_RESIDUAL_RATIO {
+        base
+    } else {
+        fixed
+    }
 }
 
 /// 희소 모델 전체(포즈·점·BA 전용 점)에 닮음 변환을 적용한다.
@@ -3580,5 +3610,59 @@ mod refine_tests {
         refine_centers(&mut poses, &k, &tracks, &opts);
         let after = err(&poses);
         assert!(after < 0.7 * before, "{before} -> {after}");
+    }
+}
+
+#[cfg(test)]
+mod fixed_up_fallback_tests {
+    use super::*;
+
+    fn pts() -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>) {
+        let src: Vec<Vector3<f64>> = (0..21)
+            .map(|i| Vector3::new(i as f64 * 5.0, (i % 4) as f64 * 3.0, (i % 3) as f64))
+            .collect();
+        (src.clone(), src)
+    }
+
+    fn tilted(deg: f64) -> Similarity {
+        Similarity {
+            s: 1.0,
+            r: Rotation3::from_axis_angle(&nalgebra::Vector3::x_axis(), deg.to_radians()),
+            t: Vector3::zeros(),
+        }
+    }
+
+    #[test]
+    fn falls_back_when_fixed_up_residual_is_worse() {
+        let (src, dst) = pts();
+        let base = Similarity::identity();
+        let fixed = tilted(20.0);
+        let rb = similarity_residual_median(&base, &src, &dst);
+        let rf = similarity_residual_median(&fixed, &src, &dst);
+        assert!(rb < 1e-9 && rf > 0.5, "기존 {rb} 고정 {rf}");
+        let got = prefer_fixed_up(base, fixed, &src, &dst);
+        assert!(
+            got.r.angle() < 1e-9,
+            "기존 해로 물러나야 함: {}",
+            got.r.angle()
+        );
+    }
+
+    #[test]
+    fn keeps_fixed_up_when_residual_is_not_worse() {
+        let (src, dst) = pts();
+        // 기존 해가 조금 기울어 잔차가 크고, 고정 해가 정답이면 고정 해를 쓴다.
+        let got = prefer_fixed_up(tilted(5.0), Similarity::identity(), &src, &dst);
+        assert!(got.r.angle() < 1e-9);
+        // 잔차 비율이 1.2 이하이면 고정 해를 유지한다.
+        let a = tilted(10.0);
+        let b = tilted(11.0);
+        let (ra, rb) = (
+            similarity_residual_median(&a, &src, &dst),
+            similarity_residual_median(&b, &src, &dst),
+        );
+        assert!(rb / ra < FIXED_UP_RESIDUAL_RATIO, "{ra} {rb}");
+        let got = prefer_fixed_up(a, b, &src, &dst);
+        assert!((got.r.angle() - 11f64.to_radians()).abs() < 1e-9);
     }
 }

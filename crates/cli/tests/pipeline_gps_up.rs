@@ -10,12 +10,12 @@ use skylens_core::geo::{geodetic_to_enu, Geodetic};
 use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
 
-/// README 의 `run` 공통 옵션(stride 제외).
 /// 켬 측정 최대 0.523 m, 끔 0.700 m.
 const CENTER_MAX_LIMIT: f64 = 0.75;
 /// 켬 측정 중앙 0.147 m, 끔 0.151 m.
 const SURFACE_MED_LIMIT: f64 = 0.17;
 
+/// README 의 `run` 공통 옵션(stride 제외).
 const RUN_OPTS: [&str; 12] = [
     "--span",
     "48",
@@ -236,7 +236,7 @@ fn gps_fixed_up_does_not_regress() {
     assert_eq!(on.registered, off.registered, "등록 수");
     assert_eq!(on.registered, 240, "등록 수");
     assert!(
-        on.points * 10 >= off.points * 9 && on.points * 9 <= off.points * 10 * 11 / 10,
+        on.points * 10 >= off.points * 9 && on.points * 10 <= off.points * 11,
         "점 수 켬 {} 끔 {}",
         on.points,
         off.points
