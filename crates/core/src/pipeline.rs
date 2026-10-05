@@ -1400,16 +1400,74 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>], fixed_up: bool) -> Op
         };
         if let Some(up) = crate::align::up_from_rotations(&rots) {
             if let Some(fixed) = crate::align::similarity_fixed_up(&pick(&src), &pick(&dst), &up) {
-                sim = prefer_fixed_up(sim, fixed, &pick(&src), &pick(&dst));
+                // 공정한 비교: 기존 해의 정상 대응(inl)과 고정 해의 정상 대응(같은 임계 규칙)의 합집합에서 두 해의 잔차를 잰다.
+                let res_fixed: Vec<f64> = src
+                    .iter()
+                    .zip(&dst)
+                    .map(|(a, b)| (fixed.apply_point(a) - b).norm())
+                    .collect();
+                let own: Vec<f64> = res_fixed
+                    .iter()
+                    .zip(&inl)
+                    .filter(|(_, &k)| k)
+                    .map(|(&r, _)| r)
+                    .collect();
+                let thr = (3.0 * median_of(&own)).max(3.0);
+                let union: Vec<bool> = inl
+                    .iter()
+                    .zip(&res_fixed)
+                    .map(|(&k, &r)| k || r <= thr)
+                    .collect();
+                let pick_u = |v: &[Vector3<f64>]| -> Vec<Vector3<f64>> {
+                    v.iter()
+                        .zip(&union)
+                        .filter(|(_, &k)| k)
+                        .map(|(x, _)| *x)
+                        .collect()
+                };
+                if diag_enabled() {
+                    // 기존 해가 내포하는 위 방향(복원 좌표계)과 고정한 위 방향의 각도.
+                    let free_up = sim.r.inverse() * Vector3::z();
+                    let cos = free_up.dot(&up) / (free_up.norm() * up.norm());
+                    eprintln!(
+                        "gps-up diag: up angle free vs fixed {:.3} deg, pairs inlier-free {} union {}",
+                        cos.clamp(-1.0, 1.0).acos().to_degrees(),
+                        inl.iter().filter(|&&k| k).count(),
+                        union.iter().filter(|&&k| k).count()
+                    );
+                }
+                sim = prefer_fixed_up(sim, fixed, &pick_u(&src), &pick_u(&dst));
             }
         }
     }
     apply_sparse_sim(s, &sim);
+    if diag_enabled() {
+        // 정렬 뒤 사진별 중심과 카메라 좌표에서 본 세계 +z(정답과 견줘 구역 기울기를 잰다).
+        eprintln!("gps-up pose-block {}", s.poses.iter().flatten().count());
+        for p in s.poses.iter().flatten() {
+            let c = p.center();
+            let z = p.rotation.matrix().column(2).into_owned();
+            eprintln!(
+                "gps-up pose {} {} {} {} {} {}",
+                c.x, c.y, c.z, z[0], z[1], z[2]
+            );
+        }
+    }
     Some(sim)
 }
 
 /// 연직 고정 해가 기존 해보다 GPS 잔차 중앙값이 이 배율을 넘게 나쁘면 기존 해로 물러난다(짐벌 가정이 깨진 경우).
 const FIXED_UP_RESIDUAL_RATIO: f64 = 1.2;
+
+fn diag_enabled() -> bool {
+    std::env::var_os("SKYLENS_GPS_UP_DIAG").is_some()
+}
+
+fn median_of(v: &[f64]) -> f64 {
+    let mut v = v.to_vec();
+    v.sort_by(f64::total_cmp);
+    v.get(v.len() / 2).copied().unwrap_or(0.0)
+}
 
 /// 대응점(`src` → `dst`)에 대한 닮음 변환의 잔차 중앙값.
 fn similarity_residual_median(sim: &Similarity, src: &[Vector3<f64>], dst: &[Vector3<f64>]) -> f64 {
@@ -1432,7 +1490,7 @@ fn prefer_fixed_up(
     let rb = similarity_residual_median(&base, src, dst);
     let rf = similarity_residual_median(&fixed, src, dst);
     let fall_back = rf > rb * FIXED_UP_RESIDUAL_RATIO;
-    if std::env::var_os("SKYLENS_GPS_UP_DIAG").is_some() {
+    if diag_enabled() {
         eprintln!(
             "gps-up diag: plain median {rb:.4} m, fixed-up median {rf:.4} m, ratio {:.3}, used {}",
             if rb > 0.0 { rf / rb } else { f64::NAN },

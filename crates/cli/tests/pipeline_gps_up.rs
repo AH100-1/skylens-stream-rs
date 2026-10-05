@@ -51,6 +51,7 @@ impl Drop for TempDir {
 fn cli(args: &[&str]) -> (i32, String, String) {
     let o = Command::new(env!("CARGO_BIN_EXE_skylens-stream"))
         .args(args)
+        .env("SKYLENS_GPS_UP_DIAG", "1")
         .output()
         .unwrap();
     (
@@ -171,6 +172,55 @@ fn measure_scene(scene: &Scene, input: &Path, output: &Path) -> Metrics {
     }
 }
 
+/// 진단 출력(`gps-up pose-block n` 다음 n 줄 `gps-up pose 중심3 카메라 좌표의 세계 +z 3`)에서
+/// 구역마다 정답 카메라(가장 가까운 정답 중심)의 같은 벡터와의 각도(도) 중앙값. 진단이 없으면 빈 벡터.
+fn region_tilts(input: &Path, stderr: &str) -> Vec<f64> {
+    let shift = truth_to_output_shift(input);
+    let mut truth: Vec<([f64; 3], [f64; 3])> = Vec::new();
+    for l in std::fs::read_to_string(input.join("truth/cameras.txt"))
+        .unwrap()
+        .lines()
+    {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let n: Vec<f64> = f[7..].iter().map(|s| s.parse().unwrap()).collect();
+        let (r, t) = (&n[..9], &n[9..12]);
+        let c = [0, 1, 2].map(|j| -(r[j] * t[0] + r[3 + j] * t[1] + r[6 + j] * t[2]) + shift[j]);
+        truth.push((c, [r[2], r[5], r[8]]));
+    }
+    let mut out = Vec::new();
+    let mut lines = stderr.lines().peekable();
+    while let Some(l) = lines.next() {
+        let Some(n) = l.strip_prefix("gps-up pose-block ") else {
+            continue;
+        };
+        let n: usize = n.trim().parse().unwrap();
+        let mut ang = Vec::new();
+        for _ in 0..n {
+            let v: Vec<f64> = lines
+                .next()
+                .unwrap()
+                .strip_prefix("gps-up pose ")
+                .unwrap()
+                .split_whitespace()
+                .map(|x| x.parse().unwrap())
+                .collect();
+            let d2 = |c: &[f64; 3]| (0..3).map(|k| (c[k] - v[k]).powi(2)).sum::<f64>();
+            let (_, tz) = truth
+                .iter()
+                .min_by(|a, b| d2(&a.0).total_cmp(&d2(&b.0)))
+                .unwrap();
+            let dot: f64 = (0..3).map(|k| tz[k] * v[3 + k]).sum();
+            let nn = |a: &[f64]| a.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let cos = dot / (nn(tz) * nn(&v[3..6]));
+            ang.push(cos.clamp(-1.0, 1.0).acos().to_degrees());
+        }
+        if !ang.is_empty() {
+            out.push(median(&mut ang));
+        }
+    }
+    out
+}
+
 /// verify 표의 한 항목 (판정, 측정값).
 fn item(table: &str, name: &str) -> (String, String) {
     let line = table
@@ -204,6 +254,10 @@ fn run_case(tag: &str, scene: &Path, extra: &[&str]) -> (i32, String, Metrics) {
     assert_eq!(code, 0, "{so}{se}");
     for l in se.lines().filter(|l| l.starts_with("gps-up diag")) {
         eprintln!("{tag}: {l}");
+    }
+    let tilts = region_tilts(scene, &se);
+    for (i, t) in tilts.iter().enumerate() {
+        eprintln!("{tag}: region {i} vertical tilt vs truth median {t:.3} deg");
     }
     let (vcode, table, se) = cli(&["verify", out_s]);
     eprintln!("{tag}\n{table}verify exit {vcode} {se}");
@@ -269,10 +323,12 @@ fn gps_fixed_up_does_not_regress() {
     );
 }
 
-/// 짐벌 가정이 깨진 장면(사진마다 광축 롤 잡음 2°): 켬은 끔보다 표면·중심 중앙이 크게 나빠지지 않는다(1.2 배 한도).
+/// 짐벌 가정이 깨진 장면(사진마다 광축 롤 잡음 2°): 켬의 표면·중심 중앙은 끔의 1.2 배(+여유) 안이다.
+/// 이 시험은 "후퇴 없음"이 아니라 "1.2 배 안"을 지킨다(측정된 표면 중앙 +15% 는 한도 안). 구역별 잔차 비·선택 결과는
+/// SKYLENS_GPS_UP_DIAG 진단 출력으로 본다.
 /// 측정(4 코어 측정 기계, 시드 1): 끔 표면 중앙 0.139 m, 중심 중앙/최대 0.188/1.062 m, 켬 0.160 m, 0.172/1.063 m.
 #[test]
-fn gps_fixed_up_with_roll_noise_does_not_regress() {
+fn gps_fixed_up_with_roll_noise_stays_within_1_2x_of_off() {
     let t = TempDir::new("gpsuproll");
     let scene_dir = t.0.join("scene");
     let scene = Scene::new(SceneConfig {
