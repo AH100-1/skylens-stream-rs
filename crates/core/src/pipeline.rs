@@ -2688,7 +2688,14 @@ pub fn run_pipeline_with(
             let (tx, init, arcs) = (tx.clone(), start, arcs.clone());
             let (gps, dw, iters, dmethod) =
                 (gps.clone(), cfg.dense_width, cfg.ba_iters, cfg.dense_method);
-            let psig = cfg.prior_sigma();
+            let psig = match std::env::var("SKYLENS_GPS_PRIOR_WEIGHT")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+            {
+                Some(w) if w > 0.0 => cfg.prior_sigma() / w,
+                Some(_) => 1e9,
+                None => cfg.prior_sigma(),
+            };
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
             // 초벌이 뒤쪽 보조를 빼고 등록했으면 정밀 작업이 그 사진을 읽어 구역 전체를 다시 등록한다.
