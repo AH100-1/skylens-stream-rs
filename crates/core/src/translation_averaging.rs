@@ -480,8 +480,10 @@ pub fn average_translations_with_points(
     }
 }
 
-/// 약한 GPS 사전 정밀화: 결과 중심을 GPS 에 축척·원점만 강건 정렬한 뒤, 짝·점 방향 간선(정상 표시된 것)과
-/// 고정 가중 코시 GPS 항을 함께 IRLS 로 다시 푼다(선형화: 간선 길이는 직전 해로 고정). 쓸 수 없으면 입력 그대로.
+/// 약한 GPS 사전 정밀화(전역 위치 풀이 안에 사전 항을 함께 넣는다): 카메라 중심과 점을 한 연립에 놓고
+/// 짝·점 방향 간선의 코시 각 잔차와 코시 GPS 항(c_i − (GPS_i − t)/s)을 IRLS 로 함께 푼다(간선 길이는 직전 해로 고정,
+/// 연립은 블록 야코비 선조건 켤레 기울기). 닮음(축척 s·원점 t; 회전은 같은 축)은 매 외부 반복마다 현재 해와 GPS
+/// 사이 강건 정렬로 다시 구해 고정한다. 쓸 수 없으면 입력 그대로.
 fn gps_refine(
     mut res: TranslationResult,
     rotations: &[Option<Rotation3<f64>>],
@@ -492,11 +494,11 @@ fn gps_refine(
 ) -> TranslationResult {
     let n_cam = rotations.len();
     let rotations = finite_rotations(rotations);
-    // 정점 번호: 등록된 카메라와 점.
     let mut pos: Vec<Option<Vector3<f64>>> =
         res.centers.iter().map(|c| c.map(|c| c.coords)).collect();
     pos.truncate(n_cam);
     pos.resize(n_cam, None);
+    pos.extend(res.points.iter().map(|p| p.map(|p| p.coords)));
     let nv = pos.len();
     let local: Vec<usize> = (0..nv).filter(|&v| pos[v].is_some()).collect();
     let mut loc = vec![usize::MAX; nv];
@@ -504,10 +506,10 @@ fn gps_refine(
         loc[v] = a;
     }
     let m = local.len();
-    if m < 3 || m > cfg.dense_max_vertices {
+    if m < 3 {
         return res;
     }
-    // 간선: (정점 i, 정점 j, 세계 방향 d ∝ c_j − c_i, 가중).
+    // 간선: (국소 정점 a, 국소 정점 c, 세계 방향 d ∝ x_c − x_a, 가중).
     let mut edges: Vec<(usize, usize, Vector3<f64>, f64)> = Vec::new();
     for (k, o) in observations.iter().enumerate() {
         if !res.inliers.get(k).copied().unwrap_or(false) || o.i >= n_cam || o.j >= n_cam {
@@ -519,7 +521,12 @@ fn gps_refine(
         if loc[o.i] == usize::MAX || loc[o.j] == usize::MAX {
             continue;
         }
-        edges.push((o.i, o.j, (rj.inverse() * o.direction).normalize(), o.weight));
+        edges.push((
+            loc[o.i],
+            loc[o.j],
+            (rj.inverse() * o.direction).normalize(),
+            o.weight,
+        ));
     }
     for o in point_observations {
         if o.camera >= n_cam || o.weight <= 0.0 || o.weight.is_nan() || o.bearing.norm() < 1e-12 {
@@ -533,62 +540,18 @@ fn gps_refine(
         }
         let d = (r.inverse() * o.bearing).normalize();
         let (xp, xc) = (pos[v].unwrap(), pos[o.camera].unwrap());
-        if angle_between(&(xp - xc), &d) > cfg.point_gate_rad {
+        if angle_between(&(xc - xp), &d) > cfg.point_gate_rad {
             continue;
         }
-        edges.push((v, o.camera, d, o.weight));
+        edges.push((loc[v], loc[o.camera], d, o.weight));
     }
     if edges.is_empty() {
         return res;
     }
-    let mean_w = edges.iter().map(|e| e.3).sum::<f64>() / edges.len() as f64;
-    // 축척·원점 강건 정렬(회전은 이미 같은 축).
-    let cams: Vec<usize> = (0..n_cam)
-        .filter(|&i| pos[i].is_some() && g.positions.get(i).copied().flatten().is_some())
-        .collect();
-    if cams.len() < 3 {
-        return res;
-    }
-    let src: Vec<Vector3<f64>> = cams.iter().map(|&i| pos[i].unwrap()).collect();
-    let dst: Vec<Vector3<f64>> = cams.iter().map(|&i| g.positions[i].unwrap()).collect();
-    let mut keep = vec![true; cams.len()];
-    let (mut s, mut t) = (1.0, Vector3::zeros());
-    for _ in 0..8 {
-        let w: Vec<usize> = (0..cams.len()).filter(|&a| keep[a]).collect();
-        if w.len() < 3 {
-            return res;
-        }
-        let cnt = w.len() as f64;
-        let ms = w.iter().map(|&a| src[a]).sum::<Vector3<f64>>() / cnt;
-        let md = w.iter().map(|&a| dst[a]).sum::<Vector3<f64>>() / cnt;
-        let num: f64 = w.iter().map(|&a| (src[a] - ms).dot(&(dst[a] - md))).sum();
-        let den: f64 = w.iter().map(|&a| (src[a] - ms).norm_squared()).sum();
-        if !(den > 1e-18 && num > 0.0) {
-            return res;
-        }
-        s = num / den;
-        t = md - s * ms;
-        let mut r: Vec<f64> = (0..cams.len())
-            .map(|a| (s * src[a] + t - dst[a]).norm())
-            .collect();
-        let mut sorted = r.clone();
-        sorted.sort_by(f64::total_cmp);
-        let thr = (3.0 * sorted[sorted.len() / 2]).max(g.gate_m);
-        for (a, v) in r.drain(..).enumerate() {
-            keep[a] = v <= thr;
-        }
-    }
-    // 사전 목표(모델 단위)와 척도.
-    let mut target: Vec<Option<Vector3<f64>>> = vec![None; nv];
-    for (a, &i) in cams.iter().enumerate() {
-        if keep[a] {
-            target[i] = Some((dst[a] - t) / s);
-        }
-    }
-    let tau = (g.sigma_m / s).max(1e-12);
+    let mut x: Vec<Vector3<f64>> = local.iter().map(|&v| pos[v].unwrap()).collect();
     let mut lens: Vec<f64> = edges
         .iter()
-        .map(|e| (pos[e.1].unwrap() - pos[e.0].unwrap()).norm())
+        .map(|e| (x[e.1] - x[e.0]).norm())
         .filter(|l| *l > 1e-12)
         .collect();
     if lens.is_empty() {
@@ -596,52 +559,180 @@ fn gps_refine(
     }
     lens.sort_by(f64::total_cmp);
     let l_med = lens[lens.len() / 2];
-    let big_w = g.weight * mean_w / (l_med * l_med);
     let sig2 = cfg.robust_sigma_rad * cfg.robust_sigma_rad;
-    let mut x: Vec<Vector3<f64>> = local.iter().map(|&v| pos[v].unwrap()).collect();
+    let cams: Vec<usize> = (0..n_cam)
+        .filter(|&i| loc[i] != usize::MAX && g.positions.get(i).copied().flatten().is_some())
+        .collect();
+    if cams.len() < 3 {
+        return res;
+    }
+    let dst: Vec<Vector3<f64>> = cams.iter().map(|&i| g.positions[i].unwrap()).collect();
+    let dot = |a: &[Vector3<f64>], b: &[Vector3<f64>]| {
+        a.iter().zip(b).map(|(p, q)| p.dot(q)).sum::<f64>()
+    };
     for _ in 0..g.iterations.max(1) {
-        let mut h = DMatrix::<f64>::zeros(3 * m, 3 * m);
-        let mut b = DVector::<f64>::zeros(3 * m);
-        for &(i, j, d, w) in &edges {
-            let (a, c) = (loc[i], loc[j]);
-            let df = x[c] - x[a];
-            let l = df.norm().max(1e-9 * l_med);
-            let proj = df - d * d.dot(&df);
-            let ang2 = proj.norm_squared() / (l * l);
-            let k = w / (l * l) / (1.0 + ang2 / sig2);
-            let pm = Matrix3::identity() - d * d.transpose();
-            for r in 0..3 {
-                for q in 0..3 {
-                    let v = k * pm[(r, q)];
-                    h[(3 * a + r, 3 * a + q)] += v;
-                    h[(3 * c + r, 3 * c + q)] += v;
-                    h[(3 * a + r, 3 * c + q)] -= v;
-                    h[(3 * c + r, 3 * a + q)] -= v;
-                }
-            }
-        }
-        for (a, &v) in local.iter().enumerate() {
-            let Some(tg) = target[v] else { continue };
-            let e2 = (x[a] - tg).norm_squared() / (tau * tau);
-            let k = big_w / (1.0 + e2);
-            for r in 0..3 {
-                h[(3 * a + r, 3 * a + r)] += k;
-                b[3 * a + r] += k * tg[r];
-            }
-        }
-        for q in 0..3 * m {
-            h[(q, q)] += 1e-12 * big_w;
-        }
-        let Some(sol) = h.lu().solve(&b) else {
-            return res;
-        };
-        for a in 0..m {
-            let nx = Vector3::new(sol[3 * a], sol[3 * a + 1], sol[3 * a + 2]);
-            if !nx.iter().all(|v| v.is_finite()) {
+        // 닮음(s, t) 강건 정렬: 현재 카메라 중심 → GPS.
+        let src: Vec<Vector3<f64>> = cams.iter().map(|&i| x[loc[i]]).collect();
+        let mut keep = vec![true; cams.len()];
+        let (mut s, mut t) = (1.0, Vector3::zeros());
+        let mut rot = Matrix3::<f64>::identity();
+        for _ in 0..8 {
+            let w: Vec<usize> = (0..cams.len()).filter(|&a| keep[a]).collect();
+            if w.len() < 3 {
                 return res;
             }
-            x[a] = nx;
+            let cnt = w.len() as f64;
+            let ms = w.iter().map(|&a| src[a]).sum::<Vector3<f64>>() / cnt;
+            let md = w.iter().map(|&a| dst[a]).sum::<Vector3<f64>>() / cnt;
+            // 공분산 고윳값 비로 공선 판정: 퇴화면 회전은 항등으로 두고 축척·평행이동만.
+            let cov = w
+                .iter()
+                .map(|&a| (src[a] - ms) * (src[a] - ms).transpose())
+                .sum::<Matrix3<f64>>();
+            let ev = cov.symmetric_eigen().eigenvalues;
+            let mut e: Vec<f64> = ev.iter().copied().collect();
+            e.sort_by(f64::total_cmp);
+            let planar_ok = e[1] > 0.02 * e[2];
+            rot = Matrix3::identity();
+            if planar_ok {
+                let h = w
+                    .iter()
+                    .map(|&a| (src[a] - ms) * (dst[a] - md).transpose())
+                    .sum::<Matrix3<f64>>();
+                let svd = h.svd(true, true);
+                if let (Some(u), Some(vt)) = (svd.u, svd.v_t) {
+                    let mut dmat = Matrix3::identity();
+                    if (vt.transpose() * u.transpose()).determinant() < 0.0 {
+                        dmat[(2, 2)] = -1.0;
+                    }
+                    rot = vt.transpose() * dmat * u.transpose();
+                }
+            }
+            let num: f64 = w
+                .iter()
+                .map(|&a| (rot * (src[a] - ms)).dot(&(dst[a] - md)))
+                .sum();
+            let den: f64 = w.iter().map(|&a| (src[a] - ms).norm_squared()).sum();
+            if !(den > 1e-18 && num > 0.0) {
+                return res;
+            }
+            s = num / den;
+            t = md - s * rot * ms;
+            let r: Vec<f64> = (0..cams.len())
+                .map(|a| (s * rot * src[a] + t - dst[a]).norm())
+                .collect();
+            let mut sorted = r.clone();
+            sorted.sort_by(f64::total_cmp);
+            let thr = (3.0 * sorted[sorted.len() / 2]).max(g.gate_m);
+            for (a, v) in r.into_iter().enumerate() {
+                keep[a] = v <= thr;
+            }
         }
+        let mut target: Vec<Option<Vector3<f64>>> = vec![None; m];
+        for (a, &i) in cams.iter().enumerate() {
+            if keep[a] {
+                target[loc[i]] = Some(rot.transpose() * (dst[a] - t) / s);
+            }
+        }
+        let tau2 = (g.sigma_m / s).max(1e-12).powi(2);
+        // 이번 선형화의 블록: 간선 3×3, 사전 스칼라.
+        let ps: Vec<Matrix3<f64>> = edges
+            .iter()
+            .map(|&(a, c, d, w)| {
+                let df = x[c] - x[a];
+                let l = df.norm().max(1e-9 * l_med);
+                let proj = df - d * d.dot(&df);
+                let ang2 = proj.norm_squared() / (l * l);
+                let k = w / (l * l) / (1.0 + ang2 / sig2);
+                (Matrix3::identity() - d * d.transpose()) * k
+            })
+            .collect();
+        // 사전 강성 = 가중 × (사전을 받는 카메라의 광선 강성 평균, 대각 3×3 블록 trace/3).
+        let mut ray_tr = vec![0.0; m];
+        for (&(a, c, _, _), p) in edges.iter().zip(&ps) {
+            ray_tr[a] += p.trace() / 3.0;
+            ray_tr[c] += p.trace() / 3.0;
+        }
+        let (mut tsum, mut tcnt) = (0.0, 0usize);
+        for a in 0..m {
+            if target[a].is_some() {
+                tsum += ray_tr[a];
+                tcnt += 1;
+            }
+        }
+        let big_w = g.weight * tsum / tcnt.max(1) as f64;
+        let kp: Vec<f64> = (0..m)
+            .map(|a| match target[a] {
+                Some(tg) => big_w / (1.0 + (x[a] - tg).norm_squared() / tau2),
+                None => 0.0,
+            })
+            .collect();
+        let apply = |v: &[Vector3<f64>], y: &mut Vec<Vector3<f64>>| {
+            for (a, o) in y.iter_mut().enumerate() {
+                *o = v[a] * kp[a];
+            }
+            for (&(a, c, _, _), p) in edges.iter().zip(&ps) {
+                let q = p * (v[a] - v[c]);
+                y[a] += q;
+                y[c] -= q;
+            }
+        };
+        let mut b = vec![Vector3::zeros(); m];
+        let mut diag = vec![Matrix3::zeros(); m];
+        for a in 0..m {
+            if let Some(tg) = target[a] {
+                b[a] = tg * kp[a];
+                diag[a] += Matrix3::identity() * kp[a];
+            }
+        }
+        for (&(a, c, _, _), p) in edges.iter().zip(&ps) {
+            diag[a] += p;
+            diag[c] += p;
+        }
+        let dinv: Vec<Matrix3<f64>> = diag
+            .iter()
+            .map(|d| {
+                let reg = Matrix3::identity() * (1e-9 * d.trace()).max(1e-300);
+                (d + reg).try_inverse().unwrap_or_else(Matrix3::identity)
+            })
+            .collect();
+        let mut y = x.clone();
+        let mut ay = vec![Vector3::zeros(); m];
+        apply(&y, &mut ay);
+        let mut r: Vec<Vector3<f64>> = b.iter().zip(&ay).map(|(b, a)| b - a).collect();
+        let bnorm = dot(&b, &b).sqrt().max(1e-300);
+        let mut z: Vec<Vector3<f64>> = dinv.iter().zip(&r).map(|(d, r)| d * r).collect();
+        let mut p = z.clone();
+        let mut rz = dot(&r, &z);
+        let mut ap = vec![Vector3::zeros(); m];
+        for _ in 0..(20 * m).max(50) {
+            if dot(&r, &r).sqrt() <= 1e-11 * bnorm {
+                break;
+            }
+            apply(&p, &mut ap);
+            let pap = dot(&p, &ap);
+            if pap.is_nan() || pap <= 0.0 {
+                break;
+            }
+            let alpha = rz / pap;
+            for k in 0..m {
+                y[k] += p[k] * alpha;
+                r[k] -= ap[k] * alpha;
+            }
+            for k in 0..m {
+                z[k] = dinv[k] * r[k];
+            }
+            let rz_new = dot(&r, &z);
+            let beta = rz_new / rz;
+            rz = rz_new;
+            for k in 0..m {
+                p[k] = z[k] + p[k] * beta;
+            }
+        }
+        if !y.iter().all(|v| v.iter().all(|c| c.is_finite())) {
+            return res;
+        }
+        x = y;
     }
     for (a, &v) in local.iter().enumerate() {
         if v < n_cam {
