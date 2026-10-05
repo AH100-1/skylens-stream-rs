@@ -21,7 +21,9 @@ use crate::dataset::Dataset;
 use crate::dense::{region_cloud, region_cloud_patchmatch, DenseConfig, DenseView};
 use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
 use crate::fusion::{fuse, FusionConfig, FusionView};
-use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig};
+use crate::matching::{
+    guided_cross_match, ratio_match, scheduled_pairs, GuidedConfig, PairSchedule, RansacConfig,
+};
 use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::ply::{PointCloud, PointRecord};
 use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
@@ -425,8 +427,27 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
         .filter_map(|&(i, j)| {
             let (fa, fb) = (&imgs[i].feats, &imgs[j].feats);
             let t_pair = Instant::now();
-            let m = ratio_match(fa, fb, 0.8, true);
+            let cross = views[i].0 != views[j].0;
+            let m = if cross {
+                // 다른 카메라 짝: 겹침이 작아 기본 비율 검사만으로는 대응이 모자란다. 에피폴라 띠 안에서 다시 매칭한다.
+                let (na, nb): (Vec<_>, Vec<_>) = (
+                    fa.iter().map(|f| norm(k, f)).collect(),
+                    fb.iter().map(|f| norm(k, f)).collect(),
+                );
+                guided_cross_match(fa, fb, &na, &nb, k.fx, 0.8, &GuidedConfig::default())
+            } else {
+                ratio_match(fa, fb, 0.8, true)
+            };
             crate::timing::add("matching_ratio_cpu", t_pair.elapsed().as_secs_f64());
+            if cross && std::env::var_os("SKYLENS_CROSS_DIAG").is_some() {
+                eprintln!(
+                    "cross_match {:?} {:?} base {} guided {}",
+                    views[i],
+                    views[j],
+                    ratio_match(fa, fb, 0.8, true).len(),
+                    m.len()
+                );
+            }
             if m.len() < 20 {
                 return None;
             }
@@ -473,6 +494,15 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                 .filter(|(_, &b)| b)
                 .map(|(x, _)| *x)
                 .collect();
+            if cross && std::env::var_os("SKYLENS_CROSS_DIAG").is_some() {
+                eprintln!(
+                    "cross_verified {:?} {:?} matches {} inliers {}",
+                    views[i],
+                    views[j],
+                    m.len(),
+                    inl.len()
+                );
+            }
             Some(PairMatch {
                 i,
                 j,

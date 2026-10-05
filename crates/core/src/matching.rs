@@ -154,6 +154,128 @@ fn sq_dist(p: &[f32; DESC_LEN], r: &[f32; DESC_LEN]) -> f32 {
     acc.iter().sum()
 }
 
+/// 다른 카메라 짝 기하 유도 매칭 설정.
+#[derive(Clone, Copy, Debug)]
+pub struct GuidedConfig {
+    /// 느슨한 1차 매칭 비율 문턱(느슨한 모델 추정용 후보).
+    pub loose_ratio: f32,
+    /// 에피폴라 띠 반폭(px). 띠 안 후보끼리만 비율 검사를 한다.
+    pub band_px: f64,
+    /// 띠 안 비율 검사 문턱.
+    pub band_ratio: f32,
+    /// 느슨한 모델 추정 RANSAC 반복 수와 문턱(px).
+    pub loose_iters: usize,
+    pub loose_th_px: f64,
+    /// 느슨한 모델이 받아들여지는 최소 정상 수(이보다 적으면 유도 매칭을 쓰지 않는다).
+    pub min_loose_inliers: usize,
+}
+
+impl Default for GuidedConfig {
+    fn default() -> Self {
+        Self {
+            loose_ratio: 0.95,
+            band_px: 3.0,
+            band_ratio: 0.85,
+            loose_iters: 4000,
+            loose_th_px: 2.0,
+            min_loose_inliers: 8,
+        }
+    }
+}
+
+/// 정규화 좌표의 본질 행렬 `e` 의 에피폴라 띠(반폭 `band_px`/`focal`) 안에서만 최근접/차근접 비율 검사를 하고
+/// 띠 안 상호 최근접만 남긴다. 결과는 (a 인덱스, b 인덱스), a 인덱스 순.
+pub fn epipolar_band_match(
+    a: &[Feature],
+    b: &[Feature],
+    na: &[Vector2<f64>],
+    nb: &[Vector2<f64>],
+    e: &Matrix3<f64>,
+    focal: f64,
+    cfg: &GuidedConfig,
+) -> Vec<(usize, usize)> {
+    let th2 = (cfg.band_px / focal).powi(2);
+    // a 마다 띠 안 (j, 거리) 목록.
+    let rows: Vec<Vec<(usize, f32)>> = (0..a.len())
+        .into_par_iter()
+        .map(|i| {
+            (0..b.len())
+                .filter(|&j| sampson_error(e, &na[i], &nb[j]) < th2)
+                .map(|j| (j, sq_dist(&a[i].desc, &b[j].desc)))
+                .collect()
+        })
+        .collect();
+    let mut col = vec![(f32::INFINITY, usize::MAX); b.len()];
+    for (i, r) in rows.iter().enumerate() {
+        for &(j, d) in r {
+            if d < col[j].0 {
+                col[j] = (d, i);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        let (mut j1, mut d1, mut d2) = (usize::MAX, f32::INFINITY, f32::INFINITY);
+        for &(j, d) in r {
+            if d < d1 {
+                (j1, d2, d1) = (j, d1, d);
+            } else if d < d2 {
+                d2 = d;
+            }
+        }
+        if j1 == usize::MAX || !d2.is_finite() || d1 >= cfg.band_ratio * cfg.band_ratio * d2 {
+            continue;
+        }
+        if col[j1].1 == i {
+            out.push((i, j1));
+        }
+    }
+    out
+}
+
+/// 다른 카메라 짝 매칭: 기본 비율 상호 매칭이 겹침이 작아 모자랄 때를 위한 기하 유도 매칭.
+/// 느슨한 비율(0.95)로 후보를 모아 본질 행렬을 느슨하게 추정하고(상위 후보 몇 개), 후보마다
+/// [`epipolar_band_match`] 로 다시 매칭해 대응이 가장 많은 것을 쓴다. 느슨한 모델이 없거나
+/// 유도 매칭이 기본 매칭보다 적으면 기본 매칭(`ratio`)을 돌려준다.
+/// `na`/`nb` 는 특징의 정규화 좌표, `focal` 은 정규화에 쓴 초점(px).
+pub fn guided_cross_match(
+    a: &[Feature],
+    b: &[Feature],
+    na: &[Vector2<f64>],
+    nb: &[Vector2<f64>],
+    focal: f64,
+    ratio: f32,
+    cfg: &GuidedConfig,
+) -> Vec<(usize, usize)> {
+    let base = ratio_match(a, b, ratio, true);
+    let loose = ratio_match(a, b, cfg.loose_ratio, true);
+    if loose.len() < 8 {
+        return base;
+    }
+    let l1: Vec<_> = loose.iter().map(|&(i, _)| na[i]).collect();
+    let l2: Vec<_> = loose.iter().map(|&(_, j)| nb[j]).collect();
+    let rc = RansacConfig {
+        threshold_px: cfg.loose_th_px,
+        min_inlier_ratio: 0.0,
+        max_iters: cfg.loose_iters,
+        min_inliers: cfg.min_loose_inliers,
+        max_chance_prob: 0.0,
+        ..RansacConfig::default()
+    };
+    let cands = crate::two_view::ransac_essential_candidates(&l1, &l2, focal, &rc);
+    let mut best = base;
+    for (e, inl) in cands.iter().take(3) {
+        if inl.iter().filter(|&&v| v).count() < cfg.min_loose_inliers {
+            continue;
+        }
+        let m = epipolar_band_match(a, b, na, nb, e, focal, cfg);
+        if m.len() > best.len() {
+            best = m;
+        }
+    }
+    best
+}
+
 /// `a` 를 이 크기의 묶음으로 나눠 병렬 처리한다(묶음 기술자 64×512 B 가 L1·L2 에 머문다).
 const MATCH_BLOCK: usize = 64;
 
@@ -2662,6 +2784,221 @@ mod tests {
                 "{:?}→{:?} +{d:2}: 겹침 {:5.1}% 특징 {}/{} 매칭 {:3} 정답대응 {:3} E정상 {:3} 후보 {} 회전오차 {:.3}° 후보중최소 {:.3}° 첫후보정밀화 {:.3}°",
                 ca, cb, 100.0 * vis as f64 / tot as f64, fa.len(), fb.len(), m.len(), good, ninl, cands.len(), err, best, refined
             );
+        }
+    }
+
+    /// 정답 대응 판정: A 점의 광선이 닿는 표면점을 B 에 투영해 2 px 안.
+    fn is_true_match(
+        scene: &crate::synth::Scene,
+        a: &Camera,
+        b: &Camera,
+        pa: &Feature,
+        pb: &Feature,
+    ) -> bool {
+        let oa = a.pose.center();
+        let p = Vector2::new(pa.kp.x as f64 + 0.5, pa.kp.y as f64 + 0.5);
+        let dir = a.unproject(&p, 1.0) - oa;
+        scene
+            .intersect(&oa, &dir.normalize())
+            .and_then(|hit| b.project(&hit.point))
+            .is_some_and(|q| {
+                (q - Vector2::new(pb.kp.x as f64 + 0.5, pb.kp.y as f64 + 0.5)).norm() < 2.0
+            })
+    }
+
+    /// 시드별 F–L 짝의 기본 매칭과 유도 매칭의 대응 수·정답 비율. 수치 기록용.
+    #[test]
+    #[ignore = "수치 기록용 표(F–L 유도 매칭)"]
+    fn guided_cross_match_table() {
+        use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
+        use crate::synth::{CamId, Scene, SceneConfig};
+        let seed: u64 = std::env::var("SKYLENS_TILT_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let (w, h) = (960usize, 540usize);
+        let scene = Scene::new(SceneConfig {
+            width: w as u32,
+            height: h as u32,
+            seed,
+            ..SceneConfig::default()
+        });
+        let cfg = DetectorConfig {
+            max_features: 1500,
+            ..DetectorConfig::default()
+        };
+        let get = |cam: CamId, pos: usize| {
+            let v = scene
+                .views
+                .iter()
+                .find(|v| v.cam == cam && v.position == pos)
+                .unwrap()
+                .clone();
+            let (img, _) = scene.render(&v);
+            (
+                v,
+                detect_and_describe(&GrayImage::from_rgb(w, h, &img.data), &cfg),
+            )
+        };
+        let gcfg = GuidedConfig::default();
+        let (mut tb, mut gb, mut tg, mut gg) = (0, 0, 0, 0);
+        for (pa, cb, pb) in [
+            (4, CamId::L, 24),
+            (8, CamId::L, 28),
+            (12, CamId::L, 32),
+            (16, CamId::L, 36),
+            (20, CamId::L, 40),
+            (8, CamId::R, 28),
+        ] {
+            let (va, fa) = get(CamId::F, pa);
+            let (vb, fb) = get(cb, pb);
+            let (ca, cbm) = (&va.camera, &vb.camera);
+            let ka = &ca.intrinsics;
+            let norm = |c: &Camera, f: &[Feature]| -> Vec<Vector2<f64>> {
+                f.iter()
+                    .map(|x| {
+                        c.intrinsics
+                            .index_to_normalized(&Vector2::new(x.kp.x as f64, x.kp.y as f64))
+                    })
+                    .collect()
+            };
+            let (na, nb) = (norm(ca, &fa), norm(cbm, &fb));
+            let base = ratio_match(&fa, &fb, 0.8, true);
+            let t0 = std::time::Instant::now();
+            let g = guided_cross_match(&fa, &fb, &na, &nb, ka.fx, 0.8, &gcfg);
+            let secs = t0.elapsed().as_secs_f64();
+            let good = |m: &[(usize, usize)]| {
+                m.iter()
+                    .filter(|&&(i, j)| is_true_match(&scene, ca, cbm, &fa[i], &fb[j]))
+                    .count()
+            };
+            let (gb0, gg0) = (good(&base), good(&g));
+            if cb == CamId::L {
+                (tb, gb, tg, gg) = (tb + base.len(), gb + gb0, tg + g.len(), gg + gg0);
+            }
+            eprintln!(
+                "seed {seed} F{pa}-{cb:?}{pb}: 기본 {} (정답 {gb0}) 유도 {} (정답 {gg0}) {secs:.2}s",
+                base.len(),
+                g.len()
+            );
+        }
+        eprintln!("F–L 합계: 기본 {tb} 정답 {gb} / 유도 {tg} 정답 {gg}");
+    }
+
+    /// 같은 무리(비슷한 무늬)의 지점이 많아 기본 비율 검사가 대응을 많이 버리는 다른 카메라 짝을 만든다.
+    /// 반환: (a 특징, b 특징, a 정규화, b 정규화, a 인덱스 → 지점 번호, b 인덱스 → 지점 번호, 초점 px).
+    #[allow(clippy::type_complexity)]
+    fn clustered_pair(
+        seed: u64,
+    ) -> (
+        Vec<Feature>,
+        Vec<Feature>,
+        Vec<Vector2<f64>>,
+        Vec<Vector2<f64>>,
+        Vec<usize>,
+        Vec<usize>,
+        f64,
+    ) {
+        use crate::features::Keypoint;
+        let (c1, c2) = two_cameras();
+        let mut rng = Lcg(seed);
+        let unit = |rng: &mut Lcg| -> Vec<f32> {
+            let v: Vec<f64> = (0..DESC_LEN).map(|_| rng.gauss()).collect();
+            let n = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            v.iter().map(|x| (x / n) as f32).collect()
+        };
+        let centers: Vec<Vec<f32>> = (0..6).map(|_| unit(&mut rng)).collect();
+        let (mut fa, mut fb, mut pa, mut pb) = (vec![], vec![], vec![], vec![]);
+        let (mut ia, mut ib) = (vec![], vec![]);
+        let mk = |x: f64, y: f64, d: &[f32]| {
+            let mut desc = [0f32; DESC_LEN];
+            desc.copy_from_slice(d);
+            Feature {
+                kp: Keypoint {
+                    x: (x - 0.5) as f32,
+                    y: (y - 0.5) as f32,
+                    sigma: 2.0,
+                    response: 1.0,
+                    angle: 0.0,
+                },
+                desc,
+            }
+        };
+        let mut id = 0usize;
+        while id < 400 {
+            let x = Point3::new(
+                -12.0 + 24.0 * rng.next(),
+                -7.0 + 14.0 * rng.next(),
+                8.0 + 10.0 * rng.next(),
+            );
+            let (Some(q1), Some(q2)) = (c1.project(&x), c2.project(&x)) else {
+                continue;
+            };
+            if !c1.intrinsics.contains(&q1) || !c2.intrinsics.contains(&q2) {
+                continue;
+            }
+            // 무리 중심 + 지점 고유 성분 + 시점 잡음.
+            let own = unit(&mut rng);
+            let cl = &centers[id % centers.len()];
+            let view = |rng: &mut Lcg| -> Vec<f32> {
+                let noise = unit(rng);
+                (0..DESC_LEN)
+                    .map(|k| 0.97 * cl[k] + 0.14 * own[k] + 0.14 * noise[k])
+                    .collect()
+            };
+            let (da, db) = (view(&mut rng), view(&mut rng));
+            let (q1, q2) = (q1 + Vector2::new(rng.gauss(), rng.gauss()) * 0.3, q2);
+            fa.push(mk(q1.x, q1.y, &da));
+            fb.push(mk(q2.x, q2.y, &db));
+            ia.push(id);
+            ib.push(id);
+            id += 1;
+        }
+        // 한쪽에만 보이는 방해 특징(같은 무리).
+        for n in 0..150 {
+            let cl = &centers[n % centers.len()];
+            let mk_d = |rng: &mut Lcg| -> Vec<f32> {
+                let o = unit(rng);
+                (0..DESC_LEN).map(|k| 0.97 * cl[k] + 0.2 * o[k]).collect()
+            };
+            let d = mk_d(&mut rng);
+            fa.push(mk(480.0 * rng.next() + 240.0, 540.0 * rng.next(), &d));
+            ia.push(usize::MAX - n);
+            let d = mk_d(&mut rng);
+            fb.push(mk(960.0 * rng.next(), 540.0 * rng.next(), &d));
+            ib.push(usize::MAX - 1000 - n);
+        }
+        let f = c1.intrinsics.fx;
+        for (p, c, fs) in [(&mut pa, &c1, &fa), (&mut pb, &c2, &fb)] {
+            *p = fs
+                .iter()
+                .map(|x| {
+                    c.intrinsics
+                        .index_to_normalized(&Vector2::new(x.kp.x as f64, x.kp.y as f64))
+                })
+                .collect();
+        }
+        (fa, fb, pa, pb, ia, ib, f)
+    }
+
+    /// 기하 유도 매칭: 비슷한 무늬가 많은 다른 카메라 짝에서 기본 비율 검사보다 정답 대응을 훨씬 더 찾고
+    /// 정확도(정답 비율)가 0.9 이상이어야 한다. 측정(시드 1~3, 지점 400): 기본 정답 약 180~200, 유도 정답 약 396~400(정확도 0.98).
+    #[test]
+    fn guided_cross_match_beats_ratio_on_clustered_pair() {
+        for seed in 1..=3u64 {
+            let (fa, fb, na, nb, ia, ib, focal) = clustered_pair(seed);
+            let base = ratio_match(&fa, &fb, 0.8, true);
+            let g = guided_cross_match(&fa, &fb, &na, &nb, focal, 0.8, &GuidedConfig::default());
+            let ok = |m: &[(usize, usize)]| m.iter().filter(|&&(i, j)| ia[i] == ib[j]).count();
+            let (bo, go) = (ok(&base), ok(&g));
+            eprintln!(
+                "seed {seed}: 기본 {} (정답 {bo}) 유도 {} (정답 {go})",
+                base.len(),
+                g.len()
+            );
+            assert!(go as f64 >= 0.9 * g.len() as f64, "정확도 {go}/{}", g.len());
+            assert!(2 * go >= 3 * bo, "유도 정답 {go} 기본 정답 {bo}");
+            assert!(go >= 300, "유도 정답 {go}");
         }
     }
 
