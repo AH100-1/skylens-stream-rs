@@ -49,7 +49,7 @@ pub struct PipelineConfig {
     pub max_features: usize,
     /// 긴 변 800 미만 사진에서 확대 특징을 상한까지 더한다(기본 끔: 원래 검출이 상한 절반 미만일 때만).
     pub upscale_fill: bool,
-    /// 회전 평균 전에 카메라 쌍 단위 회전 투표로 간선을 거른다(기본 끔).
+    /// 회전 평균 전에 카메라 쌍 단위 회전 투표로 간선을 거른다(기본 켬).
     pub pair_vote: bool,
     /// 밀집 깊이 맵 폭(px).
     pub dense_width: usize,
@@ -131,7 +131,7 @@ impl Default for PipelineConfig {
         Self {
             max_features: 1500,
             upscale_fill: false,
-            pair_vote: false,
+            pair_vote: true,
             dense_width: 160,
             dense_method: DenseMethod::Sweep,
             hfov_deg: 65.0,
