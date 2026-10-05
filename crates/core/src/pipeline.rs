@@ -75,6 +75,9 @@ pub struct PipelineConfig {
     pub preview_ba_iters: usize,
     /// 초벌 위치 전용 다듬기 반복 수(회전 고정, 카메라 중심만). 0 이면 끈다. BA 가 아니다.
     pub preview_refine_iters: usize,
+    /// 구역 GPS 정렬에서 연직 방향을 사진 회전(카메라 x 축 수평)에서 구해 고정한다(기본 꺼짐).
+    /// 경로 축 둘레 기울기를 GPS 잡음 대신 사진 회전이 정하게 한다.
+    pub gps_fixed_up: bool,
 }
 
 impl PipelineConfig {
@@ -112,6 +115,7 @@ impl Default for PipelineConfig {
             gps_sigma_v: 2.0,
             preview_ba_iters: 0,
             preview_refine_iters: 5,
+            gps_fixed_up: false,
         }
     }
 }
@@ -1369,7 +1373,7 @@ fn sparse_init_with(
 
 /// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
 /// BA 는 자유 좌표계에서 움직이므로 정밀 모델을 다시 GPS 좌표계로 돌려놓는다.
-fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity> {
+fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>], fixed_up: bool) -> Option<Similarity> {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
         .collect();
@@ -1378,9 +1382,60 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
         .map(|&i| s.poses[i].unwrap().center().coords)
         .collect();
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
-    let (sim, _, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    let (mut sim, inl, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    if fixed_up {
+        // 정상 대응만으로 연직 고정 추정: 경로 축 둘레 회전은 사진 회전(짐벌: 카메라 x 축 수평)이 정한다.
+        let rots: Vec<_> = ids
+            .iter()
+            .zip(&inl)
+            .filter(|(_, &k)| k)
+            .map(|(&i, _)| s.poses[i].unwrap().rotation)
+            .collect();
+        let pick = |v: &[Vector3<f64>]| -> Vec<Vector3<f64>> {
+            v.iter()
+                .zip(&inl)
+                .filter(|(_, &k)| k)
+                .map(|(x, _)| *x)
+                .collect()
+        };
+        if let Some(up) = crate::align::up_from_rotations(&rots) {
+            if let Some(fixed) = crate::align::similarity_fixed_up(&pick(&src), &pick(&dst), &up) {
+                sim = prefer_fixed_up(sim, fixed, &pick(&src), &pick(&dst));
+            }
+        }
+    }
     apply_sparse_sim(s, &sim);
     Some(sim)
+}
+
+/// 연직 고정 해가 기존 해보다 GPS 잔차 중앙값이 이 배율을 넘게 나쁘면 기존 해로 물러난다(짐벌 가정이 깨진 경우).
+const FIXED_UP_RESIDUAL_RATIO: f64 = 1.2;
+
+/// 대응점(`src` → `dst`)에 대한 닮음 변환의 잔차 중앙값.
+fn similarity_residual_median(sim: &Similarity, src: &[Vector3<f64>], dst: &[Vector3<f64>]) -> f64 {
+    let mut r: Vec<f64> = src
+        .iter()
+        .zip(dst)
+        .map(|(a, b)| (sim.apply_point(a) - b).norm())
+        .collect();
+    r.sort_by(f64::total_cmp);
+    r.get(r.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// 연직 고정 해 `fixed` 를 쓰되, GPS 잔차 중앙값이 기존 해 `base` 의 1.2 배를 넘으면 `base` 를 쓴다.
+fn prefer_fixed_up(
+    base: Similarity,
+    fixed: Similarity,
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+) -> Similarity {
+    let rb = similarity_residual_median(&base, src, dst);
+    let rf = similarity_residual_median(&fixed, src, dst);
+    if rf > rb * FIXED_UP_RESIDUAL_RATIO {
+        base
+    } else {
+        fixed
+    }
 }
 
 /// 희소 모델 전체(포즈·점·BA 전용 점)에 닮음 변환을 적용한다.
@@ -2431,6 +2486,7 @@ pub fn run_pipeline_with(
             let (gps, dw, iters, dmethod) =
                 (gps.clone(), cfg.dense_width, cfg.ba_iters, cfg.dense_method);
             let psig = cfg.prior_sigma();
+            let fixed_up = cfg.gps_fixed_up;
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
             in_flight += 1;
@@ -2451,7 +2507,9 @@ pub fn run_pipeline_with(
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
                 if anchor.is_none() {
-                    crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
+                    crate::timing::timed("gps_align", || {
+                        gps_align_refined(&mut rs, &gps, fixed_up)
+                    });
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {
                     dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod)
@@ -2838,7 +2896,7 @@ mod diag {
             if full {
                 let mut rs = init.clone();
                 run_ba(&mut rs, &k, 10, Some(&gps), 2.0, &[]);
-                gps_align_refined(&mut rs, &gps);
+                gps_align_refined(&mut rs, &gps, false);
                 let region = split_regions(ds.positions.len(), ds.config.span, ds.config.ovl)[0];
                 let win = (region.lo, region.hi);
                 let (ta, tb) = (to_tracks(&good, &gids), to_tracks(&rs, &gids));
@@ -2974,7 +3032,7 @@ mod diag {
         .unwrap();
         let mut rs = init.clone();
         run_ba(&mut rs, &k, 10, Some(&gps), 2.0, &[]);
-        gps_align_refined(&mut rs, &gps);
+        gps_align_refined(&mut rs, &gps, false);
         // 정답 카메라(첫 GPS 기준 좌표).
         let truth_pose = |g: usize| -> Pose {
             let name = ds.positions[g / 3].images[g % 3]
@@ -3552,5 +3610,59 @@ mod refine_tests {
         refine_centers(&mut poses, &k, &tracks, &opts);
         let after = err(&poses);
         assert!(after < 0.7 * before, "{before} -> {after}");
+    }
+}
+
+#[cfg(test)]
+mod fixed_up_fallback_tests {
+    use super::*;
+
+    fn pts() -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>) {
+        let src: Vec<Vector3<f64>> = (0..21)
+            .map(|i| Vector3::new(i as f64 * 5.0, (i % 4) as f64 * 3.0, (i % 3) as f64))
+            .collect();
+        (src.clone(), src)
+    }
+
+    fn tilted(deg: f64) -> Similarity {
+        Similarity {
+            s: 1.0,
+            r: Rotation3::from_axis_angle(&nalgebra::Vector3::x_axis(), deg.to_radians()),
+            t: Vector3::zeros(),
+        }
+    }
+
+    #[test]
+    fn falls_back_when_fixed_up_residual_is_worse() {
+        let (src, dst) = pts();
+        let base = Similarity::identity();
+        let fixed = tilted(20.0);
+        let rb = similarity_residual_median(&base, &src, &dst);
+        let rf = similarity_residual_median(&fixed, &src, &dst);
+        assert!(rb < 1e-9 && rf > 0.5, "기존 {rb} 고정 {rf}");
+        let got = prefer_fixed_up(base, fixed, &src, &dst);
+        assert!(
+            got.r.angle() < 1e-9,
+            "기존 해로 물러나야 함: {}",
+            got.r.angle()
+        );
+    }
+
+    #[test]
+    fn keeps_fixed_up_when_residual_is_not_worse() {
+        let (src, dst) = pts();
+        // 기존 해가 조금 기울어 잔차가 크고, 고정 해가 정답이면 고정 해를 쓴다.
+        let got = prefer_fixed_up(tilted(5.0), Similarity::identity(), &src, &dst);
+        assert!(got.r.angle() < 1e-9);
+        // 잔차 비율이 1.2 이하이면 고정 해를 유지한다.
+        let a = tilted(10.0);
+        let b = tilted(11.0);
+        let (ra, rb) = (
+            similarity_residual_median(&a, &src, &dst),
+            similarity_residual_median(&b, &src, &dst),
+        );
+        assert!(rb / ra < FIXED_UP_RESIDUAL_RATIO, "{ra} {rb}");
+        let got = prefer_fixed_up(a, b, &src, &dst);
+        assert!((got.r.angle() - 11f64.to_radians()).abs() < 1e-9);
     }
 }
