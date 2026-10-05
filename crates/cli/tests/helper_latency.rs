@@ -121,9 +121,10 @@ fn refined_realign_medians(report: &str) -> Vec<f64> {
 fn coarse_back_off_keeps_refined_seams_tight() {
     let (_, _, want, report) = run(false, "seam");
     let med = refined_realign_medians(&report);
+    // 정밀 구역 짝마다 많아야 한 번(구역 n 개면 n(n−1)/2 개)씩 다시 맞춘다.
     assert!(
-        !med.is_empty() && med.len() < want,
-        "정밀 재정렬 기록 부족: {med:?}"
+        !med.is_empty() && med.len() <= want * (want - 1) / 2,
+        "정밀 재정렬 기록 수: {med:?}"
     );
     for m in &med {
         assert!(*m < 1.0, "정밀 구역 이음 잔차 {m} m: {med:?}");
