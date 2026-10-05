@@ -3099,6 +3099,119 @@ mod diag {
         out
     }
 
+    fn to_obs(
+        poses: &[Option<Pose>],
+        imgs: &[&ImgData],
+        tracks: &[Vec<(usize, usize)>],
+    ) -> Vec<Vec<(usize, usize, Vector2<f64>)>> {
+        tracks
+            .iter()
+            .map(|tr| {
+                tr.iter()
+                    .filter(|&&(i, _)| poses[i].is_some())
+                    .map(|&(i, f)| {
+                        let kp = imgs[i].feats[f].kp;
+                        (i, f, Vector2::new(kp.x as f64 + 0.5, kp.y as f64 + 0.5))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// 진단: 짝 종류(같은 카메라 / 왼쪽 카메라가 낀 다른 카메라 짝)별 트랙의 광선 최대 각 분포.
+    /// 측정(4 코어 측정 기계, 전체 한 구역으로 초벌 포즈를 만든 뒤): 같은 카메라 짝 트랙 9454 개는 중앙 10.7°,
+    /// 1.5° 미만 0.1%, 4° 미만 16%. 왼쪽 짝 트랙 1308 개는 중앙 46°, 4° 미만 0%. 구역별 분포(기본 경로 구역 3 개,
+    /// 점 단위)도 구역2 가 다른 구역과 비슷했다(중앙 14.1° 대 15.7~16.6°). 각이 작아서 구역2 가 나쁜 것이 아니다.
+    /// `cargo test --release diag_track_angles_by_pair_kind -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn diag_track_angles_by_pair_kind() {
+        let root = std::env::temp_dir().join(format!("skylens_angles_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let scene = Scene::new(SceneConfig {
+            width: 320,
+            height: 180,
+            ..SceneConfig::default()
+        });
+        scene.write_dataset(&root).unwrap();
+        let ds = load_dataset(
+            &root,
+            DatasetConfig {
+                stride: 2,
+                span: 48,
+                ovl: 2,
+                max_skip_run: 2,
+            },
+        )
+        .unwrap();
+        let n = ds.positions.len() * 3;
+        let data: Vec<ImgData> = (0..n)
+            .map(|g| load(&ds.positions[g / 3].images[g % 3], 800, false).unwrap())
+            .collect();
+        let imgs: Vec<&ImgData> = data.iter().collect();
+        let k = Intrinsics::from_hfov(
+            data[0].rgb.width(),
+            data[0].rgb.height(),
+            65f64.to_radians(),
+        );
+        let views: Vec<(usize, usize)> = (0..n).map(|g| (g % 3, g / 3)).collect();
+        let gps: Vec<Vector3<f64>> = (0..n)
+            .map(|g| ds.positions[g / 3].image_enu[g % 3])
+            .collect();
+        let pm = match_pairs(&imgs, &views, &k, dataset_spacing(&ds));
+        let cfg = PipelineConfig::default();
+        let tri = TriConfig::from_config(&cfg);
+        let (init, _) = sparse_init_with(
+            &imgs,
+            &pm,
+            &gps,
+            &k,
+            cfg.position,
+            &tri,
+            (0, 2.0),
+            &PreviewOpts::default(),
+        )
+        .unwrap();
+        let mut t0 = tri;
+        t0.min_deg = 0.0;
+        for (name, left) in [("same", false), ("left", true)] {
+            let ms: Vec<_> = pm
+                .iter()
+                .filter(|p| init.poses[p.i].is_some() && init.poses[p.j].is_some())
+                .filter(|p| p.left_cross == left && (left || p.views.0 .0 == p.views.1 .0))
+                .map(|p| (p.i, p.j, p.inl.clone()))
+                .collect();
+            let obs = to_obs(&init.poses, &imgs, &multi_view_tracks(&imgs, &ms));
+            let (points, o, _, _) = triangulate_tracks(&init.poses, &k, &obs, &t0);
+            let sp = Sparse {
+                poses: init.poses.clone(),
+                points,
+                obs: o,
+                ba_only: Vec::new(),
+                rms: 0.0,
+            };
+            let mut a = ray_angles(&sp);
+            a.sort_by(f64::total_cmp);
+            let m = a.len().max(1);
+            let q = |f: f64| {
+                a.get(((m as f64 * f) as usize).min(m - 1))
+                    .copied()
+                    .unwrap_or(0.0)
+            };
+            let fr = |d: f64| a.iter().filter(|&&x| x < d).count() as f64 / m as f64;
+            eprintln!(
+                "DIAG angles {name} n {} p10 {:.2} p50 {:.2} p90 {:.2} frac<1.5 {:.3} <4 {:.3}",
+                a.len(),
+                q(0.1),
+                q(0.5),
+                q(0.9),
+                fr(1.5),
+                fr(4.0)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 기본 초벌 포즈 단계의 숫자 기준(합성 장면 정답 대비). 측정: 중심 중앙 1.12 m·회전 중앙 1.06°
     /// (끔: 어긋난 간선 제거·사전 1 → 1.45 m·1.90°). 롤을 광축 높이 분산 최소로 정한 뒤 끈 쪽도 좋아져
     /// 중심 비율은 0.6 → 0.85 로 바꿨다(절대 상한은 그대로).
