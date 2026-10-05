@@ -1416,6 +1416,63 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
     Some(sim)
 }
 
+/// 환경 변수 `SKYLENS_REGION_DIAG` 가 있을 때만 쓰는 진단 출력(표준 오류): 구역 정밀 모델의 사진별 회전과
+/// GPS 정렬 요약(정렬 뒤 잔차 3 m 이하 사진 수, GPS 중심 퍼짐의 표준편차 세 값, 잔차 중앙·최대).
+fn region_diag(
+    region: usize,
+    rs: &Sparse,
+    gps: &[Vector3<f64>],
+    gids: &[usize],
+    in_region: &[bool],
+    gps_aligned: bool,
+) {
+    let ids: Vec<usize> = (0..rs.poses.len())
+        .filter(|&i| rs.poses[i].is_some())
+        .collect();
+    let mut res = Vec::new();
+    let mut pts = Vec::new();
+    for &i in &ids {
+        let p = rs.poses[i].unwrap();
+        let m = p.rotation.matrix();
+        eprintln!(
+            "diag rot region {region} gid {} own {} {}",
+            gids[i],
+            u8::from(in_region[i]),
+            m.iter()
+                .map(|v| format!("{v:.9}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        res.push((p.center().coords - gps[i]).norm());
+        pts.push(gps[i]);
+    }
+    let n = pts.len().max(1) as f64;
+    let mu = pts.iter().sum::<Vector3<f64>>() / n;
+    let mut cov = nalgebra::Matrix3::zeros();
+    for q in &pts {
+        let d = q - mu;
+        cov += d * d.transpose();
+    }
+    cov /= n;
+    let mut ev: Vec<f64> = cov
+        .symmetric_eigenvalues()
+        .iter()
+        .map(|&e| e.max(0.0).sqrt())
+        .collect();
+    ev.sort_by(|a, b| b.total_cmp(a));
+    let used = res.iter().filter(|&&r| r <= 3.0).count();
+    let mut sorted = res.clone();
+    sorted.sort_by(f64::total_cmp);
+    let med = sorted.get(sorted.len() / 2).copied().unwrap_or(f64::NAN);
+    let max = sorted.last().copied().unwrap_or(f64::NAN);
+    eprintln!(
+        "diag align region {region} gps_aligned {gps_aligned} registered {} own {} used_le3m {used} gps_spread_sd {:.3} {:.3} {:.3} resid_med {med:.3} resid_max {max:.3}",
+        ids.len(),
+        ids.iter().filter(|&&i| in_region[i]).count(),
+        ev[0], ev[1], ev[2]
+    );
+}
+
 /// 희소 모델 전체(포즈·점·BA 전용 점)에 닮음 변환을 적용한다.
 fn apply_sparse_sim(s: &mut Sparse, sim: &Similarity) {
     for p in s.poses.iter_mut().flatten() {
@@ -2643,8 +2700,13 @@ pub fn run_pipeline_with(
                 rs.rms = crate::timing::timed("ba_refined", || {
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
-                if !anchored && (anchor.is_none() || full.is_some()) {
+                let gps_aligned = !anchored && (anchor.is_none() || full.is_some());
+                if gps_aligned {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
+                }
+                if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+                    let g = full.as_ref().map_or(&gids_t, |f| &f.0);
+                    region_diag(region.index, &rs, &gps, g, &in_region, gps_aligned);
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {
                     dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod)
