@@ -203,5 +203,109 @@ fn default_path_region_tilt() {
             rms
         );
     }
+    stage_report(&stderr, &truth, &tc);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 닮음 변환(Umeyama)을 추정 중심에 맞춘 뒤 정답과 비교: (척도, 잔차 중앙, 잔차 rms).
+fn center_fit(e: &[Vector3<f64>], t: &[Vector3<f64>]) -> (f64, f64, f64) {
+    let n = e.len() as f64;
+    let me = e.iter().sum::<Vector3<f64>>() / n;
+    let mt = t.iter().sum::<Vector3<f64>>() / n;
+    let mut cov = Matrix3::zeros();
+    let mut ve = 0.0;
+    for (a, b) in e.iter().zip(t) {
+        cov += (b - mt) * (a - me).transpose() / n;
+        ve += (a - me).norm_squared() / n;
+    }
+    let svd = cov.svd(true, true);
+    let (u, vtm) = (svd.u.unwrap(), svd.v_t.unwrap());
+    let mut d = Matrix3::identity();
+    if (u * vtm).determinant() < 0.0 {
+        d[(2, 2)] = -1.0;
+    }
+    let r = u * d * vtm;
+    let scale = svd
+        .singular_values
+        .component_mul(&Vector3::new(1.0, 1.0, d[(2, 2)]))
+        .sum()
+        / ve;
+    let mut fit: Vec<f64> = e
+        .iter()
+        .zip(t)
+        .map(|(a, b)| (b - (scale * r * (a - me) + mt)).norm())
+        .collect();
+    let rms = (fit.iter().map(|x| x * x).sum::<f64>() / n).sqrt();
+    fit.sort_by(f64::total_cmp);
+    (scale, fit[fit.len() / 2], rms)
+}
+
+/// 단계별 진단 줄(`diag stage ...`)을 정답과 비교한다. 같은 (구역, 호출, 단계)가 여러 번 나오면 마지막 것.
+/// 회전 오차는 전역 회전 Q = polar(Σ R_eᵀ R_t) 를 맞춘 뒤의 각.
+fn stage_report(
+    stderr: &str,
+    truth: &HashMap<String, Matrix3<f64>>,
+    tc: &dyn Fn(&str) -> Vector3<f64>,
+) {
+    type Rows = Vec<(usize, Matrix3<f64>, Vector3<f64>)>;
+    let mut groups: Vec<((usize, String, String), Rows)> = Vec::new();
+    for l in stderr.lines() {
+        if l.starts_with("diag first_ba")
+            || l.starts_with("diag refined_ba")
+            || l.starts_with("diag gps_align n")
+        {
+            eprintln!("{l}");
+        }
+        let Some(rest) = l.strip_prefix("diag stage region ") else {
+            continue;
+        };
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let key = (f[0].parse().unwrap(), f[1].to_string(), f[2].to_string());
+        let gid: usize = f[4].parse().unwrap();
+        let n: Vec<f64> = f[5..14].iter().map(|s| s.parse().unwrap()).collect();
+        let c: Vec<f64> = f[14..17].iter().map(|s| s.parse().unwrap()).collect();
+        let row = (
+            gid,
+            Matrix3::from_column_slice(&n),
+            Vector3::new(c[0], c[1], c[2]),
+        );
+        // 새 호출이 시작되면(같은 키가 이미 있고 이 gid 가 이미 있으면) 그룹을 새로 연다.
+        match groups.iter_mut().rev().find(|(k, _)| *k == key) {
+            Some((_, rows)) if !rows.iter().any(|r| r.0 == gid) => rows.push(row),
+            _ => groups.push((key, vec![row])),
+        }
+    }
+    for ((region, tag, phase), rows) in groups {
+        let mut m = Matrix3::zeros();
+        for (gid, re, _) in &rows {
+            m += re.transpose() * truth[&image_name(*gid)];
+        }
+        let sv = m.svd(true, true);
+        let mut q = sv.u.unwrap() * sv.v_t.unwrap();
+        if q.determinant() < 0.0 {
+            let mut u = sv.u.unwrap();
+            u.column_mut(2).neg_mut();
+            q = u * sv.v_t.unwrap();
+        }
+        let errs: Vec<f64> = rows
+            .iter()
+            .map(|(gid, re, _)| {
+                let d = (re * q).transpose() * truth[&image_name(*gid)];
+                Rotation3::from_matrix_unchecked(d).angle().to_degrees()
+            })
+            .collect();
+        let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+        let max = errs.iter().cloned().fold(0.0, f64::max);
+        let mut line = format!(
+            "stage region {region} {tag} {phase} n {} rot_err_mean {mean:.3} max {max:.3}",
+            rows.len()
+        );
+        if phase != "rots" {
+            let e: Vec<Vector3<f64>> = rows.iter().map(|r| r.2).collect();
+            let t: Vec<Vector3<f64>> = rows.iter().map(|r| tc(&image_name(r.0))).collect();
+            let (sc, med, rms) = center_fit(&e, &t);
+            line += &format!(" fit_scale {sc:.4} fit_resid_med {med:.3} rms {rms:.3}");
+        }
+        eprintln!("{line}");
+    }
 }

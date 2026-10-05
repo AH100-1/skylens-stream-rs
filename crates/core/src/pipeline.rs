@@ -1212,6 +1212,7 @@ fn sparse_init_with(
     let (rots, keep_edge) = average_pruned(n, pm, opts)?;
     crate::timing::add("rotation_avg", t_stage.elapsed().as_secs_f64());
     let t_stage = Instant::now();
+    diag_stage("rots", &rots, None);
     let mut stages = PreviewStages {
         rots: rots.clone(),
         pruned: (keep_edge.iter().filter(|&&k| !k).count(), pm.len()),
@@ -1317,6 +1318,7 @@ fn sparse_init_with(
         poses[i] = Some(Pose::from_center(r, &Point3::from(c)));
     }
     stages.placed = poses.clone();
+    diag_poses("placed", &poses);
     if opts.snap {
         snap_poses_to_gps(&mut poses, gps, opts.vfix);
     }
@@ -1387,6 +1389,15 @@ fn sparse_init_with(
     let t_stage = Instant::now();
     s.rms = run_ba(&mut s, k, 0, None, 2.0, &[]);
     crate::timing::add("ba_preview", t_stage.elapsed().as_secs_f64());
+    diag_poses("ba_first", &s.poses);
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        eprintln!(
+            "diag first_ba rms {:.3} points {} obs {}",
+            s.rms,
+            s.points.len(),
+            s.obs.len()
+        );
+    }
     if pre_ba.0 > 0 {
         // 짧은 GPS 사전항 BA: 초벌 포즈·점의 스케일·기울기·깊이를 정밀 쪽으로 당긴다.
         let after = crate::timing::timed("ba_preview", || {
@@ -1411,9 +1422,63 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
         .map(|&i| s.poses[i].unwrap().center().coords)
         .collect();
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
-    let (sim, _, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    let (sim, inl, med) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        eprintln!(
+            "diag gps_align n {} inliers {} scale {:.4} inlier_med {:.3}",
+            src.len(),
+            inl.iter().filter(|&&b| b).count(),
+            sim.s,
+            med
+        );
+    }
     apply_sparse_sim(s, &sim);
     Some(sim)
+}
+
+thread_local! {
+    /// 진단용: (구역, 사진 번호 목록, 호출 이름). `SKYLENS_REGION_DIAG` 가 있을 때만 호출 쪽이 채운다.
+    static DIAG_CTX: std::cell::RefCell<Option<(usize, Vec<usize>, &'static str)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn diag_set(region: usize, gids: &[usize], tag: &'static str) {
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        DIAG_CTX.with(|c| *c.borrow_mut() = Some((region, gids.to_vec(), tag)));
+    }
+}
+
+/// 단계별 사진 자세(회전 열 우선 9개, 중심)를 표준 오류로 낸다. 문맥이 없으면 아무것도 하지 않는다.
+fn diag_stage(phase: &str, rots: &[Option<Rotation3<f64>>], centers: Option<&[Option<Pose>]>) {
+    DIAG_CTX.with(|c| {
+        let c = c.borrow();
+        let Some((region, gids, tag)) = c.as_ref() else {
+            return;
+        };
+        for (i, r) in rots.iter().enumerate() {
+            let Some(r) = r else { continue };
+            let ctr = centers
+                .and_then(|p| p[i].as_ref())
+                .map_or(Vector3::zeros(), |p| p.center().coords);
+            eprintln!(
+                "diag stage region {region} {tag} {phase} gid {} {} {:.4} {:.4} {:.4}",
+                gids[i],
+                r.matrix()
+                    .iter()
+                    .map(|v| format!("{v:.9}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                ctr.x,
+                ctr.y,
+                ctr.z
+            );
+        }
+    });
+}
+
+fn diag_poses(phase: &str, poses: &[Option<Pose>]) {
+    let rots: Vec<Option<Rotation3<f64>>> = poses.iter().map(|p| p.map(|p| p.rotation)).collect();
+    diag_stage(phase, &rots, Some(poses));
 }
 
 /// 환경 변수 `SKYLENS_REGION_DIAG` 가 있을 때만 쓰는 진단 출력(표준 오류): 구역 정밀 모델의 사진별 회전과
@@ -2422,6 +2487,7 @@ pub fn run_pipeline_with(
             .filter(|&(i, j)| i >= n_help && j >= n_help)
             .collect();
         let own_registered = |s: &Sparse| s.poses[n_help..].iter().filter(|p| p.is_some()).count();
+        diag_set(r.index, &gids, "coarse");
         let start = match check_motion(&gps, &views, &own_pairs)
             .and_then(|_| {
                 sparse_init_with(
@@ -2459,6 +2525,7 @@ pub fn run_pipeline_with(
         };
         // 초벌(미리보기)은 위의 광축 높이 분산 롤을 쓰고, 정밀 BA 시작점만 예전 롤 규칙으로 따로 만든다.
         let coarse_start = start;
+        diag_set(r.index, &gids, "start");
         let start = sparse_init_with(
             &imgs,
             &pm,
@@ -2475,6 +2542,7 @@ pub fn run_pipeline_with(
         )
         .map(|r| r.0)
         .unwrap_or_else(|_| coarse_start.clone());
+        DIAG_CTX.with(|c| *c.borrow_mut() = None);
         let init = if cfg.preview_ba_iters > 0 {
             let mut p = coarse_start.clone();
             p.rms = crate::timing::timed("ba_preview", || {
@@ -2650,6 +2718,7 @@ pub fn run_pipeline_with(
                             gf.iter().map(|g| (g % 3, g / 3)).collect();
                         let pm_f =
                             crate::timing::timed("matching", || match_pairs(&imgs_f, &views_f, &k));
+                        diag_set(region.index, &gf, "full");
                         if let Ok(sf) = sparse_init_roll(
                             &imgs_f,
                             &pm_f,
@@ -2703,6 +2772,17 @@ pub fn run_pipeline_with(
                 rs.rms = crate::timing::timed("ba_refined", || {
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
+                if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+                    let g = full.as_ref().map_or(&gids_t, |f| &f.0);
+                    diag_set(region.index, g, "refined");
+                    diag_poses("ba_refined", &rs.poses);
+                    eprintln!(
+                        "diag refined_ba region {} rms {:.3} anchored {anchored} full {}",
+                        region.index,
+                        rs.rms,
+                        full.is_some()
+                    );
+                }
                 let gps_aligned = !anchored && (anchor.is_none() || full.is_some());
                 if gps_aligned {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
