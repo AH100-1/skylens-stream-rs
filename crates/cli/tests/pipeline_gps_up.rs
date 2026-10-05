@@ -106,6 +106,10 @@ fn measure(input: &Path, output: &Path) -> Metrics {
         height: 180,
         ..SceneConfig::default()
     });
+    measure_scene(&scene, input, output)
+}
+
+fn measure_scene(scene: &Scene, input: &Path, output: &Path) -> Metrics {
     let shift = truth_to_output_shift(input);
     // 정답 카메라 중심 C = -Rᵀ t (이름 뒤 내부 파라미터 6개, 그다음 R 행 우선 9개, t 3개).
     let mut truth = std::collections::HashMap::new();
@@ -259,5 +263,38 @@ fn gps_fixed_up_does_not_regress() {
         "표면 중앙 켬 {} 끔 {}",
         on.surface_med,
         off.surface_med
+    );
+}
+
+/// 짐벌 가정이 깨진 장면(사진마다 광축 롤 잡음 2°): 켬은 끔보다 표면·중심 중앙이 크게 나빠지지 않는다(1.2 배 한도).
+/// 측정(4 코어 측정 기계, 시드 1): 끔 표면 중앙 0.139 m, 중심 중앙/최대 0.188/1.062 m, 켬 0.160 m, 0.172/1.063 m.
+#[test]
+fn gps_fixed_up_with_roll_noise_does_not_regress() {
+    let t = TempDir::new("gpsuproll");
+    let scene_dir = t.0.join("scene");
+    let scene = Scene::new(SceneConfig {
+        width: 320,
+        height: 180,
+        roll_sigma_deg: 2.0,
+        ..SceneConfig::default()
+    });
+    scene.write_dataset(&scene_dir).unwrap();
+    let (c0, t0, off) = run_case("roll_off", &scene_dir, &[]);
+    let (c1, t1, on) = run_case("roll_on", &scene_dir, &["--gps-fixed-up"]);
+    eprintln!("{t0}{t1}");
+    let _ = (c0, c1);
+    let m = |m: &Metrics| (m.registered, m.center_med, m.center_max, m.surface_med);
+    eprintln!("roll off {:?} on {:?}", m(&off), m(&on));
+    assert!(
+        on.surface_med <= off.surface_med * 1.2 + 0.01,
+        "표면 중앙 켬 {} 끔 {}",
+        on.surface_med,
+        off.surface_med
+    );
+    assert!(
+        on.center_med <= off.center_med * 1.2 + 0.02,
+        "중심 중앙 켬 {} 끔 {}",
+        on.center_med,
+        off.center_med
     );
 }

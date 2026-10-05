@@ -57,6 +57,8 @@ pub struct SceneConfig {
     pub gps_sigma: f64,
     /// 기체(카메라)별 GPS 치우침 표준편차(m, 축마다). 기체마다 한 번 뽑아 모든 위치에 같은 값을 더한다(0 이면 없음).
     pub gps_bias_sigma: f64,
+    /// 사진마다 광축 둘레로 섞는 롤 잡음 표준편차(도). 0 이면 없음(짐벌 가정이 그대로 맞는다).
+    pub roll_sigma_deg: f64,
     pub seed: u64,
 }
 
@@ -97,6 +99,7 @@ impl Default for SceneConfig {
             offsets: formation_offsets(),
             gps_sigma: 1.5,
             gps_bias_sigma: 0.0,
+            roll_sigma_deg: 0.0,
             seed: 1,
         }
     }
@@ -302,13 +305,16 @@ impl Scene {
                     gauss(config.seed, b + 2),
                 ) * config.gps_bias_sigma;
                 gps_enu.push(center + noise + bias);
+                // 광축 둘레 롤 잡음: 난수 열 번호는 위 두 열과 겹치지 않게 더 큰 값에서 시작.
+                let roll = gauss(config.seed, (1u64 << 41) + i) * config.roll_sigma_deg;
+                let roll_rot = Rotation3::from_axis_angle(&Vector3::z_axis(), roll.to_radians());
                 views.push(View {
                     name: format!("cam{}_{:04}", cam.letter(), p),
                     cam,
                     position: p,
                     camera: Camera {
                         intrinsics: k,
-                        pose: Pose::from_center(look_rotation(&dir), &center),
+                        pose: Pose::from_center(roll_rot * look_rotation(&dir), &center),
                     },
                 });
             }
