@@ -2031,17 +2031,27 @@ mod tests {
 
     #[test]
     fn real_topology_weak_wrong_edges() {
-        let (mut worst_mean, mut worst_max): (f64, f64) = (0.0, 0.0);
+        // 시드 6 은 따로 잰다: 평균 2.09°, 최대 2.95° 로 남는다. 나머지 9개는 평균 0.6° 이하.
+        const BAD_SEED: u64 = 6;
+        let (mut rest_mean, mut rest_max): (f64, f64) = (0.0, 0.0);
+        let (mut bad_mean, mut bad_max) = (0.0, 0.0);
         for seed in 0..10 {
             let (mean, max) = real_topology_case(seed);
             eprintln!("real topology seed={seed} mean={mean:.3} max={max:.3}");
-            worst_mean = worst_mean.max(mean);
-            worst_max = worst_max.max(max);
+            if seed == BAD_SEED {
+                (bad_mean, bad_max) = (mean, max);
+            } else {
+                rest_mean = rest_mean.max(mean);
+                rest_max = rest_max.max(max);
+            }
         }
-        eprintln!("real topology worst mean {worst_mean:.3} max {worst_max:.3}");
-        // 시드 하나(6)는 평균 2.09°, 최대 2.95° 로 남는다. 나머지는 평균 0.6° 이하.
-        assert!(worst_mean < 2.5, "평균 오차 {worst_mean}");
-        assert!(worst_max < 4.0, "최대 오차 {worst_max}");
+        eprintln!(
+            "real topology rest worst mean {rest_mean:.3} max {rest_max:.3}; seed {BAD_SEED} mean {bad_mean:.3} max {bad_max:.3}"
+        );
+        assert!(rest_mean < 1.0, "나머지 시드 평균 오차 {rest_mean}");
+        assert!(rest_max < 1.5, "나머지 시드 최대 오차 {rest_max}");
+        assert!(bad_mean < 2.3, "시드 {BAD_SEED} 평균 오차 {bad_mean}");
+        assert!(bad_max < 3.2, "시드 {BAD_SEED} 최대 오차 {bad_max}");
     }
 
     fn rotation_angle(r: &Rotation3<f64>) -> f64 {
