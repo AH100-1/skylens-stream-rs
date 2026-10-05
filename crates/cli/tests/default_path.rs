@@ -228,13 +228,56 @@ fn diag_surface_by_region() {
     let mut all = Vec::new();
     for f in files {
         let mut d = Vec::new();
+        let (mut src, mut dst, mut signed) = (Vec::new(), Vec::new(), Vec::new());
         for p in read_ply_file(&f).unwrap().points {
             let (x, y, z) = (
                 p.xyz[0] as f64 - shift[0],
                 p.xyz[1] as f64 - shift[1],
                 p.xyz[2] as f64 - shift[2],
             );
-            d.push((z - scene.surface_height(x, y)).abs());
+            let h = scene.surface_height(x, y);
+            d.push((z - h).abs());
+            signed.push(z - h);
+            src.push(skylens_core::nalgebra::Vector3::new(x, y, z));
+            dst.push(skylens_core::nalgebra::Vector3::new(x, y, h));
+        }
+        // 구역 모델 자체를 정답 표면 점(수직 투영)에 닮음 변환으로 맞춘 잔차: 전역 sim3 편향인지 내부 형상 오차인지 구분.
+        // 구역 안 위치(분산이 큰 축 기준) 4 구간별 부호 있는 높이 오차 중앙: 편향이 구역 끝으로 갈수록 커지는지 본다.
+        {
+            let n = src.len() as f64;
+            let mean = src
+                .iter()
+                .fold(skylens_core::nalgebra::Vector3::zeros(), |a, p| a + p)
+                / n;
+            let var = |k: usize| src.iter().map(|p| (p[k] - mean[k]).powi(2)).sum::<f64>();
+            let ax = if var(0) >= var(1) { 0 } else { 1 };
+            let mut idx: Vec<usize> = (0..src.len()).collect();
+            idx.sort_by(|&a, &b| src[a][ax].total_cmp(&src[b][ax]));
+            let q = idx.len() / 4;
+            let bins: Vec<String> = (0..4)
+                .map(|b| {
+                    let hi = if b == 3 { idx.len() } else { (b + 1) * q };
+                    let mut v: Vec<f64> = idx[b * q..hi].iter().map(|&i| signed[i]).collect();
+                    format!("{:.3}", median(&mut v))
+                })
+                .collect();
+            eprintln!("DIAG   axis {ax} signed_dz_by_quarter {}", bins.join(" "));
+        }
+        let sm = median(&mut signed);
+        if let Some(sim) = skylens_core::align::umeyama(&src, &dst) {
+            let mut res: Vec<f64> = src
+                .iter()
+                .zip(&dst)
+                .map(|(a, b)| (sim.apply_point(a) - b).norm())
+                .collect();
+            eprintln!(
+                "DIAG   signed_dz_med {sm:.4} sim3 s {:.4} rot {:.3}deg t_z {:.3} resid_med {:.4} resid_p90 {:.4}",
+                sim.s,
+                sim.r.angle().to_degrees(),
+                sim.t.z,
+                median(&mut res),
+                percentile(&mut res, 0.9)
+            );
         }
         all.extend(d.iter().copied());
         let n = d.len();
