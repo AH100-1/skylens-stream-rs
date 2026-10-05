@@ -74,7 +74,11 @@ fn default_path_region_tilt() {
     });
     scene.write_dataset(&input).unwrap();
     eprintln!("seed {seed}");
-    let (code, stdout, stderr) = cli(&["run", i, o]);
+    // 추가 run 인자는 SKYLENS_TILT_RUN_ARGS (공백 구분, 예: "--pair-vote"). 없으면 인자 없는 run.
+    let extra = std::env::var("SKYLENS_TILT_RUN_ARGS").unwrap_or_default();
+    let mut args = vec!["run", i, o];
+    args.extend(extra.split_whitespace());
+    let (code, stdout, stderr) = cli(&args);
     assert_eq!(code, 0, "{stderr}");
     for l in stdout.lines().filter(|l| l.starts_with("region ")) {
         eprintln!("{l}");
@@ -275,6 +279,7 @@ fn stage_report(
             _ => groups.push((key, vec![row])),
         }
     }
+    pair_report(stderr, truth);
     for ((region, tag, phase), rows) in groups {
         let mut m = Matrix3::zeros();
         for (gid, re, _) in &rows {
@@ -294,6 +299,14 @@ fn stage_report(
                 Rotation3::from_matrix_unchecked(d).angle().to_degrees()
             })
             .collect();
+        if phase == "rots" && tag == "coarse" && std::env::var("SKYLENS_TILT_VERBOSE").is_ok() {
+            let v: Vec<String> = rows
+                .iter()
+                .zip(&errs)
+                .map(|(r, e)| format!("{}:{e:.0}", r.0))
+                .collect();
+            eprintln!("rot_err_by_gid region {region} {}", v.join(" "));
+        }
         let mean = errs.iter().sum::<f64>() / errs.len() as f64;
         let max = errs.iter().cloned().fold(0.0, f64::max);
         let mut line = format!(
@@ -307,5 +320,51 @@ fn stage_report(
             line += &format!(" fit_scale {sc:.4} fit_resid_med {med:.3} rms {rms:.3}");
         }
         eprintln!("{line}");
+    }
+}
+
+/// 입력 상대 회전(`diag pair`)을 정답 R_j R_iᵀ 와 비교: 구역별로 간선 수, 5° 넘게 어긋난 간선 수(전체/남긴 것),
+/// 어긋난 간선의 정상 대응 수 중앙과 정상 간선의 정상 대응 수 중앙.
+fn pair_report(stderr: &str, truth: &HashMap<String, Matrix3<f64>>) {
+    let mut stats: std::collections::BTreeMap<
+        usize,
+        (usize, usize, usize, Vec<usize>, Vec<usize>),
+    > = Default::default();
+    for l in stderr.lines() {
+        let Some(rest) = l.strip_prefix("diag pair region ") else {
+            continue;
+        };
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        if f[1] != "coarse" {
+            continue;
+        }
+        let region: usize = f[0].parse().unwrap();
+        let (gi, gj): (usize, usize) = (f[3].parse().unwrap(), f[4].parse().unwrap());
+        let inl: usize = f[6].parse().unwrap();
+        let keep = f[8] == "1";
+        let n: Vec<f64> = f[9..18].iter().map(|s| s.parse().unwrap()).collect();
+        let rel = Matrix3::from_column_slice(&n);
+        let tr = truth[&image_name(gj)] * truth[&image_name(gi)].transpose();
+        let err = Rotation3::from_matrix_unchecked(rel.transpose() * tr)
+            .angle()
+            .to_degrees();
+        let e = stats.entry(region).or_default();
+        e.0 += 1;
+        if err > 5.0 {
+            e.1 += 1;
+            e.2 += usize::from(keep);
+            e.3.push(inl);
+        } else {
+            e.4.push(inl);
+        }
+    }
+    for (region, (n, bad, bad_kept, mut bi, mut gi)) in stats {
+        bi.sort();
+        gi.sort();
+        eprintln!(
+            "pairs region {region} total {n} bad_gt5deg {bad} bad_kept {bad_kept} bad_inl_med {:?} good_inl_med {:?}",
+            bi.get(bi.len() / 2),
+            gi.get(gi.len() / 2)
+        );
     }
 }

@@ -1080,6 +1080,26 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
             }
         }
     }
+    DIAG_CTX.with(|c| {
+        let c = c.borrow();
+        let Some((region, gids, tag)) = c.as_ref() else {
+            return;
+        };
+        for (p, kp) in pm.iter().zip(&keep) {
+            let m = p.rot.matrix();
+            eprintln!(
+                "diag pair region {region} {tag} gid {} {} inl {} keep {} {}",
+                gids[p.i],
+                gids[p.j],
+                p.inl.len(),
+                u8::from(*kp),
+                m.iter()
+                    .map(|v| format!("{v:.9}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    });
     Ok((rots, keep))
 }
 
