@@ -29,7 +29,10 @@ fn default_path_seed_verify() {
         .unwrap();
     assert_eq!(run.status.code(), Some(0));
     for l in String::from_utf8_lossy(&run.stderr).lines() {
-        if l.starts_with("diag gps_align") || l.starts_with("diag align region") {
+        if l.starts_with("diag gps_align")
+            || l.starts_with("diag detached")
+            || l.starts_with("diag align region")
+        {
             eprintln!("{l}");
         }
     }

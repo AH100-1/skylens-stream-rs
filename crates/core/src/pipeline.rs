@@ -923,6 +923,8 @@ pub struct PreviewOpts {
     pub legacy_roll: bool,
     /// 회전 평균 전에 카메라 쌍 단위 회전 투표로 간선을 거른다.
     pub pair_vote: bool,
+    /// 주 성분에 붙지 못한 큰 연결 성분을 따로 풀어 GPS 로 붙인다.
+    pub merge_detached: bool,
     /// 위치 전용 다듬기 반복 수(0 이면 끔).
     pub refine_iters: usize,
     /// 다듬기 Huber 문턱(도).
@@ -946,6 +948,7 @@ impl Default for PreviewOpts {
             tri_deg: None,
             legacy_roll: false,
             pair_vote: false,
+            merge_detached: true,
             refine_iters: 0,
             refine_huber_deg: 0.3,
             refine_drop_deg: 2.0,
@@ -1172,6 +1175,298 @@ fn roll_by_level_spread(
     } else {
         th + std::f64::consts::PI
     })
+}
+
+/// 부분 모델을 붙이는 데 필요한 최소 사진 수와 GPS 정상 대응 수.
+const DETACHED_MIN_PHOTOS: usize = 6;
+const DETACHED_MIN_GPS_OK: usize = 3;
+/// 붙인 뒤 GPS 대응을 정상으로 치는 거리(m). 합성 GPS 잡음(축마다 1.5 m)의 3차원 중앙값이 약 2.5 m 라 넉넉히 잡는다.
+const DETACHED_GPS_OK_M: f64 = 5.0;
+
+/// 점들의 바닥 평면 법선(위쪽). 평면을 맞추고 잔차 중앙값의 2배 밖 점을 버리며 세 번 되풀이한다.
+fn ground_normal(points: &[Vector3<f64>]) -> Option<Vector3<f64>> {
+    if points.len() < 20 {
+        return None;
+    }
+    let mut sel: Vec<Vector3<f64>> = points.to_vec();
+    let mut normal = Vector3::z();
+    for round in 0..3 {
+        let c = sel.iter().sum::<Vector3<f64>>() / sel.len() as f64;
+        let mut cov = Matrix3::zeros();
+        for p in &sel {
+            let d = p - c;
+            cov += d * d.transpose();
+        }
+        let eig = nalgebra::SymmetricEigen::new(cov);
+        let mi = (0..3).min_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))?;
+        normal = eig.eigenvectors.column(mi).into_owned();
+        if normal.z < 0.0 {
+            normal = -normal;
+        }
+        if round == 2 {
+            break;
+        }
+        let mut res: Vec<f64> = points.iter().map(|p| (p - c).dot(&normal).abs()).collect();
+        res.sort_by(f64::total_cmp);
+        let thr = (2.0 * res[res.len() / 2]).max(0.05);
+        sel = points
+            .iter()
+            .filter(|p| (*p - c).dot(&normal).abs() <= thr)
+            .copied()
+            .collect();
+        if sel.len() < 20 {
+            return None;
+        }
+    }
+    Some(normal)
+}
+
+/// 부분 모델 `sub`(사진 번호는 주 모델과 같은 번호공간)을 주 모델 `s` 에 붙인다. 부분 모델은 GPS 방향 맞춤을 한
+/// 상태지만 직선 비행에서는 비행 축 둘레 회전이 정해지지 않으므로, 두 모델의 바닥 평면 법선이 같도록 축 둘레
+/// 회전을 고른 뒤 GPS 중심으로 이동(과 규모는 그대로)을 맞춘다. 반환: (GPS 정상 대응 수, 정상 대응 잔차 중앙값 m).
+/// 사진이 6장 미만이거나 GPS 정상 대응이 3 미만이면 붙이지 않고 None.
+fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Option<(usize, f64)> {
+    let ids: Vec<usize> = (0..sub.poses.len())
+        .filter(|&i| sub.poses[i].is_some() && s.poses[i].is_none())
+        .collect();
+    if ids.len() < DETACHED_MIN_PHOTOS {
+        return None;
+    }
+    let cen: Vec<Vector3<f64>> = ids
+        .iter()
+        .map(|&i| sub.poses[i].unwrap().center().coords)
+        .collect();
+    let mean = cen.iter().sum::<Vector3<f64>>() / cen.len() as f64;
+    // 롤: 비행 축(중심 주성분) 둘레로 돌려 바닥 법선을 주 모델 것에 맞춘다.
+    if let (Some(n_main), Some(n_sub)) = (ground_normal(&s.points), ground_normal(&sub.points)) {
+        let mut cov = Matrix3::zeros();
+        for c in &cen {
+            cov += (c - mean) * (c - mean).transpose();
+        }
+        let eig = nalgebra::SymmetricEigen::new(cov);
+        let mx = (0..3).max_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))?;
+        let axis = nalgebra::Unit::new_normalize(eig.eigenvectors.column(mx).into_owned());
+        let mut best = (f64::INFINITY, 0.0);
+        for step in 0..720 {
+            let th = step as f64 * 0.5f64.to_radians();
+            let r = Rotation3::from_axis_angle(&axis, th);
+            let a = (r * n_sub).dot(&n_main).clamp(-1.0, 1.0).acos();
+            if a < best.0 {
+                best = (a, th);
+            }
+        }
+        let r = Rotation3::from_axis_angle(&axis, best.1);
+        let sim = Similarity {
+            s: 1.0,
+            r,
+            t: mean - r * mean,
+        };
+        apply_sparse_sim(&mut sub, &sim);
+    }
+    // 이동: GPS 와의 차의 중앙 근처(정상 대응만 되풀이해 평균).
+    let cen: Vec<Vector3<f64>> = ids
+        .iter()
+        .map(|&i| sub.poses[i].unwrap().center().coords)
+        .collect();
+    let mut t = Vector3::zeros();
+    let mut ok: Vec<usize> = (0..ids.len()).collect();
+    for _ in 0..5 {
+        t = ok
+            .iter()
+            .map(|&a| gps[ids[a]] - cen[a])
+            .sum::<Vector3<f64>>()
+            / ok.len().max(1) as f64;
+        let mut d: Vec<(usize, f64)> = (0..ids.len())
+            .map(|a| (a, (cen[a] + t - gps[ids[a]]).norm()))
+            .collect();
+        let mut sd: Vec<f64> = d.iter().map(|x| x.1).collect();
+        sd.sort_by(f64::total_cmp);
+        let thr = DETACHED_GPS_OK_M.min(2.5 * sd[sd.len() / 2]).max(1.0);
+        d.retain(|x| x.1 <= thr);
+        ok = d.into_iter().map(|x| x.0).collect();
+        if ok.len() < DETACHED_MIN_GPS_OK {
+            return None;
+        }
+    }
+    let mut res: Vec<f64> = (0..ids.len())
+        .map(|a| (cen[a] + t - gps[ids[a]]).norm())
+        .filter(|&r| r <= DETACHED_GPS_OK_M)
+        .collect();
+    if res.len() < DETACHED_MIN_GPS_OK {
+        return None;
+    }
+    res.sort_by(f64::total_cmp);
+    apply_sparse_sim(
+        &mut sub,
+        &Similarity {
+            s: 1.0,
+            r: Rotation3::identity(),
+            t,
+        },
+    );
+    for &i in &ids {
+        s.poses[i] = sub.poses[i];
+    }
+    s.points.extend(sub.points);
+    s.obs.extend(sub.obs);
+    s.ba_only.extend(sub.ba_only);
+    Some((res.len(), res[res.len() / 2]))
+}
+
+/// 회전 평균 주 성분에 붙지 못한 연결 성분(사진 6장 이상)마다 따로 부분 모델을 풀어 `attach_detached` 로 붙인다.
+/// 환경 변수 `SKYLENS_REGION_DIAG` 가 있으면 성분 크기와 붙인 뒤 GPS 잔차를 표준 오류로 낸다. 붙인 성분 수를 돌려준다.
+#[allow(clippy::too_many_arguments)]
+fn merge_detached_components(
+    s: &mut Sparse,
+    imgs: &[&ImgData],
+    pm: &[PairMatch],
+    keep_edge: &[bool],
+    rots: &[Option<Rotation3<f64>>],
+    gps: &[Vector3<f64>],
+    k: &Intrinsics,
+    method: PositionMethod,
+    tri: &TriConfig,
+    opts: &PreviewOpts,
+) -> usize {
+    let n = imgs.len();
+    let mut uf: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    let mut touched = vec![false; n];
+    // 회전 평균 뒤 가지치기는 주 성분 밖 사진의 간선을 모두 뺐으므로(`keep_edge`), 주 성분 밖 사진끼리의 짝을
+    // 처음 거름(대응 수 하한)만 적용해 다시 모은다. 잘못된 짝은 부분 모델의 회전 평균이 따로 거른다.
+    let _ = keep_edge;
+    let usable =
+        |p: &PairMatch| rots[p.i].is_none() && rots[p.j].is_none() && p.inl.len() >= opts.min_inl;
+    for p in pm.iter().filter(|p| usable(p)) {
+        touched[p.i] = true;
+        touched[p.j] = true;
+        let (a, b) = (find(&mut uf, p.i), find(&mut uf, p.j));
+        if a != b {
+            uf[a.max(b)] = a.min(b);
+        }
+    }
+    let mut comps: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for v in (0..n).filter(|&v| touched[v] && rots[v].is_none()) {
+        let r = find(&mut uf, v);
+        comps.entry(r).or_default().push(v);
+    }
+    let diag = std::env::var("SKYLENS_REGION_DIAG").is_ok();
+    let mut merged = 0;
+    for comp in comps.values() {
+        if comp.len() < DETACHED_MIN_PHOTOS {
+            continue;
+        }
+        let loc: HashMap<usize, usize> = comp.iter().enumerate().map(|(a, &i)| (i, a)).collect();
+        let sub_pm: Vec<PairMatch> = pm
+            .iter()
+            .filter(|p| usable(p) && loc.contains_key(&p.i) && loc.contains_key(&p.j))
+            .map(|p| PairMatch {
+                i: loc[&p.i],
+                j: loc[&p.j],
+                inl: p.inl.clone(),
+                rot: p.rot,
+                t: p.t,
+                views: p.views,
+            })
+            .collect();
+        let sub_imgs: Vec<&ImgData> = comp.iter().map(|&i| imgs[i]).collect();
+        let sub_gps: Vec<Vector3<f64>> = comp.iter().map(|&i| gps[i]).collect();
+        let sub_opts = PreviewOpts {
+            merge_detached: false,
+            pair_vote: false,
+            legacy_roll: opts.legacy_roll,
+            refine_iters: opts.refine_iters,
+            ..PreviewOpts::default()
+        };
+        let r = sparse_init_with(
+            &sub_imgs,
+            &sub_pm,
+            &sub_gps,
+            k,
+            method,
+            tri,
+            (0, 2.0),
+            &sub_opts,
+        );
+        let Ok((sub, _)) = r else {
+            if diag {
+                eprintln!("diag detached size {} solve failed", comp.len());
+            }
+            continue;
+        };
+        // 사진 번호를 주 모델 번호공간으로 되돌린다.
+        let mut full = Sparse {
+            poses: vec![None; n],
+            points: sub.points,
+            obs: sub.obs,
+            ba_only: sub.ba_only,
+            rms: sub.rms,
+        };
+        for (a, &i) in comp.iter().enumerate() {
+            full.poses[i] = sub.poses[a];
+        }
+        for o in full
+            .obs
+            .iter_mut()
+            .chain(full.ba_only.iter_mut().map(|e| &mut e.1))
+        {
+            for x in o.iter_mut() {
+                x.0 = comp[x.0];
+            }
+        }
+        let cams: Vec<usize> = comp.iter().map(|&i| imgs_cam(pm, i)).collect();
+        let res = attach_detached(s, full, gps);
+        if diag {
+            match res {
+                Some((ok, med)) => eprintln!(
+                    "diag detached size {} cams {:?} attached gps_ok {} resid_med {:.3}",
+                    comp.len(),
+                    cam_counts(&cams),
+                    ok,
+                    med
+                ),
+                None => eprintln!(
+                    "diag detached size {} cams {:?} not attached",
+                    comp.len(),
+                    cam_counts(&cams)
+                ),
+            }
+        }
+        if res.is_some() {
+            merged += 1;
+        }
+    }
+    merged
+}
+
+fn imgs_cam(pm: &[PairMatch], i: usize) -> usize {
+    pm.iter()
+        .find_map(|p| {
+            if p.i == i {
+                Some(p.views.0 .0)
+            } else if p.j == i {
+                Some(p.views.1 .0)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(usize::MAX)
+}
+
+fn cam_counts(cams: &[usize]) -> [usize; 3] {
+    let mut c = [0; 3];
+    for &x in cams {
+        if x < 3 {
+            c[x] += 1;
+        }
+    }
+    c
 }
 
 /// 회전 평균 → 방향으로 좌표계 맞춤 → 위치 → 삼각측량. 초벌 희소 모델.
@@ -1417,6 +1712,15 @@ fn sparse_init_with(
             s.points.len(),
             s.obs.len()
         );
+    }
+    if opts.merge_detached {
+        let merged = merge_detached_components(
+            &mut s, imgs, pm, &keep_edge, &rots, gps, k, method, tri, opts,
+        );
+        if merged > 0 {
+            s.rms = run_ba(&mut s, k, 10, Some(gps), 2.0, &[]);
+            diag_poses("ba_merged", &s.poses);
+        }
     }
     if pre_ba.0 > 0 {
         // 짧은 GPS 사전항 BA: 초벌 포즈·점의 스케일·기울기·깊이를 정밀 쪽으로 당긴다.
@@ -4369,5 +4673,96 @@ mod choose_roll_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod detached_tests {
+    use super::*;
+
+    fn truth_rot() -> Rotation3<f64> {
+        Rotation3::from_euler_angles(0.3, 0.2, 0.1)
+    }
+
+    fn ground(x0: f64, y0: f64) -> Vec<Vector3<f64>> {
+        (0..30)
+            .map(|a| Vector3::new(x0 + (a % 6) as f64 * 3.0, y0 + (a / 6) as f64 * 3.0, 0.0))
+            .collect()
+    }
+
+    fn truth_center(i: usize) -> Vector3<f64> {
+        Vector3::new(i as f64, 15.0, 30.0)
+    }
+
+    /// 주 모델: 사진 0..10, 바닥 점. 부분 모델: 사진 10..10+n 을 정답에서 비행 축 둘레 25° 돌리고 3 m 옮긴 것.
+    fn setup(n_sub: usize) -> (Sparse, Sparse, Vec<Vector3<f64>>) {
+        let total = 10 + n_sub;
+        let mut main = Sparse {
+            poses: vec![None; total],
+            points: ground(0.0, 0.0),
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        };
+        for i in 0..10 {
+            main.poses[i] = Some(Pose::from_center(
+                truth_rot(),
+                &Point3::from(truth_center(i)),
+            ));
+        }
+        let mut sub = Sparse {
+            poses: vec![None; total],
+            points: ground(0.0, 12.0),
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        };
+        for i in 10..total {
+            sub.poses[i] = Some(Pose::from_center(
+                truth_rot(),
+                &Point3::from(truth_center(i)),
+            ));
+        }
+        let mean = Vector3::new(10.0 + n_sub as f64 / 2.0, 15.0, 30.0);
+        let r = Rotation3::from_axis_angle(&Vector3::x_axis(), 25f64.to_radians());
+        apply_sparse_sim(
+            &mut sub,
+            &Similarity {
+                s: 1.0,
+                r,
+                t: mean - r * mean + Vector3::new(2.0, -1.5, 1.0),
+            },
+        );
+        let gps = (0..total).map(truth_center).collect();
+        (main, sub, gps)
+    }
+
+    #[test]
+    fn detached_component_attaches_within_one_meter_and_two_degrees() {
+        let (mut main, sub, gps) = setup(12);
+        let (ok, med) = attach_detached(&mut main, sub, &gps).expect("attached");
+        assert!(ok >= 10 && med < 1.0, "{ok} {med}");
+        for i in 10..22 {
+            let p = main.poses[i].expect("pose");
+            let dc = (p.center().coords - truth_center(i)).norm();
+            let da = (p.rotation * truth_rot().inverse()).angle().to_degrees();
+            assert!(dc < 1.0 && da < 2.0, "photo {i}: {dc} m {da} deg");
+        }
+        assert_eq!(main.points.len(), 60);
+    }
+
+    #[test]
+    fn too_few_photos_or_gps_inliers_are_not_attached() {
+        let (mut main, sub, gps) = setup(5);
+        assert!(attach_detached(&mut main, sub, &gps).is_none());
+        assert!(main.poses[10..].iter().all(|p| p.is_none()));
+        // GPS 정상 대응 2 개뿐: 나머지는 50 m 어긋남.
+        let (mut main, sub, mut gps) = setup(12);
+        for g in gps.iter_mut().skip(12) {
+            g.y += 50.0 + g.x;
+        }
+        assert!(attach_detached(&mut main, sub, &gps).is_none());
+        assert!(main.poses[10..].iter().all(|p| p.is_none()));
+        assert_eq!(main.points.len(), 30);
     }
 }
