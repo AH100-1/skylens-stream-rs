@@ -326,10 +326,8 @@ fn stage_report(
 /// 입력 상대 회전(`diag pair`)을 정답 R_j R_iᵀ 와 비교: 구역별로 간선 수, 5° 넘게 어긋난 간선 수(전체/남긴 것),
 /// 어긋난 간선의 정상 대응 수 중앙과 정상 간선의 정상 대응 수 중앙.
 fn pair_report(stderr: &str, truth: &HashMap<String, Matrix3<f64>>) {
-    let mut stats: std::collections::BTreeMap<
-        usize,
-        (usize, usize, usize, Vec<usize>, Vec<usize>),
-    > = Default::default();
+    type PairStat = (usize, usize, usize, Vec<usize>, Vec<usize>);
+    let mut stats: std::collections::BTreeMap<usize, PairStat> = Default::default();
     for l in stderr.lines() {
         let Some(rest) = l.strip_prefix("diag pair region ") else {
             continue;
