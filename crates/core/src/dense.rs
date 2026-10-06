@@ -833,7 +833,100 @@ fn region_cloud_impl(
     let t_fuse = std::time::Instant::now();
     let cloud = fuse_stage(&st, cfg);
     crate::timing::add("fusion", t_fuse.elapsed().as_secs_f64());
+    record_view_diag(&st, &cloud, cfg);
     cloud
+}
+
+/// 진단 기록 한 건: 밀집 단계 한 번(구역 하나)의 사진별 이웃과 융합 점의 기준 사진.
+#[derive(Clone, Debug)]
+pub struct ViewDiagRecord {
+    /// `preps` 순서의 카메라(깊이 맵 해상도 기준 내부 파라미터).
+    pub cams: Vec<Camera>,
+    /// 입력 사진 번호(준비에 실패한 사진은 빠진다).
+    pub src: Vec<usize>,
+    /// 사진별 이웃(`cams` 안 위치, 점수 내림차순).
+    pub neighbors: Vec<Vec<usize>>,
+    /// 융합 점(희소 점을 덧붙이기 전).
+    pub points: Vec<[f32; 3]>,
+    /// 점마다 기준 사진(`cams` 안 위치). 융합은 기준 사진 순서(유효 화소 많은 순)로 점을 내므로
+    /// 그 순서를 따라가며 점이 현재 기준 사진의 깊이와 맞는지(재투영·상대 깊이) 보고 정한다.
+    /// 어느 사진과도 맞지 않으면 `usize::MAX`.
+    pub point_view: Vec<usize>,
+}
+
+static VIEW_DIAG: std::sync::Mutex<Option<Vec<ViewDiagRecord>>> = std::sync::Mutex::new(None);
+
+/// 진단 기록을 켠다(이전 기록은 버린다). 기본은 꺼짐이고, 꺼져 있으면 밀집 결과에 아무 영향이 없다.
+pub fn view_diag_enable() {
+    *VIEW_DIAG.lock().unwrap() = Some(Vec::new());
+}
+
+/// 쌓인 진단 기록을 꺼내고 끈다.
+pub fn view_diag_take() -> Vec<ViewDiagRecord> {
+    VIEW_DIAG.lock().unwrap().take().unwrap_or_default()
+}
+
+fn record_view_diag(st: &DepthStage, cloud: &PointCloud, cfg: &DenseConfig) {
+    if VIEW_DIAG.lock().unwrap().is_none() {
+        return;
+    }
+    let f = fusion_config(cfg);
+    let valid: Vec<usize> = st
+        .maps
+        .iter()
+        .map(|m| {
+            m.depth
+                .iter()
+                .filter(|d| d.is_finite() && **d > 0.0)
+                .count()
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..st.maps.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(valid[i]));
+    let fits = |v: usize, p: &Point3<f64>| -> bool {
+        let (m, c) = (&st.maps[v], &st.preps[v].camera);
+        let Some(q) = c.project(p) else { return false };
+        if q.x < 0.0 || q.y < 0.0 {
+            return false;
+        }
+        let (x, y) = (q.x as usize, q.y as usize);
+        if x >= m.w || y >= m.h {
+            return false;
+        }
+        let d = m.depth[y * m.w + x];
+        if !(d.is_finite() && d > 0.0) {
+            return false;
+        }
+        let z = c.pose.transform(p).z;
+        let center = Vector2::new(x as f64 + 0.5, y as f64 + 0.5);
+        (q - center).norm() <= f.reproj_px + 1.0
+            && ((z - d as f64) / d as f64).abs() <= 2.0 * f.depth_rel
+    };
+    let mut cur = 0usize;
+    let mut point_view = Vec::with_capacity(cloud.points.len());
+    for p in &cloud.points {
+        let w = Point3::new(p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64);
+        let mut k = cur;
+        while k < order.len() && !fits(order[k], &w) {
+            k += 1;
+        }
+        if k < order.len() {
+            cur = k;
+            point_view.push(order[k]);
+        } else {
+            point_view.push(usize::MAX);
+        }
+    }
+    let rec = ViewDiagRecord {
+        cams: st.preps.iter().map(|v| v.camera).collect(),
+        src: st.src.clone(),
+        neighbors: st.neighbors.clone(),
+        points: cloud.points.iter().map(|p| p.xyz).collect(),
+        point_view,
+    };
+    if let Some(v) = VIEW_DIAG.lock().unwrap().as_mut() {
+        v.push(rec);
+    }
 }
 
 #[cfg(test)]
