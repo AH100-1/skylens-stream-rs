@@ -244,6 +244,12 @@ fn default_args_synth_run_verify() {
         number_after(&pa, "잔차 중앙 최대 ") < ALIGN_FIT_MAX_M,
         "{pa}"
     );
+    // 회귀 상한: 실측 5.77%(연구 노트 pipeline-multizone-test 표) x 1.5 = 8.7%. SPEC 판정값(10%)과 별개로 더 일찍 알린다.
+    eprintln!("preview_align: {pa}");
+    assert!(
+        number_after(&pa, "구역 간 스케일 차 ") <= 8.7,
+        "스케일 차 회귀 상한: {pa}"
+    );
     let m = measure(&input, &output);
     eprintln!(
         "chunks {chunks} run {run_secs:.1}s registered {} center med {:.4} max {:.4} points {} surface med {:.4} p95 {:.4}",
