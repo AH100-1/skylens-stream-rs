@@ -136,11 +136,26 @@ fn l_pose_errors(input: &std::path::Path, stderr: &str) {
 /// 중앙값(`abs`), 모든 카메라에 공통인 좌표계 회전(척도 평균, `global`), 그것을 뺀 나머지(`resid`)를 낸다.
 /// 공통 회전이 크면 모델 전체가 기운 것(롤·좌표계), 나머지가 크면 사진끼리 어긋난 것이다.
 fn stage_errors(input: &std::path::Path, stderr: &str) {
-    for r in stage_rows(input, stderr) {
+    let rows = stage_rows(input, stderr);
+    for r in &rows {
         eprintln!(
             "serr region {} {} {} cams {} n {} abs {:.2} global {:.2} resid {:.2}",
             r.region, r.tag, r.phase, r.cams, r.n, r.abs, r.global, r.resid
         );
+    }
+    // 같은 단계에서 정면·오른쪽 묶음과 왼쪽 묶음의 공통 오차 회전끼리의 각(상대 회전 오차)
+    for fr in rows.iter().filter(|r| r.cams == "FR") {
+        if let Some(l) = rows.iter().find(|l| {
+            l.cams == "L" && (l.region, &l.tag, &l.phase) == (fr.region, &fr.tag, &fr.phase)
+        }) {
+            let rel = Rotation3::from_matrix_unchecked(fr.bar.transpose() * l.bar)
+                .angle()
+                .to_degrees();
+            eprintln!(
+                "rel region {} {} {} fr_vs_l {:.2}",
+                fr.region, fr.tag, fr.phase, rel
+            );
+        }
     }
 }
 
@@ -153,6 +168,7 @@ struct StageRow {
     abs: f64,
     global: f64,
     resid: f64,
+    bar: Matrix3<f64>,
 }
 
 fn stage_rows(input: &std::path::Path, stderr: &str) -> Vec<StageRow> {
@@ -235,6 +251,7 @@ fn stage_rows(input: &std::path::Path, stderr: &str) -> Vec<StageRow> {
                 abs: med(errs.iter().map(|e| angle(*e)).collect()),
                 global: angle(bar),
                 resid: med(errs.iter().map(|e| angle(e * bar.transpose())).collect()),
+                bar,
             });
         }
     }
