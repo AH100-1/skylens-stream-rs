@@ -125,9 +125,16 @@ pub fn scheduled_pairs(views: &[(usize, usize)], sch: &PairSchedule) -> Vec<(usi
                             (CAM_FRONT, CAM_LEFT) => Some(left_min),
                             _ => None,
                         };
-                        lo.is_some_and(|lo| {
-                            pb >= pa + lo && pb <= pa + max && (pb - pa - lo) % step.max(1) == 0
-                        })
+                        // 맨 끝 위치의 왼쪽 사진은 +20 이상 떨어진 앞 카메라 사진이 거의 없어 짝이 비면 등록에서 빠진다.
+                        // 왼쪽만 +12·+16 두 칸을 더 둔다(틀린 회전은 짝 투표가 거른다).
+                        let near_left = (ca, cb) == (CAM_FRONT, CAM_LEFT)
+                            && pb >= pa + left_min.saturating_sub(8)
+                            && pb < pa + left_min
+                            && (pb - pa) % step.max(1) == left_min.saturating_sub(8) % step.max(1);
+                        near_left
+                            || lo.is_some_and(|lo| {
+                                pb >= pa + lo && pb <= pa + max && (pb - pa - lo) % step.max(1) == 0
+                            })
                     }
                 }
             };
@@ -2685,7 +2692,9 @@ mod tests {
                 } else {
                     ((cb, pb), (ca, pa))
                 };
-                assert!(po >= pf + 20 && po <= pf + 40 && (po - pf) % 4 == 0);
+                let near = co == CAM_LEFT && po >= pf + 12 && po < pf + 20;
+                assert!(near || (po >= pf + 20 && po <= pf + 40));
+                assert!((po - pf) % 4 == 0);
                 kinds.insert(co);
             }
         }
