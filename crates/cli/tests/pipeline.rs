@@ -245,7 +245,7 @@ fn synthetic_single_region_end_to_end() {
         check_item(&c, n, true);
     }
     // 기본 설정(초벌 BA 0회, 다듬기 5회) 실측: verify 7/7.
-    // preview_align 통과: 점쌍 2716, 잔차 중앙 최대 0.818 m (목표 < 6 m).
+    // preview_align 통과: 점쌍 6282, 잔차 중앙 최대 0.580 m (목표 < 6 m).
     check_item(&c, "preview_align", true);
     let pa = c.report.item("preview_align").unwrap();
     assert!(
@@ -256,7 +256,7 @@ fn synthetic_single_region_end_to_end() {
     // 구역 1개: 이웃 겹침은 해당 없음.
     let ov = c.report.item("refined_overlap").unwrap();
     assert!(ov.measured.contains("해당 없음"), "{}", ov.measured);
-    // 통과(초벌 다듬기 5회): 최근접 중앙 최대 0.688 m (< 3 m), 높이 차 중앙 최대 0.564 m (< 2 m). 초벌 점 광선 각 20도 이상만 남김.
+    // 통과(초벌 다듬기 5회): 최근접 중앙 최대 0.450 m (< 3 m), 높이 차 중앙 최대 0.237 m (< 2 m). 초벌 점 광선 각 20도 이상만 남김.
     check_item(&c, "preview_vs_refined", true);
     let pr = c.report.item("preview_vs_refined").unwrap();
     assert!(
@@ -297,7 +297,7 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         ov.measured
     );
-    // 통과(초벌 중심 다듬기 5회): 높이 차 중앙 최대 1.026 m, 최근접 0.970 m (목표 높이 차 < 2 m, 최근접 < 3 m).
+    // 통과(초벌 중심 다듬기 5회): 높이 차 중앙 최대 0.392 m, 최근접 0.524 m (목표 높이 차 < 2 m, 최근접 < 3 m).
     check_item(&c, "preview_vs_refined", true);
     let pr = c.report.item("preview_vs_refined").unwrap();
     assert!(
@@ -425,7 +425,7 @@ fn preview_refine_settings_verify_outcome() {
             eprintln!("REFINE {tag}   {} pass={} {}", i.name, i.pass, i.measured);
         }
     }
-    for (c, px_lo, px_hi) in [(&a, 2.5, 3.5), (&b, 0.7, 1.2)] {
+    for (c, px_lo, px_hi) in [(&a, 2.5, 3.5), (&b, 0.3, 0.6)] {
         assert_eq!(c.registered, 120);
         // 단구역은 두 설정 모두 7/7 통과한다.
         assert!(
@@ -438,7 +438,7 @@ fn preview_refine_settings_verify_outcome() {
             "초벌 재투영 {} px",
             c.preview_px
         );
-        assert!((c.refined_px - 0.313).abs() < 0.05, "정밀 {}", c.refined_px);
+        assert!((c.refined_px - 0.213).abs() < 0.03, "정밀 {}", c.refined_px);
     }
     // 정밀 쪽은 같고 초벌만 달라진다(위치 전용 다듬기는 정밀 시작점을 바꾸지 않는다).
     assert!((a.center_med - b.center_med).abs() < 1e-3);
@@ -482,7 +482,7 @@ fn two_region_refine_off_verify_outcome() {
     ] {
         check_item(&c, n, true);
     }
-    // 실측: 초벌 재투영 3.209 px, preview_vs_refined 최근접 중앙 최대 4.535 m, 높이 차 4.767 m (목표 3 m, 2 m).
+    // 실측: 초벌 재투영 3.140 px, preview_vs_refined 최근접 중앙 최대 3.916 m, 높이 차 4.656 m (목표 3 m, 2 m).
     assert!(c.preview_px > 2.5, "초벌 재투영 {}", c.preview_px);
     check_item(&c, "preview_vs_refined", false);
     let pr = c.report.item("preview_vs_refined").unwrap();
