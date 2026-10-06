@@ -907,6 +907,16 @@ impl NnIndex {
 
     /// `max_r` 안의 최근접 점 (점, 거리). 없으면 None.
     pub fn nearest(&self, q: &[f64; 3], max_r: f64) -> Option<([f64; 3], f64)> {
+        self.nearest_counted(q, max_r, &mut [0, 0])
+    }
+
+    /// `nearest` 와 같고, `work` 에 [열어 본 노드 수, 거리를 잰 점 수] 를 더한다.
+    fn nearest_counted(
+        &self,
+        q: &[f64; 3],
+        max_r: f64,
+        work: &mut [usize; 2],
+    ) -> Option<([f64; 3], f64)> {
         if self.nodes.is_empty() || !usable(q) {
             return None;
         }
@@ -921,8 +931,10 @@ impl NnIndex {
             if self.box_d2(n, q) >= best_d2 {
                 continue;
             }
+            work[0] += 1;
             match n.kids {
                 None => {
+                    work[1] += n.end - n.start;
                     for i in n.start..n.end {
                         let d = self.d2(q, &self.pts[i]);
                         if d < best_d2 {
@@ -1284,13 +1296,39 @@ mod tests {
                 }
             })
             .collect();
+        // 시간 대신 일의 양을 잰다: 질의당 연 노드 수·거리를 잰 점 수의 상한.
+        // 가지치기를 `>` 로 두면 같은 좌표 점 20만 개를 모두 열어 상한을 크게 넘는다.
+        for dims in [2usize, 3] {
+            let t = NnIndex::new(&reference, dims);
+            let mut max = [0usize; 2];
+            for q in &query {
+                let mut w = [0usize; 2];
+                let r = t.nearest_counted(q, 2.0, &mut w);
+                assert!(r.is_some());
+                // 첫 위반 질의에서 바로 멈춘다(변이에서는 질의당 20만 점이라 끝까지 돌면 오래 걸린다).
+                assert!(w[0] <= 32, "dims {dims}: nodes {} (query {q:?})", w[0]);
+                assert!(
+                    w[1] <= 4 * LEAF,
+                    "dims {dims}: points {} (query {q:?})",
+                    w[1]
+                );
+                max = [max[0].max(w[0]), max[1].max(w[1])];
+            }
+            println!("dims {dims}: max nodes {} max points {}", max[0], max[1]);
+        }
         let t0 = std::time::Instant::now();
         let m = nn_median(&query, &reference).unwrap();
+        let t_nn = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
         let h = height_pair_median(&query, &reference, 2.0).unwrap();
-        let secs = t0.elapsed().as_secs_f64();
+        let t_h = t1.elapsed().as_secs_f64();
         assert!((m - 0.5).abs() < 1e-9, "{m}");
         assert_eq!(h, 0.0);
-        assert!(secs < 1.0, "{secs:.3} s");
+        // 단독 측정은 두 함수 합쳐 0.73~0.86 s. 상한은 고치기 전 165 s 와 구분되는 값.
+        assert!(
+            t_nn < 10.0 && t_h < 10.0,
+            "nn {t_nn:.3} s, height {t_h:.3} s"
+        );
     }
 
     /// 같은 좌표·같은 거리 점이 많은 점군에서 브루트포스와 거리가 같고,
