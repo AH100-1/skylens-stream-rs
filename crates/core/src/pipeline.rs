@@ -1185,7 +1185,7 @@ fn roll_by_level_spread(
 }
 
 /// 부분 모델을 붙이는 데 필요한 최소 사진 수와 GPS 정상 대응 수.
-const DETACHED_MIN_PHOTOS: usize = 6;
+const DETACHED_MIN_PHOTOS: usize = 5;
 const DETACHED_MIN_GPS_OK: usize = 3;
 /// 붙인 뒤 GPS 대응을 정상으로 치는 거리(m). 합성 GPS 잡음(축마다 1.5 m)의 3차원 중앙값이 약 2.5 m 라 넉넉히 잡는다.
 const DETACHED_GPS_OK_M: f64 = 5.0;
@@ -1231,7 +1231,7 @@ fn ground_normal(points: &[Vector3<f64>]) -> Option<Vector3<f64>> {
 /// 부분 모델 `sub`(사진 번호는 주 모델과 같은 번호공간)을 주 모델 `s` 에 붙인다. 부분 모델은 GPS 방향 맞춤을 한
 /// 상태지만 직선 비행에서는 비행 축 둘레 회전이 정해지지 않으므로, 두 모델의 바닥 평면 법선이 같도록 축 둘레
 /// 회전을 고른 뒤 GPS 중심으로 이동(과 규모는 그대로)을 맞춘다. 반환: (GPS 정상 대응 수, 정상 대응 잔차 중앙값 m).
-/// 사진이 6장 미만이거나 GPS 정상 대응이 3 미만이면 붙이지 않고 None.
+/// 사진이 5장 미만이거나 GPS 정상 대응이 3 미만이면 붙이지 않고 None.
 fn attach_detached(
     s: &mut Sparse,
     mut sub: Sparse,
@@ -1630,7 +1630,7 @@ fn icp_similarity(
     ok.then_some(sim)
 }
 
-/// 회전 평균 주 성분에 붙지 못한 연결 성분(사진 6장 이상)마다 따로 부분 모델을 풀어 `attach_detached` 로 붙인다.
+/// 회전 평균 주 성분에 붙지 못한 연결 성분(사진 5장 이상)마다 따로 부분 모델을 풀어 `attach_detached` 로 붙인다.
 /// 환경 변수 `SKYLENS_REGION_DIAG` 가 있으면 성분 크기와 붙인 뒤 GPS 잔차를 표준 오류로 낸다. 붙인 성분 수를 돌려준다.
 #[allow(clippy::too_many_arguments)]
 fn merge_detached_components(
@@ -5125,7 +5125,7 @@ mod detached_tests {
 
     #[test]
     fn too_few_photos_or_gps_inliers_are_not_attached() {
-        let (mut main, sub, gps) = setup(5);
+        let (mut main, sub, gps) = setup(4);
         assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
         // GPS 정상 대응 2 개뿐: 나머지는 50 m 어긋남.
