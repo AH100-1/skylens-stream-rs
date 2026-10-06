@@ -381,9 +381,10 @@ pub fn image_path(root: &Path, cam: &str, frame: u32) -> PathBuf {
 
 /// 데이터셋 읽기.
 ///
-/// 세 카메라 중 하나라도 있는 프레임 가운데 가장 작은 번호 f0 에서 시작해, 실제로 있는 프레임 중
-/// (f − f0) 가 STRIDE 의 배수인 것을 고른다. 그중 세 카메라가 모두 있는 프레임만 위치 0, 1, … 로
-/// 매기고, 카메라가 빠진 프레임은 `Dataset::skipped` 에 남긴다. 건너뛴 프레임이
+/// 세 카메라 중 하나라도 있는 프레임 가운데 가장 작은 번호 f0, 가장 큰 번호 f_last 에 대해
+/// 격자 f0 + k·STRIDE (f_last 이하)를 후보로 한다. 그중 세 카메라가 모두 있는 프레임만 위치
+/// 0, 1, … 로 매기고, 카메라가 빠진 프레임과 세 카메라 모두 없는 격자 프레임은
+/// `Dataset::skipped` 에 남긴다(없는 격자 수는 산술로 센다). 건너뛴 프레임이
 /// `max_skip_run` 보다 많이 연속되면(앞·뒤 끝 포함) `SkipRun`.
 /// 고른 위치의 어느 카메라 GPS 가 없거나, 폴더·gps.txt 가 없거나, gps.txt 형식이 틀리면 Err.
 pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, DatasetError> {
@@ -429,7 +430,36 @@ pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, Datas
         }),
         _ => Ok(()),
     };
+    let f_last = *all.last().unwrap_or(&f0);
+    // 격자 f0 + k·STRIDE (k = 0..=(f_last−f0)/STRIDE) 중 아직 다루지 않은 첫 k.
+    let mut next_k: u64 = 0;
+    // 사진이 하나도 없는 격자 프레임 k0..k1 을 건너뜀 연속에 더한다(산술로 세고,
+    // 허용을 넘는 연속은 어차피 오류라 목록에 풀어 쓰지 않는다).
+    let add_absent =
+        |run: &mut Option<(u32, u32, usize)>, skipped: &mut Vec<SkippedFrame>, k0: u64, k1: u64| {
+            if k1 <= k0 {
+                return;
+            }
+            let at = |k: u64| (u64::from(f0) + k * stride) as u32;
+            let n = (k1 - k0) as usize;
+            let (first, count) = match *run {
+                Some((first, _, c)) => (first, c.saturating_add(n)),
+                None => (at(k0), n),
+            };
+            if count <= config.max_skip_run {
+                for k in k0..k1 {
+                    skipped.push(SkippedFrame {
+                        frame: at(k),
+                        missing: CAMERAS.to_vec(),
+                    });
+                }
+            }
+            *run = Some((first, at(k1 - 1), count));
+        };
     for &frame in all.iter().filter(|&&f| u64::from(f - f0) % stride == 0) {
+        let k = u64::from(frame - f0) / stride;
+        add_absent(&mut run, &mut skipped, next_k, k);
+        next_k = k + 1;
         let missing: Vec<&'static str> = (0..3)
             .filter(|&c| !sets[c].contains_key(&frame))
             .map(|c| CAMERAS[c])
@@ -468,6 +498,12 @@ pub fn load_dataset(root: &Path, config: DatasetConfig) -> Result<Dataset, Datas
     if positions.is_empty() {
         return Err(DatasetError::Empty);
     }
+    add_absent(
+        &mut run,
+        &mut skipped,
+        next_k,
+        u64::from(f_last - f0) / stride + 1,
+    );
     check_run(run)?;
     Ok(Dataset {
         root: root.to_path_buf(),
@@ -1039,7 +1075,7 @@ mod tests {
 
     #[test]
     fn huge_frame_gap_is_fast() {
-        // 프레임 0 과 4000000000 만: 공백을 한 칸씩 돌지 않고 있는 프레임에서 고른다.
+        // 프레임 0 과 4000000000 만: 빠진 격자가 허용보다 훨씬 많아 SkipRun, 1 초 안.
         let t = TempDir::new("gap");
         make(&t.0, 1, &[], &[]);
         let mut gps = std::fs::read_to_string(t.0.join("gps.txt")).unwrap();
@@ -1048,20 +1084,58 @@ mod tests {
             gps += &format!("{cam}_4000000000.jpg 37 127.1 50\n");
         }
         std::fs::write(t.0.join("gps.txt"), gps).unwrap();
-        let t0 = std::time::Instant::now();
-        let cfg = DatasetConfig {
-            stride: 1,
-            ..Default::default()
-        };
-        let ds = load_dataset(&t.0, cfg).unwrap();
-        let dt = t0.elapsed().as_secs_f64();
-        assert!(dt < 1.0, "{dt} s");
-        assert_eq!(
-            ds.positions.iter().map(|p| p.frame).collect::<Vec<_>>(),
-            vec![0, 4000000000]
-        );
-        // STRIDE 3: 4000000000 − 0 은 3 의 배수가 아니라 빠진다(3·1333333333 = 3999999999).
-        let ds3 = load_dataset(&t.0, DatasetConfig::default()).unwrap();
-        assert_eq!(ds3.positions.len(), 1);
+        for (stride, last, count) in [
+            (1, 3_999_999_999u32, 3_999_999_999usize),
+            (3, 3_999_999_999, 1_333_333_333),
+        ] {
+            let t0 = std::time::Instant::now();
+            let cfg = DatasetConfig {
+                stride,
+                ..Default::default()
+            };
+            match load_dataset(&t.0, cfg) {
+                Err(DatasetError::SkipRun {
+                    first,
+                    last: l,
+                    count: c,
+                    limit,
+                }) => assert_eq!((first, l, c, limit), (stride as u32, last, count, 2)),
+                r => panic!("{r:?}"),
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            assert!(dt < 1.0, "{dt} s");
+        }
+    }
+
+    #[test]
+    fn all_cameras_missing_frames_count_as_skipped() {
+        // 0..39 에서 6..30 을 세 카메라 모두 지움: 격자 6,9,…,30 의 9곳 연속 → SkipRun.
+        let t = TempDir::new("allgone");
+        let skip: Vec<(usize, u32)> = (0..3).flat_map(|c| (6..=30).map(move |f| (c, f))).collect();
+        make(&t.0, 40, &skip, &[]);
+        match load_dataset(&t.0, DatasetConfig::default()) {
+            Err(DatasetError::SkipRun {
+                first,
+                last,
+                count,
+                limit,
+            }) => assert_eq!((first, last, count, limit), (6, 30, 9, 2)),
+            r => panic!("{r:?}"),
+        }
+        // 프레임 6 만 세 카메라 모두 없음: skipped == [6], 위치 13곳.
+        let t = TempDir::new("onegone");
+        let skip: Vec<(usize, u32)> = (0..3).map(|c| (c, 6)).collect();
+        make(&t.0, 40, &skip, &[]);
+        let ds = load_dataset(&t.0, DatasetConfig::default()).unwrap();
+        assert_eq!(ds.skipped_frames(), vec![6]);
+        assert_eq!(ds.skipped[0].missing, vec!["camF", "camR", "camL"]);
+        assert_eq!(ds.positions.len(), 13);
+        // 33..39 가 모두 없으면 f_last = 32, 격자 끝 30 이라 빠진 격자가 없다.
+        let t = TempDir::new("tailgone");
+        let skip: Vec<(usize, u32)> = (0..3).flat_map(|c| (33..40).map(move |f| (c, f))).collect();
+        make(&t.0, 40, &skip, &[]);
+        let ds = load_dataset(&t.0, DatasetConfig::default()).unwrap();
+        assert_eq!(ds.positions.len(), 11);
+        assert!(ds.skipped.is_empty());
     }
 }

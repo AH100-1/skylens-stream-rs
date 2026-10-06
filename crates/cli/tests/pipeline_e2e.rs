@@ -280,11 +280,6 @@ fn single_region_end_to_end() {
     );
 }
 
-/// 구역 2개(README 둘째 명령, stride 1 → 80위치 × 3대 = 240장): refined_overlap 이 실제로 판정된다.
-/// 시험 전체 약 3 분(부하 낮을 때 179 초, 부하 22 에서는 run 만 332 초). 실측(초벌 위치 다듬기 이전): verify 6/7 종료 코드 1, 중심 오차 중앙 0.290/최대 3.115 m,
-/// 정밀 점 표면 거리 중앙 0.494/95% 3.022 m (점 19855개). 상한은 실측 x 1.2.
-/// 초벌 위치 다듬기 뒤 preview_vs_refined 통과(SPEC 기준 높이 차 < 2 m, 최근접 < 3 m), verify 7/7. preview_align 은 통과: 구역 간 점쌍을 구역의
-/// 모든 이미지 관측으로 만들어 점쌍 최소 1221 (정렬 창 12장만 쓰면 324), 스케일 차 0.05% (창만 쓰면 8.26%), 잔차 중앙 최대 5.130 m.
 /// 구역 ≥ 2 에서 verify 의 구역 간 항목을 '해당 없음' 없이 판정하고, SPEC/verify 기준(`skylens_core::verify` 상수)으로 상한을 건다.
 fn assert_two_region_spec(o: &Outcome) {
     assert_eq!(o.m.registered, 240, "등록 수");
@@ -330,17 +325,36 @@ fn assert_two_region_spec(o: &Outcome) {
     );
 }
 
+/// 구역 2개 구역 간 스케일 차 회귀 상한(%). 실측 0.55% 의 약 3.6배. SPEC 판정값(`ALIGN_SCALE_TOL`, 10%)과는 별개다.
+const TWO_REGION_SCALE_REGRESSION_PCT: f64 = 2.0;
+
+fn assert_two_region_scale_regression(o: &Outcome) {
+    let (_, pa) = item(&o.verify, "preview_align");
+    let s = number_after(&pa, "구역 간 스케일 차 ");
+    assert!(
+        s <= TWO_REGION_SCALE_REGRESSION_PCT,
+        "스케일 차 회귀 상한: {pa}"
+    );
+}
+
 /// README 둘째 명령에서 BA 반복만 10회로 줄인 경우(F-273: BA 반복별 수치). 구역 간 항목 기준은 15회와 같다.
 #[test]
 fn two_region_end_to_end_ba10() {
     let o = pipeline("two_ba10", "1", "10");
     assert_two_region_spec(&o);
+    assert_two_region_scale_regression(&o);
 }
 
+/// 구역 2개(README 둘째 명령, stride 1 → 80위치 × 3대 = 240장): refined_overlap 이 실제로 판정된다.
+/// 시험 전체 약 3 분(부하 낮을 때 179 초, 부하 22 에서는 run 만 332 초).
+/// 실측: verify 7/7 종료 코드 0. preview_align 은 구역 간 점쌍을 구역의 모든 이미지 관측으로 만들어 점쌍 최소 2914,
+/// 스케일 차 0.55%, 잔차 중앙 최대 0.176 m. 겹침 차 중앙 최대 0.152 m, 높이 차 중앙 최대 0.445 m, 최근접 중앙 최대 0.552 m.
+/// 판정은 SPEC 상수(`assert_two_region_spec`)로, 스케일 차는 따로 실측 기반 회귀 상한(`TWO_REGION_SCALE_REGRESSION_PCT`)을 건다.
 #[test]
 fn two_region_end_to_end() {
     let o = pipeline("two", "1", "15");
     assert_two_region_spec(&o);
+    assert_two_region_scale_regression(&o);
     assert!(o.m.center_med < 0.35, "중심 오차 중앙 {}", o.m.center_med);
     assert!(o.m.center_max < 3.75, "중심 오차 최대 {}", o.m.center_max);
     assert!(o.m.surface_med < 0.60, "점 중앙 {}", o.m.surface_med);
