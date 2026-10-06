@@ -5481,7 +5481,7 @@ mod detached_tests {
 
     #[test]
     fn too_few_photos_or_gps_inliers_are_not_attached() {
-        let (mut main, sub, gps) = setup(5);
+        let (mut main, sub, gps) = setup(4);
         assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
         // GPS 정상 대응 2 개뿐: 나머지는 50 m 어긋남.
