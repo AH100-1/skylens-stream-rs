@@ -134,7 +134,10 @@ pub struct TrackStats {
     /// 범위 밖 번호·같은 영상 짝이라 버린 대응 수.
     pub invalid_matches: usize,
     /// Drop: 버린 충돌 성분 수. Split: 충돌(또는 지지도 0 으로 두 트랙 잇기) 때문에 건너뛴 간선 수.
+    /// Split 에서는 간선 투표로 끊은 간선([`TrackStats::vote_cuts`])도 여기에 더해진다.
     pub conflicts: usize,
+    /// Split: 같은 영상 갈래 간선 투표로 끊은 간선 수(`conflicts` 에 포함된 부분).
+    pub vote_cuts: usize,
     /// 길이 미달로 버린 성분 수.
     pub too_short: usize,
     /// Split: 같은 짝 이웃 대응의 변위와 어긋나 버린 대응 수.
@@ -143,6 +146,9 @@ pub struct TrackStats {
     pub truncated: usize,
     pub tracks: usize,
 }
+
+/// 간선 투표(같은 영상 갈래) 반복 상한.
+const VOTE_ROUNDS: usize = 3;
 
 /// 합집합-찾기. 대표는 항상 성분 안 가장 작은 노드 번호다(순서와 무관한 대표).
 struct UnionFind {
@@ -253,27 +259,30 @@ pub fn build_tracks(
             // 간선 투표: 한 노드가 같은 영상의 서로 다른 특징 둘 이상과 이어지면(갈래) 적어도 하나는 오대응이다.
             // 지지도(공통 이웃 수)가 가장 큰 간선만 남기고, 가장 큰 지지도가 1 이상인 채 동률이면 모두 끊는다
             // (일관되게 바뀐 점과 참 대응이 둘 다 삼각형을 이루는 경우). 지지도 0 동률은 아래 순서 규칙에 맡긴다.
-            let (mut start, mut flat);
-            loop {
-                start = vec![0usize; n + 1];
-                for &(u, v) in &edges {
-                    start[u + 1] += 1;
-                    start[v + 1] += 1;
-                }
-                for i in 0..n {
-                    start[i + 1] += start[i];
-                }
-                let mut fill = start.clone();
-                flat = vec![0usize; 2 * edges.len()];
-                for &(u, v) in &edges {
-                    flat[fill[u]] = v;
-                    fill[u] += 1;
-                    flat[fill[v]] = u;
-                    fill[v] += 1;
-                }
-                for i in 0..n {
-                    flat[start[i]..start[i + 1]].sort_unstable();
-                }
+            // CSR 는 한 번만 만든다. 간선은 (작은 번호, 큰 번호) 순으로 정렬돼 있어 채우는 순서가 곧
+            // 노드별 이웃 오름차순이다(작은 이웃이 먼저, 큰 이웃이 나중). 노드 번호는 영상별로 연속이라
+            // 같은 영상의 이웃은 이웃 목록에서 연속 구간을 이룬다. `fe` 는 평탄 배열 항목의 간선 번호.
+            let mut start = vec![0usize; n + 1];
+            for &(u, v) in &edges {
+                start[u + 1] += 1;
+                start[v + 1] += 1;
+            }
+            for i in 0..n {
+                start[i + 1] += start[i];
+            }
+            let mut fill = start.clone();
+            let mut flat = vec![0usize; 2 * edges.len()];
+            let mut fe = vec![0usize; 2 * edges.len()];
+            for (e, &(u, v)) in edges.iter().enumerate() {
+                flat[fill[u]] = v;
+                fe[fill[u]] = e;
+                fill[u] += 1;
+                flat[fill[v]] = u;
+                fe[fill[v]] = e;
+                fill[v] += 1;
+            }
+            drop(fill);
+            for _ in 0..VOTE_ROUNDS {
                 let sup: Vec<usize> = edges
                     .iter()
                     .map(|&(u, v)| {
@@ -281,25 +290,20 @@ pub fn build_tracks(
                     })
                     .collect();
                 let mut cut = vec![false; edges.len()];
-                let mut any = false;
-                // 노드 x 의 이웃 중 같은 영상끼리 모아 갈래를 찾는다(간선 (x, y), x < y 기준 양쪽에서 본다).
-                let mut by_node: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-                for (e, &(u, v)) in edges.iter().enumerate() {
-                    by_node.entry(u).or_default().push((v, e));
-                    by_node.entry(v).or_default().push((u, e));
-                }
-                for list in by_node.values() {
-                    let mut i = 0;
-                    while i < list.len() {
-                        let img = node_image[list[i].0];
-                        let mut j = i;
-                        while j < list.len() && node_image[list[j].0] == img {
+                let mut cuts = 0usize;
+                for x in 0..n {
+                    let (lo, hi) = (start[x], start[x + 1]);
+                    let mut i = lo;
+                    while i < hi {
+                        let img = node_image[flat[i]];
+                        let mut j = i + 1;
+                        while j < hi && node_image[flat[j]] == img {
                             j += 1;
                         }
                         if j - i > 1 {
-                            let best = list[i..j].iter().map(|&(_, e)| sup[e]).max().unwrap();
-                            let top = list[i..j].iter().filter(|&&(_, e)| sup[e] == best).count();
-                            for &(_, e) in &list[i..j] {
+                            let best = fe[i..j].iter().map(|&e| sup[e]).max().unwrap();
+                            let top = fe[i..j].iter().filter(|&&e| sup[e] == best).count();
+                            for &e in &fe[i..j] {
                                 let drop = if sup[e] < best {
                                     best > 0
                                 } else {
@@ -307,24 +311,49 @@ pub fn build_tracks(
                                 };
                                 if drop && !cut[e] {
                                     cut[e] = true;
-                                    any = true;
+                                    cuts += 1;
                                 }
                             }
                         }
                         i = j;
                     }
                 }
-                if !any {
+                if cuts == 0 {
                     break;
                 }
+                stats.conflicts += cuts;
+                stats.vote_cuts += cuts;
+                // 끊은 간선을 간선 목록과 CSR 에서 제자리로 걷어낸다(순서 유지, 간선 번호 다시 매김).
+                let mut newid = vec![usize::MAX; edges.len()];
                 let mut k = 0;
-                edges.retain(|_| {
-                    k += 1;
-                    if cut[k - 1] {
-                        stats.conflicts += 1;
+                for (e, c) in cut.iter().enumerate() {
+                    if !c {
+                        newid[e] = k;
+                        k += 1;
                     }
-                    !cut[k - 1]
+                }
+                let mut e = 0;
+                edges.retain(|_| {
+                    e += 1;
+                    !cut[e - 1]
                 });
+                let mut w = 0;
+                let mut r = 0;
+                for x in 0..n {
+                    let end = start[x + 1];
+                    start[x] = w;
+                    while r < end {
+                        if !cut[fe[r]] {
+                            flat[w] = flat[r];
+                            fe[w] = newid[fe[r]];
+                            w += 1;
+                        }
+                        r += 1;
+                    }
+                }
+                start[n] = w;
+                flat.truncate(w);
+                fe.truncate(w);
             }
             let nb = |x: usize| &flat[start[x]..start[x + 1]];
             let mut order: Vec<(usize, usize, usize)> = edges
@@ -1264,21 +1293,6 @@ mod tests {
     }
 
     #[test]
-    fn consistent_swaps_at_low_recall() {
-        // 대응 재현율 30/50% 에서 정답 점 1% 를 일관되게 바꾼 경우: 순도 ≥ 0.99, 완전도 ≥ 0.95.
-        for keep in [30, 50] {
-            for seed in 1..=2 {
-                let s = synthetic_seeded(0, keep, 1, seed);
-                assert!(s.outliers > 0);
-                let (p, c, _, _) = run_policy(&s, ConflictPolicy::Split);
-                eprintln!("keep {keep} seed {seed}: purity {p:.4} completeness {c:.4}");
-                assert!(p >= 0.99, "keep {keep} seed {seed} 순도 {p}");
-                assert!(c >= 0.95, "keep {keep} seed {seed} 완전도 {c}");
-            }
-        }
-    }
-
-    #[test]
     fn consistent_swaps_stay_pure() {
         // 정답 점 1% 를 옆 격자 점과 모든 짝에서 일관되게 바꾼다(반복 무늬형 오대응).
         // 시드 1~5 × 재현율 30/40/50% 모두에서 Split 순도 >= 0.99, 완전도 >= 0.95.
@@ -1765,14 +1779,11 @@ mod tests {
                             && proj.iter().any(|q| (s.keypoints[b][j] - q).norm() <= tol)
                     })
                     .collect();
-                let best =
-                    (!cands.is_empty()).then(|| (0.0, cands[(h >> 24) as usize % cands.len()]));
-                if let Some((_, j)) = best {
-                    if s.gt[b][j] != s.gt[b][fb] {
-                        s.pairs[pi].matches[mi] = (fa, j);
-                        s.outliers += 1;
-                        s.inliers -= 1;
-                    }
+                if !cands.is_empty() {
+                    let j = cands[(h >> 24) as usize % cands.len()];
+                    s.pairs[pi].matches[mi] = (fa, j);
+                    s.outliers += 1;
+                    s.inliers -= 1;
                 }
             }
         }
@@ -1816,7 +1827,7 @@ mod tests {
                     *c.entry(s.gt[o.image][o.feature]).or_default() += 1;
                 }
                 let top = c.values().max().copied().unwrap_or(0);
-                // 다수 정답 점이 아닌 관측이 둘 이상이면 잘못 합친 것으로 센다.
+                // 다수 정답 점이 아닌 관측이 하나 이상이면 잘못 합친 것으로 센다.
                 t.observations.len() - top >= 1
             })
             .count();
