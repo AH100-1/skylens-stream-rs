@@ -1653,12 +1653,17 @@ mod tests {
         let (k, _) = g.scale_fix.unwrap();
         assert_ne!(k, c);
         assert!(p.observations.iter().any(|o| o.camera == k));
-        let (p0, _) = run_sq(&p, 1e-12, None, 0.0);
-        let (p1, _) = run_sq(&p, 1e-4, None, 0.0);
+        let (p0, r0) = run_sq(&p, 1e-12, None, 0.0);
+        let (p1, r1) = run_sq(&p, 1e-4, None, 0.0);
         let d = |q: &BaProblem| (q.poses[1].center() - q.poses[0].center()).norm();
         let rel = ((d(&p0) - d(&p1)) / d(&p1)).abs();
-        eprintln!("rel {rel:e}");
+        eprintln!(
+            "rel {rel:e} chol {} {}",
+            r0.cholesky_failures, r1.cholesky_failures
+        );
         assert!(rel < 1e-9, "{rel}");
+        assert_eq!(r0.cholesky_failures, 0);
+        assert_eq!(r1.cholesky_failures, 0);
     }
 
     /// F-165: 한 카메라만 본 점은 트랙이 아니다. 중복 관측은 하나만 남기고 센다.
@@ -1751,6 +1756,8 @@ mod tests {
         assert!(r0.prior_degenerate && r1.prior_degenerate);
         assert!(dmax < 1e-6, "{dmax}");
         assert!(r0.converged && r1.converged, "{:?} {:?}", r0.stop, r1.stop);
+        // 회전 해도 감쇠와 무관하다(각도 계산의 수치 바닥은 약 3e-8).
+        assert!(rot < 1e-6, "{rot}");
         // 정상 사전항은 조건 표시가 없다.
         let (gp, _gt, gps) = bowed_formation(11);
         let mut q = gp.clone();
