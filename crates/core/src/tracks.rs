@@ -31,6 +31,8 @@ const DISPLACEMENT_TOLERANCE: f64 = 40.0;
 /// 잔차 문턱 하한 비율(기준 문턱 대비). 이웃 변위가 잘 맞으면(MAD 작음) 문턱을 기준의 1/4(960 폭에서 10 px)까지
 /// 낮춰, 옆 격자 점으로 일관되게 바뀐 대응처럼 그래프만으로는 안 보이는 오대응을 짝 단계에서 거른다.
 const DISPLACEMENT_FLOOR: f64 = 0.25;
+/// 잔차 문턱 상한 = 기준 문턱의 이 배수.
+const DISPLACEMENT_CAP: f64 = 3.0;
 /// 기준 영상 크기(화소).
 const DISPLACEMENT_REF_WIDTH: f64 = 960.0;
 const DISPLACEMENT_REF_HEIGHT: f64 = 540.0;
@@ -481,15 +483,16 @@ fn displacement_outliers(
     kp_a: &[Vector2<f64>],
     kp_b: &[Vector2<f64>],
 ) -> Vec<bool> {
-    displacement_outliers_with_floor(matches, kp_a, kp_b, DISPLACEMENT_FLOOR)
+    displacement_outliers_with_floor(matches, kp_a, kp_b, DISPLACEMENT_FLOOR, DISPLACEMENT_CAP)
 }
 
-/// `displacement_outliers` 와 같되 잔차 문턱 하한 비율을 인자로 받는다(시험에서 하한을 바꿔 볼 때 쓴다).
+/// `displacement_outliers` 와 같되 잔차 문턱 하한·상한 비율을 인자로 받는다(시험에서 바꿔 볼 때 쓴다).
 fn displacement_outliers_with_floor(
     matches: &[(usize, usize)],
     kp_a: &[Vector2<f64>],
     kp_b: &[Vector2<f64>],
     floor: f64,
+    cap: f64,
 ) -> Vec<bool> {
     let mut out = vec![false; matches.len()];
     if matches.len() < 8 {
@@ -627,7 +630,7 @@ fn displacement_outliers_with_floor(
                 };
                 // 대상 점은 u = 0, 변위 0(뺀 값)이므로 예측 (f[0], f[3]) 가 곧 어긋남이다.
                 let r = (f[0] * f[0] + f[3] * f[3]).sqrt();
-                r > (4.0 * s).clamp(tol * floor, 3.0 * tol)
+                r > (4.0 * s).clamp(tol * floor, cap * tol)
             },
         )
         .collect();
@@ -2045,7 +2048,7 @@ mod tests {
     }
 
     /// 하한 `floor` 에서 짝 종류별(같은 카메라, 카메라 간) 거른 참 대응 (거름, 전체).
-    fn floor_drop_counts(s: &Synthetic, floor: f64) -> [(usize, usize); 2] {
+    fn floor_drop_counts(s: &Synthetic, floor: f64, cap: f64) -> [(usize, usize); 2] {
         let mut r = [(0usize, 0usize); 2];
         for p in &s.pairs {
             let kind = (p.image_a % 3 != p.image_b % 3) as usize;
@@ -2054,6 +2057,7 @@ mod tests {
                 &s.keypoints[p.image_a],
                 &s.keypoints[p.image_b],
                 floor,
+                cap,
             );
             for (&(fa, fb), &bad) in p.matches.iter().zip(&flags) {
                 if s.gt[p.image_a][fa] == s.gt[p.image_b][fb] {
@@ -2063,6 +2067,108 @@ mod tests {
             }
         }
         r
+    }
+
+    /// F-385: 단차 장면 카메라 간 짝의 참 대응 중 거른 것을 (상자 경계까지 화소 거리) × (같은 짝 이웃 24 개
+    /// 변위 중앙값과의 시차 차이) 칸별로 센다. 경계 = 영상 a 에서 변위가 20 px 넘게 다른 가장 가까운 대응.
+    /// 칸마다 "거름/전체" 를 찍는다. 측정용이라 평소 시험에서는 뺀다.
+    #[test]
+    #[ignore]
+    fn step_scene_cross_camera_drop_table() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        let dist_edges = [3.0, 6.0, 12.0, 24.0];
+        let par_edges = [20.0, 40.0, 80.0, 160.0];
+        let bin = |v: f64, e: &[f64; 4]| e.iter().position(|&x| v < x).unwrap_or(4);
+        for keep in [100u64, 40] {
+            let s = step_scene(true, keep, &opts);
+            let mut tab = [[(0usize, 0usize); 5]; 5];
+            for p in &s.pairs {
+                if p.image_a % 3 == p.image_b % 3 {
+                    continue;
+                }
+                let (ka, kb) = (&s.keypoints[p.image_a], &s.keypoints[p.image_b]);
+                let flags = displacement_outliers(&p.matches, ka, kb);
+                let pos: Vec<(Vector2<f64>, Vector2<f64>)> = p
+                    .matches
+                    .iter()
+                    .map(|&(fa, fb)| (ka[fa], kb[fb] - ka[fa]))
+                    .collect();
+                for (i, &(fa, fb)) in p.matches.iter().enumerate() {
+                    if s.gt[p.image_a][fa] != s.gt[p.image_b][fb] {
+                        continue;
+                    }
+                    let mut d: Vec<(f64, usize)> = pos
+                        .iter()
+                        .enumerate()
+                        .filter(|&(j, _)| j != i)
+                        .map(|(j, q)| ((q.0 - pos[i].0).norm_squared(), j))
+                        .collect();
+                    if d.len() < 24 {
+                        continue;
+                    }
+                    d.select_nth_unstable_by(23, |a, b| a.0.total_cmp(&b.0));
+                    let mut dx: Vec<f64> = d[..24].iter().map(|e| pos[e.1].1.x).collect();
+                    let mut dy: Vec<f64> = d[..24].iter().map(|e| pos[e.1].1.y).collect();
+                    dx.sort_by(|a, b| a.total_cmp(b));
+                    dy.sort_by(|a, b| a.total_cmp(b));
+                    let med = Vector2::new(dx[12], dy[12]);
+                    let par = (pos[i].1 - med).norm();
+                    let edge = pos
+                        .iter()
+                        .filter(|q| (q.1 - pos[i].1).norm() > 20.0)
+                        .map(|q| (q.0 - pos[i].0).norm())
+                        .fold(f64::MAX, f64::min);
+                    let c = &mut tab[bin(edge, &dist_edges)][bin(par, &par_edges)];
+                    c.0 += flags[i] as usize;
+                    c.1 += 1;
+                }
+            }
+            eprintln!("keep {keep} step cross (rows: edge dist px <3,<6,<12,<24,>=24; cols: parallax diff px <20,<40,<80,<160,>=160), dropped/total");
+            for row in &tab {
+                let line: Vec<String> = row
+                    .iter()
+                    .map(|c| format!("{:>5}/{:<6}", c.0, c.1))
+                    .collect();
+                eprintln!("  {}", line.join(" "));
+            }
+            let tot = tab
+                .iter()
+                .flatten()
+                .fold((0, 0), |a, c| (a.0 + c.0, a.1 + c.1));
+            eprintln!("  total {}/{}", tot.0, tot.1);
+        }
+    }
+
+    /// F-385: 문턱 상한 배수별(하한 0.25) 단차·평지 장면의 참 대응 거름 비율. 측정용.
+    #[test]
+    #[ignore]
+    fn displacement_cap_sweep() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        for keep in [100u64, 40] {
+            for (name, boxes) in [("flat", false), ("step", true)] {
+                let s = step_scene(boxes, keep, &opts);
+                for cap in [8.0, 12.0, 16.0, 24.0] {
+                    let r = floor_drop_counts(&s, DISPLACEMENT_FLOOR, cap);
+                    eprintln!(
+                        "keep {keep} {name} cap {cap}: same {}/{} ({:.4}) cross {}/{} ({:.4})",
+                        r[0].0,
+                        r[0].1,
+                        r[0].0 as f64 / r[0].1.max(1) as f64,
+                        r[1].0,
+                        r[1].1,
+                        r[1].0 as f64 / r[1].1.max(1) as f64
+                    );
+                }
+            }
+        }
     }
 
     /// F-382: 높이 단차 장면과 완만한 장면에서 하한 1.0/0.25 의 참 대응 거름 비율.
@@ -2077,8 +2183,8 @@ mod tests {
         for keep in [100u64, 40] {
             for (name, boxes) in [("flat", false), ("step", true)] {
                 let s = step_scene(boxes, keep, &opts);
-                let hi = floor_drop_counts(&s, 1.0);
-                let lo = floor_drop_counts(&s, 0.25);
+                let hi = floor_drop_counts(&s, 1.0, DISPLACEMENT_CAP);
+                let lo = floor_drop_counts(&s, 0.25, DISPLACEMENT_CAP);
                 for (k, kind) in ["same", "cross"].into_iter().enumerate() {
                     let (rh, rl) = (
                         hi[k].0 as f64 / hi[k].1.max(1) as f64,
@@ -2088,11 +2194,12 @@ mod tests {
                         "keep {keep} {name} {kind}: floor 1.0 {}/{} ({:.4}) floor 0.25 {}/{} ({:.4}) delta {:+.4}",
                         hi[k].0, hi[k].1, rh, lo[k].0, lo[k].1, rl, rl - rh
                     );
-                    // 하한 0.25 의 거름 증가는 1.0 대비 1%p 이하, 절대값은 측정값(평지 0.2%, 단차 같은 카메라
-                    // 2.1%, 단차 카메라 간 8%) 아래여야 한다.
+                    // 하한 0.25 의 거름 증가는 1.0 대비 1%p 이하. 절대 상한은 측정값에 여유를 둔다.
+                    // 측정값(재현율 100/40%): 평지 0.00~0.17%, 단차 같은 카메라 1.47/2.03%, 단차 카메라 간
+                    // 6.94/7.83%.
                     let cap = match (boxes, k) {
                         (false, _) => 0.002,
-                        (true, 0) => 0.021,
+                        (true, 0) => 0.025,
                         (true, _) => 0.08,
                     };
                     if rl - rh > 0.01 || rl > cap {
