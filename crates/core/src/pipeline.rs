@@ -1399,7 +1399,69 @@ fn sparse_init_with(
         }
         s.rms = after;
     }
+    if !opts.legacy_roll {
+        dump_stage_poses(&stages, &s, &track_obs, k, &stats, tri_eff.min_deg);
+    }
     Ok((s, stages))
+}
+
+/// 진단: 지금 구역(`set_stage_ctx`)의 구역 번호와 사진 번호표.
+static STAGE_CTX: std::sync::Mutex<Option<(usize, Vec<usize>)>> = std::sync::Mutex::new(None);
+
+fn set_stage_ctx(region: usize, gids: &[usize]) {
+    if std::env::var("SKYLENS_STAGE_DUMP").is_ok() {
+        *STAGE_CTX.lock().unwrap() = Some((region, gids.to_vec()));
+    }
+}
+
+/// 환경 변수 `SKYLENS_STAGE_DUMP=<폴더>` 일 때 구역마다 `stage_{구역:02}.txt` 를 쓴다(출력·정렬에는 영향 없음).
+/// 머리 줄 `H thr_px min_deg fx fy cx cy 너비 높이`, 포즈 줄 `P|F 사진번호 회전(행 우선 9) 중심(3)`
+/// (P: 회전 평균+위치 평균 직후, F: 초벌 최종), 트랙 줄 `T (사진번호 특징번호 px py)…`
+/// (px py 는 특징점 번호 규약, 화소 중심 +0.5 전).
+fn dump_stage_poses(
+    stages: &PreviewStages,
+    s: &Sparse,
+    tracks: &[Vec<(usize, usize, Vector2<f64>)>],
+    k: &Intrinsics,
+    stats: &TriStats,
+    min_deg: f64,
+) {
+    use std::fmt::Write;
+    let Ok(dir) = std::env::var("SKYLENS_STAGE_DUMP") else {
+        return;
+    };
+    let Some((region, gids)) = STAGE_CTX.lock().unwrap().take() else {
+        return;
+    };
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "H {:.6} {:.6} {} {} {} {} {} {}",
+        stats.thr_px, min_deg, k.fx, k.fy, k.cx, k.cy, k.width, k.height
+    );
+    for (tag, ps) in [("P", &stages.placed), ("F", &s.poses)] {
+        for (i, p) in ps.iter().enumerate() {
+            let Some(p) = p else { continue };
+            let m = p.rotation.matrix();
+            let c = p.center();
+            let _ = write!(o, "{tag} {}", gids[i]);
+            for r in 0..3 {
+                for q in 0..3 {
+                    let _ = write!(o, " {:.9}", m[(r, q)]);
+                }
+            }
+            let _ = writeln!(o, " {:.6} {:.6} {:.6}", c.x, c.y, c.z);
+        }
+    }
+    for t in tracks {
+        let _ = write!(o, "T");
+        for &(i, f, px) in t {
+            let _ = write!(o, " {} {} {:.3} {:.3}", gids[i], f, px.x - 0.5, px.y - 0.5);
+        }
+        o.push('\n');
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(Path::new(&dir).join(format!("stage_{region:02}.txt")), o);
 }
 
 /// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
@@ -2576,6 +2638,7 @@ pub fn run_pipeline_with(
             .filter(|&(i, j)| i >= n_help && j >= n_help)
             .collect();
         let own_registered = |s: &Sparse| s.poses[n_help..].iter().filter(|p| p.is_some()).count();
+        set_stage_ctx(r.index, &gids);
         let start = match check_motion(&gps, &views, &own_pairs)
             .and_then(|_| {
                 sparse_init_with(
