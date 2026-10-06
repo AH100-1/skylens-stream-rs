@@ -241,9 +241,16 @@ fn stage_rows(input: &std::path::Path, stderr: &str) -> Vec<StageRow> {
     out
 }
 
-/// 구역 정밀 모델의 회전 오차 한도(정답 대비, 구역·카메라 종류별 중앙값, 도). 시드 5 에서 구역 0 은 롤 선택이 틀려
-/// 14.7° 였고 수평 퍼짐 롤을 정밀 시작점에도 쓰면서 2.4° 가 됐다. 한도는 구역 0 에 3°, 나머지 구역에 4.5°.
+/// 구역 정밀 모델의 회전 오차 한도(정답 대비, 구역·카메라 종류별 중앙값, 도).
+/// 목표는 2° 이하다. 한도는 측정값이 아니라 목표에서 정한다: 합성 GPS 잡음(축마다 1.5 m)과 구역 크기에서 롤 한 개를 정할 때
+/// 생기는 기울기 불확실성이 1° 안팎이라 목표에 1° 여유를 더해 3° 를 모든 구역의 한도로 둔다.
+/// 시드 5 구역 1(4.4°)과 시드 4 구역 2(3.1°)는 높이 분산 최소 롤이 지형 기복에 치우쳐 한도를 못 맞춘다. 알려진 예외로
+/// 그 (시드, 구역)만 따로 두며, 이 값은 목표가 아니라 지금보다 나빠지지 않게 막는 상한이다.
 /// 실행: `SKYLENS_TILT_SEED=5 cargo test --release -p skylens-stream --test seed_verify -- --ignored zone_rotation`
+const ZONE_ROT_TARGET_DEG: f64 = 2.0;
+const ZONE_ROT_LIMIT_DEG: f64 = 3.0;
+const ZONE_ROT_KNOWN_MISS: [(u64, usize, f64); 2] = [(5, 1, 4.5), (4, 2, 3.5)];
+
 #[test]
 #[ignore]
 fn zone_rotation_error_limit() {
@@ -274,9 +281,12 @@ fn zone_rotation_error_limit() {
     let _ = std::fs::remove_dir_all(&root);
     assert!(rows.len() >= 3, "구역 최종 자세 {} 개", rows.len());
     for r in &rows {
-        let limit = if r.region == 0 { 3.0 } else { 4.5 };
+        let limit = ZONE_ROT_KNOWN_MISS
+            .iter()
+            .find(|m| (m.0, m.1) == (seed, r.region))
+            .map_or(ZONE_ROT_LIMIT_DEG, |m| m.2);
         eprintln!(
-            "zone {} {} rot med {:.2} (limit {limit})",
+            "zone {} {} rot med {:.2} (target {ZONE_ROT_TARGET_DEG}, limit {limit})",
             r.region, r.cams, r.abs
         );
         assert!(
