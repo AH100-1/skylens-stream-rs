@@ -159,6 +159,41 @@ fn rotation_errors(pairs: &[(Rotation3<f64>, Rotation3<f64>)]) -> (Vec<f64>, Vec
     (raw, aligned)
 }
 
+struct OffBound {
+    region: usize,
+    shared: usize,
+    own_med: f64,
+    own_max: f64,
+    out_med: f64,
+    out_max: f64,
+    vs_refined: f64,
+}
+
+/// `off` 구역별 상한 = 실측 x 1.2 (4코어 측정 기계, 초벌 -> 정밀 정렬 직후 출력 좌표).
+/// 구역 1: 초벌 자체(유사변환 후) 중앙 0.736/최대 1.234 m, 출력 대 정답 중앙 3.678/최대 6.348 m, 초벌 대 정밀 중앙 3.371~3.56 m.
+/// 구역 2: 초벌 자체 0.556/1.217 m, 출력 대 정답 1.887/2.737 m, 초벌 대 정밀 1.572 m.
+/// 구역 0 은 사진 14장이 정렬되지 못하고(중심이 거의 일직선) 표에 넣지 않는다.
+const OFF_BOUNDS: [OffBound; 2] = [
+    OffBound {
+        region: 1,
+        shared: 32,
+        own_med: 0.89,
+        own_max: 1.48,
+        out_med: 4.42,
+        out_max: 7.62,
+        vs_refined: 4.3,
+    },
+    OffBound {
+        region: 2,
+        shared: 10,
+        own_med: 0.67,
+        own_max: 1.46,
+        out_med: 2.27,
+        out_max: 3.29,
+        vs_refined: 1.89,
+    },
+];
+
 /// 단구역 합성 장면. 실측(4코어 측정 기계): 회전 오차 정렬 전 중앙 1.140/최대 1.592 도, 정렬 후 중앙 0.309/최대 0.488 도,
 /// 중심 오차 중앙 0.256/최대 0.713 m. 상한은 실측 x 1.2.
 #[test]
@@ -205,13 +240,13 @@ fn refined_pose_rotation_and_center_errors() {
         "POSES refined n {} rot raw med {rm:.4} max {rx:.4} deg, aligned med {am:.4} max {ax:.4} deg, center med {cm:.3} max {cx:.3} m",
         refined.len()
     );
-    // 정렬 전 상한: 실측 중앙 1.140/최대 1.592 도에 여유.
-    assert!(rm < 1.4, "정렬 전 회전 오차 중앙 {rm} 도");
-    assert!(rx < 1.95, "정렬 전 회전 오차 최대 {rx} 도");
-    assert!(am < 0.47, "정렬 후 회전 오차 중앙 {am} 도");
-    assert!(ax < 1.4, "정렬 후 회전 오차 최대 {ax} 도");
-    assert!(cm < 0.40, "중심 오차 중앙 {cm} m");
-    assert!(cx < 1.02, "중심 오차 최대 {cx} m");
+    // 상한은 실측 x 1.2(위 주석의 실측값).
+    assert!(rm < 1.37, "정렬 전 회전 오차 중앙 {rm} 도");
+    assert!(rx < 1.91, "정렬 전 회전 오차 최대 {rx} 도");
+    assert!(am < 0.37, "정렬 후 회전 오차 중앙 {am} 도");
+    assert!(ax < 0.59, "정렬 후 회전 오차 최대 {ax} 도");
+    assert!(cm < 0.31, "중심 오차 중앙 {cm} m");
+    assert!(cx < 0.86, "중심 오차 최대 {cx} m");
 
     // 초벌 포즈도 같은 형식이고 회전이 정답에 가깝다(느슨한 기준).
     let pp: Vec<_> = preview
@@ -352,32 +387,155 @@ fn coarse_back_off_preview_poses_stay_paired() {
             pf.poses.len(),
             pf.aligned
         );
-        // 실측(4코어): 구역 1 중앙 3.37~3.56 m, 구역 2 중앙 1.57 m. 사진 짝이 엇갈리면 구역 1 이 9.5 m, 구역 0 은 포즈가 6장만 남는다. 상한은 실측 x 1.2.
-        assert!(md < 4.3, "구역 {k} 초벌-정밀 중심 차 중앙 {md} m");
-        // 오차 분리(정답 직접 비교). 초벌 사진은 모두 정밀에도 등록되어(공유 = 전부) 구역 1 은 32/32, 구역 2 는 10/10 이다.
-        // 정밀 중심은 정답과 중앙 0.64/0.88 m, 최대 1.01 m 로 가깝다. 초벌 모델 자체는 유사변환 후 중앙 0.74/0.56 m,
-        // 최대 1.23/1.22 m 라 `on`(0.66/0.48 m)과 같은 수준이다(축척 1.019/0.970). 그런데 정렬된 출력으로는 정답과
-        // 중앙 3.68/1.89 m, 최대 6.35/2.74 m 어긋난다. 곧 초벌 대 정밀 차(3.37/1.57 m)의 대부분은 초벌 모델이 아니라
-        // 초벌 -> 정밀 정렬 잔차다. 상한은 구역별 실측 x 1.2: (자체 중앙, 자체 최대, 출력 중앙, 출력 최대, 공유 수).
-        // 구역 0 은 사진 14장이 정렬되지 못하고 유사변환도 퇴화라 비교하지 않는다.
-        let (own_med, own_max, out_med, out_max, n_shared) = match k {
-            1 => (0.89, 1.48, 4.42, 7.62, 32),
-            2 => (0.67, 1.46, 2.27, 3.29, 10),
-            _ => panic!("구역 {k} 상한 없음"),
+        // 구역별 상한 표(실측 x 1.2; 실측값은 아래 주석). 표에 없는 구역은 측정만 하고 단언하지 않는다.
+        let Some(b) = OFF_BOUNDS.iter().find(|b| b.region == k) else {
+            eprintln!("POSES off preview_{k:02} 상한 표에 없음: 측정만");
+            continue;
         };
-        assert_eq!(d.len(), n_shared, "구역 {k} 공유 사진 수");
+        assert_eq!(d.len(), b.shared, "구역 {k} 공유 사진 수");
+        assert!(md < b.vs_refined, "구역 {k} 초벌-정밀 중심 차 중앙 {md} m");
         assert!(
-            median(&own) < own_med,
+            median(&own) < b.own_med,
             "구역 {k} 초벌 자체 오차 중앙 {} m",
             median(&own)
         );
         assert!(
-            max(&own) < own_max,
+            max(&own) < b.own_max,
             "구역 {k} 초벌 자체 오차 최대 {} m",
             max(&own)
         );
         let (dm, dx) = (median(&direct_shared), max(&direct_shared));
-        assert!(dm < out_med, "구역 {k} 정답 대비 초벌 중심 중앙 {dm} m");
-        assert!(dx < out_max, "구역 {k} 정답 대비 초벌 중심 최대 {dx} m");
+        assert!(dm < b.out_med, "구역 {k} 정답 대비 초벌 중심 중앙 {dm} m");
+        assert!(dx < b.out_max, "구역 {k} 정답 대비 초벌 중심 최대 {dx} m");
+    }
+}
+
+/// `--coarse-back off` 한 번 실행: (임시 폴더, 장면, 출력, 표준 출력).
+fn run_off(tag: &str) -> (TempDir, PathBuf, PathBuf, String) {
+    let t = TempDir::new(tag);
+    let (scene, out) = (t.0.join("scene"), t.0.join("out"));
+    let (scene_s, out_s) = (scene.to_str().unwrap(), out.to_str().unwrap());
+    let (code, so, se) = cli(&["synth", scene_s, "320", "180"]);
+    assert_eq!(code, 0, "{so}{se}");
+    let args = [
+        "run",
+        scene_s,
+        out_s,
+        "--span",
+        "12",
+        "--coarse-back",
+        "off",
+        "--max-features",
+        "800",
+        "--dense-width",
+        "96",
+        "--hfov",
+        "65",
+        "--ba-iters",
+        "15",
+    ];
+    let (code, so, se) = cli(&args);
+    assert_eq!(code, 0, "{so}{se}");
+    (t, scene, out, so)
+}
+
+/// 유사변환 `sim` 이 항등에서 얼마나 벗어났는지: (축척 차 %, 회전 도, `c` 에서의 이동 m).
+fn deviation(sim: &skylens_core::align::Similarity, c: &Vector3<f64>) -> (f64, f64, f64) {
+    (
+        (sim.s - 1.0) * 100.0,
+        sim.r.angle().to_degrees(),
+        (sim.apply_point(c) - c).norm(),
+    )
+}
+
+/// 점 집합의 주축 특잇값 비 (둘째/첫째, 셋째/첫째). 1 에 가까우면 고르게 퍼짐, 0 에 가까우면 일직선·평면.
+fn spread_ratios(p: &[Vector3<f64>]) -> (f64, f64) {
+    let n = p.len() as f64;
+    let c = p.iter().fold(Vector3::zeros(), |a, x| a + x) / n;
+    let mut m = Matrix3::zeros();
+    for x in p {
+        let d = x - c;
+        m += d * d.transpose();
+    }
+    let sv = m.svd(false, false).singular_values;
+    let mut v = [sv[0].sqrt(), sv[1].sqrt(), sv[2].sqrt()];
+    v.sort_by(|a, b| b.total_cmp(a));
+    (v[1] / v[0], v[2] / v[0])
+}
+
+/// 측정(`--ignored --nocapture`): `off` 에서 초벌 -> 정밀 정렬이 어느 단계에서 잔차를 내는지.
+/// 출력 파일만으로 본다. 구역마다 같은 사진의 중심 쌍 (초벌 출력, 정밀 출력, 정답) 세 가지 사이의
+/// 최적 유사변환(Umeyama)을 구해, 현재 출력이 그 최적에서 얼마나 벗어났는지(축척 %, 회전 도, 이동 m)와
+/// 변환 뒤 남는 잔차(중앙/최대 m)를 표로 낸다. 구역 0 은 중심 배치의 퇴화(특잇값 비)를 낸다.
+#[test]
+#[ignore = "측정용: cargo test --release --test pipeline_poses align_stage_table -- --ignored --nocapture"]
+fn align_stage_table() {
+    let (_t, scene, out, so) = run_off("stages");
+    for l in so.lines().filter(|l| l.contains("pairs")) {
+        eprintln!("STAGE log {l}");
+    }
+    let truth = truth_poses(&scene);
+    let shift = truth_to_output_shift(&scene);
+    let (refined, _) = read_kind(&out, "refined");
+    let (_, n_prev) = read_kind(&out, "preview");
+    assert!(n_prev >= 3);
+    eprintln!("STAGE region | step | n | scale diff % | rot deg | shift m | residual med m | residual max m");
+    for k in 0..n_prev {
+        let pf = PosesFile::from_json(
+            &std::fs::read_to_string(out.join("poses").join(format!("preview_{k:02}.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        let ctr = |e: &skylens_core::poses_io::PoseEntry| Vector3::from(e.center);
+        let tru = |n: &str| {
+            let c = truth[n].1;
+            Vector3::new(c[0] + shift[0], c[1] + shift[1], c[2] + shift[2])
+        };
+        let (mut p, mut r, mut t) = (Vec::new(), Vec::new(), Vec::new());
+        let mut all_p = Vec::new();
+        let mut all_t = Vec::new();
+        for e in &pf.poses {
+            all_p.push(ctr(e));
+            all_t.push(tru(&e.name));
+            if let Some(re) = refined.get(&e.name) {
+                p.push(ctr(e));
+                r.push(ctr(re));
+                t.push(tru(&e.name));
+            }
+        }
+        let (sp, tp) = (spread_ratios(&all_p), spread_ratios(&all_t));
+        eprintln!(
+            "STAGE {k} | layout n {} aligned {} | preview centers sv2/sv1 {:.3} sv3/sv1 {:.3} | truth centers sv2/sv1 {:.3} sv3/sv1 {:.3}",
+            all_p.len(), pf.aligned, sp.0, sp.1, tp.0, tp.1
+        );
+        let row = |step: &str, src: &[Vector3<f64>], dst: &[Vector3<f64>]| {
+            let raw: Vec<f64> = src.iter().zip(dst).map(|(a, b)| (a - b).norm()).collect();
+            match umeyama(src, dst) {
+                Some(sm) => {
+                    let (ds, dr, dt) = deviation(&sm, &src[0]);
+                    let res: Vec<f64> = src
+                        .iter()
+                        .zip(dst)
+                        .map(|(a, b)| (sm.apply_point(a) - b).norm())
+                        .collect();
+                    eprintln!(
+                        "STAGE {k} | {step} | {} | {ds:+.2} | {dr:.3} | {dt:.3} | {:.3} | {:.3} | as-is med {:.3} max {:.3}",
+                        src.len(), median(&res), max(&res), median(&raw), max(&raw)
+                    );
+                }
+                None => eprintln!(
+                    "STAGE {k} | {step} | {} | degenerate (no similarity) | as-is med {:.3} max {:.3}",
+                    src.len(), if raw.is_empty() { f64::NAN } else { median(&raw) }, max(&raw)
+                ),
+            }
+        };
+        // 초벌 출력 -> 정답 (공유 사진): 현재 출력이 중심 기준 최적에서 벗어난 정도 = 정렬 단계의 오차.
+        row("preview-out -> truth (shared)", &p, &t);
+        // 초벌 출력 -> 정밀 출력: 정렬이 초벌을 정밀 좌표에 제대로 얹었다면 항등 근처여야 한다.
+        row("preview-out -> refined-out", &p, &r);
+        // 정밀 출력 -> 정답: 정밀 모델 자체가 정답에 얼마나 가까운지(기준선).
+        row("refined-out -> truth", &r, &t);
+        // 초벌 전체(공유 아닌 사진 포함) -> 정답: 초벌 모델 자체 오차.
+        row("preview-out -> truth (all)", &all_p, &all_t);
     }
 }
