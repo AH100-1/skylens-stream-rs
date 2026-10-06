@@ -1,26 +1,31 @@
 //! 출력 폴더 검증 (SPEC §2 출력 구조, §4 검증 기준 일곱 항목).
 //!
-//! 읽는 파일:
-//! - `report.json` (출력 폴더 바로 아래, 선택): 포즈 단계 기록. SPEC §2 출력 목록에 없는 파일이다.
+//! 읽는 파일 (SPEC §2 출력만으로 판정하고, `report.json` 은 있을 때 추가 정보로만 쓴다):
+//! - `preview/preview_{k:02}_pos{lo}-{hi}.ply`, `refined/refined_{k:02}_pos{lo}-{hi}.ply`: 구역 점군과
+//!   파일 이름의 위치 범위 [lo, hi).
+//! - `snapshots/manifest.json`, `snapshots/step_*.ply`.
+//! - `report.json` (출력 폴더 바로 아래, 선택, SPEC §2 목록에 없는 파일):
 //!   ```json
 //!   {"registered": {"total": 240, "preview": 240, "refined": 240},
 //!    "reprojection_px": {"preview": 4.5, "refined": 0.59},
 //!    "regions": [{"region": 0, "positions": 14, "images": 42}]}
 //!   ```
-//!   `registered.total` 은 입력 사진 수, `preview`/`refined` 는 초벌·정밀 포즈에 등록된 사진 수.
-//!   `reprojection_px` 는 재투영 오차 RMS(px). `regions[].positions` 는 구역의 위치 수,
-//!   `images` 는 구역 밀집 단계에 쓴 사진 수.
 //!
-//! SPEC §2 출력만으로 판정할 수 있는 항목과 없는 항목:
-//! - 판정 가능(4~7): `preview_align`(manifest `align`), `preview_vs_refined`·`refined_overlap`
-//!   (구역 PLY), `snapshots`(manifest `snapshots` + step PLY).
-//! - 판정 불가(1~3): `registered`(등록 사진 수), `region_images`(구역에 쓴 사진 수 — 파일 이름의
-//!   `pos{lo}-{hi}` 로 위치 수는 알지만 사진 수는 출력에 없음), `refined_reprojection`(재투영 오차).
-//!   세 값 모두 SPEC §2 의 어떤 파일에도 없다. `report.json` 이 없으면 이 셋은 FAIL 이 아니라
-//!   "판정 불가" 로 표시하고, 있으면 그 값으로 판정한다. 형식이 깨진 `report.json` 은 FAIL.
-//!   출력 폴더 자체가 없으면 모든 항목 FAIL.
+//! 항목별 판정 근거:
+//! - `registered`: 파일 이름 위치 범위의 합집합이 0..끝 위치를 빈틈없이 덮는지로 계산한다.
+//!   초벌·정밀 각각 덮은 위치 수 × 3 을 등록 사진 수로, 전체 위치 수 × 3 을 전체로 본다.
+//!   report 가 있으면 그 값도 같이 맞아야 PASS(report 가 더 나쁘게 말하면 FAIL).
+//! - `region_images`: 구역마다 초벌·정밀 이름의 위치 범위가 같고(hi > lo), 구역이 0 에서 시작해
+//!   이웃과 이어지며 겹치는지 본다. 구역 사진 수는 3 × 위치 수로 계산한다. report 가 있으면
+//!   `images` 도 3 × 위치 수여야 한다.
+//! - `refined_reprojection`: 재투영 오차는 SPEC §2 의 어떤 파일에서도 계산할 수 없다.
+//!   report 가 있으면 그 값으로 판정하고, 없으면 FAIL 이 아니라 "판정 불가".
+//! - 4~7(`preview_align`, `preview_vs_refined`, `refined_overlap`, `snapshots`): manifest·구역 PLY.
+//!
+//! 형식이 깨진 `report.json` 은 FAIL. 출력 폴더 자체가 없으면 모든 항목 FAIL.
 //!
 //! 종료 코드: FAIL 이 하나라도 있으면 1, FAIL 은 없고 판정 불가가 있으면 2, 모두 PASS 면 0.
+//!
 //! - `snapshots/manifest.json`: SPEC §2 형식. `snapshots[].step` 은 1부터 세는 정수,
 //!   최종만 문자열 `"final"`. 그 밖의 형(예: 문자열 `"01"`)은 형식 오류로 FAIL.
 //! - `preview/preview_{k:02}_*.ply`, `refined/refined_{k:02}_*.ply`, `snapshots/step_*.ply`.
@@ -180,20 +185,18 @@ fn item(name: &'static str, criterion: &'static str, r: Result<(bool, String), S
 }
 
 /// `report.json` 에서만 얻는 항목(1~3). 파일이 없고 출력 폴더는 있으면 판정 불가.
-/// `absent_note` 는 report.json 이 없을 때 SPEC §2 출력에서 읽은 참고 값(판정에는 쓰지 않음).
 fn report_item(
     name: &'static str,
     criterion: &'static str,
     report: &ReportJson,
     check: fn(&Json) -> Result<(bool, String), String>,
-    absent_note: &str,
 ) -> Item {
     match report {
         ReportJson::Absent => Item {
             name,
             pass: false,
             decided: false,
-            measured: format!("report.json 없음 (SPEC §2 출력에 없는 값){absent_note}"),
+            measured: "report.json 없음 (SPEC §2 출력에서 계산할 수 없는 값)".to_string(),
             criterion,
         },
         ReportJson::Read(r) => item(
@@ -201,6 +204,115 @@ fn report_item(
             criterion,
             r.as_ref().map_err(Clone::clone).and_then(check),
         ),
+    }
+}
+
+/// SPEC §2 출력에서 계산한 값(`derived`)으로 판정하고, report.json 이 있으면 그 값도 맞아야 한다.
+/// 깨진 report.json 은 FAIL.
+fn derived_item(
+    name: &'static str,
+    criterion: &'static str,
+    report: &ReportJson,
+    derived: Result<(bool, String), String>,
+    check: fn(&Json) -> Result<(bool, String), String>,
+) -> Item {
+    let r = match (derived, report) {
+        (Err(e), _) => Err(e),
+        (Ok(d), ReportJson::Absent) => Ok(d),
+        (Ok(_), ReportJson::Read(Err(e))) => Err(e.clone()),
+        (Ok((p, m)), ReportJson::Read(Ok(j))) => {
+            check(j).map(|(p2, m2)| (p && p2, format!("{m}; report.json: {m2}")))
+        }
+    };
+    item(name, criterion, r)
+}
+
+type Ranges = BTreeMap<usize, (usize, usize)>;
+
+/// 구간 [lo, hi) 들의 합집합이 [0, limit) 안에서 덮는 위치 수.
+fn covered_positions(r: &Ranges, limit: usize) -> usize {
+    let mut v: Vec<(usize, usize)> = r
+        .values()
+        .filter(|(lo, hi)| lo < hi)
+        .map(|&(lo, hi)| (lo, hi.min(limit)))
+        .filter(|(lo, hi)| lo < hi)
+        .collect();
+    v.sort_unstable();
+    let (mut total, mut end) = (0usize, 0usize);
+    for (lo, hi) in v {
+        let lo = lo.max(end);
+        if hi > lo {
+            total += hi - lo;
+            end = hi;
+        }
+    }
+    total
+}
+
+/// 전체 위치 수 = 모든 파일 이름 hi 의 최댓값.
+fn total_positions(p: &Ranges, r: &Ranges) -> usize {
+    p.values().chain(r.values()).map(|v| v.1).max().unwrap_or(0)
+}
+
+/// 등록 사진 수를 파일 이름 위치 범위에서 계산한다(위치 하나 = 사진 3장).
+fn derive_registered(p: &Ranges, r: &Ranges) -> Result<(bool, String), String> {
+    let total = total_positions(p, r);
+    if total == 0 {
+        return Err("preview/refined 파일 이름에서 위치 범위를 읽지 못함".into());
+    }
+    let (cp, cr) = (covered_positions(p, total), covered_positions(r, total));
+    Ok((
+        cp == total && cr == total,
+        format!(
+            "초벌 {}/{}, 정밀 {}/{} (파일 이름 위치 범위에서 계산)",
+            3 * cp,
+            3 * total,
+            3 * cr,
+            3 * total
+        ),
+    ))
+}
+
+/// 구역 사진 수 = 3 × 위치 수. 초벌·정밀 범위가 같고 구역이 0 에서 시작해 이어지는지 본다.
+fn derive_region_images(p: &Ranges, r: &Ranges) -> Result<(bool, String), String> {
+    let keys: BTreeSet<usize> = p.keys().chain(r.keys()).copied().collect();
+    if keys.is_empty() {
+        return Err("preview/refined 파일 이름에서 위치 범위를 읽지 못함".into());
+    }
+    let mut bad = Vec::new();
+    let mut counts = Vec::new();
+    let mut prev: Option<(usize, usize)> = None;
+    for k in &keys {
+        match (p.get(k), r.get(k)) {
+            (Some(a), Some(b)) if a == b && a.0 < a.1 => {
+                counts.push(format!("{k}:{}→{}장", a.1 - a.0, 3 * (a.1 - a.0)));
+                let ok = match prev {
+                    None => a.0 == 0,
+                    Some((plo, phi)) => a.0 > plo && a.0 <= phi && a.1 > phi,
+                };
+                if !ok {
+                    bad.push(format!("구역 {k}: 범위 {}-{} 가 이어지지 않음", a.0, a.1));
+                }
+                prev = Some(*a);
+            }
+            (Some(a), Some(b)) => bad.push(format!(
+                "구역 {k}: 초벌 {}-{} ≠ 정밀 {}-{} 또는 빈 범위",
+                a.0, a.1, b.0, b.1
+            )),
+            _ => bad.push(format!("구역 {k}: 초벌·정밀 이름 중 하나가 없음")),
+        }
+    }
+    if bad.is_empty() {
+        Ok((
+            true,
+            format!(
+                "{}개 구역 모두 3×위치 수 [{}] (파일 이름에서 계산)",
+                keys.len(),
+                counts.join(" ")
+            ),
+        ))
+    } else {
+        Ok((false, bad.join(", ")))
     }
 }
 
@@ -231,6 +343,8 @@ pub fn verify_dir(dir: &Path) -> Report {
         .as_ref()
         .map_err(Clone::clone)
         .and_then(parse_steps);
+    let names_p = region_positions(&dir.join("preview"), "preview_");
+    let names_r = region_positions(&dir.join("refined"), "refined_");
     let preview = load_regions(&dir.join("preview"), "preview_");
     let refined = load_regions(&dir.join("refined"), "refined_");
 
@@ -258,21 +372,21 @@ pub fn verify_dir(dir: &Path) -> Report {
     }
 
     let items = vec![
-        report_item(
+        derived_item(
             ITEM_REGISTERED,
-            "초벌·정밀 모두 전체 등록 (240/240)",
+            "초벌·정밀 모두 전체 등록 (파일 이름 위치 범위로 계산, 예: 240/240)",
             &report_src,
+            derive_registered(&names_p, &names_r),
             check_registered,
-            "",
         ),
-        report_item(
+        derived_item(
             ITEM_REGION_IMAGES,
-            "구역 사진 수 = 3 × 위치 수",
+            "구역 사진 수 = 3 × 위치 수 (초벌·정밀 범위 일치, 구역 이어짐)",
             &report_src,
+            derive_region_images(&names_p, &names_r),
             check_region_images,
-            &positions_note(dir),
         ),
-        report_item(ITEM_REPROJ, "정밀 재투영 ≤ 0.7 px", &report_src, check_reproj, ""),
+        report_item(ITEM_REPROJ, "정밀 재투영 ≤ 0.7 px", &report_src, check_reproj),
         item(
             ITEM_ALIGN,
             "점쌍 ≥ 1000, 구역 간 스케일 차(최대/최소 − 1) ≤ 10%, 잔차 중앙 < 6 m",
@@ -763,35 +877,6 @@ pub fn region_positions(dir: &Path, prefix: &str) -> BTreeMap<usize, (usize, usi
         }
     }
     out
-}
-
-/// report.json 이 없을 때 구역 사진 수 항목에 붙이는 참고 값: 파일 이름의 구역별 위치 수
-/// (hi − lo). 사진 수는 SPEC §2 출력에 없어 판정은 하지 않는다. 초벌·정밀 이름의 위치
-/// 범위가 다르면 그 구역도 적는다.
-fn positions_note(dir: &Path) -> String {
-    let p = region_positions(&dir.join("preview"), "preview_");
-    let r = region_positions(&dir.join("refined"), "refined_");
-    let src = if r.is_empty() { &p } else { &r };
-    if src.is_empty() {
-        return String::new();
-    }
-    let counts: Vec<String> = src
-        .iter()
-        .map(|(k, (lo, hi))| format!("{k}:{}", hi.saturating_sub(*lo)))
-        .collect();
-    let mut s = format!(
-        "; 파일 이름의 위치 수 [{}], 사진 수는 출력에 없음",
-        counts.join(" ")
-    );
-    let differ: Vec<usize> = p
-        .iter()
-        .filter(|(k, v)| r.get(k).is_some_and(|w| w != *v))
-        .map(|(k, _)| *k)
-        .collect();
-    if !differ.is_empty() {
-        let _ = write!(s, "; 초벌·정밀 위치 범위가 다른 구역 {differ:?}");
-    }
-    s
 }
 
 /// `{prefix}{k:02}_*.ply` 를 구역 번호 k 로 묶어 읽는다.
@@ -1373,5 +1458,36 @@ mod tests {
         let m = height_pair_median(&query, &reference, 2.0).unwrap();
         assert!((m - 1.5).abs() < 1e-12);
         assert!((nn_median(&query, &reference).unwrap() - 1.5).abs() < 1e-12);
+    }
+
+    fn rg(v: &[(usize, usize, usize)]) -> Ranges {
+        v.iter().map(|&(k, lo, hi)| (k, (lo, hi))).collect()
+    }
+
+    #[test]
+    fn registered_is_computed_from_name_ranges() {
+        let p = rg(&[(0, 0, 14), (1, 10, 26)]);
+        let (ok, m) = derive_registered(&p, &p).unwrap();
+        assert!(ok, "{m}");
+        assert!(m.contains("초벌 78/78, 정밀 78/78"), "{m}");
+        let gap = rg(&[(0, 0, 14), (1, 20, 26)]);
+        let (ok, m) = derive_registered(&p, &gap).unwrap();
+        assert!(!ok);
+        assert!(m.contains("초벌 78/78, 정밀 60/78"), "{m}");
+        assert!(derive_registered(&Ranges::new(), &Ranges::new()).is_err());
+    }
+
+    #[test]
+    fn region_images_checks_ranges() {
+        let p = rg(&[(0, 0, 14), (1, 10, 26)]);
+        assert!(derive_region_images(&p, &p).unwrap().0);
+        // 정밀 범위가 다르면, 구역이 0 에서 시작하지 않으면, 이어지지 않으면 FAIL.
+        let other = rg(&[(0, 0, 14), (1, 10, 27)]);
+        assert!(!derive_region_images(&p, &other).unwrap().0);
+        let late = rg(&[(0, 2, 14)]);
+        assert!(!derive_region_images(&late, &late).unwrap().0);
+        let gap = rg(&[(0, 0, 14), (1, 15, 26)]);
+        assert!(!derive_region_images(&gap, &gap).unwrap().0);
+        assert!(!derive_region_images(&p, &rg(&[(0, 0, 14)])).unwrap().0);
     }
 }
