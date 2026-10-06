@@ -1194,6 +1194,7 @@ const DETACHED_MIN_GPS_OK: usize = 3;
 /// 붙인 뒤 GPS 대응을 정상으로 치는 거리(m). 합성 GPS 잡음(축마다 1.5 m)의 3차원 중앙값이 약 2.5 m 라 넉넉히 잡는다.
 const DETACHED_GPS_OK_M: f64 = 5.0;
 /// 붙인 뒤 장착 관계로 정한 목표 회전과의 각거리 중앙값이 이 값(도)을 넘으면 붙이지 않는다.
+/// 시드 5 실측: 정상 성분 최대 2.47°(0.38°·2.47°), 거부 성분 10.05°. 문턱은 그 사이(정상 최대 +0.5° 이상 여유).
 const DETACHED_RIG_MAX_DEG: f64 = 3.0;
 /// 장착 상대 회전 추정을 믿는 데 필요한 카메라별 최소 표본 수, 표본이 평균에서 벗어난 각 중앙값의 상한(도).
 const DETACHED_RIG_MIN_SAMPLES: usize = 8;
@@ -5242,10 +5243,13 @@ mod detached_tests {
         for (deg, attached) in [
             (0.0, true),
             (2.0, true),
+            (2.47, true),
             (2.6, true),
+            (2.95, true),
+            (3.05, false),
             (3.4, false),
             (4.0, false),
-            (10.0, false),
+            (10.05, false),
         ] {
             let (mut main, sub, gps) = setup(12);
             let r = attach_detached(&mut main, sub, &gps, &[], &targets(deg));
@@ -5253,6 +5257,10 @@ mod detached_tests {
             assert_eq!(main.poses[10..].iter().all(|p| p.is_some()), attached);
             assert_eq!(main.poses[10..].iter().all(|p| p.is_none()), !attached);
         }
+        // 시드 5 실측의 정상 최대 2.47° 와 거부 최소 10.05° 사이에 문턱이 있고, 양쪽 모두에서 여유가 있다.
+        let (normal_max, reject_min) = (2.47, 10.05);
+        assert!(normal_max < DETACHED_RIG_MAX_DEG && DETACHED_RIG_MAX_DEG < reject_min);
+        assert!(DETACHED_RIG_MAX_DEG - normal_max >= 0.5);
         // 목표 회전이 NaN 이면 중앙값도 NaN: 거부한다.
         let nan = Rotation3::from_matrix_unchecked(nalgebra::Matrix3::repeat(f64::NAN));
         let bad: Vec<(usize, Rotation3<f64>)> = (10..12).map(|i| (i, nan)).collect();
