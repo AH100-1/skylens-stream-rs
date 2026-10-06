@@ -592,13 +592,19 @@ fn describe_with(
 /// 좌표·스케일은 원래 크기로 되돌리고 기술자는 확대 영상에서 같은 축척으로 계산한 값이다.
 /// (확대 쪽 특징으로 상위를 통째로 바꾸면 약한 특징이 강한 원래 특징을 밀어내 등록·포즈 정확도가 나빠졌다.)
 pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature> {
+    detect_and_describe_tagged(img, cfg).0
+}
+
+/// [`detect_and_describe`] 와 같고, 원래 크기 특징 수도 돌려준다. 번호가 그 수 이상인 특징이 확대 보충 특징이다.
+pub fn detect_and_describe_tagged(img: &GrayImage, cfg: &DetectorConfig) -> (Vec<Feature>, usize) {
     let mut feats = detect_core(img, cfg, 0.5);
+    let n_orig = feats.len();
     if cfg.upscale_below == 0
         || img.width.max(img.height) >= cfg.upscale_below
         || feats.len() >= cfg.max_features
         || (!cfg.upscale_fill && feats.len() * 2 >= cfg.max_features)
     {
-        return feats;
+        return (feats, n_orig);
     }
     let extra = detect_core(&img.upsample2(), cfg, 1.0);
     let need = cfg.max_features - feats.len();
@@ -644,7 +650,7 @@ pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature
         }
     }
     feats.extend(added);
-    feats
+    (feats, n_orig)
 }
 
 fn detect_core(img: &GrayImage, cfg: &DetectorConfig, in_sigma: f32) -> Vec<Feature> {

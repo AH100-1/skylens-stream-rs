@@ -147,6 +147,11 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
 /// 그 사진(`view.id`)이 관측한 점 중 카메라 앞에 있고 깊이가 유한한 점들에서
 /// [`DEPTH_QUANTILES`] 분위를 잡고 [`DEPTH_MARGIN`] 만큼 넓힌다. 그런 점이 없으면 None.
 pub fn try_depth_range(view: &View, points: &[SparsePoint]) -> Option<(f64, f64)> {
+    try_depth_range_q(view, points, DEPTH_QUANTILES)
+}
+
+/// [`try_depth_range`] 에서 분위를 고를 수 있는 형태.
+pub fn try_depth_range_q(view: &View, points: &[SparsePoint], q: (f64, f64)) -> Option<(f64, f64)> {
     let mut d: Vec<f64> = points
         .iter()
         .filter(|p| p.observers.contains(&view.id))
@@ -157,8 +162,8 @@ pub fn try_depth_range(view: &View, points: &[SparsePoint]) -> Option<(f64, f64)
         return None;
     }
     d.sort_by(f64::total_cmp);
-    let near = quantile(&d, DEPTH_QUANTILES.0) * (1.0 - DEPTH_MARGIN);
-    let far = quantile(&d, DEPTH_QUANTILES.1) * (1.0 + DEPTH_MARGIN);
+    let near = quantile(&d, q.0) * (1.0 - DEPTH_MARGIN);
+    let far = quantile(&d, q.1) * (1.0 + DEPTH_MARGIN);
     Some((near, far))
 }
 

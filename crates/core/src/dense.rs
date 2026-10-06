@@ -610,6 +610,51 @@ pub fn region_cloud_with(
     region_cloud_impl(views, sparse_points, cfg, estimate, sweep, SWEEP_NEIGHBORS)
 }
 
+/// 깊이 범위 계산만 바꾸는 선택 사항(이웃 선택·관측자는 그대로).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RangeOpts<'a> {
+    /// `sparse_points` 와 같은 길이. 참인 점은 깊이 범위 분위 계산에서 뺀다.
+    pub skip: Option<&'a [bool]>,
+    /// 깊이 범위 분위(없으면 기본 5~95%).
+    pub quantiles: Option<(f64, f64)>,
+}
+
+/// [`region_cloud`] 에 깊이 범위 선택 사항을 더한 형태.
+pub fn region_cloud_ranged(
+    views: &[DenseView],
+    sparse_points: &[[f64; 3]],
+    cfg: &DenseConfig,
+    range: RangeOpts,
+) -> PointCloud {
+    region_cloud_impl_r(
+        views,
+        sparse_points,
+        cfg,
+        sweep_depth,
+        &SweepConfig::default(),
+        SWEEP_NEIGHBORS,
+        range,
+    )
+}
+
+/// [`region_cloud_patchmatch`] 에 깊이 범위 선택 사항을 더한 형태.
+pub fn region_cloud_patchmatch_ranged(
+    views: &[DenseView],
+    sparse_points: &[[f64; 3]],
+    cfg: &DenseConfig,
+    range: RangeOpts,
+) -> PointCloud {
+    region_cloud_impl_r(
+        views,
+        sparse_points,
+        cfg,
+        patchmatch_depth,
+        &SweepConfig::default(),
+        cfg.neighbors.max(1),
+        range,
+    )
+}
+
 fn region_cloud_impl(
     views: &[DenseView],
     sparse_points: &[[f64; 3]],
@@ -617,6 +662,26 @@ fn region_cloud_impl(
     estimate: DepthEstimator,
     sweep: &SweepConfig,
     take_nbrs: usize,
+) -> PointCloud {
+    region_cloud_impl_r(
+        views,
+        sparse_points,
+        cfg,
+        estimate,
+        sweep,
+        take_nbrs,
+        RangeOpts::default(),
+    )
+}
+
+fn region_cloud_impl_r(
+    views: &[DenseView],
+    sparse_points: &[[f64; 3]],
+    cfg: &DenseConfig,
+    estimate: DepthEstimator,
+    sweep: &SweepConfig,
+    take_nbrs: usize,
+    range: RangeOpts,
 ) -> PointCloud {
     // 1. 왜곡 보정·축소. 실패한 사진은 건너뛴다(빈 깊이 맵).
     let t_depth = std::time::Instant::now();
@@ -633,9 +698,12 @@ fn region_cloud_impl(
     let preps: Vec<&DepthView> = ok.iter().map(|&i| prepared[i].as_ref().unwrap()).collect();
 
     // 희소 점 관측자.
-    let sparse: Vec<SparsePoint> = sparse_points
+    let kept: Vec<usize> = (0..sparse_points.len())
+        .filter(|&i| sparse_points[i].iter().all(|v| v.is_finite()))
+        .collect();
+    let sparse: Vec<SparsePoint> = kept
         .iter()
-        .filter(|p| p.iter().all(|v| v.is_finite()))
+        .map(|&i| &sparse_points[i])
         .map(|p| {
             let xyz = Point3::new(p[0], p[1], p[2]);
             let observers = preps
@@ -660,6 +728,16 @@ fn region_cloud_impl(
         })
         .collect();
 
+    let range_sparse: Vec<SparsePoint> = match range.skip {
+        Some(skip) => kept
+            .iter()
+            .zip(&sparse)
+            .filter(|(&i, _)| !skip[i])
+            .map(|(_, p)| p.clone())
+            .collect(),
+        None => sparse.clone(),
+    };
+    let rq = range.quantiles.unwrap_or(view_selection::DEPTH_QUANTILES);
     // 2. 이웃 선택·깊이 범위.
     let neighbors = view_selection::select_neighbors(&vs, &sparse, cfg.neighbors);
 
@@ -667,7 +745,8 @@ fn region_cloud_impl(
     let maps: Vec<DepthMap> = (0..preps.len())
         .into_par_iter()
         .map(|i| {
-            let (near, far) = view_selection::depth_range(&vs[i], &sparse);
+            let (near, far) = view_selection::try_depth_range_q(&vs[i], &range_sparse, rq)
+                .unwrap_or_else(|| view_selection::depth_range(&vs[i], &sparse));
             let nb: Vec<&DepthView> = neighbors[i]
                 .iter()
                 .take(take_nbrs)

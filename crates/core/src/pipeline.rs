@@ -18,8 +18,10 @@ use crate::align::Similarity;
 use crate::ba::{bundle_adjust, BaOptions, BaProblem, Observation, PositionPrior};
 use crate::camera::{Camera, Intrinsics, Pose};
 use crate::dataset::Dataset;
-use crate::dense::{region_cloud, region_cloud_patchmatch, DenseConfig, DenseView};
-use crate::features::{detect_and_describe, DetectorConfig, Feature, GrayImage};
+use crate::dense::{
+    region_cloud_patchmatch_ranged, region_cloud_ranged, DenseConfig, DenseView, RangeOpts,
+};
+use crate::features::{detect_and_describe_tagged, DetectorConfig, Feature, GrayImage};
 use crate::fusion::{fuse, FusionConfig, FusionView};
 use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig};
 use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
@@ -49,6 +51,10 @@ pub struct PipelineConfig {
     pub max_features: usize,
     /// 긴 변 800 미만 사진에서 확대 특징을 상한까지 더한다(기본 끔: 원래 검출이 상한 절반 미만일 때만).
     pub upscale_fill: bool,
+    /// 확대 보충 특징이 한 번이라도 관측된 희소 점을 밀집 깊이 범위 계산에서 뺀다(기본 끔).
+    pub range_skip_upscaled: bool,
+    /// 밀집 깊이 범위 분위(아래, 위). None 이면 기본 5~95%.
+    pub range_quantiles: Option<(f64, f64)>,
     /// 회전 평균 전에 카메라 쌍 단위 회전 투표로 간선을 거른다(기본 끔).
     pub pair_vote: bool,
     /// 밀집 깊이 맵 폭(px).
@@ -131,6 +137,8 @@ impl Default for PipelineConfig {
         Self {
             max_features: 1500,
             upscale_fill: false,
+            range_skip_upscaled: false,
+            range_quantiles: None,
             pair_vote: false,
             dense_width: 160,
             dense_method: DenseMethod::Sweep,
@@ -181,6 +189,8 @@ pub struct PipelineResult {
 struct ImgData {
     rgb: image::RgbImage,
     feats: Vec<Feature>,
+    /// 원래 크기 특징 수: 번호가 이 값 이상인 특징은 확대 보충 특징이다.
+    n_orig: usize,
 }
 
 /// 초벌(BA 전) 또는 정밀(BA 후) 희소 모델. 사진 번호는 구역 안 번호.
@@ -387,7 +397,7 @@ fn load(path: &Path, max_features: usize, upscale_fill: bool) -> Result<ImgData,
         .map_err(|e| format!("{}: {e}", path.display()))?
         .to_rgb8();
     let g = GrayImage::from_rgb(rgb.width() as usize, rgb.height() as usize, rgb.as_raw());
-    let feats = detect_and_describe(
+    let (feats, n_orig) = detect_and_describe_tagged(
         &g,
         &DetectorConfig {
             max_features,
@@ -395,7 +405,7 @@ fn load(path: &Path, max_features: usize, upscale_fill: bool) -> Result<ImgData,
             ..DetectorConfig::default()
         },
     );
-    Ok(ImgData { rgb, feats })
+    Ok(ImgData { rgb, feats, n_orig })
 }
 
 fn norm(k: &Intrinsics, f: &Feature) -> Vector2<f64> {
@@ -1594,6 +1604,7 @@ const PREVIEW_MIN_RAY_DEG: f64 = 20.0;
 
 /// 밀집: 구역 사진을 `dense::region_cloud`(보정·이웃·사진별 깊이·융합)에 넘긴다. 희소 점도 함께 담는다.
 /// `dw` 는 보정 뒤 긴 변 화소 수다. 밀집 점이 하나도 안 나오면 희소 점 보간 깊이로 대신한다.
+#[cfg(test)]
 fn dense_cloud(
     s: &Sparse,
     imgs: &[&ImgData],
@@ -1601,6 +1612,19 @@ fn dense_cloud(
     in_region: &[bool],
     dw: usize,
     method: DenseMethod,
+) -> PointCloud {
+    dense_cloud_with(s, imgs, k, in_region, dw, method, (false, None))
+}
+
+/// [`dense_cloud`] 에 깊이 범위 선택 사항(확대 유래 점 제외 여부, 분위)을 더한 형태.
+fn dense_cloud_with(
+    s: &Sparse,
+    imgs: &[&ImgData],
+    k: &Intrinsics,
+    in_region: &[bool],
+    dw: usize,
+    method: DenseMethod,
+    (range_skip_upscaled, range_quantiles): (bool, Option<(f64, f64)>),
 ) -> PointCloud {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some() && in_region[i])
@@ -1626,9 +1650,22 @@ fn dense_cloud(
         depth_rel: DenseConfig::default().depth_rel * scale,
         ..DenseConfig::default()
     };
+    // 확대 보충 특징이 한 번이라도 관측된 점(깊이 범위 계산에서 뺄 후보).
+    let from_upscale: Vec<bool> = s
+        .obs
+        .iter()
+        .map(|o| {
+            o.iter()
+                .any(|&(img, f, _)| imgs.get(img).is_some_and(|d| f >= d.n_orig))
+        })
+        .collect();
+    let ropts = RangeOpts {
+        skip: range_skip_upscaled.then_some(&from_upscale[..]),
+        quantiles: range_quantiles,
+    };
     let mut cloud = match method {
-        DenseMethod::Sweep => region_cloud(&views, &pts, &cfg),
-        DenseMethod::PatchMatch => region_cloud_patchmatch(&views, &pts, &cfg),
+        DenseMethod::Sweep => region_cloud_ranged(&views, &pts, &cfg, ropts),
+        DenseMethod::PatchMatch => region_cloud_patchmatch_ranged(&views, &pts, &cfg, ropts),
     };
     if cloud.is_empty() {
         cloud = interpolated_cloud(s, &ids, imgs, k, dw);
@@ -2456,13 +2493,14 @@ pub fn run_pipeline_with(
         let t3 = Instant::now();
         let in_region: Vec<bool> = gids.iter().map(|g| r.contains(g / 3)).collect();
         let coarse = crate::timing::timed("coarse_dense_total", || {
-            dense_cloud(
+            dense_cloud_with(
                 &well_conditioned(&init, PREVIEW_MIN_RAY_DEG, 200),
                 &imgs,
                 &k,
                 &in_region,
                 cfg.dense_width,
                 cfg.dense_method,
+                (cfg.range_skip_upscaled, cfg.range_quantiles),
             )
         });
         st.secs_dense = t3.elapsed().as_secs_f64();
@@ -2563,6 +2601,7 @@ pub fn run_pipeline_with(
             let (maxf, upf, position, region) =
                 (cfg.max_features, cfg.upscale_fill, cfg.position, *r);
             let tri_t = TriConfig::from_config(cfg);
+            let rsel = (cfg.range_skip_upscaled, cfg.range_quantiles);
             let mut cached: HashMap<usize, Arc<ImgData>> =
                 gids_t.iter().copied().zip(arcs.iter().cloned()).collect();
             in_flight += 1;
@@ -2647,7 +2686,7 @@ pub fn run_pipeline_with(
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {
-                    dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod)
+                    dense_cloud_with(&rs, &imgs, &k, &in_region, dw, dmethod, rsel)
                 });
                 let _ = tx.send(RefinedMsg {
                     slot,
