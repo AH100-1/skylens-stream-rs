@@ -73,7 +73,8 @@ skylens-stream --help
 ### 합성 장면으로 한 번 돌려 보기
 
 `synth` → `run` → `verify` 를 끝까지 잇는다. 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(`--span 48`)으로 잡는다.
-같은 명령을 `crates/cli/tests/pipeline_e2e.rs` 가 프로세스로 돌려 아래 수치에 상한을 건다(`cargo test --release -p skylens-stream --test pipeline_e2e`, 구역 2개 시험 포함 약 3~6 분).
+인자 없이도 돈다: `skylens-stream synth d/in && skylens-stream run d/in d/out && skylens-stream verify d/out` 는 구역 3개(`--span 12`)로 verify 7/7, 종료 코드 0 이다(구역 밖 앞·뒤 보조 사진이 다른 카메라 짝을 이어 준다. `--helper-front`·`--helper-back`·`--helper-back-step` 으로 범위를 바꾼다). 이 경로는 `crates/cli/tests/default_path.rs` 가 지킨다.
+같은 명령을 `crates/cli/tests/pipeline_e2e.rs` 가 프로세스로 돌려(구역 2개는 BA 15회·10회 둘 다) 구역 간 항목에 verify 기준 상한을 걸고, 구역 3개 기본 경로는 `default_path.rs` 가 같은 기준으로 판정한다(`cargo test --release -p skylens-stream --test pipeline_e2e`, 구역 2개 시험 포함 약 3~6 분).
 
 ```bash
 skylens-stream synth scene 320 180
@@ -88,10 +89,10 @@ skylens-stream verify out2
 
 | | 단구역 (`out`, 120장) | 구역 2개 (`out2`, 240장) |
 |---|---|---|
-| run 시간 | 약 30 초 (부하 낮을 때) | 332 초 (부하 22), 시험 전체 179 초 (부하 낮을 때) |
-| verify | 7/7, 종료 코드 0 | 6/7, 종료 코드 1 |
-| 미달 항목 | 없음 (preview_vs_refined 최근접 중앙 1.416 m, 높이 차 중앙 1.553 m 통과) | preview_vs_refined (최근접 4.923 m, 높이 차 5.829 m). preview_align 은 통과(점쌍 최소 1221, 스케일 차 0.05%, 잔차 5.130 m) |
-| refined_overlap | 해당 없음 (구역 1개) | PASS, 1쌍 겹침 차 중앙 최대 0.257 m |
+| run 시간 | 약 30 초 (부하 낮을 때) | 약 380 초 (4코어, 다른 빌드 동시) |
+| verify | 7/7, 종료 코드 0 | 7/7, 종료 코드 0 |
+| 구역 간 항목 | preview_vs_refined 최근접 중앙 1.416 m, 높이 차 중앙 1.553 m 통과 | preview_align 점쌍 최소 2914, 스케일 차 0.55%, 잔차 0.176 m, preview_vs_refined 최근접 0.552 m, 높이 차 0.445 m (모두 통과) |
+| refined_overlap | 해당 없음 (구역 1개) | PASS, 1쌍 겹침 차 중앙 최대 0.152 m (BA 10회: 0.157 m) |
 | 재투영 (초벌 → 정밀) | 3.026 → 0.300 px | 3.232 → 0.282 px |
 | 카메라 중심 오차 중앙 / 최대 | 0.329 / 2.912 m | 0.290 / 3.115 m |
 | 정밀 점 → 정답 표면 중앙 / 95% | 0.475 / 1.465 m (점 11054) | 0.494 / 3.022 m (점 19855) |
@@ -318,6 +319,9 @@ skylens-stream synth <output dir> [width height]
 # Exit code: 1 if any FAIL, 2 if no FAIL but some undecided, 0 if all PASS
 # Registered images, region images and reprojection error are decided only when report.json is in the output folder
 skylens-stream verify <output dir>
+
+# With no options: synth -> run -> verify gives 3 regions, 7/7, exit 0 (helper photos outside each region link the cameras; see --helper-front/--helper-back/--helper-back-step)
+skylens-stream synth d/in && skylens-stream run d/in d/out && skylens-stream verify d/out
 
 # Run a synthetic scene end to end (synth -> run -> verify); cross-camera overlap only appears between positions 12-40 apart, so use regions of 40+ positions (--span 48)
 skylens-stream synth scene 320 180
