@@ -240,6 +240,61 @@ pub mod stand_in {
         )
     }
 
+    /// `solve_centers` 에 GPS 잔차 강건 손실(IRLS)을 더한 것. 손실 무게는 카메라마다 (c_i − g_i) 의 길이로 정한다.
+    pub fn solve_centers_robust(
+        gps: &[Vector3<f64>],
+        dirs: &[(usize, usize, Vector3<f64>)],
+        prior: f64,
+        loss: GpsLoss,
+        thr: f64,
+    ) -> Option<Vec<Vector3<f64>>> {
+        let n = gps.len();
+        let mut h0 = DMatrix::<f64>::zeros(3 * n, 3 * n);
+        for &(i, j, d) in dirs {
+            let m = Matrix3::identity() - d * d.transpose();
+            for r in 0..3 {
+                for c in 0..3 {
+                    h0[(3 * i + r, 3 * i + c)] += m[(r, c)];
+                    h0[(3 * j + r, 3 * j + c)] += m[(r, c)];
+                    h0[(3 * i + r, 3 * j + c)] -= m[(r, c)];
+                    h0[(3 * j + r, 3 * i + c)] -= m[(r, c)];
+                }
+            }
+        }
+        let mut w = vec![1.0f64; n];
+        let mut out: Option<Vec<Vector3<f64>>> = None;
+        for _ in 0..12 {
+            let mut h = h0.clone();
+            let mut rhs = DMatrix::<f64>::zeros(3 * n, 1);
+            for (i, g) in gps.iter().enumerate() {
+                for r in 0..3 {
+                    h[(3 * i + r, 3 * i + r)] += w[i] * prior * prior;
+                    rhs[(3 * i + r, 0)] += w[i] * prior * prior * g[r];
+                }
+            }
+            let x = h.lu().solve(&rhs)?;
+            let c: Vec<Vector3<f64>> = (0..n)
+                .map(|i| Vector3::new(x[(3 * i, 0)], x[(3 * i + 1, 0)], x[(3 * i + 2, 0)]))
+                .collect();
+            for i in 0..n {
+                let r = (c[i] - gps[i]).norm();
+                w[i] = match loss {
+                    GpsLoss::Squared => 1.0,
+                    GpsLoss::Huber => {
+                        if r <= thr {
+                            1.0
+                        } else {
+                            thr / r
+                        }
+                    }
+                    GpsLoss::Cauchy => 1.0 / (1.0 + (r / thr) * (r / thr)),
+                };
+            }
+            out = Some(c);
+        }
+        out
+    }
+
     /// 점-광선 최소제곱 삼각측량. 반환: 점(깊이가 모두 양수, 재투영 `max_px` 이하일 때만).
     pub fn triangulate_track(cams: &[(Camera, Vector2<f64>)], max_px: f64) -> Option<Vector3<f64>> {
         let mut a = Matrix3::zeros();
@@ -915,6 +970,63 @@ fn refine_centers(
     }
 }
 
+/// GPS 사전항 잔차 손실(위치 풀이 단계).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GpsLoss {
+    Squared,
+    Huber,
+    Cauchy,
+}
+
+/// GPS 사전항 선택 옵션(기본 끔 = 제곱 손실, 무게 1, 풀이에 포함). 위치 풀이 단계에만 적용된다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpsPriorOpts {
+    /// 사전 가중 배수(`PreviewOpts::prior` 에 곱한다).
+    pub weight: f64,
+    pub loss: GpsLoss,
+    /// Huber/Cauchy 문턱(m).
+    pub thr: f64,
+    /// 참이면 사전항을 풀이에서 사실상 빼고(가중 1e-3) 풀이 뒤 닮음 정렬로만 GPS 를 쓴다.
+    pub post_only: bool,
+}
+
+impl Default for GpsPriorOpts {
+    fn default() -> Self {
+        Self {
+            weight: 1.0,
+            loss: GpsLoss::Squared,
+            thr: 1.0,
+            post_only: false,
+        }
+    }
+}
+
+impl GpsPriorOpts {
+    /// `SKYLENS_GPS_PRIOR=w=0.5,loss=huber,thr=1,post=1` 꼴. 없으면 기본(끔).
+    pub fn from_env() -> Self {
+        let mut o = Self::default();
+        let Ok(spec) = std::env::var("SKYLENS_GPS_PRIOR") else {
+            return o;
+        };
+        for kv in spec.split(',') {
+            match kv.split_once('=') {
+                Some(("w", v)) => o.weight = v.parse().unwrap_or(1.0),
+                Some(("thr", v)) => o.thr = v.parse().unwrap_or(1.0),
+                Some(("post", v)) => o.post_only = v == "1",
+                Some(("loss", v)) => {
+                    o.loss = match v {
+                        "huber" => GpsLoss::Huber,
+                        "cauchy" => GpsLoss::Cauchy,
+                        _ => GpsLoss::Squared,
+                    }
+                }
+                _ => {}
+            }
+        }
+        o
+    }
+}
+
 /// 초벌 포즈 단계 선택(후보 비교용). 기본값은 비교에서 가장 좋았던 조합.
 #[derive(Clone, Copy, Debug)]
 pub struct PreviewOpts {
@@ -947,6 +1059,8 @@ pub struct PreviewOpts {
     pub refine_drop_deg: f64,
     /// 다듬기: 시작 위치로 당기는 약한 항의 상대 가중.
     pub refine_anchor: f64,
+    /// GPS 사전항 무게·강건화(기본 끔).
+    pub gps_prior: GpsPriorOpts,
 }
 
 impl Default for PreviewOpts {
@@ -966,6 +1080,7 @@ impl Default for PreviewOpts {
             refine_huber_deg: 0.3,
             refine_drop_deg: 2.0,
             refine_anchor: 0.02,
+            gps_prior: GpsPriorOpts::default(),
         }
     }
 }
@@ -1335,7 +1450,18 @@ fn sparse_init_with(
     let placed: Vec<Option<Vector3<f64>>> = match placed {
         Some(c) => c,
         None => {
-            let c = stand_in::solve_centers(&gl, &dirs, opts.prior).ok_or("위치 풀이 실패")?;
+            let gp = opts.gps_prior;
+            let c = if gp == GpsPriorOpts::default() {
+                stand_in::solve_centers(&gl, &dirs, opts.prior)
+            } else {
+                let w = if gp.post_only {
+                    1e-3
+                } else {
+                    opts.prior * gp.weight
+                };
+                stand_in::solve_centers_robust(&gl, &dirs, w, gp.loss, gp.thr)
+            }
+            .ok_or("위치 풀이 실패")?;
             let mut v = vec![None; n];
             for (a, &i) in ids.iter().enumerate() {
                 v[i] = Some(c[a]);
@@ -1351,7 +1477,7 @@ fn sparse_init_with(
         poses[i] = Some(Pose::from_center(r, &Point3::from(c)));
     }
     stages.placed = poses.clone();
-    if opts.snap {
+    if opts.snap || opts.gps_prior.post_only {
         snap_poses_to_gps(&mut poses, gps, opts.vfix);
     }
     if std::env::var("PIPE_DEBUG").is_ok() {
@@ -2664,6 +2790,7 @@ pub fn run_pipeline_with(
                     &PreviewOpts {
                         refine_iters: cfg.preview_refine_iters,
                         pair_vote: cfg.pair_vote,
+                        gps_prior: GpsPriorOpts::from_env(),
                         ..PreviewOpts::default()
                     },
                 )
@@ -2705,6 +2832,7 @@ pub fn run_pipeline_with(
             &PreviewOpts {
                 legacy_roll: true,
                 pair_vote: cfg.pair_vote,
+                gps_prior: GpsPriorOpts::from_env(),
                 ..PreviewOpts::default()
             },
         )
