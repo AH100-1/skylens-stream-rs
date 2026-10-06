@@ -31,6 +31,8 @@ const DISPLACEMENT_TOLERANCE: f64 = 40.0;
 /// 잔차 문턱 하한 비율(기준 문턱 대비). 이웃 변위가 잘 맞으면(MAD 작음) 문턱을 기준의 1/4(960 폭에서 10 px)까지
 /// 낮춰, 옆 격자 점으로 일관되게 바뀐 대응처럼 그래프만으로는 안 보이는 오대응을 짝 단계에서 거른다.
 const DISPLACEMENT_FLOOR: f64 = 0.25;
+/// 잔차 문턱 상한 = 기준 문턱의 이 배수.
+const DISPLACEMENT_CAP: f64 = 3.0;
 /// 기준 영상 크기(화소).
 const DISPLACEMENT_REF_WIDTH: f64 = 960.0;
 const DISPLACEMENT_REF_HEIGHT: f64 = 540.0;
@@ -510,15 +512,16 @@ fn displacement_outliers(
     kp_a: &[Vector2<f64>],
     kp_b: &[Vector2<f64>],
 ) -> Vec<bool> {
-    displacement_outliers_with_floor(matches, kp_a, kp_b, DISPLACEMENT_FLOOR)
+    displacement_outliers_with_floor(matches, kp_a, kp_b, DISPLACEMENT_FLOOR, DISPLACEMENT_CAP)
 }
 
-/// `displacement_outliers` 와 같되 잔차 문턱 하한 비율을 인자로 받는다(시험에서 하한을 바꿔 볼 때 쓴다).
+/// `displacement_outliers` 와 같되 잔차 문턱 하한·상한 비율을 인자로 받는다(시험에서 바꿔 볼 때 쓴다).
 fn displacement_outliers_with_floor(
     matches: &[(usize, usize)],
     kp_a: &[Vector2<f64>],
     kp_b: &[Vector2<f64>],
     floor: f64,
+    cap: f64,
 ) -> Vec<bool> {
     let mut out = vec![false; matches.len()];
     if matches.len() < 8 {
@@ -656,7 +659,7 @@ fn displacement_outliers_with_floor(
                 };
                 // 대상 점은 u = 0, 변위 0(뺀 값)이므로 예측 (f[0], f[3]) 가 곧 어긋남이다.
                 let r = (f[0] * f[0] + f[3] * f[3]).sqrt();
-                r > (4.0 * s).clamp(tol * floor, 3.0 * tol)
+                r > (4.0 * s).clamp(tol * floor, cap * tol)
             },
         )
         .collect();
@@ -1933,10 +1936,44 @@ mod tests {
         assert!(times[1] <= 8.0 * times[0] + 0.05, "{times:?}");
     }
 
-    /// F-382: 참 대응만(오대응 0) 있는 합성 대응 장면. `boxes` 가 참이면 지형 위에 5~15 m 높이 상자 10 개를
-    /// 더해 건물 모서리 같은 시차 단차를 만든다(꼭대기 면 점만 표본, 벽 점은 없음). 거짓이면 지형만(완만).
-    /// 영상마다 더 가까운 점이 2 화소 안에 있는 점은 가려진 것으로 보고 뺀다. 같은 정답 점의 두 영상 특징을 모두 잇는다.
-    fn step_scene(boxes: bool, keep_percent: u64, opts: &SceneOpts) -> Synthetic {
+    /// 단차 장면의 상자 하나: 중심 (x, y), 반변 (hx, hy), 윗면 z. 윗면 = 중심 지형 높이 + 5~15 m.
+    type StepBox = (f64, f64, f64, f64, f64);
+
+    /// 선분 `c`→`q` 가 상자 안쪽(0.1 m 줄인 상자)을 지나는지. 줄여서 상자 표면 위 점은 자기 상자에 가려지지 않는다.
+    fn segment_hits_box(c: &Point3<f64>, q: &Point3<f64>, b: &StepBox) -> bool {
+        let m = 0.1;
+        let lo = [b.0 - b.2 + m, b.1 - b.3 + m, -100.0];
+        let hi = [b.0 + b.2 - m, b.1 + b.3 - m, b.4 - m];
+        let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        for k in 0..3 {
+            let d = q[k] - c[k];
+            if d.abs() < 1e-12 {
+                if c[k] < lo[k] || c[k] > hi[k] {
+                    return false;
+                }
+            } else {
+                let (u, v) = ((lo[k] - c[k]) / d, (hi[k] - c[k]) / d);
+                t0 = t0.max(u.min(v));
+                t1 = t1.min(u.max(v));
+                if t0 > t1 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// F-382/F-392: 참 대응만(오대응 0) 있는 합성 대응 장면. `boxes` 가 참이면 지형 위에 (지형 높이 + 5~15 m)
+    /// 높이 상자 10 개를 더해 건물 모서리 같은 시차 단차를 만든다(윗면 점과 벽 면 점 표본, 간격 1.5 m).
+    /// 거짓이면 지형만(완만). 영상마다 카메라 중심에서 점까지 광선이 상자를 지나면 그 점은 가려진 것으로 뺀다.
+    /// `seed` 는 상자 배치. 같은 정답 점의 두 영상 특징을 모두 잇는다. 돌려주는 값: 장면, 점마다 상자 경계
+    /// ±3 m(수평) 안 여부, (가려 빠진 점 수, 가림 판정 전 보이는 점 수) 의 영상 합.
+    fn step_scene_seeded(
+        boxes: bool,
+        keep_percent: u64,
+        opts: &SceneOpts,
+        seed: u64,
+    ) -> (Synthetic, Vec<bool>, (usize, usize)) {
         let scene = Scene::new(SceneConfig {
             positions: opts.positions,
             width: opts.width,
@@ -1944,19 +1981,21 @@ mod tests {
             ..SceneConfig::default()
         });
         let x_end = 40.0 + opts.positions.saturating_sub(12) as f64;
-        // 상자: x 를 따라 좌우로 번갈아, 한 변 5~9 m, 높이 5~15 m.
-        let mut bx: Vec<(f64, f64, f64, f64, f64)> = Vec::new();
+        // 상자: x 를 따라 좌우로 번갈아, 한 변 5~9 m, 높이 지형 + 5~15 m.
+        let mut bx: Vec<StepBox> = Vec::new();
         if boxes {
             for i in 0..10u64 {
-                let h = hash(i + 0x57E9);
+                let h = hash(i + seed);
                 let u = |s: u32| ((h >> s) & 0xFFFF) as f64 / 65535.0;
                 let cx = -4.0 + (x_end + 8.0) * (i as f64 + 0.5) / 10.0;
                 let cy = if i % 2 == 0 { 1.0 } else { -1.0 } * (4.0 + 10.0 * u(0));
                 let half = 2.5 + 2.0 * u(16);
-                bx.push((cx, cy, half, half, 5.0 + 10.0 * u(32)));
+                let top = crate::synth::terrain_height(cx, cy) + 5.0 + 10.0 * u(32);
+                bx.push((cx, cy, half, half, top));
             }
         }
         let mut points = Vec::new();
+        let mut near_edge = Vec::new();
         let mut x = -10.0;
         while x <= x_end {
             let mut y = -30.0;
@@ -1972,41 +2011,62 @@ mod tests {
             }
             x += 1.5;
         }
+        // 벽 면 점: 네 벽을 수평 1.5 m, 수직 1.5 m 간격으로(바닥은 그 자리 지형, 위는 윗면).
+        for &(cx, cy, hx, hy, top) in &bx {
+            for side in 0..4 {
+                let (along, fixed) = if side < 2 { (hy, hx) } else { (hx, hy) };
+                let sign = if side % 2 == 0 { 1.0 } else { -1.0 };
+                let n = (2.0 * along / 1.5).floor() as i32;
+                for k in 0..=n {
+                    let s = -along + 1.5 * k as f64;
+                    let (px, py) = if side < 2 {
+                        (cx + sign * fixed, cy + s)
+                    } else {
+                        (cx + s, cy + sign * fixed)
+                    };
+                    let g = crate::synth::terrain_height(px, py);
+                    let mut z = g;
+                    while z < top {
+                        points.push(Point3::new(px, py, z));
+                        z += 1.5;
+                    }
+                }
+            }
+        }
+        // 상자 경계(수평 사각형 둘레)까지 거리 ±3 m 안.
+        for p in &points {
+            near_edge.push(bx.iter().any(|&(cx, cy, hx, hy, _)| {
+                let (dx, dy) = ((p.x - cx).abs() - hx, (p.y - cy).abs() - hy);
+                let sd = if dx > 0.0 || dy > 0.0 {
+                    dx.max(0.0).hypot(dy.max(0.0))
+                } else {
+                    dx.max(dy)
+                };
+                sd.abs() <= 3.0
+            }));
+        }
         let nv = scene.views.len();
         let mut keypoints = vec![Vec::new(); nv];
         let mut gt = vec![Vec::new(); nv];
         let mut feat_of: Vec<HashMap<usize, usize>> = vec![HashMap::new(); nv];
+        let (mut hidden, mut seen) = (0usize, 0usize);
         for (i, v) in scene.views.iter().enumerate() {
-            let mut vis: Vec<(u64, usize, Vector2<f64>, f64)> = Vec::new();
+            let c = v.camera.pose.center();
+            let mut vis: Vec<(u64, usize, Vector2<f64>)> = Vec::new();
             for (p, x) in points.iter().enumerate() {
                 if let Some(px) = v.camera.project(x) {
                     if v.camera.intrinsics.contains(&px) {
-                        let depth = v.camera.pose.transform(x).z;
-                        vis.push((hash((i as u64) << 32 | p as u64), p, px, depth));
+                        seen += 1;
+                        if bx.iter().any(|b| segment_hits_box(&c, x, b)) {
+                            hidden += 1;
+                        } else {
+                            vis.push((hash((i as u64) << 32 | p as u64), p, px));
+                        }
                     }
                 }
             }
-            // 가림: 2 화소 칸(이웃 칸 포함)에 더 가까운 점이 있으면 뺀다.
-            let cell = |q: &Vector2<f64>| ((q.x / 2.0).floor() as i64, (q.y / 2.0).floor() as i64);
-            type Cell = (i64, i64);
-            type Seen = Vec<(Vector2<f64>, f64)>;
-            let mut near: HashMap<Cell, Seen> = HashMap::new();
-            for e in &vis {
-                near.entry(cell(&e.2)).or_default().push((e.2, e.3));
-            }
-            vis.retain(|e| {
-                let (cx, cy) = cell(&e.2);
-                !(cx - 1..=cx + 1).any(|gx| {
-                    (cy - 1..=cy + 1).any(|gy| {
-                        near.get(&(gx, gy)).is_some_and(|v| {
-                            v.iter()
-                                .any(|(q, d)| (q - e.2).norm() <= 2.0 && *d < e.3 - 0.5)
-                        })
-                    })
-                })
-            });
             vis.sort_unstable_by_key(|e| e.0);
-            for (f, &(_, p, px, _)) in vis.iter().enumerate() {
+            for (f, &(_, p, px)) in vis.iter().enumerate() {
                 keypoints[i].push(px);
                 gt[i].push(p);
                 feat_of[i].insert(p, f);
@@ -2046,17 +2106,35 @@ mod tests {
                 matches: m,
             });
         }
-        Synthetic {
-            keypoints,
-            gt,
-            pairs,
-            outliers: 0,
-            inliers,
-        }
+        (
+            Synthetic {
+                keypoints,
+                gt,
+                pairs,
+                outliers: 0,
+                inliers,
+            },
+            near_edge,
+            (hidden, seen),
+        )
+    }
+
+    fn step_scene(boxes: bool, keep_percent: u64, opts: &SceneOpts) -> Synthetic {
+        step_scene_seeded(boxes, keep_percent, opts, 0x57E9).0
     }
 
     /// 하한 `floor` 에서 짝 종류별(같은 카메라, 카메라 간) 거른 참 대응 (거름, 전체).
-    fn floor_drop_counts(s: &Synthetic, floor: f64) -> [(usize, usize); 2] {
+    fn floor_drop_counts(s: &Synthetic, floor: f64, cap: f64) -> [(usize, usize); 2] {
+        floor_drop_counts_masked(s, floor, cap, None)
+    }
+
+    /// `edge` 가 있으면 정답 점이 `edge[점]` 인 대응만 센다(상자 경계 ±3 m 부분집합).
+    fn floor_drop_counts_masked(
+        s: &Synthetic,
+        floor: f64,
+        cap: f64,
+        edge: Option<&[bool]>,
+    ) -> [(usize, usize); 2] {
         let mut r = [(0usize, 0usize); 2];
         for p in &s.pairs {
             let kind = (p.image_a % 3 != p.image_b % 3) as usize;
@@ -2065,9 +2143,11 @@ mod tests {
                 &s.keypoints[p.image_a],
                 &s.keypoints[p.image_b],
                 floor,
+                cap,
             );
             for (&(fa, fb), &bad) in p.matches.iter().zip(&flags) {
-                if s.gt[p.image_a][fa] == s.gt[p.image_b][fb] {
+                let g = s.gt[p.image_a][fa];
+                if g == s.gt[p.image_b][fb] && edge.is_none_or(|e| e[g]) {
                     r[kind].0 += bad as usize;
                     r[kind].1 += 1;
                 }
@@ -2076,7 +2156,136 @@ mod tests {
         r
     }
 
-    /// F-382: 높이 단차 장면과 완만한 장면에서 하한 1.0/0.25 의 참 대응 거름 비율.
+    /// F-385: 단차 장면 카메라 간 짝의 참 대응 중 거른 것을 (상자 경계까지 화소 거리) × (같은 짝 이웃 24 개
+    /// 변위 중앙값과의 시차 차이) 칸별로 센다. 경계 = 영상 a 에서 변위가 20 px 넘게 다른 가장 가까운 대응.
+    /// 칸마다 "거름/전체" 를 찍는다. 측정용이라 평소 시험에서는 뺀다.
+    #[test]
+    #[ignore]
+    fn step_scene_cross_camera_drop_table() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        let dist_edges = [3.0, 6.0, 12.0, 24.0];
+        let par_edges = [20.0, 40.0, 80.0, 160.0];
+        let bin = |v: f64, e: &[f64; 4]| e.iter().position(|&x| v < x).unwrap_or(4);
+        for keep in [100u64, 40] {
+            let s = step_scene(true, keep, &opts);
+            let mut tab = [[(0usize, 0usize); 5]; 5];
+            for p in &s.pairs {
+                if p.image_a % 3 == p.image_b % 3 {
+                    continue;
+                }
+                let (ka, kb) = (&s.keypoints[p.image_a], &s.keypoints[p.image_b]);
+                let flags = displacement_outliers(&p.matches, ka, kb);
+                let pos: Vec<(Vector2<f64>, Vector2<f64>)> = p
+                    .matches
+                    .iter()
+                    .map(|&(fa, fb)| (ka[fa], kb[fb] - ka[fa]))
+                    .collect();
+                for (i, &(fa, fb)) in p.matches.iter().enumerate() {
+                    if s.gt[p.image_a][fa] != s.gt[p.image_b][fb] {
+                        continue;
+                    }
+                    let mut d: Vec<(f64, usize)> = pos
+                        .iter()
+                        .enumerate()
+                        .filter(|&(j, _)| j != i)
+                        .map(|(j, q)| ((q.0 - pos[i].0).norm_squared(), j))
+                        .collect();
+                    if d.len() < 24 {
+                        continue;
+                    }
+                    d.select_nth_unstable_by(23, |a, b| a.0.total_cmp(&b.0));
+                    let mut dx: Vec<f64> = d[..24].iter().map(|e| pos[e.1].1.x).collect();
+                    let mut dy: Vec<f64> = d[..24].iter().map(|e| pos[e.1].1.y).collect();
+                    dx.sort_by(|a, b| a.total_cmp(b));
+                    dy.sort_by(|a, b| a.total_cmp(b));
+                    let med = Vector2::new(dx[12], dy[12]);
+                    let par = (pos[i].1 - med).norm();
+                    let edge = pos
+                        .iter()
+                        .filter(|q| (q.1 - pos[i].1).norm() > 20.0)
+                        .map(|q| (q.0 - pos[i].0).norm())
+                        .fold(f64::MAX, f64::min);
+                    let c = &mut tab[bin(edge, &dist_edges)][bin(par, &par_edges)];
+                    c.0 += flags[i] as usize;
+                    c.1 += 1;
+                }
+            }
+            eprintln!("keep {keep} step cross (rows: edge dist px <3,<6,<12,<24,>=24; cols: parallax diff px <20,<40,<80,<160,>=160), dropped/total");
+            for row in &tab {
+                let line: Vec<String> = row
+                    .iter()
+                    .map(|c| format!("{:>5}/{:<6}", c.0, c.1))
+                    .collect();
+                eprintln!("  {}", line.join(" "));
+            }
+            let tot = tab
+                .iter()
+                .flatten()
+                .fold((0, 0), |a, c| (a.0 + c.0, a.1 + c.1));
+            eprintln!("  total {}/{}", tot.0, tot.1);
+        }
+    }
+
+    /// F-385: 문턱 상한 배수별(하한 0.25) 단차·평지 장면의 참 대응 거름 비율. 측정용.
+    #[test]
+    #[ignore]
+    fn displacement_cap_sweep() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        for keep in [100u64, 40] {
+            for (name, boxes) in [("flat", false), ("step", true)] {
+                let s = step_scene(boxes, keep, &opts);
+                for cap in [8.0, 12.0, 16.0, 24.0] {
+                    let r = floor_drop_counts(&s, DISPLACEMENT_FLOOR, cap);
+                    eprintln!(
+                        "keep {keep} {name} cap {cap}: same {}/{} ({:.4}) cross {}/{} ({:.4})",
+                        r[0].0,
+                        r[0].1,
+                        r[0].0 as f64 / r[0].1.max(1) as f64,
+                        r[1].0,
+                        r[1].1,
+                        r[1].0 as f64 / r[1].1.max(1) as f64
+                    );
+                }
+            }
+        }
+    }
+
+    /// F-382/F-385/F-392/F-393: 광선 가림 단차 장면에서 재현율 × 상자 배치 × 하한별 참 대응 거름 비율. 측정용.
+    #[test]
+    #[ignore]
+    fn displacement_floor_occlusion_table() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        for seed in [0x57E9u64, 0x1234, 0xBEEF] {
+            for keep in [30u64, 40, 50, 100] {
+                let (s, edge, (hid, seen)) = step_scene_seeded(true, keep, &opts, seed);
+                let mut line = format!("seed {seed:#x} keep {keep} hidden {hid}/{seen}");
+                for floor in [1.0, 0.5, 0.35, 0.25] {
+                    let r = floor_drop_counts(&s, floor, DISPLACEMENT_CAP);
+                    let e = floor_drop_counts_masked(&s, floor, DISPLACEMENT_CAP, Some(&edge));
+                    let f = |c: (usize, usize)| 100.0 * c.0 as f64 / c.1.max(1) as f64;
+                    line += &format!(
+                        " | floor {floor}: same {:.2}% cross {:.2}% edge same {:.2}% cross {:.2}% (n {} {})",
+                        f(r[0]), f(r[1]), f(e[0]), f(e[1]), r[0].1, r[1].1
+                    );
+                }
+                eprintln!("{line}");
+            }
+        }
+    }
+
+    /// F-382/F-392: 광선 가림 단차 장면(상자 배치 3 종)과 완만한 장면에서 하한 1.0/0.25 의 참 대응 거름 비율.
     #[test]
     fn displacement_floor_on_depth_step_scene() {
         let opts = SceneOpts {
@@ -2085,29 +2294,42 @@ mod tests {
             ..SceneOpts::default()
         };
         let mut failures = Vec::new();
-        for keep in [100u64, 40] {
-            for (name, boxes) in [("flat", false), ("step", true)] {
-                let s = step_scene(boxes, keep, &opts);
-                let hi = floor_drop_counts(&s, 1.0);
-                let lo = floor_drop_counts(&s, 0.25);
+        for keep in [100u64, 40, 30] {
+            let mut cases = vec![("flat", false, 0x57E9u64)];
+            for seed in [0x57E9u64, 0x1234, 0xBEEF] {
+                cases.push(("step", true, seed));
+            }
+            for (name, boxes, seed) in cases {
+                let (s, edge, (hid, seen)) = step_scene_seeded(boxes, keep, &opts, seed);
+                if boxes {
+                    // 광선 가림이 실제로 점을 뺀다: 화면에 들어온 점의 약 1/4~1/3.
+                    eprintln!("keep {keep} seed {seed:#x}: occluded {hid}/{seen}");
+                    assert!(hid * 5 > seen && hid * 2 < seen, "{hid}/{seen}");
+                } else {
+                    assert_eq!(hid, 0);
+                }
+                let hi = floor_drop_counts(&s, 1.0, DISPLACEMENT_CAP);
+                let lo = floor_drop_counts(&s, DISPLACEMENT_FLOOR, DISPLACEMENT_CAP);
+                let eh = floor_drop_counts_masked(&s, 1.0, DISPLACEMENT_CAP, Some(&edge));
+                let el =
+                    floor_drop_counts_masked(&s, DISPLACEMENT_FLOOR, DISPLACEMENT_CAP, Some(&edge));
                 for (k, kind) in ["same", "cross"].into_iter().enumerate() {
-                    let (rh, rl) = (
-                        hi[k].0 as f64 / hi[k].1.max(1) as f64,
-                        lo[k].0 as f64 / lo[k].1.max(1) as f64,
-                    );
+                    let r = |c: (usize, usize)| c.0 as f64 / c.1.max(1) as f64;
+                    let (rh, rl) = (r(hi[k]), r(lo[k]));
                     eprintln!(
-                        "keep {keep} {name} {kind}: floor 1.0 {}/{} ({:.4}) floor 0.25 {}/{} ({:.4}) delta {:+.4}",
-                        hi[k].0, hi[k].1, rh, lo[k].0, lo[k].1, rl, rl - rh
+                        "keep {keep} {name} {seed:#x} {kind}: floor 1.0 {}/{} ({:.4}) floor 0.25 {}/{} ({:.4}) delta {:+.4}; edge +-3 m {:.4} -> {:.4} (n {})",
+                        hi[k].0, hi[k].1, rh, lo[k].0, lo[k].1, rl, rl - rh,
+                        r(eh[k]), r(el[k]), el[k].1
                     );
-                    // 하한 0.25 의 거름 증가는 1.0 대비 1%p 이하, 절대값은 측정값(평지 0.2%, 단차 같은 카메라
-                    // 2.1%, 단차 카메라 간 8%) 아래여야 한다.
+                    // 하한 0.25 의 거름 증가는 1.0 대비 1%p 이하. 절대 상한은 측정값(재현율 30/40/100%, 배치 3 종)
+                    // 에 여유를 둔다: 평지 0.00~0.28%, 단차 같은 카메라 최대 1.37%, 카메라 간 최대 22.6%.
                     let cap = match (boxes, k) {
-                        (false, _) => 0.002,
-                        (true, 0) => 0.021,
-                        (true, _) => 0.08,
+                        (false, _) => 0.004,
+                        (true, 0) => 0.02,
+                        (true, _) => 0.25,
                     };
                     if rl - rh > 0.01 || rl > cap {
-                        failures.push(format!("keep {keep} {name} {kind}: {rh} -> {rl}"));
+                        failures.push(format!("keep {keep} {name} {seed:#x} {kind}: {rh} -> {rl}"));
                     }
                 }
             }
