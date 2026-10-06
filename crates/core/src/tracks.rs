@@ -736,6 +736,7 @@ fn displacement_outliers_with_layer(
 }
 
 /// 짝의 강건한 기본 행렬과 영상 크기 비(960 폭 기준).
+#[derive(Clone)]
 struct PairFit {
     f: Matrix3<f64>,
     size: f64,
@@ -970,6 +971,225 @@ fn rescue_with_fit(
         n += 1;
     }
     n
+}
+
+/// 세 시점 지지·양의 깊이 구제 조건(둘 다 0 이면 보지 않는다).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg(test)]
+struct TriRule {
+    /// 전이 검사 문턱(960 폭 기준 화소). 0 이하이면 세 시점 지지를 보지 않는다.
+    transfer_px: f64,
+    /// 전이 검사를 통과하는 제3 시점이 이 수 이상이어야 한다.
+    views: usize,
+    /// 참이면 제3 시점에서 a·b 가 같은 특징으로 이어져야 하고, 거짓이면 한쪽만 이어져도 된다.
+    both: bool,
+    /// 두 에피폴라 선이 이루는 각의 sin 하한(선이 거의 나란하면 교점이 정해지지 않아 지지로 세지 않는다).
+    min_sin: f64,
+    /// 0 보다 크면 양의 깊이 조건을 본다: 짝 정상 대응의 깊이 2~98% 분위 범위를 이 배수만큼 넓힌 안.
+    depth_margin: f64,
+}
+
+/// 세 시점 전이 검사용 색인: 짝(작은 번호, 큰 번호)별 대응 양방향 조회, 기본 행렬, 거름 표시.
+#[cfg(test)]
+struct TriIndex {
+    pair_of: HashMap<(usize, usize), usize>,
+    fwd: Vec<HashMap<usize, usize>>,
+    bwd: Vec<HashMap<usize, usize>>,
+    fits: Vec<Option<PairFit>>,
+    /// 짝마다 거름에 걸린 대응의 작은 영상 쪽 특징 번호.
+    flagged: Vec<std::collections::HashSet<usize>>,
+    n_images: usize,
+}
+
+/// `TriIndex` 입력 한 짝: (작은 영상, 큰 영상, 대응, 거름 표시, 기본 행렬 맞춤).
+#[cfg(test)]
+type TriPair<'a> = (
+    usize,
+    usize,
+    &'a [(usize, usize)],
+    &'a [bool],
+    Option<PairFit>,
+);
+
+#[cfg(test)]
+impl TriIndex {
+    fn new(pairs: Vec<TriPair<'_>>, n_images: usize) -> Self {
+        let mut t = Self {
+            pair_of: HashMap::new(),
+            fwd: Vec::new(),
+            bwd: Vec::new(),
+            fits: Vec::new(),
+            flagged: Vec::new(),
+            n_images,
+        };
+        for (i, (a, b, m, fl, fit)) in pairs.into_iter().enumerate() {
+            t.pair_of.insert((a, b), i);
+            t.fwd.push(m.iter().copied().collect());
+            t.bwd.push(m.iter().map(|&(x, y)| (y, x)).collect());
+            t.flagged.push(
+                m.iter()
+                    .zip(fl)
+                    .filter(|(_, &f)| f)
+                    .map(|(&(x, _), _)| x)
+                    .collect(),
+            );
+            t.fits.push(fit);
+        }
+        t
+    }
+
+    /// 영상 `x` 의 점 `kp_x` 가 영상 `c` 에서 놓이는 에피폴라 선(둘 사이 짝의 기본 행렬).
+    fn line_to(&self, x: usize, c: usize, kp_x: &Vector2<f64>) -> Option<Vector3<f64>> {
+        let p = Vector3::new(kp_x.x, kp_x.y, 1.0);
+        if x < c {
+            let &i = self.pair_of.get(&(x, c))?;
+            Some(self.fits[i].as_ref()?.f * p)
+        } else {
+            let &i = self.pair_of.get(&(c, x))?;
+            Some(self.fits[i].as_ref()?.f.transpose() * p)
+        }
+    }
+
+    /// 영상 `x` 의 특징 `f` 와 (거름에 안 걸린) 대응인 영상 `c` 의 특징.
+    fn partner(&self, x: usize, f: usize, c: usize) -> Option<usize> {
+        if x < c {
+            let &i = self.pair_of.get(&(x, c))?;
+            let fc = *self.fwd[i].get(&f)?;
+            (!self.flagged[i].contains(&f)).then_some(fc)
+        } else {
+            let &i = self.pair_of.get(&(c, x))?;
+            let fc = *self.bwd[i].get(&f)?;
+            (!self.flagged[i].contains(&fc)).then_some(fc)
+        }
+    }
+
+    /// 대응 a(fa) ↔ b(fb) 를 지지하는 제3 시점이 `rule.views` 이상인지: c 에서 a 나 b 중 하나(`both` 이면 둘 다, 같은
+    /// 특징으로)와 대응인 특징 `fc` 가 있고, a·b 두 점의 에피폴라 선의 교점이 그 관측과 `rule.transfer_px * size`
+    /// 안이다(삼중 에피폴라 전이).
+    fn supported(
+        &self,
+        kps: &[Vec<Vector2<f64>>],
+        (a, b): (usize, usize),
+        (fa, fb): (usize, usize),
+        size: f64,
+        rule: &TriRule,
+    ) -> bool {
+        let mut n = 0;
+        for c in 0..self.n_images.min(kps.len()) {
+            if c == a || c == b {
+                continue;
+            }
+            let (pa, pb) = (self.partner(a, fa, c), self.partner(b, fb, c));
+            let fc = match (pa, pb) {
+                (Some(x), Some(y)) if x == y => x,
+                (Some(_), Some(_)) => continue,
+                (Some(x), None) | (None, Some(x)) if !rule.both => x,
+                _ => continue,
+            };
+            let (Some(la), Some(lb)) = (
+                self.line_to(a, c, &kps[a][fa]),
+                self.line_to(b, c, &kps[b][fb]),
+            ) else {
+                continue;
+            };
+            let (na, nb) = (la.xy().norm(), lb.xy().norm());
+            let x = la.cross(&lb);
+            if na < 1e-12 || nb < 1e-12 || x.z.abs() < 1e-12 {
+                continue;
+            }
+            // 두 선 법선 사이 각의 sin = |x.z| / (na nb)
+            if x.z.abs() / (na * nb) < rule.min_sin {
+                continue;
+            }
+            let p = Vector2::new(x.x / x.z, x.y / x.z);
+            if (p - kps[c][fc]).norm() <= rule.transfer_px * size {
+                n += 1;
+                if n >= rule.views {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// 짝의 상대 자세와 정상 대응 깊이 범위(양의 깊이 조건용).
+#[cfg(test)]
+struct DepthGate {
+    r: crate::math::Rotation3<f64>,
+    t: Vector3<f64>,
+    k: crate::camera::Intrinsics,
+    lo: f64,
+    hi: f64,
+}
+
+#[cfg(test)]
+impl DepthGate {
+    /// 짝의 기본 행렬 `fit` 과 대응으로 상대 자세를 복원하고(수평 화각 `hfov_deg`, 주점은 영상 중심) 정상 대응(Sampson
+    /// 1.5 px 안)을 삼각측량해 깊이 범위를 잡는다. 이동 방향이 안 정해지면 `None`.
+    fn new(
+        fit: &PairFit,
+        matches: &[(usize, usize)],
+        kp_a: &[Vector2<f64>],
+        kp_b: &[Vector2<f64>],
+        hfov_deg: f64,
+    ) -> Option<Self> {
+        let w = (DISPLACEMENT_REF_WIDTH * fit.size).round().max(1.0) as u32;
+        let h = (DISPLACEMENT_REF_HEIGHT * fit.size).round().max(1.0) as u32;
+        let k = crate::camera::Intrinsics::from_hfov(w, h, hfov_deg.to_radians());
+        let lim2 = (EPIPOLAR_FIT_PX * fit.size).powi(2);
+        let step = (matches.len() / 400).max(1);
+        let norm = |p: &Vector2<f64>| Vector2::new((p.x - k.cx) / k.fx, (p.y - k.cy) / k.fy);
+        let (mut n1, mut n2) = (Vec::new(), Vec::new());
+        for &(fa, fb) in matches.iter().step_by(step) {
+            if sampson_error(&fit.f, &kp_a[fa], &kp_b[fb]) <= lim2 {
+                n1.push(norm(&kp_a[fa]));
+                n2.push(norm(&kp_b[fb]));
+            }
+        }
+        if n1.len() < 12 {
+            return None;
+        }
+        let e = crate::two_view::essential_from_fundamental(&fit.f, &k, &k);
+        let pose = crate::two_view::recover_pose(&e, &n1, &n2)?;
+        if !pose.translation_observable {
+            return None;
+        }
+        let mut d: Vec<f64> = n1
+            .iter()
+            .zip(&n2)
+            .zip(&pose.in_front)
+            .filter(|(_, &f)| f)
+            .filter_map(|((a, b), _)| {
+                crate::two_view::triangulate(&pose.rotation, &pose.translation, a, b)
+            })
+            .map(|p| p.z)
+            .collect();
+        if d.len() < 12 {
+            return None;
+        }
+        d.sort_unstable_by(|a, b| a.total_cmp(b));
+        let (lo, hi) = (d[d.len() / 50], d[d.len() - 1 - d.len() / 50]);
+        Some(Self {
+            r: pose.rotation,
+            t: pose.translation,
+            k,
+            lo,
+            hi,
+        })
+    }
+
+    /// 후보 대응을 삼각측량해 두 카메라 앞이고 깊이가 (정상 대응 범위 ± `margin` 배) 안인지.
+    fn accepts(&self, pa: &Vector2<f64>, pb: &Vector2<f64>, margin: f64) -> bool {
+        let k = &self.k;
+        let n1 = Vector2::new((pa.x - k.cx) / k.fx, (pa.y - k.cy) / k.fy);
+        let n2 = Vector2::new((pb.x - k.cx) / k.fx, (pb.y - k.cy) / k.fy);
+        let Some(x) = crate::two_view::triangulate(&self.r, &self.t, &n1, &n2) else {
+            return false;
+        };
+        let z2 = (self.r.matrix() * x.coords + self.t).z;
+        x.z > 0.0 && z2 > 0.0 && x.z >= self.lo / margin && x.z <= self.hi * margin
+    }
 }
 
 /// `keep` 인 이웃에 대해 `dx = a0 + a1 u + a2 v`, `dy = b0 + b1 u + b2 v` 의 최소제곱 해
@@ -3186,6 +3406,7 @@ mod tests {
         matches: Vec<(usize, usize)>,
         flags: Vec<bool>,
         fit: Option<PairFit>,
+        gate: Option<DepthGate>,
         /// 0 참 대응, 1 오대응, 2.. 군집(모드 × 크기) 번호 + 2.
         slot: usize,
         /// 오대응·군집이면 해당 대응 표시.
@@ -3238,18 +3459,25 @@ mod tests {
                 } else {
                     None
                 };
+                let gate = fit
+                    .as_ref()
+                    .and_then(|f| DepthGate::new(f, &matches, ka, kb, TRI_TEST_HFOV_DEG));
                 RescueCase {
                     a: p.image_a,
                     b: p.image_b,
                     matches,
                     flags,
                     fit,
+                    gate,
                     slot,
                     mark,
                 }
             })
             .collect()
     }
+
+    /// 합성 장면의 수평 화각(도).
+    const TRI_TEST_HFOV_DEG: f64 = 65.0;
 
     /// 변형 비교 슬롯: 0 참 같은 카메라, 1 참 카메라 간, 2 참 경계 카메라 간, 3 오대응, 4.. 군집(모드 × 크기).
     const RESCUE_SLOTS: usize = 13;
@@ -3259,8 +3487,17 @@ mod tests {
         s: &Synthetic,
         cases: &[RescueCase],
         edge: &[bool],
-        rules: &[RescueRule],
+        rules: &[(RescueRule, Option<TriRule>)],
     ) -> Vec<[(usize, usize); RESCUE_SLOTS]> {
+        // 세 시점 지지의 제3 시점 색인: 장면 원본 대응(참 대응 경우)과 그 거름·기본 행렬.
+        let tri_idx = TriIndex::new(
+            cases
+                .iter()
+                .filter(|c| c.slot == 0)
+                .map(|c| (c.a, c.b, &c.matches[..], &c.flags[..], c.fit.clone()))
+                .collect(),
+            s.keypoints.len(),
+        );
         cases
             .par_iter()
             .map(|c| {
@@ -3268,11 +3505,35 @@ mod tests {
                 let kind = (c.a % 3 != c.b % 3) as usize;
                 rules
                     .iter()
-                    .map(|rule| {
+                    .map(|(rule, tri)| {
                         let mut fl = c.flags.clone();
                         if rule.thr_px > 0.0 {
                             if let Some(fit) = &c.fit {
                                 rescue_with_fit(&mut fl, &c.matches, ka, kb, fit, rule);
+                                if let Some(tr) = tri {
+                                    // 에피폴라(+지지) 구제 중 세 시점·깊이 조건을 못 채운 것은 되돌린다.
+                                    let size = fit.size;
+                                    for (i, &(fa, fb)) in c.matches.iter().enumerate() {
+                                        if !c.flags[i] || fl[i] {
+                                            continue;
+                                        }
+                                        let tri_ok = tr.transfer_px <= 0.0
+                                            || tri_idx.supported(
+                                                &s.keypoints,
+                                                (c.a, c.b),
+                                                (fa, fb),
+                                                size,
+                                                tr,
+                                            );
+                                        let depth_ok = tr.depth_margin <= 0.0
+                                            || c.gate.as_ref().is_some_and(|g| {
+                                                g.accepts(&ka[fa], &kb[fb], tr.depth_margin)
+                                            });
+                                        if !(tri_ok && depth_ok) {
+                                            fl[i] = true;
+                                        }
+                                    }
+                                }
                             }
                         }
                         let mut r = [(0usize, 0usize); RESCUE_SLOTS];
@@ -3372,7 +3633,45 @@ mod tests {
                 },
             ),
         ];
-        let rules: Vec<RescueRule> = variants.iter().map(|v| v.1).collect();
+        let tri = |transfer_px: f64, views: usize, depth_margin: f64| TriRule {
+            transfer_px,
+            views,
+            both: false,
+            min_sin: 0.05,
+            depth_margin,
+        };
+        let mut variants: Vec<(String, RescueRule, Option<TriRule>)> =
+            variants.into_iter().map(|(n, r)| (n, r, None)).collect();
+        let epi = RescueRule::epipolar(t);
+        variants.extend([
+            ("t1 v1".into(), epi, Some(tri(1.0, 1, 0.0))),
+            ("t2 v1".into(), epi, Some(tri(2.0, 1, 0.0))),
+            ("t4 v1".into(), epi, Some(tri(4.0, 1, 0.0))),
+            ("t2 v2".into(), epi, Some(tri(2.0, 2, 0.0))),
+            ("t2 v3".into(), epi, Some(tri(2.0, 3, 0.0))),
+            (
+                "t1 v1 sin.01".into(),
+                epi,
+                Some(TriRule {
+                    min_sin: 0.01,
+                    ..tri(1.0, 1, 0.0)
+                }),
+            ),
+            (
+                "t1 v1 sin.2".into(),
+                epi,
+                Some(TriRule {
+                    min_sin: 0.2,
+                    ..tri(1.0, 1, 0.0)
+                }),
+            ),
+            ("z1".into(), epi, Some(tri(0.0, 1, 1.0))),
+            ("t2 v1+z1".into(), epi, Some(tri(2.0, 1, 1.0))),
+            ("t2 v2+z1".into(), epi, Some(tri(2.0, 2, 1.0))),
+            ("t4 v2+z1".into(), epi, Some(tri(4.0, 2, 1.0))),
+        ]);
+        let rules: Vec<(RescueRule, Option<TriRule>)> =
+            variants.iter().map(|v| (v.1, v.2)).collect();
         for keep in [100u64, 40] {
             let mut acc = vec![[(0usize, 0usize); RESCUE_SLOTS]; rules.len()];
             for (boxes, seed) in [
