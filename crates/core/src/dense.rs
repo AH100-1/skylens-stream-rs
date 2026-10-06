@@ -796,7 +796,7 @@ fn fusion_config(cfg: &DenseConfig) -> FusionConfig {
         depth_rel: cfg.depth_rel,
         min_views: cfg.min_views.max(1),
         normal_deg: 25.0,
-        ..FusionConfig::default()
+        ..FusionConfig::default().with_env()
     }
 }
 

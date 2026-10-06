@@ -76,6 +76,11 @@ pub struct FusionConfig {
     pub same_group_views: Option<usize>,
     /// 일치한 화소들의 3D 점에서 출력 위치를 정하는 방식.
     pub position: FusePosition,
+    /// 자유공간 위반 검사(`None` 이면 끔, 기본). `Some(r)` 이면 후보 점을 이웃 사진에 투영했을 때
+    /// 그 사진의 깊이가 점 깊이보다 상대 `r` 넘게 뒤에 있는 사진을 반박 사진으로 센다(그 사진의
+    /// 광선이 점을 통과한 것). 앞에 있으면 단순 가림이라 세지 않는다. 반박 수가 동의 이웃 수 이상이면
+    /// 점을 버리고, 동의가 [`FusionConfig::min_views`] 에 겨우 걸친 점은 반박이 하나라도 있으면 버린다.
+    pub free_space_rel: Option<f64>,
 }
 
 /// 융합 점 위치 결정 방식.
@@ -107,7 +112,23 @@ impl Default for FusionConfig {
             min_groups: 2,
             same_group_views: SAME_GROUP_VIEWS,
             position: FusePosition::Mean,
+            free_space_rel: None,
         }
+    }
+}
+
+impl FusionConfig {
+    /// 환경 변수로 선택 항목을 켠다(측정용): `SKYLENS_FUSION_FREESPACE=1` 이면 자유공간 검사(상대 2%),
+    /// `SKYLENS_FUSION_MEDIAN=1` 이면 중앙값 위치. 설정하지 않으면 그대로 돌려준다.
+    pub fn with_env(mut self) -> Self {
+        let on = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
+        if on("SKYLENS_FUSION_FREESPACE") {
+            self.free_space_rel = Some(0.02);
+        }
+        if on("SKYLENS_FUSION_MEDIAN") {
+            self.position = FusePosition::Median;
+        }
+        self
     }
 }
 
@@ -175,6 +196,12 @@ fn check(
     }
     if cfg.same_group_views == Some(0) {
         return Err(FusionError::BadConfig("same_group_views"));
+    }
+    if cfg
+        .free_space_rel
+        .is_some_and(|r| !(r.is_finite() && r > 0.0))
+    {
+        return Err(FusionError::BadConfig("free_space_rel"));
     }
     if !(cfg.min_ratio >= 0.0 && cfg.min_ratio <= 1.0) {
         return Err(FusionError::BadConfig("min_ratio"));
@@ -394,6 +421,7 @@ pub fn try_fuse(
                     let nr_ok = nr.norm() > 1e-6;
                     let mut agree = Vec::new();
                     let mut seen = 0usize;
+                    let mut rebut = 0usize;
                     for &j in &nbrs {
                         let jm = &depth_maps[j];
                         let jc = &views[j].camera;
@@ -403,6 +431,12 @@ pub fn try_fuse(
                         };
                         let jidx = qy * jm.w + qx;
                         let Some(dj) = jm.get(qx, qy) else { continue };
+                        if let Some(r) = cfg.free_space_rel {
+                            let zq = jc.pose.transform(&xw).z;
+                            if zq > 0.0 && dj as f64 > zq * (1.0 + r) {
+                                rebut += 1;
+                            }
+                        }
                         let yw = jc.unproject(&center(qx, qy), dj as f64);
                         let ok = agrees(&p, d, &nr, nr_ok, j, jidx, &yw);
                         // 동의 비율 분모: 이미 다른 점에 쓰인 이웃 화소는 동의하면
@@ -419,6 +453,12 @@ pub fn try_fuse(
                         }
                     }
                     if !enough(&agree, seen) {
+                        continue;
+                    }
+                    if cfg.free_space_rel.is_some()
+                        && rebut > 0
+                        && (rebut >= agree.len() || agree.len() < cfg.min_views)
+                    {
                         continue;
                     }
                     let mut cross = false;
@@ -1973,5 +2013,113 @@ mod tests {
         }
         let cloud = fuse(&views(&cams), &maps2, FusionConfig::default());
         assert!(!cloud.has_nan());
+    }
+
+    /// 시점 0·1 에만 있는 공중 점 P 를 깊이 지도에 심는다(3×3 화소). 나머지 시점 깊이는 P 뒤의 표면이다.
+    fn plant_floating(maps: &mut [DepthMap], cams: &[Camera], p: &Point3<f64>) {
+        for v in [0usize, 1] {
+            let q = cams[v].project(p).unwrap();
+            let (cx, cy) = pixel_of(&q, maps[v].w, maps[v].h).unwrap();
+            let z = cams[v].pose.transform(p).z as f32;
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    let i = (cy + dy - 1) * maps[v].w + cx + dx - 1;
+                    maps[v].depth[i] = z;
+                    let n = cams[v].pose.rotation * (cams[v].pose.center() - p).normalize();
+                    maps[v].normal[i] = [n.x as f32, n.y as f32, n.z as f32];
+                }
+            }
+        }
+    }
+
+    fn near_floating(cloud: &PointCloud, p: &Point3<f64>) -> usize {
+        cloud
+            .points
+            .iter()
+            .filter(|q| (pt(q) - p.coords).norm() < 0.15)
+            .count()
+    }
+
+    /// 자유공간 검사(켬)는 두 시점에만 있는 공중 점을 지우고 참 표면 점은 거의 그대로 둔다. 끔은 기존 결과와 같다.
+    #[test]
+    fn free_space_removes_floating_points() {
+        let cams = small_cameras();
+        let clean: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        let mut maps = clean.clone();
+        let p = Point3::new(0.0, 0.0, 1.6);
+        plant_floating(&mut maps, &cams, &p);
+        let vs = views(&cams);
+        let base = FusionConfig {
+            min_views: 2,
+            min_ratio: 0.0,
+            min_groups: 1,
+            same_group_views: None,
+            normal_deg: 180.0,
+            ..FusionConfig::default()
+        };
+        let on_cfg = FusionConfig {
+            free_space_rel: Some(0.02),
+            ..base
+        };
+        let off = fuse(&vs, &maps, base);
+        let on = fuse(&vs, &maps, on_cfg);
+        let (nf_off, nf_on) = (near_floating(&off, &p), near_floating(&on, &p));
+        let (_, max_on, far_on) = errors(&SMALL, &on);
+        println!(
+            "floating off {nf_off} on {nf_on}; points off {} on {}; max {max_on:.4} far {far_on}",
+            off.len(),
+            on.len()
+        );
+        assert!(nf_off > 0, "공중 점이 끔에서 안 나옴");
+        assert_eq!(nf_on, 0, "켬에서 공중 점 남음");
+        // 참 표면 점은 유지: 깨끗한 입력에서 끔과 켬의 점 수 차는 1% 미만.
+        let c_off = fuse(&vs, &clean, base);
+        let c_on = fuse(&vs, &clean, on_cfg);
+        println!("clean off {} on {}", c_off.len(), c_on.len());
+        assert!(c_on.len() * 100 >= c_off.len() * 99, "표면 점 손실");
+        // 기본(끔)은 필드가 없던 때와 같다.
+        assert_eq!(FusionConfig::default().free_space_rel, None);
+        assert_eq!(fuse(&vs, &clean, base).points, c_off.points);
+    }
+
+    /// 한 시점 깊이가 일관되게 1.5% 틀린 클러스터: 중앙값 위치 오차가 평균 위치 오차보다 작다.
+    #[test]
+    fn median_position_beats_mean_with_one_outlier_view() {
+        let cams = small_cameras();
+        let mut maps: Vec<DepthMap> = cams.iter().map(|c| render(&SMALL, c)).collect();
+        for d in maps[2].depth.iter_mut() {
+            *d *= 1.015;
+        }
+        let vs = views(&cams);
+        let cfg = FusionConfig {
+            depth_rel: 0.03,
+            reproj_px: 3.0,
+            min_views: 4,
+            ..FusionConfig::default()
+        };
+        let mean = fuse(&vs, &maps, cfg);
+        let med = fuse(
+            &vs,
+            &maps,
+            FusionConfig {
+                position: FusePosition::Median,
+                ..cfg
+            },
+        );
+        let avg = |c: &PointCloud| {
+            c.points
+                .iter()
+                .map(|p| surface_dist(&SMALL, &pt(p)))
+                .sum::<f64>()
+                / c.len() as f64
+        };
+        let (em, ed) = (avg(&mean), avg(&med));
+        println!(
+            "mean pos err {em:.5} (n {}), median pos err {ed:.5} (n {})",
+            mean.len(),
+            med.len()
+        );
+        assert!(!mean.is_empty() && !med.is_empty());
+        assert!(ed < em, "median {ed} mean {em}");
     }
 }
