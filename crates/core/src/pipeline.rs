@@ -1191,6 +1191,9 @@ const DETACHED_MIN_GPS_OK: usize = 3;
 const DETACHED_GPS_OK_M: f64 = 5.0;
 /// 붙인 뒤 장착 관계로 정한 목표 회전과의 각거리 중앙값이 이 값(도)을 넘으면 붙이지 않는다.
 const DETACHED_RIG_MAX_DEG: f64 = 3.0;
+/// 켜면 붙일 때 비행 축 롤 하나 대신 목표 회전과의 3자유도 회전 평균으로 성분 전체를 돌린다.
+/// 시드 5 측정에서 붙은 L 성분의 정답 대비 회전 오차가 4.50° 로 3° 를 넘어 기본은 끈다.
+const DETACHED_RIG_FULL_ROTATION: bool = false;
 
 /// 점들의 바닥 평면 법선(위쪽). 평면을 맞추고 잔차 중앙값의 2배 밖 점을 버리며 세 번 되풀이한다.
 fn ground_normal(points: &[Vector3<f64>]) -> Option<Vector3<f64>> {
@@ -1272,7 +1275,8 @@ fn attach_detached(
             );
         }
         let th = th_rig.unwrap_or(th_n);
-        let r = Rotation3::from_axis_angle(&axis, th);
+        let r = rig_rotation(&sub, rig_targets, DETACHED_RIG_FULL_ROTATION)
+            .unwrap_or_else(|| Rotation3::from_axis_angle(&axis, th));
         let sim = Similarity {
             s: 1.0,
             r,
@@ -1338,13 +1342,15 @@ fn attach_detached(
     }
     // 닮음 보정이 회전을 다시 돌렸을 수 있으므로, 장착 관계가 있으면 롤을 한 번 더 맞춘다.
     if let Some(axis) = roll_axis {
-        if let Some(th) = roll_from_rig(&axis, &sub, rig_targets) {
+        let full = rig_rotation(&sub, rig_targets, DETACHED_RIG_FULL_ROTATION);
+        let th = roll_from_rig(&axis, &sub, rig_targets);
+        if full.is_some() || th.is_some() {
             let m = ids
                 .iter()
                 .map(|&i| sub.poses[i].unwrap().center().coords)
                 .sum::<Vector3<f64>>()
                 / ids.len() as f64;
-            let r = Rotation3::from_axis_angle(&axis, th);
+            let r = full.unwrap_or_else(|| Rotation3::from_axis_angle(&axis, th.unwrap_or(0.0)));
             apply_sparse_sim(
                 &mut sub,
                 &Similarity {
@@ -1354,7 +1360,7 @@ fn attach_detached(
                 },
             );
             if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
-                eprintln!("diag rig post_icp roll_deg {:.2}", th.to_degrees());
+                eprintln!("diag rig post_icp rot_deg {:.2}", r.angle().to_degrees());
             }
         }
     }
@@ -1389,6 +1395,26 @@ fn attach_detached(
     s.obs.extend(sub.obs);
     s.ba_only.extend(sub.ba_only);
     Some((res.len(), res[res.len() / 2]))
+}
+
+/// 부분 모델 `sub` 전체에 적용할 회전(3자유도): 사진 회전을 목표 회전으로 가장 가깝게 보내는 회전의 평균.
+/// 사진 회전 R_i 에 새 회전은 R_i G^-1 이므로 G^-1 = mean(R_i^T T_i) 를 구해 G 를 돌려준다. 목표가 3개 미만이면 None.
+fn rig_rotation(
+    sub: &Sparse,
+    rig_targets: &[(usize, Rotation3<f64>)],
+    enabled: bool,
+) -> Option<Rotation3<f64>> {
+    if !enabled {
+        return None;
+    }
+    let qs: Vec<Rotation3<f64>> = rig_targets
+        .iter()
+        .filter_map(|(i, t)| sub.poses[*i].map(|p| p.rotation.inverse() * t))
+        .collect();
+    if qs.len() < 3 {
+        return None;
+    }
+    mean_rotation(&qs).map(|q| q.inverse())
 }
 
 /// 장착 관계로 정한 목표 자세(`rig_targets`: 사진 번호, 목표 회전)에 부분 모델 `sub` 의 사진 회전을 가장 가깝게
@@ -5157,6 +5183,38 @@ mod detached_tests {
         assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
         assert_eq!(main.points.len(), 30);
+    }
+
+    #[test]
+    fn three_axis_tilt_is_recovered_from_rig_targets() {
+        // 목표 회전이 사진마다 다르고, 부분 모델은 목표에 알려진 3축 기울기 G 가 곱해져 있다(약간의 잡음 포함).
+        let g = Rotation3::from_euler_angles(0.12, -0.09, 0.15);
+        let mut sub = Sparse {
+            poses: vec![None; 6],
+            points: vec![],
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        };
+        let mut targets = Vec::new();
+        for i in 0..6 {
+            let t = Rotation3::from_euler_angles(0.3 + 0.01 * i as f64, 0.2, 0.1 - 0.02 * i as f64);
+            let sgn = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let noise = Rotation3::from_euler_angles(
+                0.002 * (i as f64 - 2.5),
+                0.002 * sgn,
+                0.001 * (i as f64 - 2.5),
+            );
+            sub.poses[i] = Some(Pose::from_center(
+                t * g * noise,
+                &Point3::new(i as f64, 0.0, 0.0),
+            ));
+            targets.push((i, t));
+        }
+        let est = rig_rotation(&sub, &targets, true).expect("rotation");
+        let err = (est * g.inverse()).angle().to_degrees();
+        assert!(err <= 0.1, "recovery error {err} deg");
+        assert!(rig_rotation(&sub, &targets[..2], true).is_none());
     }
 
     #[test]
