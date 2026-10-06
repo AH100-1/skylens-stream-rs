@@ -9,6 +9,10 @@ use std::time::Instant;
 use skylens_core::geo::{geodetic_to_enu, Geodetic};
 use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
+use skylens_core::verify::{
+    ALIGN_FIT_MAX_M, ALIGN_MIN_PAIRS, ALIGN_SCALE_TOL, HEIGHT_MEDIAN_MAX_M, NN_MEDIAN_MAX_M,
+    OVERLAP_MEDIAN_MAX_M,
+};
 
 struct TempDir(PathBuf);
 
@@ -146,6 +150,19 @@ fn measure(input: &Path, output: &Path) -> Metrics {
     }
 }
 
+/// "접두 123.456 m" 형태의 측정 문자열에서 접두 뒤 첫 숫자.
+fn number_after(s: &str, prefix: &str) -> f64 {
+    let at = s
+        .find(prefix)
+        .unwrap_or_else(|| panic!("{prefix} 없음: {s}"))
+        + prefix.len();
+    let t = &s[at..];
+    let end = t
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(t.len());
+    t[..end].parse().unwrap()
+}
+
 /// verify 표의 한 항목 (판정, 측정값).
 fn item(table: &str, name: &str) -> (String, String) {
     let line = table
@@ -183,9 +200,50 @@ fn default_args_synth_run_verify() {
         reg.contains("초벌 81/81") && reg.contains("정밀 81/81"),
         "{reg}"
     );
-    for name in ["preview_vs_refined", "refined_overlap", "snapshots"] {
+    for name in [
+        "preview_align",
+        "preview_vs_refined",
+        "refined_overlap",
+        "snapshots",
+    ] {
         assert_eq!(item(&vout, name).0, "PASS", "{vout}");
     }
+    // 구역 3개: 구역 간 항목을 '해당 없음' 없이 실제로 판정하고 verify 기준(SPEC) 상수로 상한을 건다(F-273).
+    let (_, ov) = item(&vout, "refined_overlap");
+    assert!(!ov.contains("해당 없음"), "겹침이 판정돼야 함: {ov}");
+    assert_eq!(
+        number_after(&ov, "") as usize,
+        chunks - 1,
+        "이웃 쌍 수: {ov}"
+    );
+    assert!(
+        number_after(&ov, "겹침 차 중앙 최대 ") < OVERLAP_MEDIAN_MAX_M,
+        "{ov}"
+    );
+    let (_, pr) = item(&vout, "preview_vs_refined");
+    assert!(
+        number_after(&pr, "높이 차 중앙 최대 ") < HEIGHT_MEDIAN_MAX_M,
+        "{pr}"
+    );
+    assert!(
+        number_after(&pr, "최근접 중앙 최대 ") < NN_MEDIAN_MAX_M,
+        "{pr}"
+    );
+    let (_, pa) = item(&vout, "preview_align");
+    assert_eq!(
+        number_after(&pa, "정렬 기록 ") as usize,
+        chunks,
+        "구역마다 정렬 기록: {pa}"
+    );
+    assert!(number_after(&pa, "점쌍 최소 ") >= ALIGN_MIN_PAIRS, "{pa}");
+    assert!(
+        number_after(&pa, "구역 간 스케일 차 ") <= ALIGN_SCALE_TOL * 100.0,
+        "{pa}"
+    );
+    assert!(
+        number_after(&pa, "잔차 중앙 최대 ") < ALIGN_FIT_MAX_M,
+        "{pa}"
+    );
     let m = measure(&input, &output);
     eprintln!(
         "chunks {chunks} run {run_secs:.1}s registered {} center med {:.4} max {:.4} points {} surface med {:.4} p95 {:.4}",
