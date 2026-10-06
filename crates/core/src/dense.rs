@@ -699,9 +699,13 @@ fn depth_stage(
 }
 
 /// 반점 제거: 4-연결 성분(이웃 상대 깊이차 < `rel`)의 화소 수가 `min_px` 미만이면
-/// 그 성분의 깊이·법선·비용을 비운다. 지워진 화소 수를 돌려준다.
+/// 그 성분의 깊이·법선을 비우고 비용은 무효 값(`f32::INFINITY`)으로 둔다. 지워진 화소 수를
+/// 돌려준다. 지도 길이가 w·h 와 맞지 않으면 아무것도 건드리지 않고 0 을 돌려준다.
 pub fn remove_speckles(map: &mut DepthMap, rel: f32, min_px: usize) -> usize {
     let (w, h) = (map.w, map.h);
+    if map.depth.len() != w * h {
+        return 0;
+    }
     let ok = |d: f32| d.is_finite() && d > 0.0;
     let mut seen = vec![false; w * h];
     let mut removed = 0;
@@ -746,7 +750,7 @@ pub fn remove_speckles(map: &mut DepthMap, rel: f32, min_px: usize) -> usize {
                     *n = [0.0; 3];
                 }
                 if let Some(c) = map.cost.get_mut(i) {
-                    *c = 1.0;
+                    *c = f32::INFINITY;
                 }
             }
         }
@@ -1417,7 +1421,91 @@ mod tests {
         assert_eq!(m.depth[0], 10.0);
         assert_eq!(m.depth[31 * w + 31], 0.0);
         assert_eq!(m.depth[22], 0.0);
-        assert_eq!(m.cost[22], 1.0);
+        assert_eq!(m.cost[22], f32::INFINITY);
+        assert_eq!(m.cost[0], 0.1);
+        assert_eq!(m.normal[22], [0.0; 3]);
+    }
+
+    fn blank(w: usize, h: usize) -> DepthMap {
+        DepthMap {
+            w,
+            h,
+            depth: vec![0.0; w * h],
+            normal: vec![[0.0, 0.0, 1.0]; w * h],
+            cost: vec![0.1; w * h],
+        }
+    }
+
+    fn fill(m: &mut DepthMap, xs: std::ops::Range<usize>, ys: std::ops::Range<usize>, d: f32) {
+        for y in ys {
+            for x in xs.clone() {
+                m.depth[y * m.w + x] = d;
+            }
+        }
+    }
+
+    #[test]
+    fn diagonal_contact_is_not_connected() {
+        // 12x12(144) 와 9x9(81) 가 모서리 한 점에서만 닿는다. 깊이는 같다.
+        // 4-연결이면 81 화소가 지워지고, 8-연결이면 한 성분(225)이라 남는다.
+        let mut m = blank(40, 40);
+        fill(&mut m, 0..12, 0..12, 10.0);
+        fill(&mut m, 12..21, 12..21, 10.0);
+        let removed = remove_speckles(&mut m, 0.007, 100);
+        assert_eq!(removed, 81);
+        assert_eq!(m.depth[11 * 40 + 11], 10.0);
+        assert_eq!(m.depth[12 * 40 + 12], 0.0);
+        assert_eq!(m.depth[20 * 40 + 20], 0.0);
+    }
+
+    #[test]
+    fn gentle_slope_stays_one_region() {
+        // 깊이가 열마다 0.5% 씩 늘어나는 30x30 경사 평면: 이웃 상대차 0.005 < 0.007 이므로 전부 유지.
+        let mut m = blank(40, 40);
+        for y in 0..30 {
+            for x in 0..30 {
+                m.depth[y * 40 + x] = 10.0 * 1.005f32.powi(x as i32);
+            }
+        }
+        let before = m.depth.clone();
+        assert_eq!(remove_speckles(&mut m, 0.007, 100), 0);
+        assert_eq!(m.depth, before);
+    }
+
+    #[test]
+    fn eight_tenths_percent_step_splits() {
+        // 20x20 평면(깊이 10) 옆의 5x5 조각(깊이 10.08, 상대차 0.8% > 0.7%)은 별도 성분이라 지워진다.
+        let mut m = blank(40, 40);
+        fill(&mut m, 0..20, 0..20, 10.0);
+        fill(&mut m, 20..25, 0..5, 10.08);
+        assert_eq!(remove_speckles(&mut m, 0.007, 100), 25);
+        assert_eq!(m.depth[0], 10.0);
+        assert_eq!(m.depth[22], 0.0);
+    }
+
+    #[test]
+    fn relative_gap_equal_to_threshold_splits() {
+        // 문턱 rel=0.25 에서 8 -> 10 의 상대차가 정확히 0.25(f32 로 정확). 엄격한 `<` 라서 분리된다.
+        let mut m = blank(40, 40);
+        fill(&mut m, 0..20, 0..20, 8.0);
+        fill(&mut m, 20..25, 0..5, 10.0);
+        assert_eq!(remove_speckles(&mut m, 0.25, 100), 25);
+        assert_eq!(m.depth[0], 8.0);
+        assert_eq!(m.depth[22], 0.0);
+    }
+
+    #[test]
+    fn mismatched_map_length_returns_zero() {
+        let mut m = DepthMap {
+            w: 4,
+            h: 4,
+            depth: vec![5.0; 8],
+            normal: vec![[0.0, 0.0, 1.0]; 8],
+            cost: vec![0.1; 8],
+        };
+        assert_eq!(remove_speckles(&mut m, 0.007, 100), 0);
+        assert_eq!(m.depth, vec![5.0; 8]);
+        assert_eq!(m.cost, vec![0.1; 8]);
     }
 
     const POINTS48: usize = 300_000;
