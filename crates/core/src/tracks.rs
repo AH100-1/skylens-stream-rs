@@ -38,6 +38,10 @@ const DISPLACEMENT_REF_WIDTH: f64 = 960.0;
 const DISPLACEMENT_REF_HEIGHT: f64 = 540.0;
 /// 국소 아핀 맞춤에 쓰는 최근접 이웃 수.
 const DISPLACEMENT_NEIGHBORS: usize = 24;
+/// 층 지지: 우세 변위장과 어긋난 대응이라도, 이웃 중 변위가 자기와 `LAYER_RADIUS * 기준 문턱` 안인 것이
+/// 이만큼 이상이면 (같은 칸 고리의 후보 점 전체를 본다; 다른 시차 층의 일관된 점으로 보고) 오대응으로 치지 않는다. 0 이면 끈다.
+const DISPLACEMENT_LAYER_SUPPORT: usize = 5;
+const DISPLACEMENT_LAYER_RADIUS: f64 = 0.25;
 
 /// SPEC 번들 조정 트랙 상한과 같은 값.
 pub const MAX_TRACKS: usize = 100_000;
@@ -523,6 +527,25 @@ fn displacement_outliers_with_floor(
     floor: f64,
     cap: f64,
 ) -> Vec<bool> {
+    displacement_outliers_with_layer(
+        matches,
+        kp_a,
+        kp_b,
+        floor,
+        cap,
+        (DISPLACEMENT_LAYER_SUPPORT, DISPLACEMENT_LAYER_RADIUS),
+    )
+}
+
+/// `displacement_outliers_with_floor` 에 층 지지 최소 이웃 수 `layer_min`(0 = 끔)을 더 받는다.
+fn displacement_outliers_with_layer(
+    matches: &[(usize, usize)],
+    kp_a: &[Vector2<f64>],
+    kp_b: &[Vector2<f64>],
+    floor: f64,
+    cap: f64,
+    (layer_min, layer_radius): (usize, f64),
+) -> Vec<bool> {
     let mut out = vec![false; matches.len()];
     if matches.len() < 8 {
         return out;
@@ -572,6 +595,7 @@ fn displacement_outliers_with_floor(
     // 점마다 독립이므로 병렬로 계산한다(결과는 순서·스레드 수와 무관). 버퍼는 스레드마다 한 벌.
     type Scratch = (
         Vec<(f64, usize)>,
+        Vec<(f64, usize)>,
         Vec<(f64, f64, f64, f64)>,
         Vec<f64>,
         Vec<f64>,
@@ -588,9 +612,10 @@ fn displacement_outliers_with_floor(
                     Vec::with_capacity(k),
                     Vec::with_capacity(k),
                     Vec::with_capacity(k),
+                    Vec::with_capacity(k),
                 )
             },
-            |(cand, nb, res, sorted, keep), (i, q)| {
+            |(cand, near, nb, res, sorted, keep), (i, q)| {
                 let (cx, cy) = key(&q.0);
                 for ring in 1..=3i64 {
                     cand.clear();
@@ -612,12 +637,15 @@ fn displacement_outliers_with_floor(
                 if cand.len() < 8 {
                     return false;
                 }
-                if cand.len() > k {
-                    cand.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
-                    cand.truncate(k);
+                // cand 는 그대로 둔다(층 지지가 더 넓은 후보를 본다). 맞춤은 가까운 k 개만 쓴다.
+                near.clear();
+                near.extend_from_slice(cand);
+                if near.len() > k {
+                    near.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
+                    near.truncate(k);
                 }
                 nb.clear();
-                for &(_, j) in cand.iter() {
+                for &(_, j) in near.iter() {
                     let u = (pos[j].0 - q.0) / cell;
                     nb.push((u.x, u.y, pos[j].1.x - q.1.x, pos[j].1.y - q.1.y));
                 }
@@ -659,7 +687,21 @@ fn displacement_outliers_with_floor(
                 };
                 // 대상 점은 u = 0, 변위 0(뺀 값)이므로 예측 (f[0], f[3]) 가 곧 어긋남이다.
                 let r = (f[0] * f[0] + f[3] * f[3]).sqrt();
-                r > (4.0 * s).clamp(tol * floor, cap * tol)
+                if r <= (4.0 * s).clamp(tol * floor, cap * tol) {
+                    return false;
+                }
+                // 우세 변위장과 어긋나도, 변위가 비슷한 이웃이 충분하면 다른 시차 층의 참 대응으로 본다.
+                if layer_min > 0 {
+                    let rad2 = (tol * layer_radius).powi(2);
+                    let sup = cand
+                        .iter()
+                        .filter(|&&(_, j)| (pos[j].1 - q.1).norm_squared() <= rad2)
+                        .count();
+                    if sup >= layer_min {
+                        return false;
+                    }
+                }
+                true
             },
         )
         .collect();
@@ -2013,6 +2055,8 @@ mod tests {
         }
         // 벽 면 점: 네 벽을 수평 1.5 m, 수직 1.5 m 간격으로(바닥은 그 자리 지형, 위는 윗면).
         for &(cx, cy, hx, hy, top) in &bx {
+            // 모서리 기둥은 이웃한 두 벽이 모두 지나므로 (수평 위치 기준) 한 번만 만든다.
+            let mut seen_col: std::collections::HashSet<(i64, i64)> = Default::default();
             for side in 0..4 {
                 let (along, fixed) = if side < 2 { (hy, hx) } else { (hx, hy) };
                 let sign = if side % 2 == 0 { 1.0 } else { -1.0 };
@@ -2024,6 +2068,9 @@ mod tests {
                     } else {
                         (cx + s, cy + sign * fixed)
                     };
+                    if !seen_col.insert(((px * 1e6).round() as i64, (py * 1e6).round() as i64)) {
+                        continue;
+                    }
                     let g = crate::synth::terrain_height(px, py);
                     let mut z = g;
                     while z < top {
@@ -2123,9 +2170,55 @@ mod tests {
         step_scene_seeded(boxes, keep_percent, opts, 0x57E9).0
     }
 
+    /// 정답 점마다 (참 대응 간선에 나온 관측 전부가 한 트랙에 들어 있는지) 를 센다: (완전한 점 수, 점 수).
+    /// `mask` 가 있으면 `mask[점]` 인 점만. 트랙에 안 들어간 관측이 있거나 둘 이상의 트랙에 갈라지면 완전하지 않다.
+    fn track_completeness(
+        s: &Synthetic,
+        tracks: &[Track],
+        mask: Option<&[bool]>,
+    ) -> (usize, usize) {
+        let mut owner: HashMap<(usize, usize), usize> = HashMap::new();
+        for (ti, t) in tracks.iter().enumerate() {
+            for o in &t.observations {
+                owner.insert((o.image, o.feature), ti);
+            }
+        }
+        let mut nodes: HashMap<usize, std::collections::HashSet<(usize, usize)>> = HashMap::new();
+        for p in &s.pairs {
+            for &(fa, fb) in &p.matches {
+                let g = s.gt[p.image_a][fa];
+                if g == s.gt[p.image_b][fb] && mask.is_none_or(|m| m[g]) {
+                    let e = nodes.entry(g).or_default();
+                    e.insert((p.image_a, fa));
+                    e.insert((p.image_b, fb));
+                }
+            }
+        }
+        let complete = nodes
+            .values()
+            .filter(|ns| {
+                let first = owner.get(ns.iter().next().unwrap());
+                first.is_some() && ns.iter().all(|n| owner.get(n) == first)
+            })
+            .count();
+        (complete, nodes.len())
+    }
+
     /// 하한 `floor` 에서 짝 종류별(같은 카메라, 카메라 간) 거른 참 대응 (거름, 전체).
+    /// 층 지지는 끈다(하한 자체의 효과를 보려고).
     fn floor_drop_counts(s: &Synthetic, floor: f64, cap: f64) -> [(usize, usize); 2] {
         floor_drop_counts_masked(s, floor, cap, None)
+    }
+
+    /// 기본 설정(하한·상한·층 지지 모두 제품 값)에서의 같은 집계.
+    fn layer_drop_counts(s: &Synthetic, edge: Option<&[bool]>) -> [(usize, usize); 2] {
+        drop_counts(
+            s,
+            DISPLACEMENT_FLOOR,
+            DISPLACEMENT_CAP,
+            (DISPLACEMENT_LAYER_SUPPORT, DISPLACEMENT_LAYER_RADIUS),
+            edge,
+        )
     }
 
     /// `edge` 가 있으면 정답 점이 `edge[점]` 인 대응만 센다(상자 경계 ±3 m 부분집합).
@@ -2135,15 +2228,26 @@ mod tests {
         cap: f64,
         edge: Option<&[bool]>,
     ) -> [(usize, usize); 2] {
+        drop_counts(s, floor, cap, (0, 0.0), edge)
+    }
+
+    fn drop_counts(
+        s: &Synthetic,
+        floor: f64,
+        cap: f64,
+        layer: (usize, f64),
+        edge: Option<&[bool]>,
+    ) -> [(usize, usize); 2] {
         let mut r = [(0usize, 0usize); 2];
         for p in &s.pairs {
             let kind = (p.image_a % 3 != p.image_b % 3) as usize;
-            let flags = displacement_outliers_with_floor(
+            let flags = displacement_outliers_with_layer(
                 &p.matches,
                 &s.keypoints[p.image_a],
                 &s.keypoints[p.image_b],
                 floor,
                 cap,
+                layer,
             );
             for (&(fa, fb), &bad) in p.matches.iter().zip(&flags) {
                 let g = s.gt[p.image_a][fa];
@@ -2285,6 +2389,95 @@ mod tests {
         }
     }
 
+    /// 단차 장면 짝마다 참 대응에 오대응(같은 짝의 다른 대응 끝점과 엇갈려 이은 것) 5% 를 섞어, 층 지지 설정별로
+    /// (참 대응 거름 비율 [같은 카메라, 카메라 간], 오대응 거름 비율) 을 낸다. 측정용.
+    fn layer_rates(s: &Synthetic, layer: (usize, f64)) -> ([f64; 2], f64) {
+        let mut tr = [(0usize, 0usize); 2];
+        let mut bad = (0usize, 0usize);
+        for p in &s.pairs {
+            let kind = (p.image_a % 3 != p.image_b % 3) as usize;
+            let n = p.matches.len();
+            let mut m = p.matches.clone();
+            let mut is_out = vec![false; n];
+            for i in 0..n {
+                let h =
+                    hash((p.image_a as u64) << 40 | (p.image_b as u64) << 20 | i as u64 | 7 << 60);
+                if h.is_multiple_of(20) {
+                    let j = (hash(i as u64 * 31 + 5 + p.image_b as u64) % n as u64) as usize;
+                    if s.gt[p.image_b][p.matches[j].1] != s.gt[p.image_a][p.matches[i].0] {
+                        m[i].1 = p.matches[j].1;
+                        is_out[i] = true;
+                    }
+                }
+            }
+            let fl = displacement_outliers_with_layer(
+                &m,
+                &s.keypoints[p.image_a],
+                &s.keypoints[p.image_b],
+                DISPLACEMENT_FLOOR,
+                DISPLACEMENT_CAP,
+                layer,
+            );
+            for i in 0..n {
+                if is_out[i] {
+                    bad.0 += fl[i] as usize;
+                    bad.1 += 1;
+                } else {
+                    tr[kind].0 += fl[i] as usize;
+                    tr[kind].1 += 1;
+                }
+            }
+        }
+        let r = |c: (usize, usize)| c.0 as f64 / c.1.max(1) as f64;
+        ([r(tr[0]), r(tr[1])], r(bad))
+    }
+
+    /// 층 지지가 오대응 거름을 해치지 않는다: 단차 장면에 오대응 5% 를 섞어 층 지지 켬/끔의 오대응 거름 비율(순도 쪽)과
+    /// 참 대응 거름 비율을 비교한다. 측정(재현율 40%, 배치 3 종): 오대응 거름 98.1~98.6% (끔) → 98.0~98.5% (켬).
+    #[test]
+    fn layer_support_keeps_outlier_rejection() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        for seed in [0x57E9u64, 0x1234, 0xBEEF] {
+            let (s, _e, _) = step_scene_seeded(true, 40, &opts, seed);
+            let (t0, o0) = layer_rates(&s, (0, 0.0));
+            let (t1, o1) = layer_rates(&s, (DISPLACEMENT_LAYER_SUPPORT, DISPLACEMENT_LAYER_RADIUS));
+            eprintln!("seed {seed:#x}: outlier rejected {o0:.4} -> {o1:.4}; true drop same {:.4} -> {:.4} cross {:.4} -> {:.4}", t0[0], t1[0], t0[1], t1[1]);
+            assert!(o1 >= 0.97 && o0 - o1 <= 0.005, "{o0} {o1}");
+            assert!(t1[0] <= t0[0] && t1[1] <= t0[1], "{t0:?} {t1:?}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn layer_support_sweep() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        for keep in [100u64, 40] {
+            for seed in [0x57E9u64, 0x1234, 0xBEEF] {
+                let (s, _e, _) = step_scene_seeded(true, keep, &opts, seed);
+                for layer in [
+                    (0, 0.0),
+                    (5, 0.25),
+                    (5, 1.0),
+                    (5, 1.5),
+                    (5, 2.5),
+                    (8, 2.5),
+                    (5, 4.0),
+                ] {
+                    let (t, o) = layer_rates(&s, layer);
+                    eprintln!("keep {keep} seed {seed:#x} layer {layer:?}: true drop same {:.4} cross {:.4} | outlier rejected {:.4}", t[0], t[1], o);
+                }
+            }
+        }
+    }
+
     /// F-382/F-392: 광선 가림 단차 장면(상자 배치 3 종)과 완만한 장면에서 하한 1.0/0.25 의 참 대응 거름 비율.
     #[test]
     fn displacement_floor_on_depth_step_scene() {
@@ -2293,6 +2486,11 @@ mod tests {
             formation_pairs: true,
             ..SceneOpts::default()
         };
+        // 완전도 하한: 측정 최저(재현율 30%) 전체 76.9%, 경계 71.5%.
+        // 경계 같은 카메라 거름 증가 상한: 측정 하한 0.25 최대 +2.03%p(0.1 로 바꾸면 +2.39%p).
+        const COMPLETE_ALL: f64 = 0.75;
+        const COMPLETE_EDGE: f64 = 0.70;
+        const EDGE_SAME_DELTA: f64 = 0.022;
         let mut failures = Vec::new();
         for keep in [100u64, 40, 30] {
             let mut cases = vec![("flat", false, 0x57E9u64)];
@@ -2313,8 +2511,36 @@ mod tests {
                 let eh = floor_drop_counts_masked(&s, 1.0, DISPLACEMENT_CAP, Some(&edge));
                 let el =
                     floor_drop_counts_masked(&s, DISPLACEMENT_FLOOR, DISPLACEMENT_CAP, Some(&edge));
+                // F-393: 같은 장면의 트랙 완전도(참 점의 관측이 모두 한 트랙에 든 점의 비율): 전체 / 상자 경계 ±3 m.
+                let (tracks, _) = build_tracks(&s.pairs, &s.keypoints, &TrackConfig::default());
+                let ca = track_completeness(&s, &tracks, None);
+                let cb = track_completeness(&s, &tracks, Some(&edge));
+                let cf = |c: (usize, usize)| c.0 as f64 / c.1.max(1) as f64;
+                eprintln!(
+                    "keep {keep} {name} {seed:#x} completeness: overall {}/{} ({:.4}) near-boundary {}/{} ({:.4})",
+                    ca.0, ca.1, cf(ca), cb.0, cb.1, cf(cb)
+                );
+                if cf(ca) < COMPLETE_ALL || (boxes && cf(cb) < COMPLETE_EDGE) {
+                    failures.push(format!(
+                        "keep {keep} {name} {seed:#x} completeness {} {}",
+                        cf(ca),
+                        cf(cb)
+                    ));
+                }
+                let on = layer_drop_counts(&s, None);
+                let on_edge = layer_drop_counts(&s, Some(&edge));
                 for (k, kind) in ["same", "cross"].into_iter().enumerate() {
                     let r = |c: (usize, usize)| c.0 as f64 / c.1.max(1) as f64;
+                    eprintln!(
+                        "keep {keep} {name} {seed:#x} {kind}: layer support on {}/{} ({:.4}) near-boundary {:.4}",
+                        on[k].0, on[k].1, r(on[k]), r(on_edge[k])
+                    );
+                    // 층 지지는 거름을 늘리지 않는다.
+                    if on[k].0 > lo[k].0 || on_edge[k].0 > el[k].0 {
+                        failures.push(format!(
+                            "keep {keep} {name} {seed:#x} {kind}: layer support adds drops"
+                        ));
+                    }
                     let (rh, rl) = (r(hi[k]), r(lo[k]));
                     eprintln!(
                         "keep {keep} {name} {seed:#x} {kind}: floor 1.0 {}/{} ({:.4}) floor 0.25 {}/{} ({:.4}) delta {:+.4}; edge +-3 m {:.4} -> {:.4} (n {})",
@@ -2322,12 +2548,21 @@ mod tests {
                         r(eh[k]), r(el[k]), el[k].1
                     );
                     // 하한 0.25 의 거름 증가는 1.0 대비 1%p 이하. 절대 상한은 측정값(재현율 30/40/100%, 배치 3 종)
-                    // 에 여유를 둔다: 평지 0.00~0.28%, 단차 같은 카메라 최대 1.37%, 카메라 간 최대 22.6%.
+                    // 에 여유를 둔다(층 지지 끔 기준): 평지 0.00~0.28%, 단차 같은 카메라 최대 1.45%, 카메라 간 최대 22.6%.
+                    // 층 지지를 켜면 단차 같은 카메라 최대 0.21%, 카메라 간 최대 21.4%.
                     let cap = match (boxes, k) {
                         (false, _) => 0.004,
                         (true, 0) => 0.02,
                         (true, _) => 0.25,
                     };
+                    // F-421: 경계 ±3 m 부분집합의 같은 카메라 거름 증가(하한 1.0 → 하한). 하한을 0.1 로 낮추면
+                    // 이 증가가 이 값을 넘는다(변이 확인).
+                    let edge_delta = r(el[k]) - r(eh[k]);
+                    if boxes && k == 0 && edge_delta > EDGE_SAME_DELTA {
+                        failures.push(format!(
+                            "keep {keep} {name} {seed:#x} edge same +{edge_delta:.4}"
+                        ));
+                    }
                     if rl - rh > 0.01 || rl > cap {
                         failures.push(format!("keep {keep} {name} {seed:#x} {kind}: {rh} -> {rl}"));
                     }
