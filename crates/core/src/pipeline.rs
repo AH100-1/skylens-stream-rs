@@ -1252,13 +1252,7 @@ fn attach_detached(
     // 롤: 비행 축(중심 주성분) 둘레로 돌려 바닥 법선을 주 모델 것에 맞춘다.
     let mut roll_axis = None;
     if let (Some(n_main), Some(n_sub)) = (ground_normal(&s.points), ground_normal(&sub.points)) {
-        let mut cov = Matrix3::zeros();
-        for c in &cen {
-            cov += (c - mean) * (c - mean).transpose();
-        }
-        let eig = nalgebra::SymmetricEigen::new(cov);
-        let mx = (0..3).max_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))?;
-        let axis = nalgebra::Unit::new_normalize(eig.eigenvectors.column(mx).into_owned());
+        let axis = principal_axis(&cen)?;
         roll_axis = Some(axis);
         let th_rig = roll_from_rig(&axis, &sub, rig_targets);
         let th_n = roll_about_axis(&axis, &n_sub, &n_main);
@@ -1335,7 +1329,13 @@ fn attach_detached(
         }
     }
     // 닮음 보정이 회전을 다시 돌렸을 수 있으므로, 장착 관계가 있으면 롤을 한 번 더 맞춘다.
-    if let Some(axis) = roll_axis {
+    // 재조정 축은 보정 뒤 중심의 주성분으로 다시 구한다(보정 전 좌표의 축이 아니다).
+    if roll_axis.is_some() {
+        let cen_now: Vec<Vector3<f64>> = ids
+            .iter()
+            .map(|&i| sub.poses[i].unwrap().center().coords)
+            .collect();
+        let axis = principal_axis(&cen_now)?;
         if let Some(th) = roll_from_rig(&axis, &sub, rig_targets) {
             let m = ids
                 .iter()
@@ -1372,6 +1372,20 @@ fn attach_detached(
     s.obs.extend(sub.obs);
     s.ba_only.extend(sub.ba_only);
     Some((res.len(), res[res.len() / 2]))
+}
+
+/// 점 모음의 주성분 방향(분산이 가장 큰 축).
+fn principal_axis(pts: &[Vector3<f64>]) -> Option<nalgebra::Unit<Vector3<f64>>> {
+    let mean = pts.iter().sum::<Vector3<f64>>() / pts.len().max(1) as f64;
+    let mut cov = Matrix3::zeros();
+    for c in pts {
+        cov += (c - mean) * (c - mean).transpose();
+    }
+    let eig = nalgebra::SymmetricEigen::new(cov);
+    let mx = (0..3).max_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))?;
+    Some(nalgebra::Unit::new_normalize(
+        eig.eigenvectors.column(mx).into_owned(),
+    ))
 }
 
 /// 장착 관계로 정한 목표 자세(`rig_targets`: 사진 번호, 목표 회전)에 부분 모델 `sub` 의 사진 회전을 가장 가깝게
@@ -1446,7 +1460,7 @@ fn mean_rotation(rs: &[Rotation3<f64>]) -> Option<Rotation3<f64>> {
 fn collect_rig_samples(
     s: &Sparse,
     views: &[(usize, usize)],
-    samples: &mut [Vec<Rotation3<f64>>; 3],
+    samples: &mut [BTreeMap<usize, Rotation3<f64>>; 3],
 ) {
     let mut by_pos: BTreeMap<usize, [Option<Rotation3<f64>>; 3]> = BTreeMap::new();
     for (i, &(c, p)) in views.iter().enumerate() {
@@ -1456,11 +1470,12 @@ fn collect_rig_samples(
             }
         }
     }
-    for rs in by_pos.values() {
+    for (p, rs) in &by_pos {
         if let Some(r0) = rs[0] {
             for c in 1..3 {
                 if let Some(rc) = rs[c] {
-                    samples[c].push(rc * r0.inverse());
+                    // 위치 번호당 표본 하나: 구역마다 같은 위치를 다시 모아도 중복으로 세지 않는다.
+                    samples[c].entry(*p).or_insert(rc * r0.inverse());
                 }
             }
         }
@@ -1468,11 +1483,12 @@ fn collect_rig_samples(
 }
 
 /// 표본에서 카메라별 장착 상대 회전을 낸다(카메라 0 은 항상 항등, 표본이 3개 미만인 카메라는 None).
-fn rig_from_samples(samples: &[Vec<Rotation3<f64>>; 3]) -> [Option<Rotation3<f64>>; 3] {
+fn rig_from_samples(samples: &[BTreeMap<usize, Rotation3<f64>>; 3]) -> [Option<Rotation3<f64>>; 3] {
     let mut out = [Some(Rotation3::identity()), None, None];
     for c in 1..3 {
         if samples[c].len() >= 3 {
-            out[c] = mean_rotation(&samples[c]);
+            let v: Vec<Rotation3<f64>> = samples[c].values().copied().collect();
+            out[c] = mean_rotation(&v);
         }
     }
     out
@@ -3153,7 +3169,7 @@ pub fn run_pipeline_with(
         Ok(())
     };
 
-    let mut rig_samples: [Vec<Rotation3<f64>>; 3] = Default::default();
+    let mut rig_samples: [BTreeMap<usize, Rotation3<f64>>; 3] = Default::default();
     for r in &regions {
         // 끝난 정밀 결과를 먼저 반영해 이번 등록·정렬이 최신 모델을 기준으로 삼게 한다.
         while let Ok(m) = rx.try_recv() {
