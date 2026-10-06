@@ -257,7 +257,7 @@ pub fn build_tracks(
                 &valid,
                 &keypoints[lo],
                 &keypoints[hi],
-                cfg.epipolar_rescue_px,
+                &RescueRule::epipolar(cfg.epipolar_rescue_px),
             );
             flags
         } else {
@@ -735,20 +735,55 @@ fn displacement_outliers_with_layer(
     out
 }
 
-/// 에피폴라 구제: `flags`(참이면 변위 일관성에 걸린 대응)가 있으면 짝의 대응 전체로 기본 행렬을 강건하게
-/// 맞추고(정규화 8점 + RANSAC, Hartley & Zisserman 11 장), 걸린 대응 중 Sampson 거리가 `thr_px`(960 폭 기준,
-/// 영상 폭에 비례) 이하인 것을 해제한다. 맞춤이 안 되거나 정상 비율이 낮거나 평면 짝(F 가 정해지지 않음)이면
-/// 아무것도 하지 않는다. 해제한 개수를 돌려준다.
-fn epipolar_rescue(
-    flags: &mut [bool],
+/// 짝의 강건한 기본 행렬과 영상 크기 비(960 폭 기준).
+struct PairFit {
+    f: Matrix3<f64>,
+    size: f64,
+}
+
+/// 구제 조건. `thr_px` 만 있으면(나머지 0) 에피폴라 일치만 본다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RescueRule {
+    /// Sampson 거리 문턱(960 폭 기준 화소). 0 이하이면 끈다.
+    thr_px: f64,
+    /// (a) 같은 층 지지: 후보와 변위가 `DISPLACEMENT_LAYER_RADIUS * 기준 문턱` 안이고 같은 기본 행렬을 만족하며
+    /// 서로의 국소 아핀 맞춤 잔차가 `fit_frac * 기준 문턱` 이하인 이웃이 이만큼 이상이어야 구제한다. 0 이면 보지 않는다.
+    support: usize,
+    /// (c) 위 개수 문턱을 이웃 후보 수 대비 비율로 더 올린다(`max(support, ceil(ratio * 후보 수))`). 0 이면 보지 않는다.
+    support_ratio: f64,
+    /// 지지점 아핀 맞춤 잔차 문턱 비율(기준 문턱 대비). 후보 자신의 잔차도 이 값 이하여야 한다.
+    fit_frac: f64,
+    /// 지지점을 고르는 변위 반경(기준 문턱 대비, 2 차원). 변위 거름의 층 지지 반경(0.25)에서는 후보가 이미 지지가
+    /// 모자라 걸린 것이라 더 넓게 본다.
+    radius: f64,
+    /// 0 보다 크면 (b) 지지점을 2 차원 반경 대신 에피폴라 선 방향 시차 차이 `line_range * 기준 문턱` 이하로 고른다.
+    line_range: f64,
+    /// (b) 에피폴라 선 방향 시차 상한: 후보 변위와 가까운 이웃 변위 중앙값의 차이를 선 방향으로 사영한 길이가
+    /// `parallax * 기준 문턱` 이하여야 구제한다. 0 이하이면 보지 않는다.
+    parallax: f64,
+}
+
+impl RescueRule {
+    const fn epipolar(thr_px: f64) -> Self {
+        Self {
+            thr_px,
+            support: 0,
+            support_ratio: 0.0,
+            fit_frac: 0.1,
+            radius: DISPLACEMENT_LAYER_RADIUS,
+            line_range: 0.0,
+            parallax: 0.0,
+        }
+    }
+}
+
+/// 짝의 대응 전체로 기본 행렬을 강건하게 맞춘다(정규화 8점 + RANSAC, Hartley & Zisserman 11 장). 맞춤이 안 되거나
+/// 정상 비율이 낮거나 평면 짝(F 가 정해지지 않음)이면 `None`.
+fn fit_pair_fundamental(
     matches: &[(usize, usize)],
     kp_a: &[Vector2<f64>],
     kp_b: &[Vector2<f64>],
-    thr_px: f64,
-) -> usize {
-    if thr_px <= 0.0 || !flags.iter().any(|&f| f) {
-        return 0;
-    }
+) -> Option<PairFit> {
     let (mut max_x, mut max_y) = (0.0f64, 0.0f64);
     let (mut xa, mut xb) = (
         Vec::with_capacity(matches.len()),
@@ -762,26 +797,177 @@ fn epipolar_rescue(
     }
     let size = (max_x / DISPLACEMENT_REF_WIDTH).max(max_y / DISPLACEMENT_REF_HEIGHT);
     if size <= 0.0 || !size.is_finite() {
-        return 0;
+        return None;
     }
     let cfg = RansacConfig {
         threshold_px: EPIPOLAR_FIT_PX * size,
         min_inlier_ratio: EPIPOLAR_FIT_MIN_RATIO,
         ..RansacConfig::default()
     };
-    let Some(fit) = ransac_fundamental(&xa, &xb, &cfg) else {
-        return 0;
-    };
+    let fit = ransac_fundamental(&xa, &xb, &cfg)?;
     if fit.model == TwoViewModel::Homography {
+        return None;
+    }
+    Some(PairFit { f: fit.f, size })
+}
+
+/// 에피폴라 구제: `flags`(참이면 변위 일관성에 걸린 대응)가 있으면 짝의 기본 행렬을 맞추고, 걸린 대응 중
+/// `rule` 을 만족하는 것을 해제한다. 해제한 개수를 돌려준다.
+fn epipolar_rescue(
+    flags: &mut [bool],
+    matches: &[(usize, usize)],
+    kp_a: &[Vector2<f64>],
+    kp_b: &[Vector2<f64>],
+    rule: &RescueRule,
+) -> usize {
+    if rule.thr_px <= 0.0 || !flags.iter().any(|&f| f) {
         return 0;
     }
-    let lim2 = (thr_px * size).powi(2);
-    let mut n = 0;
-    for (i, f) in flags.iter_mut().enumerate() {
-        if *f && sampson_error(&fit.f, &xa[i], &xb[i]) <= lim2 {
-            *f = false;
-            n += 1;
+    let Some(fit) = fit_pair_fundamental(matches, kp_a, kp_b) else {
+        return 0;
+    };
+    rescue_with_fit(flags, matches, kp_a, kp_b, &fit, rule)
+}
+
+/// `epipolar_rescue` 의 구제 단계(기본 행렬은 이미 맞춘 것).
+fn rescue_with_fit(
+    flags: &mut [bool],
+    matches: &[(usize, usize)],
+    kp_a: &[Vector2<f64>],
+    kp_b: &[Vector2<f64>],
+    fit: &PairFit,
+    rule: &RescueRule,
+) -> usize {
+    let size = fit.size;
+    let lim2 = (rule.thr_px * size).powi(2);
+    let pos: Vec<(Vector2<f64>, Vector2<f64>)> = matches
+        .iter()
+        .map(|&(fa, fb)| (kp_a[fa], kp_b[fb] - kp_a[fa]))
+        .collect();
+    let epi_ok: Vec<bool> = matches
+        .iter()
+        .map(|&(fa, fb)| sampson_error(&fit.f, &kp_a[fa], &kp_b[fb]) <= lim2)
+        .collect();
+    let gated = rule.support > 0 || rule.support_ratio > 0.0 || rule.parallax > 0.0;
+    let tol = DISPLACEMENT_TOLERANCE * size;
+    // 이웃 조회용 격자: 칸당 평균 8 점.
+    let (mut lo, mut hi) = (
+        Vector2::new(f64::MAX, f64::MAX),
+        Vector2::new(f64::MIN, f64::MIN),
+    );
+    for q in &pos {
+        lo.x = lo.x.min(q.0.x);
+        lo.y = lo.y.min(q.0.y);
+        hi.x = hi.x.max(q.0.x);
+        hi.y = hi.y.max(q.0.y);
+    }
+    let cell = (((hi.x - lo.x) * (hi.y - lo.y)).max(1e-12) * 8.0 / pos.len().max(1) as f64)
+        .sqrt()
+        .max(size * 4.0)
+        .max(1e-9);
+    let key = |p: &Vector2<f64>| ((p.x / cell).floor() as i64, (p.y / cell).floor() as i64);
+    let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    if gated {
+        for (i, q) in pos.iter().enumerate() {
+            grid.entry(key(&q.0)).or_default().push(i);
         }
+    }
+    let k = DISPLACEMENT_NEIGHBORS;
+    let rad2 = (tol * rule.radius).powi(2);
+    let mut n = 0;
+    for i in 0..flags.len() {
+        if !flags[i] || !epi_ok[i] {
+            continue;
+        }
+        if gated {
+            // 후보 이웃: 같은 칸 고리 안 점 전체(변위 거름의 층 지지와 같은 후보 집합).
+            let q = &pos[i];
+            let (cx, cy) = key(&q.0);
+            let mut cand: Vec<(f64, usize)> = Vec::new();
+            for ring in 1..=3i64 {
+                cand.clear();
+                for gx in cx - ring..=cx + ring {
+                    for gy in cy - ring..=cy + ring {
+                        if let Some(v) = grid.get(&(gx, gy)) {
+                            for &j in v {
+                                if j != i {
+                                    cand.push(((pos[j].0 - q.0).norm_squared(), j));
+                                }
+                            }
+                        }
+                    }
+                }
+                if cand.len() >= k {
+                    break;
+                }
+            }
+            if cand.is_empty() {
+                continue;
+            }
+            if rule.support > 0 || rule.support_ratio > 0.0 {
+                let l = fit.f * Vector3::new(q.0.x, q.0.y, 1.0);
+                let nl = l.x.hypot(l.y).max(1e-12);
+                let line = Vector2::new(-l.y, l.x) / nl;
+                let mut nb: Vec<(f64, f64, f64, f64)> = vec![(0.0, 0.0, q.1.x, q.1.y)];
+                for &(_, j) in &cand {
+                    let dd = pos[j].1 - q.1;
+                    let near = if rule.line_range > 0.0 {
+                        dd.dot(&line).abs() <= rule.line_range * tol
+                    } else {
+                        dd.norm_squared() <= rad2
+                    };
+                    if epi_ok[j] && near {
+                        let u = (pos[j].0 - q.0) / cell;
+                        nb.push((u.x, u.y, pos[j].1.x, pos[j].1.y));
+                    }
+                }
+                let need = rule
+                    .support
+                    .max((rule.support_ratio * cand.len() as f64).ceil() as usize);
+                if nb.len() - 1 < need.max(3) {
+                    continue;
+                }
+                // 후보와 지지점이 한 국소 아핀 변위장을 이뤄야 한다(한 직선 위면 맞춤이 안 돼 거절).
+                let keep = vec![true; nb.len()];
+                let Some(f) = fit_affine(&nb, &keep) else {
+                    continue;
+                };
+                let mut res: Vec<f64> = nb
+                    .iter()
+                    .map(|e| {
+                        let rx = e.2 - (f[0] + f[1] * e.0 + f[2] * e.1);
+                        let ry = e.3 - (f[3] + f[4] * e.0 + f[5] * e.1);
+                        rx.hypot(ry)
+                    })
+                    .collect();
+                let own = res[0];
+                res.sort_unstable_by(|a, b| a.total_cmp(b));
+                if res[res.len() / 2] > rule.fit_frac * tol || own > rule.fit_frac * tol {
+                    continue;
+                }
+            }
+            if rule.parallax > 0.0 {
+                let mut near = cand.clone();
+                if near.len() > k {
+                    near.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
+                    near.truncate(k);
+                }
+                let med = |sel: fn(&Vector2<f64>) -> f64| {
+                    let mut v: Vec<f64> = near.iter().map(|&(_, j)| sel(&pos[j].1)).collect();
+                    v.sort_unstable_by(|a, b| a.total_cmp(b));
+                    v[v.len() / 2]
+                };
+                let d = q.1 - Vector2::new(med(|d| d.x), med(|d| d.y));
+                let l = fit.f * Vector3::new(q.0.x, q.0.y, 1.0);
+                let nl = l.x.hypot(l.y).max(1e-12);
+                let along = (d.x * -l.y + d.y * l.x) / nl;
+                if along.abs() > rule.parallax * tol {
+                    continue;
+                }
+            }
+        }
+        flags[i] = false;
+        n += 1;
     }
     n
 }
@@ -2669,7 +2855,7 @@ mod tests {
             let kind = (p.image_a % 3 != p.image_b % 3) as usize;
             let (ka, kb) = (&s.keypoints[p.image_a], &s.keypoints[p.image_b]);
             let mut flags = displacement_outliers(&p.matches, ka, kb);
-            epipolar_rescue(&mut flags, &p.matches, ka, kb, thr);
+            epipolar_rescue(&mut flags, &p.matches, ka, kb, &RescueRule::epipolar(thr));
             for (&(fa, fb), &bad) in p.matches.iter().zip(&flags) {
                 let g = s.gt[p.image_a][fa];
                 if g == s.gt[p.image_b][fb] && edge.is_none_or(|e| e[g]) {
@@ -2703,7 +2889,7 @@ mod tests {
             }
             let (ka, kb) = (&s.keypoints[p.image_a], &s.keypoints[p.image_b]);
             let mut fl = displacement_outliers(&m, ka, kb);
-            epipolar_rescue(&mut fl, &m, ka, kb, thr);
+            epipolar_rescue(&mut fl, &m, ka, kb, &RescueRule::epipolar(thr));
             for i in 0..n {
                 if is_out[i] {
                     bad.0 += fl[i] as usize;
@@ -2907,7 +3093,7 @@ mod tests {
             let (ka, kb) = (&s.keypoints[p.image_a], &s.keypoints[p.image_b]);
             let f0 = displacement_outliers(m, ka, kb);
             let mut f1 = f0.clone();
-            epipolar_rescue(&mut f1, m, ka, kb, thr);
+            epipolar_rescue(&mut f1, m, ka, kb, &RescueRule::epipolar(thr));
             for i in 0..m.len() {
                 if mark[i] {
                     tot += 1;
@@ -2989,6 +3175,322 @@ mod tests {
         eprintln!("across pooled: {ro:.4} -> {rn:.4} (n {})", across.2);
         if across.2 < 500 || ro - rn > 0.02 {
             failures.push(format!("across pooled {ro:.4} -> {rn:.4} n {}", across.2));
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// 구제 조건 변형 비교에 쓰는 한 짝의 한 경우(참 대응 / 5% 오대응 / 군집 오대응).
+    struct RescueCase {
+        a: usize,
+        b: usize,
+        matches: Vec<(usize, usize)>,
+        flags: Vec<bool>,
+        fit: Option<PairFit>,
+        /// 0 참 대응, 1 오대응, 2.. 군집(모드 × 크기) 번호 + 2.
+        slot: usize,
+        /// 오대응·군집이면 해당 대응 표시.
+        mark: Vec<bool>,
+    }
+
+    /// 단차·평지 장면 하나에서 변형 비교용 경우를 모은다: 짝마다 참 대응 1, 오대응 5% 1, (카메라 간 짝만) 군집 9.
+    fn rescue_cases(s: &Synthetic, opts: &SceneOpts, clusters: bool) -> Vec<RescueCase> {
+        let mut sets: Vec<(usize, Vec<ClusterPair>)> = Vec::new();
+        if clusters {
+            let mut slot = 2;
+            for mode in [ShiftMode::Along, ShiftMode::Across, ShiftMode::Lattice] {
+                for size in [5usize, 10, 20] {
+                    sets.push((slot, shifted_cluster_pairs(s, opts, size, mode, 24.0)));
+                    slot += 1;
+                }
+            }
+        }
+        let mut raw: Vec<(usize, ClusterPair, usize)> = Vec::new();
+        for (pi, p) in s.pairs.iter().enumerate() {
+            raw.push((pi, (p.matches.clone(), Vec::new()), 0));
+            let n = p.matches.len();
+            let mut m = p.matches.clone();
+            let mut is_out = vec![false; n];
+            for i in 0..n {
+                let h =
+                    hash((p.image_a as u64) << 40 | (p.image_b as u64) << 20 | i as u64 | 7 << 60);
+                if h.is_multiple_of(20) {
+                    let j = (hash(i as u64 * 31 + 5 + p.image_b as u64) % n as u64) as usize;
+                    if s.gt[p.image_b][p.matches[j].1] != s.gt[p.image_a][p.matches[i].0] {
+                        m[i].1 = p.matches[j].1;
+                        is_out[i] = true;
+                    }
+                }
+            }
+            raw.push((pi, (m, is_out), 1));
+            if p.image_a % 3 != p.image_b % 3 {
+                for (slot, cl) in &sets {
+                    raw.push((pi, cl[pi].clone(), *slot));
+                }
+            }
+        }
+        raw.into_par_iter()
+            .map(|(pi, (matches, mark), slot)| {
+                let p = &s.pairs[pi];
+                let (ka, kb) = (&s.keypoints[p.image_a], &s.keypoints[p.image_b]);
+                let flags = displacement_outliers(&matches, ka, kb);
+                let fit = if flags.iter().any(|&f| f) {
+                    fit_pair_fundamental(&matches, ka, kb)
+                } else {
+                    None
+                };
+                RescueCase {
+                    a: p.image_a,
+                    b: p.image_b,
+                    matches,
+                    flags,
+                    fit,
+                    slot,
+                    mark,
+                }
+            })
+            .collect()
+    }
+
+    /// 변형 비교 슬롯: 0 참 같은 카메라, 1 참 카메라 간, 2 참 경계 카메라 간, 3 오대응, 4.. 군집(모드 × 크기).
+    const RESCUE_SLOTS: usize = 13;
+
+    /// `cases` 를 `rules` 마다 구제해 슬롯별 (거름, 전체) 를 센다.
+    fn rescue_variant_counts(
+        s: &Synthetic,
+        cases: &[RescueCase],
+        edge: &[bool],
+        rules: &[RescueRule],
+    ) -> Vec<[(usize, usize); RESCUE_SLOTS]> {
+        cases
+            .par_iter()
+            .map(|c| {
+                let (ka, kb) = (&s.keypoints[c.a], &s.keypoints[c.b]);
+                let kind = (c.a % 3 != c.b % 3) as usize;
+                rules
+                    .iter()
+                    .map(|rule| {
+                        let mut fl = c.flags.clone();
+                        if rule.thr_px > 0.0 {
+                            if let Some(fit) = &c.fit {
+                                rescue_with_fit(&mut fl, &c.matches, ka, kb, fit, rule);
+                            }
+                        }
+                        let mut r = [(0usize, 0usize); RESCUE_SLOTS];
+                        for (i, &(fa, fb)) in c.matches.iter().enumerate() {
+                            let bad = fl[i] as usize;
+                            match c.slot {
+                                0 => {
+                                    let g = s.gt[c.a][fa];
+                                    if g == s.gt[c.b][fb] {
+                                        r[kind].0 += bad;
+                                        r[kind].1 += 1;
+                                        if kind == 1 && edge[g] {
+                                            r[2].0 += bad;
+                                            r[2].1 += 1;
+                                        }
+                                    }
+                                }
+                                1 => {
+                                    if c.mark[i] {
+                                        r[3].0 += bad;
+                                        r[3].1 += 1;
+                                    }
+                                }
+                                sl => {
+                                    if c.mark[i] {
+                                        r[sl + 2].0 += bad;
+                                        r[sl + 2].1 += 1;
+                                    }
+                                }
+                            }
+                        }
+                        r
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .reduce(
+                || vec![[(0, 0); RESCUE_SLOTS]; rules.len()],
+                |mut x, y| {
+                    for (xv, yv) in x.iter_mut().zip(&y) {
+                        for (a, b) in xv.iter_mut().zip(yv) {
+                            a.0 += b.0;
+                            a.1 += b.1;
+                        }
+                    }
+                    x
+                },
+            )
+    }
+
+    /// 구제 조건 변형 비교표(측정용): 끔 / 에피폴라만 / (a) 같은 층 지지 / (b) 시차 상한 / (c) 비율 문턱 / 조합.
+    /// 재현율 100%·40% 각각 단차 3 배치(군집은 단차 2 배치 + 평지 1) 를 합산해 끔 대비 차이(%p)를 찍는다.
+    #[test]
+    #[ignore]
+    fn rescue_variant_table() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        let t = EPIPOLAR_RESCUE_TEST_PX;
+        let r = |support: usize, ratio: f64, radius: f64, line: f64, fit: f64| RescueRule {
+            support,
+            support_ratio: ratio,
+            radius,
+            line_range: line,
+            fit_frac: fit,
+            ..RescueRule::epipolar(t)
+        };
+        let p = |parallax: f64| RescueRule {
+            parallax,
+            ..RescueRule::epipolar(t)
+        };
+        let variants: Vec<(String, RescueRule)> = vec![
+            ("off".into(), RescueRule::epipolar(0.0)),
+            ("epi".into(), RescueRule::epipolar(t)),
+            ("a3 r1.5 f.1".into(), r(3, 0.0, 1.5, 0.0, 0.1)),
+            ("a3 r2.5 f.2".into(), r(3, 0.0, 2.5, 0.0, 0.2)),
+            ("a3 r4 f.3".into(), r(3, 0.0, 4.0, 0.0, 0.3)),
+            ("b3 l2 f.2".into(), r(3, 0.0, 0.0, 2.0, 0.2)),
+            ("b3 l4 f.2".into(), r(3, 0.0, 0.0, 4.0, 0.2)),
+            ("g2".into(), p(2.0)),
+            ("g3".into(), p(3.0)),
+            ("g4".into(), p(4.0)),
+            ("g6".into(), p(6.0)),
+            (
+                "a3r2.5f.2+g4".into(),
+                RescueRule {
+                    parallax: 4.0,
+                    ..r(3, 0.0, 2.5, 0.0, 0.2)
+                },
+            ),
+            (
+                "b3l2f.2+g4".into(),
+                RescueRule {
+                    parallax: 4.0,
+                    ..r(3, 0.0, 0.0, 2.0, 0.2)
+                },
+            ),
+        ];
+        let rules: Vec<RescueRule> = variants.iter().map(|v| v.1).collect();
+        for keep in [100u64, 40] {
+            let mut acc = vec![[(0usize, 0usize); RESCUE_SLOTS]; rules.len()];
+            for (boxes, seed) in [
+                (true, 0x57E9u64),
+                (true, 0x1234),
+                (true, 0xBEEF),
+                (false, 0x57E9),
+            ] {
+                let (s, edge, _) = step_scene_seeded(boxes, keep, &opts, seed);
+                let clusters = seed != 0xBEEF;
+                let cases = rescue_cases(&s, &opts, clusters);
+                let part = rescue_variant_counts(&s, &cases, &edge, &rules);
+                for (x, y) in acc.iter_mut().zip(&part) {
+                    for (a, b) in x.iter_mut().zip(y) {
+                        a.0 += b.0;
+                        a.1 += b.1;
+                    }
+                }
+            }
+            let pc = |c: (usize, usize)| 100.0 * c.0 as f64 / c.1.max(1) as f64;
+            for (name, a) in variants.iter().zip(&acc).map(|(v, a)| (&v.0, a)) {
+                let o = &acc[0];
+                let mut line = format!(
+                    "keep {keep} {name:>12}: true same {:.2} cross {:.2} edge {:.2} | outlier rej {:.2} ({:+.2}pp) | clusters(Along,Across,Lattice x 5/10/20) dpp:",
+                    pc(a[0]), pc(a[1]), pc(a[2]), pc(a[3]), pc(a[3]) - pc(o[3])
+                );
+                for k in 4..RESCUE_SLOTS {
+                    line += &format!(" {:+.2}", pc(a[k]) - pc(o[k]));
+                }
+                eprintln!("{line}");
+            }
+            eprintln!(
+                "keep {keep} cluster off rates: {:?}",
+                (4..RESCUE_SLOTS)
+                    .map(|k| format!("{:.1}", pc(acc[0][k])))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// 층 지지 켬/끔의 군집 오대응 거름 비율(%p 차이를 찍는다): 크기 5/10/20 × 방향 3 종을 합산한다.
+    /// 재현율 100%·40% 단차 2 배치 + 평지. 에피폴라 구제는 쓰지 않는다. 반환: 크기별 [(끔 거름, 켬 거름, 전체)].
+    fn layer_cluster_rates(table: bool) -> Vec<[(usize, usize, usize); 3]> {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        let mut acc = vec![[(0usize, 0usize, 0usize); 3]; 3];
+        for keep in [100u64, 40] {
+            for (boxes, seed) in [(true, 0x57E9u64), (true, 0x1234), (false, 0x57E9)] {
+                let (s, _, _) = step_scene_seeded(boxes, keep, &opts, seed);
+                for mode in [ShiftMode::Along, ShiftMode::Across, ShiftMode::Lattice] {
+                    for (si, size) in [5usize, 10, 20].into_iter().enumerate() {
+                        let cl = shifted_cluster_pairs(&s, &opts, size, mode, 24.0);
+                        let (mut off, mut on, mut tot) = (0, 0, 0);
+                        for (p, (m, mark)) in s.pairs.iter().zip(&cl) {
+                            if p.image_a % 3 == p.image_b % 3 {
+                                continue;
+                            }
+                            let (ka, kb) = (&s.keypoints[p.image_a], &s.keypoints[p.image_b]);
+                            let f0 = displacement_outliers_with_layer(
+                                m,
+                                ka,
+                                kb,
+                                DISPLACEMENT_FLOOR,
+                                DISPLACEMENT_CAP,
+                                (0, 0.0),
+                            );
+                            let f1 = displacement_outliers(m, ka, kb);
+                            for i in 0..m.len() {
+                                if mark[i] {
+                                    tot += 1;
+                                    off += f0[i] as usize;
+                                    on += f1[i] as usize;
+                                }
+                            }
+                        }
+                        if table {
+                            eprintln!(
+                                "keep {keep} boxes {boxes} {seed:#x} {mode:?} size {size}: layer off {:.2}% on {:.2}% (n {tot})",
+                                100.0 * off as f64 / tot.max(1) as f64,
+                                100.0 * on as f64 / tot.max(1) as f64
+                            );
+                        }
+                        let slot = &mut acc[si][match mode {
+                            ShiftMode::Along => 0,
+                            ShiftMode::Across => 1,
+                            ShiftMode::Lattice => 2,
+                        }];
+                        slot.0 += off;
+                        slot.1 += on;
+                        slot.2 += tot;
+                    }
+                }
+            }
+        }
+        acc
+    }
+
+    /// 밀린 무리(크기 5/10/20, 방향 3 종)를 섞은 단차·평지 장면에서 층 지지 켬의 무리 오대응 거름 비율이 끔 대비
+    /// 0.5%p 이내다(크기별 세 방향 합산).
+    #[test]
+    fn layer_support_keeps_cluster_rejection() {
+        let acc = layer_cluster_rates(false);
+        let mut failures = Vec::new();
+        for (si, size) in [5usize, 10, 20].into_iter().enumerate() {
+            let (off, on, tot) = acc[si]
+                .iter()
+                .fold((0, 0, 0), |a, c| (a.0 + c.0, a.1 + c.1, a.2 + c.2));
+            let (ro, rn) = (
+                off as f64 / tot.max(1) as f64,
+                on as f64 / tot.max(1) as f64,
+            );
+            eprintln!("size {size}: layer off {ro:.4} on {rn:.4} (n {tot})");
+            if tot < 500 || ro - rn > 0.005 {
+                failures.push(format!("size {size}: {ro:.4} -> {rn:.4} n {tot}"));
+            }
         }
         assert!(failures.is_empty(), "{failures:?}");
     }
