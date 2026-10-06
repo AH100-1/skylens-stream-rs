@@ -1987,6 +1987,11 @@ mod tests {
     /// 시드 3 구역0 구조에 정답 회전 + 잡음 간선을 만들고, 대응 20·25 개인 간선 둘(번호 135, 161)을
     /// 83° 틀리게 한다. 반환: (평균, 최대) 회전 오차(도, 전역 회전을 맞춘 뒤).
     fn real_topology_case(seed: u64) -> (f64, f64) {
+        real_topology_case_parts(seed, true, true)
+    }
+
+    /// `wrong`: 틀린 두 간선(83°)을 넣는다, `noise`: 나머지 간선 잡음을 넣는다. 난수 소비는 항상 같다.
+    fn real_topology_case_parts(seed: u64, wrong: bool, noise: bool) -> (f64, f64) {
         let scene = Scene::new(SceneConfig {
             seed: 3,
             ..SceneConfig::default()
@@ -2013,9 +2018,18 @@ mod tests {
                 let rel = truth[j] * truth[i].inverse();
                 let rotation = if k == 135 || k == 161 {
                     let axis = Vector3::new(rng.gauss(), rng.gauss(), rng.gauss()).normalize();
-                    Rotation3::new(axis * 83f64.to_radians()) * rel
+                    if wrong {
+                        Rotation3::new(axis * 83f64.to_radians()) * rel
+                    } else {
+                        rel
+                    }
                 } else {
-                    rng.rotation(0.6f64.to_radians() / 3f64.sqrt()) * rel
+                    let n = rng.rotation(0.6f64.to_radians() / 3f64.sqrt());
+                    if noise {
+                        n * rel
+                    } else {
+                        rel
+                    }
                 };
                 RelativeRotation {
                     i,
@@ -2031,17 +2045,41 @@ mod tests {
 
     #[test]
     fn real_topology_weak_wrong_edges() {
-        let (mut worst_mean, mut worst_max): (f64, f64) = (0.0, 0.0);
+        // 시드 6 은 따로 잰다: 평균 2.09°, 최대 2.95° 로 남는다. 나머지 9개는 평균 0.6° 이하.
+        // 원인(`real_topology_seed_parts`): 시드 6 은 틀린 간선만 있거나(잡음 없음) 잡음만 있으면(평균 0.28°)
+        // 정확히 풀리는데 둘이 함께일 때만 2.09° 가 된다. 이 시드의 틀린 두 간선 회전 축에서는 0.6° 잡음이
+        // 얹힌 주변 간선 잔차와 틀린 간선 잔차를 가르지 못해 틀린 간선이 완전히 걸러지지 않는 것으로 보인다.
+        const BAD_SEED: u64 = 6;
+        let (mut rest_mean, mut rest_max): (f64, f64) = (0.0, 0.0);
+        let (mut bad_mean, mut bad_max) = (0.0, 0.0);
         for seed in 0..10 {
             let (mean, max) = real_topology_case(seed);
             eprintln!("real topology seed={seed} mean={mean:.3} max={max:.3}");
-            worst_mean = worst_mean.max(mean);
-            worst_max = worst_max.max(max);
+            if seed == BAD_SEED {
+                (bad_mean, bad_max) = (mean, max);
+            } else {
+                rest_mean = rest_mean.max(mean);
+                rest_max = rest_max.max(max);
+            }
         }
-        eprintln!("real topology worst mean {worst_mean:.3} max {worst_max:.3}");
-        // 시드 하나(6)는 평균 2.09°, 최대 2.95° 로 남는다. 나머지는 평균 0.6° 이하.
-        assert!(worst_mean < 2.5, "평균 오차 {worst_mean}");
-        assert!(worst_max < 4.0, "최대 오차 {worst_max}");
+        eprintln!(
+            "real topology rest worst mean {rest_mean:.3} max {rest_max:.3}; seed {BAD_SEED} mean {bad_mean:.3} max {bad_max:.3}"
+        );
+        assert!(rest_mean < 1.0, "나머지 시드 평균 오차 {rest_mean}");
+        assert!(rest_max < 1.5, "나머지 시드 최대 오차 {rest_max}");
+        assert!(bad_mean < 2.3, "시드 {BAD_SEED} 평균 오차 {bad_mean}");
+        assert!(bad_max < 3.2, "시드 {BAD_SEED} 최대 오차 {bad_max}");
+    }
+
+    #[test]
+    #[ignore = "원인 조사용 출력"]
+    fn real_topology_seed_parts() {
+        for seed in [5, 6, 7] {
+            for (wrong, noise) in [(true, true), (true, false), (false, true), (false, false)] {
+                let (m, x) = real_topology_case_parts(seed, wrong, noise);
+                eprintln!("parts seed={seed} wrong={wrong} noise={noise} mean={m:.3} max={x:.3}");
+            }
+        }
     }
 
     fn rotation_angle(r: &Rotation3<f64>) -> f64 {

@@ -1431,21 +1431,63 @@ fn sparse_init_with(
     Ok((s, stages))
 }
 
-/// GPS 중심 퍼짐의 둘째/첫째 주성분 표준편차 비가 이 값 미만이면 거의 한 직선으로 본다.
-/// 기울어진 구역 실측은 3.3/22.9 = 0.14, 1.35/22.9 = 0.06 이고, 격자형 비행은 0.5 이상이다.
-const COLLINEAR_SPREAD_RATIO: f64 = 0.25;
+/// 두 롤 후보(GPS 닮음 해, 수평 퍼짐 해)의 정상 대응 정렬 잔차(RMS)를 비교할 때, GPS 해 잔차가
+/// 수평 퍼짐 해 잔차의 이 비율 미만일 때만 GPS 해를 쓴다. 그 밖(차가 5 % 이내거나 퍼짐 해가 더 작음)은 수평 퍼짐 해.
+/// 측정한 정상 구역의 GPS 중심 퍼짐 비(둘째/첫째 주성분 표준편차)는 0.09~0.24 로 직선 판정 문턱을
+/// 가르지 못해 문턱 대신 잔차로 고른다(구역별 실측 표 기준).
+/// 0.95 의 근거(`choose_roll_tests::bank_sweep_table`, 옆 퍼짐 12~120 m × 기울기 0/1/2/4° × 잡음 0/0.5/2.4 m,
+/// 조건당 200회): 기울기 0° 에서 비 GPS/퍼짐 의 최소가 0.960(평균 0.994)이라 0.95 는 기울지 않은 비행에서
+/// 한 번도 GPS 해로 넘어가지 않는 가장 큰 값에 가깝고, 실데이터 최소 사례(0.966)도 그 위에 있다.
+/// 문턱을 올리면 기울기 0° 에서 GPS 해(롤 오차 1~4°)로 잘못 넘어가므로 올리지 않았다. 대신 기울기 2° 이하·
+/// 옆 퍼짐이 작거나 잡음이 큰 구역에서는 기운 비행을 놓치고 퍼짐 해를 쓴다(표의 wrong 열).
+const ROLL_GPS_KEEP_RATIO: f64 = 0.95;
 
-/// GPS 중심이 거의 한 직선이면 닮음 변환의 비행 축 둘레 회전이 GPS 로 정해지지 않는다.
-/// 이때 초기 정렬과 같은 규칙(`roll_by_level_spread`: 카메라 광축 높이 분산 최소)으로 비행 축 둘레 회전만
-/// 다시 고르고, 이동은 정상 대응 무게중심으로 다시 맞춘다. `rots` 는 정렬 전 모델의 (세계→카메라) 회전.
-/// 직선이 아니면 입력을 그대로 돌려준다.
-fn level_collinear_roll(
+/// 비행 축 둘레 회전 후보 둘 중 하나를 고른다: (a) GPS 닮음 해 그대로, (b) 초기 정렬과 같은 규칙
+/// (`roll_by_level_spread`: 카메라 광축 높이 분산 최소)으로 비행 축 둘레 회전만 다시 고르고 이동은 정상 대응
+/// 무게중심으로 맞춘 해. 두 해의 정상 대응 정렬 잔차가 비슷하면 GPS 가 롤을 정하지 못하는 것이므로 (b),
+/// GPS 해 잔차가 뚜렷이 작으면 (a). `rots` 는 정렬 전 모델의 (세계→카메라) 회전. 반환 bool 은 (b) 선택 여부.
+fn choose_roll(
     sim: &Similarity,
     src: &[Vector3<f64>],
     dst: &[Vector3<f64>],
     inl: &[bool],
     rots: &[Rotation3<f64>],
 ) -> (Similarity, bool) {
+    let Some(c) = roll_candidates(sim, src, dst, inl, rots) else {
+        return (*sim, false);
+    };
+    let keep_gps = c.rms_gps < ROLL_GPS_KEEP_RATIO * c.rms_roll;
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        eprintln!(
+            "diag align roll spread_ratio {:.4} rms_gps {:.3} rms_roll {:.3} chosen {}",
+            c.spread_ratio,
+            c.rms_gps,
+            c.rms_roll,
+            if keep_gps { "gps" } else { "roll" }
+        );
+    }
+    if keep_gps {
+        (*sim, false)
+    } else {
+        (c.rolled, true)
+    }
+}
+
+/// `choose_roll` 이 비교하는 두 후보와 그 정렬 잔차.
+struct RollCandidates {
+    spread_ratio: f64,
+    rolled: Similarity,
+    rms_gps: f64,
+    rms_roll: f64,
+}
+
+fn roll_candidates(
+    sim: &Similarity,
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    inl: &[bool],
+    rots: &[Rotation3<f64>],
+) -> Option<RollCandidates> {
     let pts: Vec<Vector3<f64>> = dst
         .iter()
         .zip(inl)
@@ -1453,7 +1495,7 @@ fn level_collinear_roll(
         .map(|(p, _)| *p)
         .collect();
     if pts.len() < 3 || rots.is_empty() {
-        return (*sim, false);
+        return None;
     }
     let n = pts.len() as f64;
     let mean = pts.iter().sum::<Vector3<f64>>() / n;
@@ -1469,21 +1511,17 @@ fn level_collinear_roll(
         eig.eigenvalues[order[0]].max(0.0),
         eig.eigenvalues[order[1]].max(0.0),
     );
-    if std::env::var("SKYLENS_REGION_DIAG").is_ok() && l1 > 1e-12 {
-        eprintln!("diag gps_align spread_ratio {:.4}", l2.sqrt() / l1.sqrt());
+    if l1 <= 1e-12 {
+        return None;
     }
-    if l1 <= 1e-12 || l2.sqrt() / l1.sqrt() >= COLLINEAR_SPREAD_RATIO {
-        return (*sim, false);
-    }
+    let ratio = l2.sqrt() / l1.sqrt();
     let axis = nalgebra::Unit::new_normalize(eig.eigenvectors.column(order[0]).into_owned());
     // 비행 축이 연직에 가까우면 둘레 회전이 곧 방위라 손대지 않는다.
     if axis.z.abs() > 0.98 {
-        return (*sim, true);
+        return None;
     }
     let g = *sim.r.matrix();
-    let Some(theta) = roll_by_level_spread(&axis, &g, rots) else {
-        return (*sim, true);
-    };
+    let theta = roll_by_level_spread(&axis, &g, rots)?;
     let r = Rotation3::from_axis_angle(&axis, theta) * sim.r;
     let (mut cs, mut cd, mut m) = (Vector3::zeros(), Vector3::zeros(), 0.0);
     for ((a, b), &ok) in src.iter().zip(dst).zip(inl) {
@@ -1494,14 +1532,28 @@ fn level_collinear_roll(
         }
     }
     let (cs, cd) = (cs / m, cd / m);
-    (
-        Similarity {
-            s: sim.s,
-            r,
-            t: cd - sim.s * (r * cs),
-        },
-        true,
-    )
+    let rolled = Similarity {
+        s: sim.s,
+        r,
+        t: cd - sim.s * (r * cs),
+    };
+    let rms = |c: &Similarity| -> f64 {
+        let ss: f64 = src
+            .iter()
+            .zip(dst)
+            .zip(inl)
+            .filter(|(_, &ok)| ok)
+            .map(|((a, b), _)| (c.apply_point(a) - b).norm_squared())
+            .sum();
+        (ss / m).sqrt()
+    };
+    let (rms_gps, rms_roll) = (rms(sim), rms(&rolled));
+    Some(RollCandidates {
+        spread_ratio: ratio,
+        rolled,
+        rms_gps,
+        rms_roll,
+    })
 }
 
 /// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
@@ -1517,10 +1569,10 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
     let (sim, inl, med) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
     let rots: Vec<Rotation3<f64>> = ids.iter().map(|&i| s.poses[i].unwrap().rotation).collect();
-    let (sim, collinear) = level_collinear_roll(&sim, &src, &dst, &inl, &rots);
+    let (sim, rolled) = choose_roll(&sim, &src, &dst, &inl, &rots);
     if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
         eprintln!(
-            "diag gps_align collinear {collinear} n {} inliers {} scale {:.4} inlier_med {:.3}",
+            "diag gps_align rolled {rolled} n {} inliers {} scale {:.4} inlier_med {:.3}",
             src.len(),
             inl.iter().filter(|&&b| b).count(),
             sim.s,
@@ -4105,7 +4157,7 @@ mod refit_anchor_tests {
 }
 
 #[cfg(test)]
-mod collinear_roll_tests {
+mod choose_roll_tests {
     use super::*;
 
     fn tilt_deg(sim: &Similarity) -> f64 {
@@ -4157,7 +4209,7 @@ mod collinear_roll_tests {
     }
 
     #[test]
-    fn collinear_gps_keeps_vertical() {
+    fn line_gps_rolls_to_level() {
         let pts = line_points();
         let tilted = Similarity {
             s: 1.0,
@@ -4166,7 +4218,7 @@ mod collinear_roll_tests {
         };
         let inl = vec![true; pts.len()];
         assert!(tilt_deg(&tilted) > 12.0);
-        let (fixed, col) = level_collinear_roll(&tilted, &pts, &pts, &inl, &mount_rots());
+        let (fixed, col) = choose_roll(&tilted, &pts, &pts, &inl, &mount_rots());
         assert!(col);
         assert!(tilt_deg(&fixed) < 1.0, "tilt {}", tilt_deg(&fixed));
         // 원점·대응이 같은 점집합이라 정상 대응 무게중심은 제자리에 대응한다.
@@ -4176,16 +4228,170 @@ mod collinear_roll_tests {
     }
 
     #[test]
-    fn spread_gps_is_unchanged() {
+    fn consistent_gps_is_kept() {
+        // 정렬이 GPS 와 잘 맞으면(잔차 0) 기울어진 회전이어도 GPS 해를 그대로 둔다.
         let pts = grid_points();
         let sim = Similarity {
             s: 1.0,
             r: Rotation3::from_axis_angle(&Vector3::x_axis(), 13f64.to_radians()),
             t: Vector3::new(1.0, 2.0, 3.0),
         };
+        let dst: Vec<Vector3<f64>> = pts.iter().map(|p| sim.apply_point(p)).collect();
         let inl = vec![true; pts.len()];
-        let (out, col) = level_collinear_roll(&sim, &pts, &pts, &inl, &mount_rots());
-        assert!(!col);
+        let (out, rolled) = choose_roll(&sim, &pts, &dst, &inl, &mount_rots());
+        assert!(!rolled);
         assert_eq!(out, sim);
+    }
+
+    #[test]
+    fn gps_matches_untilted_points_but_tilted_rotation_prefers_level_roll() {
+        // GPS 점이 기울지 않은 점집합과 같아 롤을 되돌리면 잔차가 오히려 줄어드는 경우: 수평 퍼짐 해를 고른다.
+        let pts = grid_points();
+        let sim = Similarity {
+            s: 1.0,
+            r: Rotation3::from_axis_angle(&Vector3::x_axis(), 13f64.to_radians()),
+            t: Vector3::zeros(),
+        };
+        let inl = vec![true; pts.len()];
+        let (out, rolled) = choose_roll(&sim, &pts, &pts, &inl, &mount_rots());
+        assert!(rolled);
+        assert!(tilt_deg(&out) < 1.0, "tilt {}", tilt_deg(&out));
+    }
+
+    /// 수평 퍼짐 가정이 틀린 장면(비행 내내 일정하게 기운 카메라 장착)에서 GPS 해가 이겨야 하는지 재는 표.
+    /// 세계 = GPS 좌표계(모델과 같은 틀)라 정답 회전은 항등(롤 0°). 격자: 비행 축(x) 0~270 m(30 m 간격 10단계), 옆으로 3열(폭 W), 높이 흩어짐 ±0.4 m.
+    /// 카메라 광축은 비행 축 수직 방향으로 `bank` 를 중심으로 -6°~+6°(3° 간격 5단계) 흩어진다.
+    /// 오차 열 두 종류: `err_*` 는 후보 회전 전체의 회전각(방위·피치 오차 포함), `roll_*` 는 그중 비행 축(x) 둘레 성분만 뽑은 롤 오차.
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    struct SweepRow {
+        gps_wins: usize,
+        wrong: usize,
+        min_ratio: f64,
+        ratio: f64,
+        err_gps: f64,
+        err_roll: f64,
+        err_chosen: f64,
+        roll_gps: f64,
+        roll_roll: f64,
+        roll_chosen: f64,
+    }
+
+    fn sweep_case(width: f64, noise: f64, bank_deg: f64, trials: u64) -> SweepRow {
+        let bank = bank_deg.to_radians();
+        let rots: Vec<Rotation3<f64>> = (0..30)
+            .map(|i| {
+                let b = bank + ((i % 5) as f64 - 2.0) * 3f64.to_radians();
+                let zc = Vector3::new(0.0, b.sin(), -b.cos());
+                let xc = Vector3::x();
+                let yc = zc.cross(&xc);
+                Rotation3::from_matrix_unchecked(Matrix3::from_columns(&[xc, yc, zc])).inverse()
+            })
+            .collect();
+        let truth: Vec<Vector3<f64>> = (0..30)
+            .map(|i| {
+                Vector3::new(
+                    (i / 3) as f64 * 30.0,
+                    ((i % 3) as f64 - 1.0) * 0.5 * width,
+                    ((i * 7) % 5) as f64 * 0.2 - 0.4,
+                )
+            })
+            .collect();
+        let inl = vec![true; truth.len()];
+        let mut row = SweepRow {
+            gps_wins: 0,
+            wrong: 0,
+            min_ratio: f64::MAX,
+            ratio: 0.0,
+            err_gps: 0.0,
+            err_roll: 0.0,
+            err_chosen: 0.0,
+            roll_gps: 0.0,
+            roll_roll: 0.0,
+            roll_chosen: 0.0,
+        };
+        for seed in 0..trials {
+            let mut st = 0x9E37_79B9_7F4A_7C15u64 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
+            let mut unit = || (splitmix64(&mut st) >> 11) as f64 / (1u64 << 53) as f64;
+            let mut gauss = || {
+                let (u1, u2) = (unit().max(1e-300), unit());
+                (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+            };
+            let dst: Vec<Vector3<f64>> = truth
+                .iter()
+                .map(|p| p + Vector3::new(gauss(), gauss(), gauss()) * noise)
+                .collect();
+            let sim = crate::align::umeyama(&truth, &dst).unwrap();
+            let c = roll_candidates(&sim, &truth, &dst, &inl, &rots).unwrap();
+            let (chosen, rolled) = choose_roll(&sim, &truth, &dst, &inl, &rots);
+            let ang = |s: &Similarity| s.r.angle().to_degrees();
+            // 정답이 항등이므로 s.r 자체가 오차 회전. 비행 축(x) 둘레 성분(twist)만 뽑는다.
+            let roll = |s: &Similarity| {
+                let q = nalgebra::UnitQuaternion::from_rotation_matrix(&s.r);
+                (2.0 * q.i.atan2(q.w.abs())).to_degrees().abs()
+            };
+            row.gps_wins += usize::from(!rolled);
+            row.min_ratio = row.min_ratio.min(c.rms_gps / c.rms_roll);
+            // 두 후보 중 롤 오차가 더 큰 쪽을 골랐으면 틀린 선택.
+            row.wrong += usize::from(ang(&chosen) > ang(&sim).min(ang(&c.rolled)) + 1e-9);
+            row.ratio += c.rms_gps / c.rms_roll / trials as f64;
+            row.err_gps += ang(&sim) / trials as f64;
+            row.err_roll += ang(&c.rolled) / trials as f64;
+            row.err_chosen += ang(&chosen) / trials as f64;
+            row.roll_gps += roll(&sim) / trials as f64;
+            row.roll_roll += roll(&c.rolled) / trials as f64;
+            row.roll_chosen += roll(&chosen) / trials as f64;
+        }
+        row
+    }
+
+    #[test]
+    fn bank_sweep_table() {
+        const TRIALS: u64 = 200;
+        eprintln!(
+            "noise width bank | gps_win/{TRIALS} wrong min_ratio ratio | 전체 회전각 err_gps err_roll err_chosen | x축 둘레 롤 roll_gps roll_roll roll_chosen"
+        );
+        for noise in [0.0, 0.5, 2.4] {
+            for width in [12.0, 30.0, 60.0, 120.0] {
+                for bank in [0.0, 1.0, 2.0, 4.0] {
+                    let t = if noise == 0.0 { 1 } else { TRIALS };
+                    let r = sweep_case(width, noise, bank, t);
+                    eprintln!(
+                        "{noise:.1} {width:5.0} {bank:.0} | {:2} {:2} {:.3} {:.3} | {:.3} {:.3} {:.3} | {:.3} {:.3} {:.3}",
+                        r.gps_wins,
+                        r.wrong,
+                        r.min_ratio,
+                        r.ratio,
+                        r.err_gps,
+                        r.err_roll,
+                        r.err_chosen,
+                        r.roll_gps,
+                        r.roll_roll,
+                        r.roll_chosen
+                    );
+                    if noise > 0.0 && bank == 0.0 {
+                        // 기울기가 없으면 어떤 폭·잡음에서도 GPS 해로 잘못 넘어가지 않는다(최소 비 0.96 > 0.95).
+                        assert_eq!(r.gps_wins, 0, "width {width} noise {noise}");
+                        assert!(r.min_ratio > ROLL_GPS_KEEP_RATIO);
+                    }
+                    if noise == 2.4 && width == 120.0 && bank == 4.0 {
+                        // 옆 퍼짐이 크고 4° 기운 비행: 잡음 2.4 m 에서도 GPS 해를 고르고 전체 회전각 오차가 1° 미만.
+                        assert_eq!(r.gps_wins as u64, TRIALS);
+                        assert!(r.err_chosen < 1.0 && r.err_roll > 3.9);
+                    }
+                    if noise == 0.0 && bank >= 2.0 {
+                        // 잡음이 없으면 GPS 해가 정확하고 수평 퍼짐 해는 기울기만큼 틀린다.
+                        assert_eq!(r.gps_wins, 1, "width {width} bank {bank}");
+                        assert!(r.err_chosen < 1e-6 && r.err_roll > 0.9 * bank);
+                    }
+                }
+            }
+        }
     }
 }
