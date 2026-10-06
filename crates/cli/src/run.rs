@@ -7,7 +7,7 @@ use skylens_core::dataset::{load_dataset, DatasetConfig};
 use skylens_core::pipeline::{run_pipeline, DenseMethod, PipelineConfig, PositionMethod};
 
 pub const USAGE: &str =
-    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N] [--max-features N] [--dense-width N] [--hfov DEG] [--ba-iters N] [--dense-method sweep|patchmatch] [--position gps|translation-averaging] [--preview-ba-iters N] [--preview-refine-iters N] [--gps-sigma-h M] [--gps-sigma-v M] [--tri-loose-frac F] [--tri-median-k K] [--tri-min-px PX] [--list-only]";
+    "skylens-stream run <입력폴더> <출력폴더> [--stride N] [--span N] [--ovl N] [--max-skip-run N] [--max-features N] [--upscale-fill] [--pair-vote] [--dense-width N] [--hfov DEG] [--ba-iters N] [--dense-method sweep|patchmatch] [--position gps|translation-averaging] [--preview-ba-iters N] [--preview-refine-iters N] [--helper-front N] [--helper-back N] [--helper-back-step N] [--coarse-back on|off] [--gps-sigma-h M] [--gps-sigma-v M] [--tri-loose-frac F] [--tri-median-k K] [--tri-min-px PX] [--list-only]";
 
 /// 출력 폴더 아래에 만드는 하위 폴더.
 pub const OUTPUT_DIRS: [&str; 3] = ["preview", "refined", "snapshots"];
@@ -20,6 +20,14 @@ fn parse_options(rest: &[&str]) -> Result<(DatasetConfig, PipelineConfig, bool),
     while let Some(&key) = it.next() {
         if key == "--list-only" {
             list_only = true;
+            continue;
+        }
+        if key == "--upscale-fill" {
+            pc.upscale_fill = true;
+            continue;
+        }
+        if key == "--pair-vote" {
+            pc.pair_vote = true;
             continue;
         }
         if key == "--hfov" {
@@ -53,6 +61,15 @@ fn parse_options(rest: &[&str]) -> Result<(DatasetConfig, PipelineConfig, bool),
             };
             continue;
         }
+        if key == "--coarse-back" {
+            let v = it.next().ok_or("--coarse-back 뒤에 값이 없음")?;
+            pc.helper.coarse_back = match *v {
+                "on" => true,
+                "off" => false,
+                _ => return Err(format!("--coarse-back 값이 on|off 가 아님: {v}")),
+            };
+            continue;
+        }
         let fslot = match key {
             "--gps-sigma-h" => Some(&mut pc.gps_sigma_h),
             "--gps-sigma-v" => Some(&mut pc.gps_sigma_v),
@@ -76,6 +93,9 @@ fn parse_options(rest: &[&str]) -> Result<(DatasetConfig, PipelineConfig, bool),
             "--max-features" => &mut pc.max_features,
             "--dense-width" => &mut pc.dense_width,
             "--ba-iters" => &mut pc.ba_iters,
+            "--helper-front" => &mut pc.helper.front_span,
+            "--helper-back" => &mut pc.helper.back_span,
+            "--helper-back-step" => &mut pc.helper.back_step,
             "--stride" => &mut cfg.stride,
             "--span" => &mut cfg.span,
             "--ovl" => &mut cfg.ovl,
@@ -89,6 +109,9 @@ fn parse_options(rest: &[&str]) -> Result<(DatasetConfig, PipelineConfig, bool),
     }
     if cfg.stride == 0 || cfg.span == 0 {
         return Err("--stride, --span 은 1 이상".into());
+    }
+    if pc.helper.back_step == 0 {
+        return Err("--helper-back-step 은 1 이상".into());
     }
     if pc.max_features == 0 || pc.dense_width < 8 {
         return Err("--max-features 는 1 이상, --dense-width 는 8 이상".into());
