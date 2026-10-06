@@ -2325,4 +2325,168 @@ mod tests {
         eprintln!("편대 평면 실패 {} {fails:.3?}", fails.len());
         assert!(fails.is_empty(), "하한 + 0.2° 초과(쌍둥이) {fails:.3?}");
     }
+
+    /// 편대 장면의 시점 `sel`(카메라, 위치)을 일정 `sch` 로 잇고, 검증한 간선을 회전 평균에 넣는다.
+    /// 반환: (짝 수, 통과 수, 2° 초과 수, 반환 시점 수, 정렬 오차 중앙(도)).
+    fn formation_run(
+        sel: &[(usize, usize)],
+        sch: &crate::matching::PairSchedule,
+    ) -> (usize, usize, usize, usize, f64) {
+        use crate::features::{detect_and_describe, DetectorConfig, GrayImage};
+        use crate::matching::{ratio_match, scheduled_pairs};
+        use crate::rotation_averaging::{
+            aligned_errors, average_rotations, AveragingConfig, RelativeRotation,
+        };
+        use crate::synth::{CamId, Scene, SceneConfig};
+        let (w, h) = (480usize, 270usize);
+        let scene = Scene::new(SceneConfig {
+            width: w as u32,
+            height: h as u32,
+            seed: 1,
+            ..SceneConfig::default()
+        });
+        let views: Vec<_> = sel
+            .iter()
+            .map(|&(c, p)| {
+                scene
+                    .views
+                    .iter()
+                    .find(|v| v.cam == CamId::ALL[c] && v.position == p)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        let det = DetectorConfig::default();
+        let feats: Vec<_> = views
+            .iter()
+            .map(|v| {
+                let (img, _) = scene.render(v);
+                detect_and_describe(&GrayImage::from_rgb(w, h, &img.data), &det)
+            })
+            .collect();
+        let pairs = scheduled_pairs(sel, sch);
+        let truth: Vec<_> = views.iter().map(|v| v.camera.pose.rotation).collect();
+        let mut edges = Vec::new();
+        let mut bad = 0usize;
+        for &(i, j) in &pairs {
+            let (a, b) = (&views[i].camera, &views[j].camera);
+            let m = ratio_match(&feats[i], &feats[j], 0.8, true);
+            let nrm = |c: &Camera, f: &crate::features::Feature| {
+                c.intrinsics
+                    .index_to_normalized(&Vector2::new(f.kp.x as f64, f.kp.y as f64))
+            };
+            let n1: Vec<_> = m.iter().map(|&(x, _)| nrm(a, &feats[i][x])).collect();
+            let n2: Vec<_> = m.iter().map(|&(_, y)| nrm(b, &feats[j][y])).collect();
+            let Some((e, inl)) =
+                ransac_essential(&n1, &n2, a.intrinsics.fx, &RansacConfig::default())
+            else {
+                continue;
+            };
+            let s1: Vec<_> = (0..inl.len()).filter(|&k| inl[k]).map(|k| n1[k]).collect();
+            let s2: Vec<_> = (0..inl.len()).filter(|&k| inl[k]).map(|k| n2[k]).collect();
+            let Some(p) = recover_pose(&e, &s1, &s2) else {
+                continue;
+            };
+            let t = truth[j] * truth[i].inverse();
+            let err = rotation_angle_between(&p.rotation, &t).to_degrees();
+            if err > 2.0 {
+                bad += 1;
+                eprintln!(
+                    "2° 초과 간선 {:?}-{:?} {err:.3}° 정상 {}",
+                    sel[i],
+                    sel[j],
+                    s1.len()
+                );
+            }
+            edges.push(RelativeRotation {
+                i,
+                j,
+                rotation: p.rotation,
+                weight: s1.len() as f64,
+            });
+        }
+        let avg = average_rotations(sel.len(), &edges, &AveragingConfig::default())
+            .expect("회전 평균 실패");
+        let returned = avg.rotations.iter().filter(|r| r.is_some()).count();
+        let mut err: Vec<f64> = aligned_errors(&avg.rotations, &truth)
+            .into_iter()
+            .filter(|x| x.is_finite())
+            .collect();
+        err.sort_by(f64::total_cmp);
+        let med = err
+            .get(err.len() / 2)
+            .copied()
+            .unwrap_or(f64::NAN)
+            .to_degrees();
+        (pairs.len(), edges.len(), bad, returned, med)
+    }
+
+    /// F-148·F-209: 편대 합성 장면(480×270, 시드 1)에서 F 4·R 6·L 6 시점을 짝 일정(같은 카메라 SPEC +
+    /// F–R·F–L +32..=+40)으로 매칭·E 검증한 뒤 회전 평균을 돌린다. 모든 시점이 반환되고,
+    /// 통과 간선 중 정답 상대 회전과 2° 넘게 다른 비율 < 5%, 정답 대비 정렬 오차 중앙 < 1°.
+    /// 위치 8곳(24장) 기본 bench 는 다른 카메라 짝이 겹치지 않아(F–R·F–L 은 +12 이상부터 겹침) 한 덩어리가
+    /// 될 수 없으므로 시점을 겹침이 있는 위치로 골랐다.
+    #[test]
+    fn formation_verified_edges_average_all_views() {
+        use crate::matching::{CrossSchedule, PairSchedule, CAM_FRONT, CAM_LEFT, CAM_RIGHT};
+        let mut sel: Vec<(usize, usize)> = vec![];
+        for p in (0..=12).step_by(4) {
+            sel.push((CAM_FRONT, p));
+        }
+        for p in (32..=52).step_by(4) {
+            sel.push((CAM_RIGHT, p));
+            sel.push((CAM_LEFT, p));
+        }
+        let sch = PairSchedule {
+            cross: CrossSchedule::Formation {
+                right_min: 32,
+                left_min: 32,
+                max: 40,
+                step: 4,
+            },
+            ..PairSchedule::default()
+        };
+        let (np, ne, bad, returned, med) = formation_run(&sel, &sch);
+        let share = bad as f64 / ne.max(1) as f64;
+        eprintln!(
+            "편대 검증 간선: 시점 {}, 짝 {np}, 통과 {ne}, 2° 초과 {bad} ({share:.3}), 반환 {returned}, 정렬 오차 중앙 {med:.3}°",
+            sel.len()
+        );
+        assert_eq!(returned, sel.len(), "반환 시점");
+        assert!(share < 0.05, "2° 초과 간선 비율 {share}");
+        assert!(med < 1.0, "정렬 오차 중앙 {med}°");
+    }
+
+    /// 기준 규모에 가까운 편대 장면(위치 번호 0..=72, 40 초과)에서 같은 단언. F 위치 0..=36, R·L 위치 28..=72
+    /// (4칸 간격), 카메라 간 일정 F(p)–R/L(p+28..=p+36).
+    #[test]
+    fn formation_wide_edges_average_all_views() {
+        use crate::matching::{CrossSchedule, PairSchedule, CAM_FRONT, CAM_LEFT, CAM_RIGHT};
+        let mut sel: Vec<(usize, usize)> = vec![];
+        for p in (0..=36).step_by(4) {
+            sel.push((CAM_FRONT, p));
+        }
+        for p in (28..=72).step_by(4) {
+            sel.push((CAM_RIGHT, p));
+            sel.push((CAM_LEFT, p));
+        }
+        let sch = PairSchedule {
+            cross: CrossSchedule::Formation {
+                right_min: 28,
+                left_min: 28,
+                max: 36,
+                step: 4,
+            },
+            ..PairSchedule::default()
+        };
+        let (np, ne, bad, returned, med) = formation_run(&sel, &sch);
+        let share = bad as f64 / ne.max(1) as f64;
+        eprintln!(
+            "편대 넓은 장면: 시점 {}, 짝 {np}, 통과 {ne}, 2° 초과 {bad} ({share:.3}), 반환 {returned}, 정렬 오차 중앙 {med:.3}°",
+            sel.len()
+        );
+        assert_eq!(returned, sel.len(), "반환 시점");
+        assert!(share < 0.05, "2° 초과 간선 비율 {share}");
+        assert!(med < 1.0, "정렬 오차 중앙 {med}°");
+    }
 }
