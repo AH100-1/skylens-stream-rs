@@ -5123,6 +5123,106 @@ mod detached_tests {
         assert_eq!(main.points.len(), 60);
     }
 
+    /// 부분 모델의 사진 자세만 비행 축(x) 둘레로 `deg` 도 돌린다(점은 그대로 두어 바닥 법선 단서를 없앤다).
+    fn roll_poses_about_flight_axis(sub: &mut Sparse, ids: std::ops::Range<usize>, deg: f64) {
+        let mean = ids
+            .clone()
+            .map(|i| sub.poses[i].unwrap().center().coords)
+            .sum::<Vector3<f64>>()
+            / ids.len() as f64;
+        let r = Rotation3::from_axis_angle(&Vector3::x_axis(), deg.to_radians());
+        let mut only_poses = Sparse {
+            poses: sub.poses.clone(),
+            points: vec![],
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        };
+        apply_sparse_sim(
+            &mut only_poses,
+            &Similarity {
+                s: 1.0,
+                r,
+                t: mean - r * mean,
+            },
+        );
+        sub.poses = only_poses.poses;
+    }
+
+    #[test]
+    fn rig_targets_pull_the_roll_back_within_a_fifth_of_a_degree() {
+        let (mut main, mut sub, gps) = setup(12);
+        // 25° 회전을 취소해 점을 정답에 두고, 사진 자세에만 7° 를 더한다.
+        // 장착 목표(정답 회전)가 이를 되돌려야 한다.
+        let undo = Rotation3::from_axis_angle(&Vector3::x_axis(), (-25f64).to_radians());
+        let mean = Vector3::new(16.0, 15.0, 30.0);
+        apply_sparse_sim(
+            &mut sub,
+            &Similarity {
+                s: 1.0,
+                r: undo,
+                t: mean - undo * mean,
+            },
+        );
+        roll_poses_about_flight_axis(&mut sub, 10..22, 7.0);
+        let targets: Vec<(usize, Rotation3<f64>)> = (10..22).map(|i| (i, truth_rot())).collect();
+        attach_detached(&mut main, sub, &gps, &targets).expect("attached");
+        for i in 10..22 {
+            let p = main.poses[i].expect("pose");
+            let da = (p.rotation * truth_rot().inverse()).angle().to_degrees();
+            assert!(da < 0.2, "photo {i}: {da} deg");
+        }
+    }
+
+    #[test]
+    fn mean_rotation_ignores_quaternion_sign_and_one_outlier() {
+        // 180° 근처 회전: 가까운 회전끼리도 쿼터니언 부호가 서로 반대로 나온다.
+        let axis = nalgebra::Unit::new_normalize(Vector3::new(0.3, -0.5, 0.8));
+        let base = Rotation3::from_axis_angle(&axis, 179.6f64.to_radians());
+        let mut rs = Vec::new();
+        for k in 0..8 {
+            let a = nalgebra::Unit::new_normalize(Vector3::new(
+                (k as f64).cos(),
+                (k as f64 * 1.7).sin(),
+                0.4,
+            ));
+            for sgn in [1.0, -1.0] {
+                rs.push(Rotation3::from_axis_angle(&a, sgn * 0.5f64.to_radians()) * base);
+            }
+        }
+        let signs: Vec<bool> = rs
+            .iter()
+            .map(|r| nalgebra::UnitQuaternion::from_rotation_matrix(r).w >= 0.0)
+            .collect();
+        assert!(
+            signs.iter().any(|&s| s) && signs.iter().any(|&s| !s),
+            "표본에 부호가 반대인 쿼터니언이 섞여 있어야 한다"
+        );
+        let clean = mean_rotation(&rs).expect("mean");
+        assert!(clean.rotation_to(&base).angle().to_degrees() < 0.1);
+        let out_axis = nalgebra::Unit::new_normalize(Vector3::new(1.0, 0.2, 0.1));
+        rs.push(Rotation3::from_axis_angle(&out_axis, 25f64.to_radians()) * base);
+        let m = mean_rotation(&rs).expect("mean");
+        let err = m.rotation_to(&base).angle().to_degrees();
+        assert!(err < 0.1, "{err}");
+        assert!(mean_rotation(&[]).is_none());
+    }
+
+    #[test]
+    fn roll_from_rig_needs_three_targets() {
+        let (_, sub, _) = setup(12);
+        let axis = Vector3::x_axis();
+        let t = |n: usize| -> Vec<(usize, Rotation3<f64>)> {
+            (10..10 + n).map(|i| (i, truth_rot())).collect()
+        };
+        assert!(roll_from_rig(&axis, &sub, &t(2)).is_none());
+        assert!(roll_from_rig(&axis, &sub, &t(3)).is_some());
+        // 부분 모델에 없는 사진(0..10)의 목표는 세지 않는다.
+        let mut mixed = t(2);
+        mixed.push((0, truth_rot()));
+        assert!(roll_from_rig(&axis, &sub, &mixed).is_none());
+    }
+
     #[test]
     fn too_few_photos_or_gps_inliers_are_not_attached() {
         let (mut main, sub, gps) = setup(5);
