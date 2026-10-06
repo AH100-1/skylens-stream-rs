@@ -927,6 +927,8 @@ pub struct PreviewOpts {
     pub merge_detached: bool,
     /// 위치 전용 다듬기 반복 수(0 이면 끔).
     pub refine_iters: usize,
+    /// 떨어진 성분의 부분 모델에만 쓰는 위치 다듬기 반복 수. None 이면 `refine_iters` 를 따른다.
+    pub detached_refine_iters: Option<usize>,
     /// 다듬기 Huber 문턱(도).
     pub refine_huber_deg: f64,
     /// 다듬기 바깥 관측 제거 각(도), 두 번째 바퀴부터.
@@ -950,6 +952,7 @@ impl Default for PreviewOpts {
             pair_vote: false,
             merge_detached: true,
             refine_iters: 0,
+            detached_refine_iters: None,
             refine_huber_deg: 0.3,
             refine_drop_deg: 2.0,
             refine_anchor: 0.02,
@@ -1547,7 +1550,7 @@ fn merge_detached_components(
             merge_detached: false,
             pair_vote: false,
             legacy_roll: opts.legacy_roll,
-            refine_iters: opts.refine_iters,
+            refine_iters: opts.detached_refine_iters.unwrap_or(opts.refine_iters),
             ..PreviewOpts::default()
         };
         let r = sparse_init_with(
@@ -3164,6 +3167,7 @@ pub fn run_pipeline_with(
             &PreviewOpts {
                 legacy_roll: false,
                 pair_vote: cfg.pair_vote,
+                detached_refine_iters: Some(cfg.preview_refine_iters),
                 ..PreviewOpts::default()
             },
         )
