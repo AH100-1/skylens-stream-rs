@@ -59,14 +59,19 @@ fn cli(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// 빈 목록은 NaN.
 fn median(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
     let mut s = v.to_vec();
     s.sort_by(f64::total_cmp);
     s[s.len() / 2]
 }
 
+/// 빈 목록은 NaN(0 으로 찍히면 "잔차 0" 으로 읽힌다).
 fn max(v: &[f64]) -> f64 {
-    v.iter().copied().fold(0.0, f64::max)
+    v.iter().copied().fold(f64::NAN, f64::max)
 }
 
 fn geodetic_of(fields: &[&str]) -> Geodetic {
@@ -321,6 +326,8 @@ fn coarse_back_off_preview_poses_stay_paired() {
     }
     assert!(n_regions >= 3, "구역 수 {n_regions}");
     assert_eq!(registered.len(), n_regions);
+    // 상한 표를 실제로 단언한 구역. 표 구역이 정렬되지 않거나 사라지면 아래에서 빠진 채 끝나므로 마지막에 잡는다.
+    let mut asserted: Vec<usize> = Vec::new();
     for (k, &n_reg) in registered.iter().enumerate() {
         let f = out.join("poses").join(format!("preview_{k:02}.json"));
         let pf = PosesFile::from_json(&std::fs::read_to_string(&f).unwrap()).unwrap();
@@ -392,6 +399,7 @@ fn coarse_back_off_preview_poses_stay_paired() {
             eprintln!("POSES off preview_{k:02} 상한 표에 없음: 측정만");
             continue;
         };
+        asserted.push(k);
         assert_eq!(d.len(), b.shared, "구역 {k} 공유 사진 수");
         assert!(md < b.vs_refined, "구역 {k} 초벌-정밀 중심 차 중앙 {md} m");
         assert!(
@@ -407,6 +415,14 @@ fn coarse_back_off_preview_poses_stay_paired() {
         let (dm, dx) = (median(&direct_shared), max(&direct_shared));
         assert!(dm < b.out_med, "구역 {k} 정답 대비 초벌 중심 중앙 {dm} m");
         assert!(dx < b.out_max, "구역 {k} 정답 대비 초벌 중심 최대 {dx} m");
+    }
+    // 표 구역이 정렬되지 않았거나 없으면 단언이 하나도 돌지 않으므로 여기서 실패시킨다.
+    for b in &OFF_BOUNDS {
+        assert!(
+            asserted.contains(&b.region),
+            "상한 표 구역 {} 이 단언되지 않음(정렬 안 됨 또는 구역 없음): 단언된 구역 {asserted:?}",
+            b.region
+        );
     }
 }
 
@@ -525,7 +541,7 @@ fn align_stage_table() {
                 }
                 None => eprintln!(
                     "STAGE {k} | {step} | {} | degenerate (no similarity) | as-is med {:.3} max {:.3}",
-                    src.len(), if raw.is_empty() { f64::NAN } else { median(&raw) }, max(&raw)
+                    src.len(), median(&raw), max(&raw)
                 ),
             }
         };
@@ -537,5 +553,131 @@ fn align_stage_table() {
         row("refined-out -> truth", &r, &t);
         // 초벌 전체(공유 아닌 사진 포함) -> 정답: 초벌 모델 자체 오차.
         row("preview-out -> truth (all)", &all_p, &all_t);
+    }
+}
+
+/// 사진 이름 `camF_0036` 의 위치 번호(이름 끝 번호는 사진 번호, 위치마다 3장).
+fn position_of(name: &str) -> usize {
+    name.rsplit('_').next().unwrap().parse::<usize>().unwrap() / 3
+}
+
+/// 점 집합의 축별 범위 중 가장 긴 주축 방향 길이(m): 중심에서 주축으로 투영한 최대-최소.
+fn principal_range(p: &[Vector3<f64>]) -> f64 {
+    if p.len() < 2 {
+        return 0.0;
+    }
+    let n = p.len() as f64;
+    let c = p.iter().fold(Vector3::zeros(), |a, x| a + x) / n;
+    let mut m = Matrix3::zeros();
+    for x in p {
+        let d = x - c;
+        m += d * d.transpose();
+    }
+    let svd = m.svd(false, true);
+    let vt = svd.v_t.unwrap();
+    let mut best = (0.0, 0);
+    for i in 0..3 {
+        if svd.singular_values[i] > best.0 {
+            best = (svd.singular_values[i], i);
+        }
+    }
+    let axis = vt.row(best.1).transpose();
+    let t: Vec<f64> = p.iter().map(|x| (x - c).dot(&axis)).collect();
+    max(&t) - t.iter().copied().fold(f64::NAN, f64::min)
+}
+
+/// 측정(`--ignored --nocapture`): 점 쌍 쏠림·외삽 가설을 카메라 중심으로 대신 본다(`PAIRSPREAD` 줄).
+///
+/// 정렬에 쓰인 공유 3D 점 쌍(트랙 대응)은 출력 파일에 없고 시험에서 만들 수 없어 점 단위 분포는 얻지 못한다.
+/// 대신 구역 안 사진 중심으로 같은 구조를 만든다. 구역 k 의 사진을 "겹침 띠"(`align_window`, 앞 구역과 겹치는 위치)와
+/// 나머지로 나눠, (a) 띠 안 사진 비율·띠 범위 대 구역 범위·주축 비, (b) 띠 사진만으로 구한 유사변환을
+/// 나머지 사진에 적용했을 때의 잔차(외삽)를 전체 사진으로 구한 변환의 잔차와 비교한다.
+/// 띠 + 전체를 함께 넣는 경우는 중심 항을 더한 정렬에 해당한다. 모두 계산만 하며 제품 동작은 바꾸지 않는다.
+#[test]
+#[ignore = "측정용: cargo test --release --test pipeline_poses align_pair_spread -- --ignored --nocapture"]
+fn align_pair_spread() {
+    let (_t, scene, out, _so) = run_off("spread");
+    let truth = truth_poses(&scene);
+    let shift = truth_to_output_shift(&scene);
+    let n_pos = truth.keys().map(|n| position_of(n) + 1).max().unwrap();
+    let regions = skylens_core::stream::split_regions(n_pos, 12, 2);
+    let (refined, _) = read_kind(&out, "refined");
+    let (_, n_prev) = read_kind(&out, "preview");
+    assert!(n_prev >= 3);
+    let tru = |n: &str| {
+        let c = truth[n].1;
+        Vector3::new(c[0] + shift[0], c[1] + shift[1], c[2] + shift[2])
+    };
+    eprintln!("PAIRSPREAD region | cams | in-band | band/region range | sv2/sv1 band | sv2/sv1 region | fit set | fit residual med/max m | non-band residual med/max m | scale diff % | rot deg");
+    for (k, r) in regions.iter().enumerate().take(n_prev) {
+        let pf = PosesFile::from_json(
+            &std::fs::read_to_string(out.join("poses").join(format!("preview_{k:02}.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        let band = skylens_core::stream::align_window(r, 2, n_pos);
+        let (mut all_p, mut all_t, mut is_band) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut ref_p, mut ref_r) = (Vec::new(), Vec::new());
+        for e in &pf.poses {
+            let pos = position_of(&e.name);
+            all_p.push(Vector3::from(e.center));
+            all_t.push(tru(&e.name));
+            is_band.push(pos >= band.0 && pos < band.1);
+            if let Some(re) = refined.get(&e.name) {
+                ref_p.push(Vector3::from(e.center));
+                ref_r.push(Vector3::from(re.center));
+            }
+        }
+        let pick = |v: &[Vector3<f64>], want: bool| -> Vec<Vector3<f64>> {
+            v.iter()
+                .zip(&is_band)
+                .filter(|(_, &b)| b == want)
+                .map(|(x, _)| *x)
+                .collect()
+        };
+        let (bp, bt) = (pick(&all_p, true), pick(&all_t, true));
+        let (np, nt) = (pick(&all_p, false), pick(&all_t, false));
+        let (sb, sa) = (spread_ratios(&bp), spread_ratios(&all_p));
+        eprintln!(
+            "PAIRSPREAD {k} | {} cams, aligned {} | in-band {} ({:.2}) | band/region principal range {:.1}/{:.1} m = {:.2} | sv2/sv1 band {:.3} region {:.3} | shared with refined {}",
+            all_p.len(), pf.aligned, bp.len(), bp.len() as f64 / all_p.len().max(1) as f64,
+            principal_range(&bp), principal_range(&all_p),
+            principal_range(&bp) / principal_range(&all_p).max(1e-9), sb.0, sa.0, ref_p.len()
+        );
+        let line = |tag: &str,
+                    fit_s: &[Vector3<f64>],
+                    fit_d: &[Vector3<f64>],
+                    extra_s: &[Vector3<f64>],
+                    extra_d: &[Vector3<f64>]| {
+            let mut s = fit_s.to_vec();
+            let mut d = fit_d.to_vec();
+            s.extend_from_slice(extra_s);
+            d.extend_from_slice(extra_d);
+            let Some(sm) = umeyama(&s, &d) else {
+                eprintln!("PAIRSPREAD {k} | {tag} | degenerate");
+                return;
+            };
+            let res = |a: &[Vector3<f64>], b: &[Vector3<f64>]| -> Vec<f64> {
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (sm.apply_point(x) - y).norm())
+                    .collect()
+            };
+            let (rf, rn) = (res(&s, &d), res(&np, &nt));
+            eprintln!(
+                "PAIRSPREAD {k} | {tag} | fit n {} | fit res {:.3}/{:.3} | non-band res {:.3}/{:.3} (n {}) | scale {:+.2} % rot {:.2} deg",
+                s.len(), median(&rf), max(&rf), median(&rn), max(&rn), np.len(),
+                (sm.s - 1.0) * 100.0, sm.r.angle().to_degrees()
+            );
+        };
+        line("all cameras", &all_p, &all_t, &[], &[]);
+        line("band cameras only", &bp, &bt, &[], &[]);
+        line(
+            "band + all cameras (center term added)",
+            &bp,
+            &bt,
+            &all_p,
+            &all_t,
+        );
     }
 }
