@@ -9,11 +9,14 @@
 //! 호출 규약: 제품 경로(`sparse.rs` 의 GPS 정렬 두 곳)는 정밀 포즈 회전에서
 //! [`up_from_rotations`] 로 위 방향을 구해 `GpsAlignConfig::up` 에 넣고 [`align_to_enu_with`]
 //! 를 부른다(`gps_align_poses` 와 같은 구성이며 그 함수 자체는 파이프라인에서 쓰이지 않는다).
-//! SPEC §1 실측 편대(약 10 m 삼각형)의 둘째 주축 표준편차는 실제 배치(`SceneConfig::default()`)
-//! 에서 약 4.3 m, 시험 띠(AB 가 진행 방향과 나란한 배치)에서 약 4.4 m(GPS 잡음 σ 1 m 를 더하면
-//! 약 4.5 m)로 경로 폭 문턱(5 m)보다 0.6~0.7 m 좁다. 이 배치·잡음에서는 위 방향 없는
-//! [`gps_align`]·[`align_to_enu`] 가 `None` 이지만, 오프셋이 +10% 쯤 커지고 잡음 σ 1.5 m 가
-//! 겹치면 문턱에 닿으므로 판정에 기대지 말고 편대는 위 방향을 주는 경로로 정렬한다.
+//! `GpsAlignment::spread_m` 은 정렬된 정상 카메라 중심(복원 중심을 닮음 변환한 점)의 주축
+//! 표준편차라 GPS 잡음이 들어가지 않는다. SPEC §1 실측 편대(약 10 m 삼각형)의 둘째 주축
+//! 표준편차는 실제 배치(`SceneConfig::default()`)에서 약 4.3 m, 시험 띠(AB 가 진행 방향과
+//! 나란한 배치)에서 약 4.4 m 로 경로 폭 문턱(5 m)보다 0.6~0.7 m 좁다. 이 배치에서는 위 방향
+//! 없는 [`gps_align`]·[`align_to_enu`] 가 `None` 이다. GPS 점 자체의 표준편차는 잡음이 더해져
+//! 이보다 커서(σ 1.5 m·오프셋 +10% 에서 약 5.0 m) 문턱에 닿지만 판정은 정렬된 카메라 중심의
+//! 값(같은 조건에서 약 4.7 m)을 보므로, 그래도 판정에 기대지 말고 편대는 위 방향을 주는
+//! 경로로 정렬한다.
 
 use crate::geo::{geodetic_to_enu, Geodetic};
 use crate::math::{Matrix3, Vector3};
@@ -1179,25 +1182,27 @@ mod tests {
         assert!((real - 4.3).abs() < 0.1, "real {real}");
         assert!((strip - 4.4).abs() < 0.1, "strip {strip}");
         assert!(TILT_MIN_SPREAD_M - real > 0.5 && TILT_MIN_SPREAD_M - strip > 0.5);
-        // `align_to_enu` 가 내는 `spread_m[1]` 과도 0.1 m 안(잡음 σ 1 m 포함 ≈ 4.5 m).
-        let c = gps_case(&mut rng, strip_enu(&mut Rng(2)), 1.0, 0.0, 0.0, 0.0);
+        // `spread_m` 은 정렬된 카메라 중심 기준이라 GPS 잡음(σ 2 m)과 무관하게 잡음 없는 띠 값과 0.1 m 안.
+        let c = gps_case(&mut rng, strip_enu(&mut Rng(2)), 2.0, 0.0, 0.0, 0.0);
         let cfgu = GpsAlignConfig {
             up: Some(c.gt.r.inverse() * Vector3::new(0.0, 0.0, 1.0)),
             ..Default::default()
         };
         let al = align_to_enu_with(&c.centers, &c.enu, &cfgu).unwrap();
-        let expect = (strip * strip + 1.0).sqrt();
-        println!("align spread_m {:?}, expected {expect:.3}", al.spread_m);
-        assert!((al.spread_m[1] - expect).abs() < 0.15, "{:?}", al.spread_m);
+        println!("align spread_m {:?}, strip {strip:.3}", al.spread_m);
+        assert!((al.spread_m[1] - strip).abs() < 0.1, "{:?}", al.spread_m);
     }
 
     /// F-361: 오프셋 흔들림에서 위 방향 없는 판정(`None` ↔ 정렬)이 바뀌는지 잰다.
     /// 전체 배율 0.9~1.1 과 오프셋별 독립 ±10%(x·y 각각, 200회)를 잡음 0·1·1.5 m 에서 본다.
-    /// 잡음 0 에서는 ±10% 어디서도 판정이 `None` 으로 같아야 하고, 잡음이 있으면 문턱 쪽으로 다가간 정도를 출력한다.
+    /// 판정이 보는 값은 정렬된 카메라 중심의 둘째 주축 표준편차(`spread_m[1]`, 위 방향을 줘서
+    /// 읽음)이며 GPS 점의 표준편차(잡음 포함)와 다르다. 둘 다 출력하고, 판정이 `spread_m[1]` 과
+    /// 문턱의 비교와 일치하는지 단언한다. 잡음 0 에서는 ±10% 어디서도 `None` 이어야 한다.
     #[test]
     fn formation_threshold_sensitivity() {
         let base = crate::synth::SceneConfig::default();
-        let decide = |off: &[[f64; 3]; 3], sigma: f64, seed: u64| -> (f64, bool) {
+        // (GPS 점 표준편차, 판정 값 `spread_m[1]`, 위 방향 없는 정렬 성공 여부)
+        let decide = |off: &[[f64; 3]; 3], sigma: f64, seed: u64| -> (f64, f64, bool) {
             let mut rng = Rng(seed);
             let c = gps_case(
                 &mut rng,
@@ -1207,8 +1212,26 @@ mod tests {
                 0.0,
                 0.0,
             );
-            let sd = second_axis_sd(&c.enu);
-            (sd, align_to_enu(&c.centers, &c.enu, 3.0).is_some())
+            let gps_sd = second_axis_sd(&c.enu);
+            let clean_sd = second_axis_sd(&c.enu_true);
+            let cfgu = GpsAlignConfig {
+                up: Some(c.gt.r.inverse() * Vector3::new(0.0, 0.0, 1.0)),
+                ..Default::default()
+            };
+            let al = align_to_enu_with(&c.centers, &c.enu, &cfgu).unwrap();
+            let ok = align_to_enu(&c.centers, &c.enu, 3.0).is_some();
+            // `spread_m` 은 정렬된 카메라 중심 기준이라 잡음 없는 배치 값과 0.1 m 안(GPS 점 값과는 다름).
+            assert!(
+                (al.spread_m[1] - clean_sd).abs() < 0.1,
+                "spread_m {:?} clean {clean_sd} sigma {sigma}",
+                al.spread_m
+            );
+            let gate = TILT_MIN_SPREAD_M.max(TILT_MIN_REL * al.spread_m[0]);
+            // 판정은 `spread_m[1]` 만 본다(문턱과 0.05 m 안이면 두 적합의 차이로 갈릴 수 있어 제외).
+            if (al.spread_m[1] - gate).abs() > 0.05 {
+                assert_eq!(ok, al.spread_m[1] >= gate, "{:?} gate {gate}", al.spread_m);
+            }
+            (gps_sd, al.spread_m[1], ok)
         };
         for &sigma in &[0.0, 1.0, 1.5] {
             for &k in &[0.9, 0.95, 1.0, 1.05, 1.1] {
@@ -1217,25 +1240,30 @@ mod tests {
                     o[0] *= k;
                     o[1] *= k;
                 }
-                let (sd, ok) = decide(&off, sigma, 7);
-                println!("scale sigma {sigma} k {k:.2}: sd {sd:.3} aligned {ok}");
+                let (gps_sd, sd, ok) = decide(&off, sigma, 7);
+                println!(
+                    "scale sigma {sigma} k {k:.2}: gps sd {gps_sd:.3} spread_m[1] {sd:.3} aligned {ok}"
+                );
                 if sigma == 0.0 {
                     assert!(!ok && sd < TILT_MIN_SPREAD_M, "k {k}: sd {sd}");
                 }
             }
             let mut rng = Rng(99);
-            let (mut flips, mut max_sd) = (0, 0.0f64);
+            let (mut flips, mut max_gps, mut max_sd) = (0, 0.0f64, 0.0f64);
             for t in 0..200u64 {
                 let mut off = base.offsets;
                 for o in off.iter_mut() {
                     o[0] *= 1.0 + 0.2 * (rng.uni() - 0.5);
                     o[1] *= 1.0 + 0.2 * (rng.uni() - 0.5);
                 }
-                let (sd, ok) = decide(&off, sigma, 1000 + t);
+                let (gps_sd, sd, ok) = decide(&off, sigma, 1000 + t);
+                max_gps = max_gps.max(gps_sd);
                 max_sd = max_sd.max(sd);
                 flips += ok as usize;
             }
-            println!("random ±10% sigma {sigma}: aligned {flips}/200, max sd {max_sd:.3}");
+            println!(
+                "random ±10% sigma {sigma}: aligned {flips}/200, max gps sd {max_gps:.3}, max spread_m[1] {max_sd:.3}"
+            );
             if sigma == 0.0 {
                 assert_eq!(flips, 0);
                 assert!(max_sd < TILT_MIN_SPREAD_M);
