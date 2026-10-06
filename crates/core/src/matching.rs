@@ -78,6 +78,9 @@ pub struct PairSchedule {
     pub cross: CrossSchedule,
 }
 
+/// 끝 구역으로 보는 위치 칸 수(구역 하나의 크기).
+const TAIL_SPAN: usize = 5;
+
 impl Default for PairSchedule {
     fn default() -> Self {
         Self {
@@ -102,6 +105,10 @@ impl PairSchedule {
 /// 같은 카메라 규칙은 [`candidate_pairs`] 와 같다. 결과 (i, j) 는 i < j, 중복 없음, 정렬됨.
 pub fn scheduled_pairs(views: &[(usize, usize)], sch: &PairSchedule) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
+    // 끝 구역 판정용: 사진 집합이 `left_min` 칸 이상 걸칠 때만 맨 끝 5 칸을 끝 구역으로 본다.
+    let (min_pos, max_pos) = views
+        .iter()
+        .fold((usize::MAX, 0), |(lo, hi), &(_, p)| (lo.min(p), hi.max(p)));
     for i in 0..views.len() {
         for j in 0..views.len() {
             if i == j {
@@ -125,9 +132,11 @@ pub fn scheduled_pairs(views: &[(usize, usize)], sch: &PairSchedule) -> Vec<(usi
                             (CAM_FRONT, CAM_LEFT) => Some(left_min),
                             _ => None,
                         };
-                        // 맨 끝 위치의 왼쪽 사진은 +20 이상 떨어진 앞 카메라 사진이 거의 없어 짝이 비면 등록에서 빠진다.
-                        // 왼쪽만 +12·+16 두 칸을 더 둔다(틀린 회전은 짝 투표가 거른다).
+                        // 맨 끝 위치의 왼쪽 사진은 +20 이상 떨어진 앞 카메라 사진과 짝이 비면 등록에서 빠진다.
+                        // 끝 구역(맨 끝 5 칸)의 왼쪽 사진에만 +12·+16 두 칸을 더 둔다.
                         let near_left = (ca, cb) == (CAM_FRONT, CAM_LEFT)
+                            && max_pos >= min_pos + left_min
+                            && pb + TAIL_SPAN > max_pos
                             && pb >= pa + left_min.saturating_sub(8)
                             && pb < pa + left_min
                             && (pb - pa) % step.max(1) == left_min.saturating_sub(8) % step.max(1);
@@ -2670,6 +2679,31 @@ mod tests {
                 ca, cb, 100.0 * vis as f64 / tot as f64, fa.len(), fb.len(), m.len(), good, ninl, cands.len(), err, best, refined
             );
         }
+    }
+
+    #[test]
+    fn near_left_pairs_only_in_tail_zone() {
+        // 위치 0..=26, 세 카메라. 앞(p)–왼쪽(p+12·p+16) 짝은 끝 5 칸의 왼쪽 사진에만 있다.
+        let views: Vec<(usize, usize)> = (0..27)
+            .flat_map(|p| [CAM_FRONT, CAM_RIGHT, CAM_LEFT].map(|c| (c, p)))
+            .collect();
+        let near = |v: &[(usize, usize)], pairs: &[(usize, usize)]| {
+            pairs
+                .iter()
+                .filter(|&&(i, j)| {
+                    let ((ca, pa), (cb, pb)) = (v[i], v[j]);
+                    (ca, cb) == (CAM_FRONT, CAM_LEFT) && pb >= pa + 12 && pb < pa + 20
+                })
+                .map(|&(_, j)| v[j].1)
+                .collect::<Vec<_>>()
+        };
+        let got = near(&views, &scheduled_pairs(&views, &PairSchedule::default()));
+        assert!(!got.is_empty());
+        assert!(got.iter().all(|&pb| pb >= 22), "{got:?}");
+        // 좁은 구역 창(끝 구역 판정 불가)에서는 추가 짝이 없다.
+        let win: Vec<(usize, usize)> = views.iter().copied().filter(|v| v.1 < 12).collect();
+        let w = near(&win, &scheduled_pairs(&win, &PairSchedule::default()));
+        assert!(w.is_empty(), "{w:?}");
     }
 
     #[test]
