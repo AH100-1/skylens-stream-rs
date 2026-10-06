@@ -1,26 +1,35 @@
 //! 출력 폴더 검증 (SPEC §2 출력 구조, §4 검증 기준 일곱 항목).
 //!
-//! 읽는 파일:
-//! - `report.json` (출력 폴더 바로 아래, 선택): 포즈 단계 기록. SPEC §2 출력 목록에 없는 파일이다.
+//! 읽는 파일 (SPEC §2 출력만으로 판정하고, `report.json` 은 있을 때 추가 정보로만 쓴다):
+//! - `preview/preview_{k:02}_pos{lo}-{hi}.ply`, `refined/refined_{k:02}_pos{lo}-{hi}.ply`: 구역 점군과
+//!   파일 이름의 위치 범위 [lo, hi).
+//! - `snapshots/manifest.json`, `snapshots/step_*.ply`.
+//! - `report.json` (출력 폴더 바로 아래, 선택, SPEC §2 목록에 없는 파일):
 //!   ```json
 //!   {"registered": {"total": 240, "preview": 240, "refined": 240},
 //!    "reprojection_px": {"preview": 4.5, "refined": 0.59},
 //!    "regions": [{"region": 0, "positions": 14, "images": 42}]}
 //!   ```
-//!   `registered.total` 은 입력 사진 수, `preview`/`refined` 는 초벌·정밀 포즈에 등록된 사진 수.
-//!   `reprojection_px` 는 재투영 오차 RMS(px). `regions[].positions` 는 구역의 위치 수,
-//!   `images` 는 구역 밀집 단계에 쓴 사진 수.
 //!
-//! SPEC §2 출력만으로 판정할 수 있는 항목과 없는 항목:
-//! - 판정 가능(4~7): `preview_align`(manifest `align`), `preview_vs_refined`·`refined_overlap`
-//!   (구역 PLY), `snapshots`(manifest `snapshots` + step PLY).
-//! - 판정 불가(1~3): `registered`(등록 사진 수), `region_images`(구역에 쓴 사진 수 — 파일 이름의
-//!   `pos{lo}-{hi}` 로 위치 수는 알지만 사진 수는 출력에 없음), `refined_reprojection`(재투영 오차).
-//!   세 값 모두 SPEC §2 의 어떤 파일에도 없다. `report.json` 이 없으면 이 셋은 FAIL 이 아니라
-//!   "판정 불가" 로 표시하고, 있으면 그 값으로 판정한다. 형식이 깨진 `report.json` 은 FAIL.
-//!   출력 폴더 자체가 없으면 모든 항목 FAIL.
+//! 항목별 판정 근거:
+//! - `registered`: 파일 이름 위치 범위의 합집합이 0..끝 위치를 빈틈없이 덮는지 본다. 전체 위치 수 N 은
+//!   출력에 없다(끝 구역 이름이 줄거나 파일이 사라져도 남은 이름은 이어진다). 그래서 report 가 없으면
+//!   빈틈이 있을 때만 FAIL, 빈틈이 없으면 "판정 불가". report 가 있으면 report 구역 목록과 출력 구역 번호 집합·
+//!   `positions == hi−lo` 가 같고 등록 수 = total 이어야 한다(total 은 입력 위치 수 기준이라 이름 끝과 비교 안 함).
+//! - `region_images`: 위치 범위 구조 검사(사진 수는 출력에 없음). 구역마다 초벌·정밀 이름의 범위가 같고
+//!   (hi > lo), 구역 번호가 0..K 로 이어지며 구역 0 이 0 에서 시작하고, 구역 0·1 에서 SPAN·OVL 을
+//!   추정해(SPAN = (구역 0 끝 + 구역 1 시작)/2, OVL = (구역 0 끝 − 구역 1 시작)/2) 구역 k 가
+//!   [k·SPAN−OVL, k·SPAN+SPAN+OVL) 인지 본다(끝 구역은 hi 가 (kS+O, kS+S+O] 안). 같은 구역 번호 파일
+//!   중복·이름 해석 실패는 FAIL. report 가 있으면 `images == 3×positions`, 구역 번호 집합,
+//!   `positions == hi − lo` 도 요구한다.
+//! - `refined_reprojection`: 재투영 오차는 SPEC §2 의 어떤 파일에서도 계산할 수 없다.
+//!   report 가 있으면 그 값으로 판정하고, 없으면 FAIL 이 아니라 "판정 불가".
+//! - 4~7(`preview_align`, `preview_vs_refined`, `refined_overlap`, `snapshots`): manifest·구역 PLY.
+//!
+//! 형식이 깨진 `report.json` 은 FAIL. 출력 폴더 자체가 없으면 모든 항목 FAIL.
 //!
 //! 종료 코드: FAIL 이 하나라도 있으면 1, FAIL 은 없고 판정 불가가 있으면 2, 모두 PASS 면 0.
+//!
 //! - `snapshots/manifest.json`: SPEC §2 형식. `snapshots[].step` 은 1부터 세는 정수,
 //!   최종만 문자열 `"final"`. 그 밖의 형(예: 문자열 `"01"`)은 형식 오류로 FAIL.
 //! - `preview/preview_{k:02}_*.ply`, `refined/refined_{k:02}_*.ply`, `snapshots/step_*.ply`.
@@ -180,20 +189,18 @@ fn item(name: &'static str, criterion: &'static str, r: Result<(bool, String), S
 }
 
 /// `report.json` 에서만 얻는 항목(1~3). 파일이 없고 출력 폴더는 있으면 판정 불가.
-/// `absent_note` 는 report.json 이 없을 때 SPEC §2 출력에서 읽은 참고 값(판정에는 쓰지 않음).
 fn report_item(
     name: &'static str,
     criterion: &'static str,
     report: &ReportJson,
     check: fn(&Json) -> Result<(bool, String), String>,
-    absent_note: &str,
 ) -> Item {
     match report {
         ReportJson::Absent => Item {
             name,
             pass: false,
             decided: false,
-            measured: format!("report.json 없음 (SPEC §2 출력에 없는 값){absent_note}"),
+            measured: "report.json 없음 (SPEC §2 출력에서 계산할 수 없는 값)".to_string(),
             criterion,
         },
         ReportJson::Read(r) => item(
@@ -201,6 +208,343 @@ fn report_item(
             criterion,
             r.as_ref().map_err(Clone::clone).and_then(check),
         ),
+    }
+}
+
+type Ranges = BTreeMap<usize, (usize, usize)>;
+
+/// 구간 [lo, hi) 들의 합집합이 [0, limit) 안에서 덮는 위치 수.
+fn covered_positions(r: &Ranges, limit: usize) -> usize {
+    let mut v: Vec<(usize, usize)> = r
+        .values()
+        .filter(|(lo, hi)| lo < hi)
+        .map(|&(lo, hi)| (lo, hi.min(limit)))
+        .filter(|(lo, hi)| lo < hi)
+        .collect();
+    v.sort_unstable();
+    let (mut total, mut end) = (0usize, 0usize);
+    for (lo, hi) in v {
+        let lo = lo.max(end);
+        if hi > lo {
+            total += hi - lo;
+            end = hi;
+        }
+    }
+    total
+}
+
+/// 남아 있는 파일 이름 hi 의 최댓값(끝 구역이 사라졌다면 실제 위치 수보다 작다).
+fn max_hi(p: &Ranges, r: &Ranges) -> usize {
+    p.values().chain(r.values()).map(|v| v.1).max().unwrap_or(0)
+}
+
+/// 파일 이름 검사 결과: 구역 번호별 범위와 읽지 못한 이름·번호 중복.
+#[derive(Default)]
+struct NameScan {
+    ranges: Ranges,
+    problems: Vec<String>,
+}
+
+/// `{prefix}{k:02}_pos{lo}-{hi}.ply` 이름을 이름순으로 읽는다. 같은 구역 번호 파일이 둘 이상이거나
+/// 이름을 해석하지 못하면 `problems` 에 적는다.
+fn scan_region_names(dir: &Path, prefix: &str) -> NameScan {
+    let mut scan = NameScan::default();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return scan;
+    };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(prefix) && n.ends_with(".ply"))
+        .collect();
+    names.sort();
+    let mut owner: BTreeMap<usize, String> = BTreeMap::new();
+    for n in names {
+        match parse_region_name(&n, prefix) {
+            Some((k, lo, hi)) => {
+                if let Some(first) = owner.get(&k) {
+                    scan.problems
+                        .push(format!("구역 {k} 파일 중복: {first}, {n}"));
+                } else {
+                    owner.insert(k, n);
+                    scan.ranges.insert(k, (lo, hi));
+                }
+            }
+            None => scan.problems.push(format!("이름 해석 실패: {n}")),
+        }
+    }
+    scan
+}
+
+fn parse_region_name(n: &str, prefix: &str) -> Option<(usize, usize, usize)> {
+    let rest = n.strip_prefix(prefix)?.strip_suffix(".ply")?;
+    let (k, pos) = rest.split_once("_pos")?;
+    let (lo, hi) = pos.split_once('-')?;
+    Some((k.parse().ok()?, lo.parse().ok()?, hi.parse().ok()?))
+}
+
+/// 구역 0·1 에서 추정한 구역 크기 SPAN, 겹침 OVL (SPEC §3.5: 구역 k = [k·SPAN−OVL, k·SPAN+SPAN+OVL)).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Layout {
+    span: usize,
+    ovl: usize,
+}
+
+impl Layout {
+    /// 끝 구역(번호 `last`) 이 있어야 하는 위치 수 N 의 범위 (kS+O, kS+S+O].
+    fn last_hi_range(&self, last: usize) -> (usize, usize) {
+        let lo = last * self.span + self.ovl;
+        (lo, lo + self.span)
+    }
+}
+
+/// 위치 범위 구조 검사: 초벌·정밀 범위 일치, 구역 번호 0..K 연속, 구역 0 이 0 에서 시작,
+/// 구역 0·1 에서 SPAN·OVL 추정 후 나머지 구역 경계가 규칙과 맞는지(끝 구역은 hi 가 위 범위 안).
+/// 반환: (문제 목록, 구역 수 K, 추정 배치).
+fn structure_check(p: &Ranges, r: &Ranges) -> (Vec<String>, usize, Option<Layout>) {
+    let keys: BTreeSet<usize> = p.keys().chain(r.keys()).copied().collect();
+    let mut bad = Vec::new();
+    for k in &keys {
+        match (p.get(k), r.get(k)) {
+            (Some(a), Some(b)) if a == b && a.0 < a.1 => {}
+            (Some(a), Some(b)) => bad.push(format!(
+                "구역 {k}: 초벌 {}-{} ≠ 정밀 {}-{} 또는 빈 범위",
+                a.0, a.1, b.0, b.1
+            )),
+            _ => bad.push(format!("구역 {k}: 초벌·정밀 이름 중 하나가 없음")),
+        }
+    }
+    let Some(&top) = keys.iter().next_back() else {
+        return (bad, 0, None);
+    };
+    let k_count = top + 1;
+    let skipped: Vec<usize> = (0..=top).filter(|k| !keys.contains(k)).collect();
+    if !skipped.is_empty() {
+        bad.push(format!("구역 번호 건너뜀 {}", brief(&skipped)));
+    }
+    let good = |k: usize| match (p.get(&k), r.get(&k)) {
+        (Some(a), Some(b)) if a == b && a.0 < a.1 => Some(*a),
+        _ => None,
+    };
+    match good(0) {
+        Some(a) if a.0 != 0 => bad.push(format!(
+            "구역 0 이 위치 0 에서 시작하지 않음({}-{})",
+            a.0, a.1
+        )),
+        _ => {}
+    }
+    let mut layout = None;
+    if let (Some(a0), Some(a1)) = (good(0), good(1)) {
+        let (h0, l1) = (a0.1, a1.0);
+        if h0 < l1 || (h0 + l1) % 2 != 0 || h0 + l1 == 0 {
+            bad.push(format!(
+                "구역 0·1 에서 SPAN·OVL 을 정할 수 없음(구역 0 끝 {h0}, 구역 1 시작 {l1}: 겹침이 짝수 칸이어야 함)"
+            ));
+        } else {
+            layout = Some(Layout {
+                span: (h0 + l1) / 2,
+                ovl: (h0 - l1) / 2,
+            });
+        }
+    }
+    if let Some(l) = layout {
+        for k in 1..k_count {
+            let Some(a) = good(k) else { continue };
+            let lo_exp = k * l.span - l.ovl;
+            let hi_exp = k * l.span + l.span + l.ovl;
+            let is_last = k + 1 == k_count;
+            let (lo_min, hi_max) = l.last_hi_range(k);
+            let (lo_ok, hi_ok) = if is_last {
+                (a.0 == lo_exp, a.1 > lo_min && a.1 <= hi_max)
+            } else {
+                (a.0 == lo_exp, a.1 == hi_exp)
+            };
+            if !lo_ok || !hi_ok {
+                bad.push(format!(
+                    "구역 {k}: 범위 {}-{} 가 규칙(SPAN {}, OVL {}) {}과 어긋남",
+                    a.0,
+                    a.1,
+                    l.span,
+                    l.ovl,
+                    if is_last {
+                        format!("{lo_exp}-({}..={hi_max})", lo_min + 1)
+                    } else {
+                        format!("{lo_exp}-{hi_exp}")
+                    }
+                ));
+            }
+        }
+    }
+    (bad, k_count, layout)
+}
+
+/// 항목 1 판정. 파일 이름만으로는 전체 위치 수 N 을 알 수 없으므로(끝 구역이 사라져도 이름 hi 는
+/// 줄어든 채 이어진다) report 가 없으면 빈틈이 있을 때만 FAIL 이고 빈틈이 없으면 판정 불가다.
+/// report 가 있으면 report 구역 목록과 출력 구역 번호 집합·범위 길이가 같아야 한다.
+fn registered_item(
+    criterion: &'static str,
+    report: &ReportJson,
+    pn: &NameScan,
+    rn: &NameScan,
+) -> Item {
+    let mk = |pass: bool, decided: bool, measured: String| Item {
+        name: ITEM_REGISTERED,
+        pass,
+        decided,
+        measured,
+        criterion,
+    };
+    let (p, r) = (&pn.ranges, &rn.ranges);
+    let top = max_hi(p, r);
+    if top == 0 {
+        return mk(
+            false,
+            true,
+            "오류: preview/refined 파일 이름에서 위치 범위를 읽지 못함".into(),
+        );
+    }
+    let (cp, cr) = (covered_positions(p, top), covered_positions(r, top));
+    let mut bad: Vec<String> = pn.problems.iter().chain(&rn.problems).cloned().collect();
+    if cp != top || cr != top {
+        bad.push(format!(
+            "위치 범위에 빈틈: 초벌 {}/{}, 정밀 {}/{} (이름에 남은 끝 위치 {top} 기준)",
+            3 * cp,
+            3 * top,
+            3 * cr,
+            3 * top
+        ));
+    }
+    match report {
+        ReportJson::Absent => {
+            if bad.is_empty() {
+                mk(
+                    false,
+                    false,
+                    format!(
+                        "판정 불가: 이름 위치 범위는 0..{top} 빈틈 없음(초벌 {0}/{0}, 정밀 {0}/{0})이나 입력 위치 수가 출력에 없어 끝 구역 손실을 알 수 없음 (report.json 없음)",
+                        3 * top
+                    ),
+                )
+            } else {
+                mk(false, true, bad.join("; "))
+            }
+        }
+        ReportJson::Read(Err(e)) => mk(false, true, format!("오류: {e}")),
+        ReportJson::Read(Ok(j)) => {
+            let res = check_registered(j);
+            // report 의 구역 목록(번호·위치 수)이 기준: 출력 구역 파일이 빠졌거나 범위가 잘렸으면 FAIL.
+            // total 은 입력 위치 수 기준이라 출력 구역이 전체를 덮는지와는 따로 본다.
+            if j.get("regions").and_then(Json::as_array).is_none() {
+                bad.push("report.json 에 regions 없음".into());
+            }
+            bad.extend(report_regions_match(j, p));
+            match res {
+                Ok((ok, m)) => {
+                    if !ok {
+                        bad.push(format!("report.json: {m}"));
+                    }
+                    if bad.is_empty() {
+                        mk(
+                            true,
+                            true,
+                            format!(
+                                "초벌 {0}/{0}, 정밀 {0}/{0} (이름 위치 범위 0..{top} 빈틈 없음; report.json {m})",
+                                3 * top
+                            ),
+                        )
+                    } else {
+                        mk(false, true, bad.join("; "))
+                    }
+                }
+                Err(e) => mk(false, true, format!("오류: {e}")),
+            }
+        }
+    }
+}
+
+/// report 의 구역 목록이 이름에서 읽은 구역 번호 집합·`positions == hi − lo` 와 맞는지.
+fn report_regions_match(j: &Json, p: &Ranges) -> Vec<String> {
+    let mut bad = Vec::new();
+    let Some(regs) = j.get("regions").and_then(Json::as_array) else {
+        return bad;
+    };
+    let mut seen = BTreeSet::new();
+    for (i, g) in regs.iter().enumerate() {
+        let k = g.get("region").and_then(as_index).unwrap_or(i);
+        if !seen.insert(k) {
+            bad.push(format!("report 구역 {k} 중복"));
+            continue;
+        }
+        match (p.get(&k), g.get("positions").and_then(Json::as_f64)) {
+            (Some(&(lo, hi)), Some(pos)) if pos != hi.saturating_sub(lo) as f64 => {
+                bad.push(format!("구역 {k}: report positions {pos} ≠ 이름 {hi}−{lo}"));
+            }
+            _ => {}
+        }
+    }
+    let names: BTreeSet<usize> = p.keys().copied().collect();
+    let only_r: Vec<usize> = seen.difference(&names).copied().collect();
+    let only_n: Vec<usize> = names.difference(&seen).copied().collect();
+    if !only_r.is_empty() {
+        bad.push(format!("report 에만 있는 구역 {}", brief(&only_r)));
+    }
+    if !only_n.is_empty() {
+        bad.push(format!("report 에 없는 구역 {}", brief(&only_n)));
+    }
+    bad
+}
+
+/// 항목 2 판정: 위치 범위 구조 검사(사진 수는 출력에 없음). report 가 있으면 `images == 3×positions`,
+/// 구역 번호 집합, `positions == hi − lo` 도 요구한다.
+fn region_images_item(
+    criterion: &'static str,
+    report: &ReportJson,
+    pn: &NameScan,
+    rn: &NameScan,
+) -> Item {
+    let mk = |pass: bool, measured: String| Item {
+        name: ITEM_REGION_IMAGES,
+        pass,
+        decided: true,
+        measured,
+        criterion,
+    };
+    let (p, r) = (&pn.ranges, &rn.ranges);
+    if p.is_empty() && r.is_empty() {
+        return mk(
+            false,
+            "오류: preview/refined 파일 이름에서 위치 범위를 읽지 못함".into(),
+        );
+    }
+    let (mut bad, k_count, layout) = structure_check(p, r);
+    bad.extend(pn.problems.iter().chain(&rn.problems).cloned());
+    let mut msg = match layout {
+        Some(l) => format!(
+            "{k_count}개 구역 위치 범위 구조 일치(SPAN {}, OVL {}; 사진 수는 출력에 없음)",
+            l.span, l.ovl
+        ),
+        None => format!("{k_count}개 구역 위치 범위 구조 검사(사진 수는 출력에 없음)"),
+    };
+    match report {
+        ReportJson::Absent => {}
+        ReportJson::Read(Err(e)) => bad.push(e.clone()),
+        ReportJson::Read(Ok(j)) => {
+            bad.extend(report_regions_match(j, p));
+            match check_region_images(j) {
+                Ok((ok, m)) => {
+                    if !ok {
+                        bad.push(format!("report.json: {m}"));
+                    }
+                    let _ = write!(msg, "; report.json: {m}");
+                }
+                Err(e) => bad.push(e),
+            }
+        }
+    }
+    if bad.is_empty() {
+        mk(true, msg)
+    } else {
+        mk(false, bad.join("; "))
     }
 }
 
@@ -231,6 +575,8 @@ pub fn verify_dir(dir: &Path) -> Report {
         .as_ref()
         .map_err(Clone::clone)
         .and_then(parse_steps);
+    let names_p = scan_region_names(&dir.join("preview"), "preview_");
+    let names_r = scan_region_names(&dir.join("refined"), "refined_");
     let preview = load_regions(&dir.join("preview"), "preview_");
     let refined = load_regions(&dir.join("refined"), "refined_");
 
@@ -258,21 +604,19 @@ pub fn verify_dir(dir: &Path) -> Report {
     }
 
     let items = vec![
-        report_item(
-            ITEM_REGISTERED,
-            "초벌·정밀 모두 전체 등록 (240/240)",
+        registered_item(
+            "초벌·정밀 모두 전체 등록 (이름 위치 범위 빈틈 없음; 전체 위치 수는 report.json 이 있을 때만 대조, 없으면 판정 불가)",
             &report_src,
-            check_registered,
-            "",
+            &names_p,
+            &names_r,
         ),
-        report_item(
-            ITEM_REGION_IMAGES,
-            "구역 사진 수 = 3 × 위치 수",
+        region_images_item(
+            "위치 범위 구조 검사(사진 수는 출력에 없음): 초벌·정밀 범위 일치, 구역 번호 0..K 연속, [start−OVL, start+SPAN+OVL) 규칙",
             &report_src,
-            check_region_images,
-            &positions_note(dir),
+            &names_p,
+            &names_r,
         ),
-        report_item(ITEM_REPROJ, "정밀 재투영 ≤ 0.7 px", &report_src, check_reproj, ""),
+        report_item(ITEM_REPROJ, "정밀 재투영 ≤ 0.7 px", &report_src, check_reproj),
         item(
             ITEM_ALIGN,
             "점쌍 ≥ 1000, 구역 간 스케일 차(최대/최소 − 1) ≤ 10%, 잔차 중앙 < 6 m",
@@ -743,55 +1087,7 @@ fn read_json(path: &Path) -> Result<Json, String> {
 /// `{prefix}{k:02}_pos{lo}-{hi}.ply` 이름에서 구역별 위치 범위 [lo, hi) 를 읽는다
 /// (SPEC §3.5 구역 [start-OVL, start+SPAN+OVL), hi 는 포함 안 함).
 pub fn region_positions(dir: &Path, prefix: &str) -> BTreeMap<usize, (usize, usize)> {
-    let mut out = BTreeMap::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for e in rd.filter_map(|e| e.ok()) {
-        let n = e.file_name().to_string_lossy().into_owned();
-        let Some(rest) = n.strip_prefix(prefix).and_then(|r| r.strip_suffix(".ply")) else {
-            continue;
-        };
-        let Some((k, pos)) = rest.split_once("_pos") else {
-            continue;
-        };
-        let Some((lo, hi)) = pos.split_once('-') else {
-            continue;
-        };
-        if let (Ok(k), Ok(lo), Ok(hi)) = (k.parse(), lo.parse(), hi.parse()) {
-            out.insert(k, (lo, hi));
-        }
-    }
-    out
-}
-
-/// report.json 이 없을 때 구역 사진 수 항목에 붙이는 참고 값: 파일 이름의 구역별 위치 수
-/// (hi − lo). 사진 수는 SPEC §2 출력에 없어 판정은 하지 않는다. 초벌·정밀 이름의 위치
-/// 범위가 다르면 그 구역도 적는다.
-fn positions_note(dir: &Path) -> String {
-    let p = region_positions(&dir.join("preview"), "preview_");
-    let r = region_positions(&dir.join("refined"), "refined_");
-    let src = if r.is_empty() { &p } else { &r };
-    if src.is_empty() {
-        return String::new();
-    }
-    let counts: Vec<String> = src
-        .iter()
-        .map(|(k, (lo, hi))| format!("{k}:{}", hi.saturating_sub(*lo)))
-        .collect();
-    let mut s = format!(
-        "; 파일 이름의 위치 수 [{}], 사진 수는 출력에 없음",
-        counts.join(" ")
-    );
-    let differ: Vec<usize> = p
-        .iter()
-        .filter(|(k, v)| r.get(k).is_some_and(|w| w != *v))
-        .map(|(k, _)| *k)
-        .collect();
-    if !differ.is_empty() {
-        let _ = write!(s, "; 초벌·정밀 위치 범위가 다른 구역 {differ:?}");
-    }
-    s
+    scan_region_names(dir, prefix).ranges
 }
 
 /// `{prefix}{k:02}_*.ply` 를 구역 번호 k 로 묶어 읽는다.
@@ -1373,5 +1669,242 @@ mod tests {
         let m = height_pair_median(&query, &reference, 2.0).unwrap();
         assert!((m - 1.5).abs() < 1e-12);
         assert!((nn_median(&query, &reference).unwrap() - 1.5).abs() < 1e-12);
+    }
+
+    fn rg(v: &[(usize, usize, usize)]) -> Ranges {
+        v.iter().map(|&(k, lo, hi)| (k, (lo, hi))).collect()
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 이름만 있는 빈 PLY 로 출력 폴더를 만든다(항목 1·2 는 이름과 report 만 본다).
+    fn out_dir(
+        p: &[(usize, usize, usize)],
+        r: &[(usize, usize, usize)],
+        report: Option<&str>,
+    ) -> std::path::PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "verify_names_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        for (sub, pre, v) in [("preview", "preview", p), ("refined", "refined", r)] {
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+            for &(k, lo, hi) in v {
+                std::fs::write(
+                    d.join(sub).join(format!("{pre}_{k:02}_pos{lo}-{hi}.ply")),
+                    b"",
+                )
+                .unwrap();
+            }
+        }
+        std::fs::create_dir_all(d.join("snapshots")).unwrap();
+        if let Some(j) = report {
+            std::fs::write(d.join("report.json"), j).unwrap();
+        }
+        d
+    }
+
+    /// N = 80 위치, SPAN 12, OVL 2: 구역 7개.
+    const FULL: [(usize, usize, usize); 7] = [
+        (0, 0, 14),
+        (1, 10, 26),
+        (2, 22, 38),
+        (3, 34, 50),
+        (4, 46, 62),
+        (5, 58, 74),
+        (6, 70, 80),
+    ];
+
+    fn report_json(n: usize, regs: &[(usize, usize, usize)]) -> String {
+        let r: Vec<String> = regs
+            .iter()
+            .map(|&(k, lo, hi)| {
+                format!(
+                    r#"{{"region":{k},"positions":{},"images":{}}}"#,
+                    hi - lo,
+                    3 * (hi - lo)
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"registered":{{"total":{0},"preview":{0},"refined":{0}}},"reprojection_px":{{"preview":4.5,"refined":0.59}},"regions":[{1}]}}"#,
+            3 * n,
+            r.join(",")
+        )
+    }
+
+    fn item_of(d: &std::path::Path, name: &str) -> Item {
+        let rep = verify_dir(d);
+        let it = rep.items.iter().find(|i| i.name == name).unwrap().clone();
+        let _ = std::fs::remove_dir_all(d);
+        it
+    }
+
+    #[test]
+    fn registered_without_report_is_undecided_when_gapless() {
+        let it = item_of(&out_dir(&FULL, &FULL, None), ITEM_REGISTERED);
+        assert!(!it.decided && !it.pass, "{}", it.measured);
+        // 빈틈이 있으면 판정 불가가 아니라 FAIL.
+        let mut gap = FULL.to_vec();
+        gap[3] = (3, 40, 50);
+        let it = item_of(&out_dir(&FULL, &gap, None), ITEM_REGISTERED);
+        assert!(it.decided && !it.pass, "{}", it.measured);
+        assert!(it.measured.contains("정밀 "), "{}", it.measured);
+    }
+
+    #[test]
+    fn registered_last_region_renamed_is_not_pass() {
+        // (a) 마지막 구역 pos10-26 → pos10-20, report 없음: 판정 불가, report 78/78 이면 FAIL.
+        let short = [(0, 0, 14), (1, 10, 20)];
+        let it = item_of(&out_dir(&short, &short, None), ITEM_REGISTERED);
+        assert!(!it.decided && !it.pass, "{}", it.measured);
+        let rep = report_json(26, &[(0, 0, 14), (1, 10, 26)]);
+        let it = item_of(&out_dir(&short, &short, Some(&rep)), ITEM_REGISTERED);
+        assert!(it.decided && !it.pass, "{}", it.measured);
+        assert!(it.measured.contains("positions 16"), "{}", it.measured);
+    }
+
+    #[test]
+    fn registered_last_region_files_deleted_with_report_fails() {
+        // (b) 마지막 구역 두 파일을 지우고 report 240/240 은 그대로.
+        let cut = &FULL[..6];
+        let rep = report_json(80, &FULL);
+        let it = item_of(&out_dir(cut, cut, Some(&rep)), ITEM_REGISTERED);
+        assert!(it.decided && !it.pass, "{}", it.measured);
+        assert!(
+            it.measured.contains("report 에만 있는 구역 [6]"),
+            "{}",
+            it.measured
+        );
+        // 구역 수 대조: 이름 끝이 N 인데 끝 구역 하나가 빠진 경우도 FAIL(구역 5 가 N 까지 이어짐).
+        let it = item_of(&out_dir(&FULL, &FULL, Some(&rep)), ITEM_REGISTERED);
+        assert!(it.decided && it.pass, "{}", it.measured);
+        // report 구역 목록과 이름이 어긋나면 항목 2 FAIL.
+        let it = item_of(&out_dir(cut, cut, Some(&rep)), ITEM_REGION_IMAGES);
+        assert!(!it.pass, "{}", it.measured);
+    }
+
+    #[test]
+    fn registered_report_total_is_input_based() {
+        // total 은 입력 위치 수 기준이라 이름 끝(26)과 달라도 구역 목록이 맞으면 통과한다.
+        let two = [(0, 0, 14), (1, 10, 26)];
+        let rep = report_json(80, &two);
+        let it = item_of(&out_dir(&two, &two, Some(&rep)), ITEM_REGISTERED);
+        assert!(it.decided && it.pass, "{}", it.measured);
+        let mut bad = report_json(80, &FULL);
+        bad = bad.replace(r#""positions":14"#, r#""positions":13"#);
+        let it = item_of(&out_dir(&FULL, &FULL, Some(&bad)), ITEM_REGION_IMAGES);
+        assert!(
+            !it.pass && it.measured.contains("positions 13"),
+            "{}",
+            it.measured
+        );
+    }
+
+    fn structure_ok(p: &[(usize, usize, usize)]) -> bool {
+        let (r, _, _) = structure_check(&rg(p), &rg(p));
+        r.is_empty()
+    }
+
+    #[test]
+    fn region_structure_follows_span_ovl_rule() {
+        assert!(structure_ok(&FULL));
+        assert!(structure_ok(&FULL[..2]));
+        assert!(structure_ok(&[(0, 0, 14)]));
+        let (_, k, l) = structure_check(&rg(&FULL), &rg(&FULL));
+        assert_eq!((k, l), (7, Some(Layout { span: 12, ovl: 2 })));
+        // 겹침 1칸.
+        assert!(!structure_ok(&[(0, 0, 14), (1, 13, 26)]));
+        // 구역 번호 건너뜀(0·2 만).
+        assert!(!structure_ok(&[(0, 0, 14), (2, 22, 38)]));
+        // 경계 규칙 어긋남: 중간 구역 시작·끝, 끝 구역 범위.
+        assert!(!structure_ok(&[
+            (0, 0, 14),
+            (1, 10, 26),
+            (2, 23, 38),
+            (3, 34, 50)
+        ]));
+        assert!(!structure_ok(&[
+            (0, 0, 14),
+            (1, 10, 26),
+            (2, 22, 37),
+            (3, 34, 50)
+        ]));
+        assert!(!structure_ok(&[
+            (0, 0, 14),
+            (1, 10, 26),
+            (2, 22, 38),
+            (3, 34, 52)
+        ]));
+        assert!(!structure_ok(&[
+            (0, 0, 14),
+            (1, 10, 26),
+            (2, 22, 38),
+            (3, 34, 36)
+        ]));
+        // 마지막 꽉 찬 구역은 통과.
+        assert!(structure_ok(&FULL[..6]));
+        // [0,14)·[0,26), 구역 0 이 0 에서 시작하지 않음, 같은 범위 두 구역.
+        assert!(!structure_ok(&[(0, 0, 14), (1, 0, 26)]));
+        assert!(!structure_ok(&[(0, 0, 14), (1, 0, 14)]));
+        assert!(!structure_ok(&[(0, 2, 14)]));
+        // hi < lo, hi == lo.
+        assert!(!structure_ok(&[(0, 5, 3)]));
+        assert!(!structure_ok(&[(0, 0, 14), (1, 10, 10)]));
+    }
+
+    #[test]
+    fn region_structure_needs_both_folders() {
+        let (bad, _, _) = structure_check(&rg(&FULL), &rg(&FULL[..6]));
+        assert!(bad.iter().any(|b| b.contains("구역 6")), "{bad:?}");
+        let it = item_of(&out_dir(&FULL, &[], None), ITEM_REGION_IMAGES);
+        assert!(!it.pass, "{}", it.measured);
+        let it = item_of(&out_dir(&[], &FULL, None), ITEM_REGION_IMAGES);
+        assert!(!it.pass, "{}", it.measured);
+        let it = item_of(&out_dir(&[], &[], None), ITEM_REGION_IMAGES);
+        assert!(!it.pass, "{}", it.measured);
+        let it = item_of(&out_dir(&FULL, &FULL, None), ITEM_REGION_IMAGES);
+        assert!(
+            it.pass && it.measured.contains("사진 수는 출력에 없음"),
+            "{}",
+            it.measured
+        );
+    }
+
+    #[test]
+    fn duplicate_region_files_and_bad_names_fail() {
+        // 같은 구역 번호 파일 둘.
+        let d = out_dir(&FULL, &FULL, None);
+        std::fs::write(d.join("refined").join("refined_01_pos20-26.ply"), b"").unwrap();
+        let it = item_of(&d, ITEM_REGION_IMAGES);
+        assert!(
+            !it.pass && it.measured.contains("파일 중복"),
+            "{}",
+            it.measured
+        );
+        let d = out_dir(&FULL, &FULL, None);
+        std::fs::write(d.join("refined").join("refined_01_pos20-26.ply"), b"").unwrap();
+        let it = item_of(&d, ITEM_REGISTERED);
+        assert!(it.decided && !it.pass, "{}", it.measured);
+        // 이름 해석 실패.
+        let d = out_dir(&FULL, &FULL, None);
+        std::fs::write(d.join("preview").join("preview_07_pos3.ply"), b"").unwrap();
+        let it = item_of(&d, ITEM_REGION_IMAGES);
+        assert!(
+            !it.pass && it.measured.contains("이름 해석 실패"),
+            "{}",
+            it.measured
+        );
+        // 이름만 보는 공개 함수는 첫 파일(이름순)을 쓴다.
+        let d = out_dir(&FULL, &FULL, None);
+        std::fs::write(d.join("refined").join("refined_01_pos20-26.ply"), b"").unwrap();
+        assert_eq!(
+            region_positions(&d.join("refined"), "refined_")[&1],
+            (10, 26)
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

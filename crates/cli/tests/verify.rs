@@ -525,28 +525,83 @@ fn sloped_ground_with_different_extent_passes() {
     assert!(out.contains("높이 차 중앙 최대 1.990 m"), "{out}");
 }
 
-/// F-089: SPEC §2 출력만 있는 폴더(report.json 없음) → 1~3 판정 불가, 4~7 은 측정값으로 PASS, 종료 코드 2.
+/// F-089: SPEC §2 출력만 있는 폴더(report.json 없음) → 2 는 파일 이름 구조로 PASS,
+/// 1(전체 위치 수 없음)·3(재투영)은 판정 불가, 4~7 은 측정값으로 PASS, 종료 코드 2.
 #[test]
-fn spec_outputs_only_marks_report_items_undecided() {
+fn spec_outputs_only_decides_from_files() {
     let (code, out) = run_with("noreport", &Fixture::default(), |d| {
         std::fs::remove_file(d.join("report.json")).unwrap();
     });
     assert_eq!(code, 2, "{out}");
-    for it in &ITEMS[..3] {
+    for name in ["registered", "refined_reprojection"] {
         let line = out
             .lines()
-            .find(|l| l.starts_with(&format!("| {it} |")))
+            .find(|l| l.starts_with(&format!("| {name} |")))
             .unwrap();
-        assert!(line.contains("| 판정 불가 |"), "{it}\n{out}");
+        assert!(line.contains("| 판정 불가 |"), "{out}");
     }
-    for it in &ITEMS[3..] {
+    for it in ITEMS
+        .iter()
+        .filter(|i| !["registered", "refined_reprojection"].contains(i))
+    {
         assert_eq!(status(&out, it), "PASS", "{it}\n{out}");
     }
-    assert!(out.contains("결과: 4/7 통과"), "{out}");
-    assert!(out.contains("판정 불가: 3개"), "{out}");
+    assert!(out.contains("결과: 5/7 통과"), "{out}");
+    assert!(out.contains("판정 불가: 2개"), "{out}");
+    assert!(out.contains("0..26 빈틈 없음"), "{out}");
+    assert!(out.contains("SPAN 12, OVL 2"), "{out}");
     assert!(out.contains("최근접 중앙 최대 1.990 m"), "{out}");
-    // 사진 수는 출력에 없지만 위치 수는 파일 이름 pos0-14·pos10-26 (hi 미포함)에서 읽어 보여 준다.
-    assert!(out.contains("파일 이름의 위치 수 [0:14 1:16]"), "{out}");
+}
+
+/// report.json 을 지워도 1·2·4~7 판정이 같다(통과·실패 두 경우, 항목별 PASS/FAIL 비교).
+#[test]
+fn report_json_removal_keeps_verdicts() {
+    let cases = [
+        ("same_pass", Fixture::default()),
+        (
+            "same_dz",
+            Fixture {
+                preview_dz: 2.5,
+                ..Fixture::default()
+            },
+        ),
+        (
+            "same_align",
+            Fixture {
+                align_pairs: [999, 2000],
+                ..Fixture::default()
+            },
+        ),
+    ];
+    for (tag, f) in cases {
+        let (_, with) = run(&format!("{tag}_w"), &f);
+        let (_, without) = run_with(&format!("{tag}_n"), &f, |d| {
+            std::fs::remove_file(d.join("report.json")).unwrap();
+        });
+        for it in ITEMS
+            .iter()
+            .filter(|i| !["registered", "refined_reprojection"].contains(i))
+        {
+            assert_eq!(status(&with, it), status(&without, it), "{tag} {it}");
+        }
+    }
+}
+
+/// report.json 없이 정밀 구역 이름이 이웃과 이어지지 않으면(위치 14..20 빈틈) 1·2 가 FAIL.
+#[test]
+fn name_gap_fails_registered_without_report() {
+    let (code, out) = run_with("gap", &Fixture::default(), |d| {
+        std::fs::remove_file(d.join("report.json")).unwrap();
+        std::fs::rename(
+            d.join("refined/refined_01_pos10-26.ply"),
+            d.join("refined/refined_01_pos20-26.ply"),
+        )
+        .unwrap();
+    });
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(status(&out, "registered"), "FAIL", "{out}");
+    assert_eq!(status(&out, "region_images"), "FAIL", "{out}");
+    assert!(out.contains("정밀 60/78"), "{out}");
 }
 
 /// F-089: report.json 없이 판정 가능한 항목이 FAIL 이면 종료 코드 1.
