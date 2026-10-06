@@ -923,8 +923,15 @@ pub struct PreviewOpts {
     pub legacy_roll: bool,
     /// 회전 평균 전에 카메라 쌍 단위 회전 투표로 간선을 거른다.
     pub pair_vote: bool,
+    /// 주 성분에 붙지 못한 큰 연결 성분을 따로 풀어 GPS 로 붙인다.
+    pub merge_detached: bool,
     /// 위치 전용 다듬기 반복 수(0 이면 끔).
     pub refine_iters: usize,
+    /// 떨어진 성분의 부분 모델에만 쓰는 위치 다듬기 반복 수. None 이면 `refine_iters` 를 따른다.
+    pub detached_refine_iters: Option<usize>,
+    /// 장착(rig) 상대 회전: 카메라 번호별 (카메라 0 기준) 상대 회전. 있으면 떨어진 성분 붙이기의 롤을
+    /// 같은 위치의 주 모델 사진과의 장착 관계로 정한다. 없으면 바닥 법선으로 정한다.
+    pub rig_rel: Option<[Option<Rotation3<f64>>; 3]>,
     /// 다듬기 Huber 문턱(도).
     pub refine_huber_deg: f64,
     /// 다듬기 바깥 관측 제거 각(도), 두 번째 바퀴부터.
@@ -946,7 +953,10 @@ impl Default for PreviewOpts {
             tri_deg: None,
             legacy_roll: false,
             pair_vote: false,
+            merge_detached: true,
             refine_iters: 0,
+            detached_refine_iters: None,
+            rig_rel: None,
             refine_huber_deg: 0.3,
             refine_drop_deg: 2.0,
             refine_anchor: 0.02,
@@ -1172,6 +1182,637 @@ fn roll_by_level_spread(
     } else {
         th + std::f64::consts::PI
     })
+}
+
+/// 부분 모델을 붙이는 데 필요한 최소 사진 수와 GPS 정상 대응 수.
+const DETACHED_MIN_PHOTOS: usize = 6;
+const DETACHED_MIN_GPS_OK: usize = 3;
+/// 붙인 뒤 GPS 대응을 정상으로 치는 거리(m). 합성 GPS 잡음(축마다 1.5 m)의 3차원 중앙값이 약 2.5 m 라 넉넉히 잡는다.
+const DETACHED_GPS_OK_M: f64 = 5.0;
+
+/// 점들의 바닥 평면 법선(위쪽). 평면을 맞추고 잔차 중앙값의 2배 밖 점을 버리며 세 번 되풀이한다.
+fn ground_normal(points: &[Vector3<f64>]) -> Option<Vector3<f64>> {
+    if points.len() < 20 {
+        return None;
+    }
+    let mut sel: Vec<Vector3<f64>> = points.to_vec();
+    let mut normal = Vector3::z();
+    for round in 0..3 {
+        let c = sel.iter().sum::<Vector3<f64>>() / sel.len() as f64;
+        let mut cov = Matrix3::zeros();
+        for p in &sel {
+            let d = p - c;
+            cov += d * d.transpose();
+        }
+        let eig = nalgebra::SymmetricEigen::new(cov);
+        let mi = (0..3).min_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))?;
+        normal = eig.eigenvectors.column(mi).into_owned();
+        if normal.z < 0.0 {
+            normal = -normal;
+        }
+        if round == 2 {
+            break;
+        }
+        let mut res: Vec<f64> = points.iter().map(|p| (p - c).dot(&normal).abs()).collect();
+        res.sort_by(f64::total_cmp);
+        let thr = (2.0 * res[res.len() / 2]).max(0.05);
+        sel = points
+            .iter()
+            .filter(|p| (*p - c).dot(&normal).abs() <= thr)
+            .copied()
+            .collect();
+        if sel.len() < 20 {
+            return None;
+        }
+    }
+    Some(normal)
+}
+
+/// 부분 모델 `sub`(사진 번호는 주 모델과 같은 번호공간)을 주 모델 `s` 에 붙인다. 부분 모델은 GPS 방향 맞춤을 한
+/// 상태지만 직선 비행에서는 비행 축 둘레 회전이 정해지지 않으므로, 두 모델의 바닥 평면 법선이 같도록 축 둘레
+/// 회전을 고른 뒤 GPS 중심으로 이동(과 규모는 그대로)을 맞춘다. 반환: (GPS 정상 대응 수, 정상 대응 잔차 중앙값 m).
+/// 사진이 6장 미만이거나 GPS 정상 대응이 3 미만이면 붙이지 않고 None.
+fn attach_detached(
+    s: &mut Sparse,
+    mut sub: Sparse,
+    gps: &[Vector3<f64>],
+    rig_targets: &[(usize, Rotation3<f64>)],
+) -> Option<(usize, f64)> {
+    let ids: Vec<usize> = (0..sub.poses.len())
+        .filter(|&i| sub.poses[i].is_some() && s.poses[i].is_none())
+        .collect();
+    if ids.len() < DETACHED_MIN_PHOTOS {
+        return None;
+    }
+    let cen: Vec<Vector3<f64>> = ids
+        .iter()
+        .map(|&i| sub.poses[i].unwrap().center().coords)
+        .collect();
+    let mean = cen.iter().sum::<Vector3<f64>>() / cen.len() as f64;
+    // 롤: 비행 축(중심 주성분) 둘레로 돌려 바닥 법선을 주 모델 것에 맞춘다.
+    let mut roll_axis = None;
+    if let (Some(n_main), Some(n_sub)) = (ground_normal(&s.points), ground_normal(&sub.points)) {
+        let mut cov = Matrix3::zeros();
+        for c in &cen {
+            cov += (c - mean) * (c - mean).transpose();
+        }
+        let eig = nalgebra::SymmetricEigen::new(cov);
+        let mx = (0..3).max_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))?;
+        let axis = nalgebra::Unit::new_normalize(eig.eigenvectors.column(mx).into_owned());
+        roll_axis = Some(axis);
+        let th_rig = roll_from_rig(&axis, &sub, rig_targets);
+        let th_n = roll_about_axis(&axis, &n_sub, &n_main);
+        if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+            eprintln!(
+                "diag rig roll_deg rig {:?} normal {:.2}",
+                th_rig.map(|t| t.to_degrees()),
+                th_n.to_degrees()
+            );
+        }
+        let th = th_rig.unwrap_or(th_n);
+        let r = Rotation3::from_axis_angle(&axis, th);
+        let sim = Similarity {
+            s: 1.0,
+            r,
+            t: mean - r * mean,
+        };
+        apply_sparse_sim(&mut sub, &sim);
+    }
+    // 이동: GPS 와의 차의 중앙 근처(정상 대응만 되풀이해 평균).
+    let cen: Vec<Vector3<f64>> = ids
+        .iter()
+        .map(|&i| sub.poses[i].unwrap().center().coords)
+        .collect();
+    let mut t = Vector3::zeros();
+    let mut ok: Vec<usize> = (0..ids.len()).collect();
+    for _ in 0..5 {
+        t = ok
+            .iter()
+            .map(|&a| gps[ids[a]] - cen[a])
+            .sum::<Vector3<f64>>()
+            / ok.len().max(1) as f64;
+        let mut d: Vec<(usize, f64)> = (0..ids.len())
+            .map(|a| (a, (cen[a] + t - gps[ids[a]]).norm()))
+            .collect();
+        let mut sd: Vec<f64> = d.iter().map(|x| x.1).collect();
+        sd.sort_by(f64::total_cmp);
+        let thr = DETACHED_GPS_OK_M.min(2.5 * sd[sd.len() / 2]).max(1.0);
+        d.retain(|x| x.1 <= thr);
+        ok = d.into_iter().map(|x| x.0).collect();
+        if ok.len() < DETACHED_MIN_GPS_OK {
+            return None;
+        }
+    }
+    apply_sparse_sim(
+        &mut sub,
+        &Similarity {
+            s: 1.0,
+            r: Rotation3::identity(),
+            t,
+        },
+    );
+    // 닮음 보정: 주 모델 점과의 최근접 겹침 + GPS 중심(약하게)으로 규모·회전·이동을 함께 다시 맞춘다.
+    let cen: Vec<Vector3<f64>> = ids
+        .iter()
+        .map(|&i| sub.poses[i].unwrap().center().coords)
+        .collect();
+    let g_ok: Vec<(Vector3<f64>, Vector3<f64>)> = (0..ids.len())
+        .filter(|&a| (cen[a] - gps[ids[a]]).norm() <= DETACHED_GPS_OK_M)
+        .map(|a| (cen[a], gps[ids[a]]))
+        .collect();
+    if let Some(sim) = icp_similarity(&sub.points, &s.points, &g_ok) {
+        let after: Vec<f64> = g_ok
+            .iter()
+            .map(|(c, g)| (sim.apply_point(c) - g).norm())
+            .collect();
+        let n_ok = after.iter().filter(|&&d| d <= DETACHED_GPS_OK_M).count();
+        if sim_ok(&sim)
+            && n_ok >= DETACHED_MIN_GPS_OK
+            && n_ok * 10 >= g_ok.len() * 8
+            && overlap_not_worse(&sub.points, &s.points, &sim)
+        {
+            apply_sparse_sim(&mut sub, &sim);
+        }
+    }
+    // 닮음 보정이 회전을 다시 돌렸을 수 있으므로, 장착 관계가 있으면 롤을 한 번 더 맞춘다.
+    if let Some(axis) = roll_axis {
+        if let Some(th) = roll_from_rig(&axis, &sub, rig_targets) {
+            let m = ids
+                .iter()
+                .map(|&i| sub.poses[i].unwrap().center().coords)
+                .sum::<Vector3<f64>>()
+                / ids.len() as f64;
+            let r = Rotation3::from_axis_angle(&axis, th);
+            apply_sparse_sim(
+                &mut sub,
+                &Similarity {
+                    s: 1.0,
+                    r,
+                    t: m - r * m,
+                },
+            );
+            if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+                eprintln!("diag rig post_icp roll_deg {:.2}", th.to_degrees());
+            }
+        }
+    }
+    let mut res: Vec<f64> = ids
+        .iter()
+        .map(|&i| (sub.poses[i].unwrap().center().coords - gps[i]).norm())
+        .filter(|&r| r <= DETACHED_GPS_OK_M)
+        .collect();
+    res.sort_by(f64::total_cmp);
+    if res.len() < DETACHED_MIN_GPS_OK {
+        return None;
+    }
+    for &i in &ids {
+        s.poses[i] = sub.poses[i];
+    }
+    s.points.extend(sub.points);
+    s.obs.extend(sub.obs);
+    s.ba_only.extend(sub.ba_only);
+    Some((res.len(), res[res.len() / 2]))
+}
+
+/// 장착 관계로 정한 목표 자세(`rig_targets`: 사진 번호, 목표 회전)에 부분 모델 `sub` 의 사진 회전을 가장 가깝게
+/// 하는, 축 `axis` 둘레 회전각(rad). 목표가 3개 미만이면 None. 각 거리의 합(L1)을 0.1도 간격으로 훑어 고른다.
+fn roll_from_rig(
+    axis: &nalgebra::Unit<Vector3<f64>>,
+    sub: &Sparse,
+    rig_targets: &[(usize, Rotation3<f64>)],
+) -> Option<f64> {
+    let pairs: Vec<(Rotation3<f64>, Rotation3<f64>)> = rig_targets
+        .iter()
+        .filter_map(|(i, t)| sub.poses[*i].map(|p| (p.rotation, *t)))
+        .collect();
+    if pairs.len() < 3 {
+        return None;
+    }
+    let cost = |th: f64| -> f64 {
+        let inv = Rotation3::from_axis_angle(axis, th).inverse();
+        pairs
+            .iter()
+            .map(|(r, t)| (r * inv).rotation_to(t).angle())
+            .sum::<f64>()
+    };
+    let n = 3600;
+    let mut best = (f64::INFINITY, 0.0);
+    for k in 0..n {
+        let th = -std::f64::consts::PI + std::f64::consts::TAU * k as f64 / n as f64;
+        let c = cost(th);
+        if c < best.0 {
+            best = (c, th);
+        }
+    }
+    Some(best.1)
+}
+
+/// 회전들의 평균(쿼터니언 외적 행렬의 최대 고유벡터, 교과서 방식). 평균에서 가장 먼 쪽 절반 밖의 이상값
+/// (중앙 각거리의 3배 초과)을 한 번 빼고 다시 평균한다. 비어 있으면 None.
+fn mean_rotation(rs: &[Rotation3<f64>]) -> Option<Rotation3<f64>> {
+    fn avg(rs: &[Rotation3<f64>]) -> Rotation3<f64> {
+        let mut m = nalgebra::Matrix4::zeros();
+        for r in rs {
+            let q = nalgebra::UnitQuaternion::from_rotation_matrix(r);
+            m += q.coords * q.coords.transpose();
+        }
+        let eig = nalgebra::SymmetricEigen::new(m);
+        let k = (0..4)
+            .max_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))
+            .unwrap_or(0);
+        let v = eig.eigenvectors.column(k).into_owned();
+        nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::from(v))
+            .to_rotation_matrix()
+    }
+    if rs.is_empty() {
+        return None;
+    }
+    let m0 = avg(rs);
+    let mut d: Vec<f64> = rs.iter().map(|r| r.rotation_to(&m0).angle()).collect();
+    let mut sd = d.clone();
+    sd.sort_by(f64::total_cmp);
+    let thr = (3.0 * sd[sd.len() / 2]).max(1.0_f64.to_radians());
+    let keep: Vec<Rotation3<f64>> = rs
+        .iter()
+        .zip(d.drain(..))
+        .filter(|(_, a)| *a <= thr)
+        .map(|(r, _)| *r)
+        .collect();
+    Some(if keep.is_empty() { m0 } else { avg(&keep) })
+}
+
+/// 모델 `s` 에서 같은 위치의 카메라 0 과 카메라 c(1, 2) 가 모두 등록된 곳의 상대 회전 `R_c R_0^T` 표본을
+/// `samples[c]` 에 보탠다. `views` 는 사진별 (카메라, 위치).
+fn collect_rig_samples(
+    s: &Sparse,
+    views: &[(usize, usize)],
+    samples: &mut [Vec<Rotation3<f64>>; 3],
+) {
+    let mut by_pos: BTreeMap<usize, [Option<Rotation3<f64>>; 3]> = BTreeMap::new();
+    for (i, &(c, p)) in views.iter().enumerate() {
+        if c < 3 {
+            if let Some(pose) = s.poses[i] {
+                by_pos.entry(p).or_default()[c] = Some(pose.rotation);
+            }
+        }
+    }
+    for rs in by_pos.values() {
+        if let Some(r0) = rs[0] {
+            for c in 1..3 {
+                if let Some(rc) = rs[c] {
+                    samples[c].push(rc * r0.inverse());
+                }
+            }
+        }
+    }
+}
+
+/// 표본에서 카메라별 장착 상대 회전을 낸다(카메라 0 은 항상 항등, 표본이 3개 미만인 카메라는 None).
+fn rig_from_samples(samples: &[Vec<Rotation3<f64>>; 3]) -> [Option<Rotation3<f64>>; 3] {
+    let mut out = [Some(Rotation3::identity()), None, None];
+    for c in 1..3 {
+        if samples[c].len() >= 3 {
+            out[c] = mean_rotation(&samples[c]);
+        }
+    }
+    out
+}
+
+/// 축 `axis` 둘레로 `n_sub` 를 돌려 `n_main` 에 가장 가깝게 만드는 각(rad): 두 법선에서 축 성분을 뺀 벡터 사이의 부호 있는 각.
+/// 둘 중 하나가 축과 거의 나란하면 정해지지 않으므로 0.
+fn roll_about_axis(
+    axis: &nalgebra::Unit<Vector3<f64>>,
+    n_sub: &Vector3<f64>,
+    n_main: &Vector3<f64>,
+) -> f64 {
+    let perp = |v: &Vector3<f64>| v - axis.as_ref() * v.dot(axis);
+    let (a, b) = (perp(n_sub), perp(n_main));
+    if a.norm() < 1e-9 || b.norm() < 1e-9 {
+        return 0.0;
+    }
+    axis.dot(&a.cross(&b)).atan2(a.dot(&b))
+}
+
+/// 부분 모델 점 `src` 와 주 모델 점 `dst` 의 겹침 잔차: `src` 점마다 가장 가까운 `dst` 점까지의 거리(상한 3 m)의 평균.
+/// `sim` 이 `None` 이면 변환 없이.
+fn overlap_residual(src: &[Vector3<f64>], dst: &[Vector3<f64>], sim: Option<&Similarity>) -> f64 {
+    const CELL: f64 = 3.0;
+    let key = |p: &Vector3<f64>| {
+        (
+            (p.x / CELL).floor() as i64,
+            (p.y / CELL).floor() as i64,
+            (p.z / CELL).floor() as i64,
+        )
+    };
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (j, p) in dst.iter().enumerate() {
+        grid.entry(key(p)).or_default().push(j);
+    }
+    let step = (src.len() / 4000).max(1);
+    let (mut sum, mut n) = (0.0, 0usize);
+    for p in src.iter().step_by(step) {
+        let q = sim.map_or(*p, |s| s.apply_point(p));
+        let (kx, ky, kz) = key(&q);
+        let mut best = CELL * CELL;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for &j in grid.get(&(kx + dx, ky + dy, kz + dz)).into_iter().flatten() {
+                        best = best.min((dst[j] - q).norm_squared());
+                    }
+                }
+            }
+        }
+        sum += best.sqrt();
+        n += 1;
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum / n as f64
+    }
+}
+
+/// ICP 보정이 점 겹침 잔차를 키우지 않는가(GPS 정상 대응 수만으로는 겹침이 나빠지는 보정을 못 거른다).
+fn overlap_not_worse(src: &[Vector3<f64>], dst: &[Vector3<f64>], sim: &Similarity) -> bool {
+    overlap_residual(src, dst, Some(sim)) <= overlap_residual(src, dst, None) + 1e-9
+}
+
+/// 보정 닮음 변환의 허용 범위: 규모 0.85~1.18, 회전 변화 20° 이내.
+fn sim_ok(sim: &Similarity) -> bool {
+    (0.85..=1.18).contains(&sim.s) && sim.r.angle() <= 20f64.to_radians()
+}
+
+/// `src`(부분 모델 점, 대략 맞춘 상태)를 `dst`(주 모델 점)에 ICP 식으로 맞추는 닮음 변환(`dst ≈ s·R·src + t`).
+/// 가까운 점쌍(거리 문턱 3 m 에서 1 m 로 줄임)의 Umeyama 에 GPS 중심 쌍 `anchors`(약한 사전항: 점쌍 수의 약 1/4
+/// 가중)를 더해 되풀이한다. 점쌍이 50 개 미만이면 None.
+fn icp_similarity(
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    anchors: &[(Vector3<f64>, Vector3<f64>)],
+) -> Option<Similarity> {
+    const CELL: f64 = 3.0;
+    if src.len() < 50 || dst.len() < 50 || anchors.is_empty() {
+        return None;
+    }
+    let key = |p: &Vector3<f64>| {
+        (
+            (p.x / CELL).floor() as i64,
+            (p.y / CELL).floor() as i64,
+            (p.z / CELL).floor() as i64,
+        )
+    };
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (j, p) in dst.iter().enumerate() {
+        grid.entry(key(p)).or_default().push(j);
+    }
+    let step = (src.len() / 4000).max(1);
+    let src: Vec<Vector3<f64>> = src.iter().step_by(step).copied().collect();
+    let mut sim = Similarity {
+        s: 1.0,
+        r: Rotation3::identity(),
+        t: Vector3::zeros(),
+    };
+    let mut ok = false;
+    for it in 0..60 {
+        let thr = match it {
+            0..=9 => 3.0,
+            10..=24 => 1.5,
+            25..=44 => 0.8,
+            _ => 0.4,
+        };
+        let mut a: Vec<Vector3<f64>> = Vec::new();
+        let mut b: Vec<Vector3<f64>> = Vec::new();
+        for p in &src {
+            let q = sim.apply_point(p);
+            let (kx, ky, kz) = key(&q);
+            let mut best = (thr * thr, usize::MAX);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(v) = grid.get(&(kx + dx, ky + dy, kz + dz)) {
+                            for &j in v {
+                                let d = (dst[j] - q).norm_squared();
+                                if d < best.0 {
+                                    best = (d, j);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if best.1 != usize::MAX {
+                a.push(*p);
+                b.push(dst[best.1]);
+            }
+        }
+        if a.len() < 50 {
+            return if ok { Some(sim) } else { None };
+        }
+        let rep = (a.len() / 4 / anchors.len()).max(1);
+        for (c, g) in anchors {
+            // 앵커는 점 쌍의 같은 좌표계(보정 전 부분 모델 좌표)에 있어야 하므로 현재 닮음 변환의 역으로 되돌리지 않고
+            // 원래 좌표 `c` 그대로 쓴다.
+            for _ in 0..rep {
+                a.push(*c);
+                b.push(*g);
+            }
+        }
+        let Some(next) = crate::align::umeyama(&a, &b) else {
+            break;
+        };
+        if !(0.5..=2.0).contains(&next.s) {
+            break;
+        }
+        sim = next;
+        ok = true;
+    }
+    ok.then_some(sim)
+}
+
+/// 회전 평균 주 성분에 붙지 못한 연결 성분(사진 6장 이상)마다 따로 부분 모델을 풀어 `attach_detached` 로 붙인다.
+/// 환경 변수 `SKYLENS_REGION_DIAG` 가 있으면 성분 크기와 붙인 뒤 GPS 잔차를 표준 오류로 낸다. 붙인 성분 수를 돌려준다.
+#[allow(clippy::too_many_arguments)]
+fn merge_detached_components(
+    s: &mut Sparse,
+    imgs: &[&ImgData],
+    pm: &[PairMatch],
+    rots: &[Option<Rotation3<f64>>],
+    gps: &[Vector3<f64>],
+    k: &Intrinsics,
+    method: PositionMethod,
+    tri: &TriConfig,
+    opts: &PreviewOpts,
+) -> usize {
+    let n = imgs.len();
+    let mut uf: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    let mut touched = vec![false; n];
+    // 회전 평균 뒤 가지치기는 주 성분 밖 사진의 간선을 모두 뺐으므로, 주 성분 밖 사진끼리의 짝을
+    // 처음 거름(대응 수 하한)만 적용해 다시 모은다. 잘못된 짝은 부분 모델의 회전 평균이 따로 거른다.
+    let usable =
+        |p: &PairMatch| rots[p.i].is_none() && rots[p.j].is_none() && p.inl.len() >= opts.min_inl;
+    for p in pm.iter().filter(|p| usable(p)) {
+        touched[p.i] = true;
+        touched[p.j] = true;
+        let (a, b) = (find(&mut uf, p.i), find(&mut uf, p.j));
+        if a != b {
+            uf[a.max(b)] = a.min(b);
+        }
+    }
+    let mut comps: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for v in (0..n).filter(|&v| touched[v] && rots[v].is_none()) {
+        let r = find(&mut uf, v);
+        comps.entry(r).or_default().push(v);
+    }
+    let diag = std::env::var("SKYLENS_REGION_DIAG").is_ok();
+    let mut view_of: HashMap<usize, (usize, usize)> = HashMap::new();
+    for p in pm {
+        view_of.insert(p.i, p.views.0);
+        view_of.insert(p.j, p.views.1);
+    }
+    let mut merged = 0;
+    for comp in comps.values() {
+        if comp.len() < DETACHED_MIN_PHOTOS {
+            continue;
+        }
+        let loc: HashMap<usize, usize> = comp.iter().enumerate().map(|(a, &i)| (i, a)).collect();
+        let sub_pm: Vec<PairMatch> = pm
+            .iter()
+            .filter(|p| usable(p) && loc.contains_key(&p.i) && loc.contains_key(&p.j))
+            .map(|p| PairMatch {
+                i: loc[&p.i],
+                j: loc[&p.j],
+                inl: p.inl.clone(),
+                rot: p.rot,
+                t: p.t,
+                views: p.views,
+            })
+            .collect();
+        let sub_imgs: Vec<&ImgData> = comp.iter().map(|&i| imgs[i]).collect();
+        let sub_gps: Vec<Vector3<f64>> = comp.iter().map(|&i| gps[i]).collect();
+        let sub_opts = PreviewOpts {
+            merge_detached: false,
+            pair_vote: false,
+            legacy_roll: opts.legacy_roll,
+            refine_iters: opts.detached_refine_iters.unwrap_or(opts.refine_iters),
+            ..PreviewOpts::default()
+        };
+        let r = sparse_init_with(
+            &sub_imgs,
+            &sub_pm,
+            &sub_gps,
+            k,
+            method,
+            tri,
+            (0, 2.0),
+            &sub_opts,
+        );
+        let Ok((sub, _)) = r else {
+            if diag {
+                eprintln!("diag detached size {} solve failed", comp.len());
+            }
+            continue;
+        };
+        // 사진 번호를 주 모델 번호공간으로 되돌린다.
+        let mut full = Sparse {
+            poses: vec![None; n],
+            points: sub.points,
+            obs: sub.obs,
+            ba_only: sub.ba_only,
+            rms: sub.rms,
+        };
+        for (a, &i) in comp.iter().enumerate() {
+            full.poses[i] = sub.poses[a];
+        }
+        for o in full
+            .obs
+            .iter_mut()
+            .chain(full.ba_only.iter_mut().map(|e| &mut e.1))
+        {
+            for x in o.iter_mut() {
+                x.0 = comp[x.0];
+            }
+        }
+        let cams: Vec<usize> = comp.iter().map(|&i| imgs_cam(pm, i)).collect();
+        let mut rig_targets: Vec<(usize, Rotation3<f64>)> = Vec::new();
+        if let Some(rig) = &opts.rig_rel {
+            for &i in comp {
+                let Some(&(ci, pi)) = view_of.get(&i) else {
+                    continue;
+                };
+                let Some(rci) = rig.get(ci).copied().flatten() else {
+                    continue;
+                };
+                let partner = (0..n).find_map(|j| {
+                    let &(cj, pj) = view_of.get(&j)?;
+                    let rcj = rig.get(cj).copied().flatten()?;
+                    let pose = s.poses[j].as_ref()?;
+                    (pj == pi && cj != ci).then(|| rci * rcj.inverse() * pose.rotation)
+                });
+                if let Some(t) = partner {
+                    rig_targets.push((i, t));
+                }
+            }
+        }
+        let res = attach_detached(s, full, gps, &rig_targets);
+        if diag {
+            eprintln!(
+                "diag rig targets {} of {} rig {:?}",
+                rig_targets.len(),
+                comp.len(),
+                opts.rig_rel.map(|r| r.map(|x| x.is_some()))
+            );
+            match res {
+                Some((ok, med)) => eprintln!(
+                    "diag detached size {} cams {:?} attached gps_ok {} resid_med {:.3}",
+                    comp.len(),
+                    cam_counts(&cams),
+                    ok,
+                    med
+                ),
+                None => eprintln!(
+                    "diag detached size {} cams {:?} not attached",
+                    comp.len(),
+                    cam_counts(&cams)
+                ),
+            }
+        }
+        if res.is_some() {
+            merged += 1;
+        }
+    }
+    merged
+}
+
+fn imgs_cam(pm: &[PairMatch], i: usize) -> usize {
+    pm.iter()
+        .find_map(|p| {
+            if p.i == i {
+                Some(p.views.0 .0)
+            } else if p.j == i {
+                Some(p.views.1 .0)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(usize::MAX)
+}
+
+fn cam_counts(cams: &[usize]) -> [usize; 3] {
+    let mut c = [0; 3];
+    for &x in cams {
+        if x < 3 {
+            c[x] += 1;
+        }
+    }
+    c
 }
 
 /// 회전 평균 → 방향으로 좌표계 맞춤 → 위치 → 삼각측량. 초벌 희소 모델.
@@ -1418,6 +2059,13 @@ fn sparse_init_with(
             s.obs.len()
         );
     }
+    if opts.merge_detached {
+        let merged = merge_detached_components(&mut s, imgs, pm, &rots, gps, k, method, tri, opts);
+        if merged > 0 {
+            s.rms = run_ba(&mut s, k, 10, Some(gps), 2.0, &[]);
+            diag_poses("ba_merged", &s.poses);
+        }
+    }
     if pre_ba.0 > 0 {
         // 짧은 GPS 사전항 BA: 초벌 포즈·점의 스케일·기울기·깊이를 정밀 쪽으로 당긴다.
         let after = crate::timing::timed("ba_preview", || {
@@ -1569,6 +2217,18 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
     let (sim, inl, med) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
     let rots: Vec<Rotation3<f64>> = ids.iter().map(|&i| s.poses[i].unwrap().rotation).collect();
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        if let Some(c) = roll_candidates(&sim, &src, &dst, &inl, &rots) {
+            let n = s.poses.len();
+            for (tag, cand) in [("cand_gps", &sim), ("cand_spread", &c.rolled)] {
+                let mut v: Vec<Option<Rotation3<f64>>> = vec![None; n];
+                for (a, &i) in ids.iter().enumerate() {
+                    v[i] = Some(rots[a] * cand.r.inverse());
+                }
+                diag_stage(tag, &v, None);
+            }
+        }
+    }
     let (sim, rolled) = choose_roll(&sim, &src, &dst, &inl, &rots);
     if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
         eprintln!(
@@ -2493,6 +3153,7 @@ pub fn run_pipeline_with(
         Ok(())
     };
 
+    let mut rig_samples: [Vec<Rotation3<f64>>; 3] = Default::default();
     for r in &regions {
         // 끝난 정밀 결과를 먼저 반영해 이번 등록·정렬이 최신 모델을 기준으로 삼게 한다.
         while let Ok(m) = rx.try_recv() {
@@ -2672,6 +3333,19 @@ pub fn run_pipeline_with(
         };
         // 초벌(미리보기)은 위의 광축 높이 분산 롤을 쓰고, 정밀 BA 시작점만 예전 롤 규칙으로 따로 만든다.
         let coarse_start = start;
+        // 장착 상대 회전은 모든 위치·구역에서 같다: 초벌 모델에서 지금까지 모은 표본의 평균을 정밀 시작에 물려준다.
+        collect_rig_samples(&coarse_start, &views, &mut rig_samples);
+        let rig = rig_from_samples(&rig_samples);
+        if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+            eprintln!(
+                "diag rig region {} samples {:?} rel_deg {:?}",
+                r.index,
+                rig_samples.iter().map(|v| v.len()).collect::<Vec<_>>(),
+                rig.iter()
+                    .map(|x| x.map(|q| q.angle().to_degrees()))
+                    .collect::<Vec<_>>()
+            );
+        }
         diag_set(r.index, &gids, "start");
         let start = sparse_init_with(
             &imgs,
@@ -2682,8 +3356,10 @@ pub fn run_pipeline_with(
             &tri,
             (0, 2.0),
             &PreviewOpts {
-                legacy_roll: true,
+                legacy_roll: false,
                 pair_vote: cfg.pair_vote,
+                detached_refine_iters: Some(cfg.preview_refine_iters),
+                rig_rel: Some(rig),
                 ..PreviewOpts::default()
             },
         )
@@ -2874,7 +3550,7 @@ pub fn run_pipeline_with(
                             position,
                             &tri_t,
                             (0, 2.0),
-                            true,
+                            false,
                         ) {
                             in_region = gf.iter().map(|g| region.contains(g / 3)).collect();
                             rs = sf;
@@ -4369,5 +5045,218 @@ mod choose_roll_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod detached_tests {
+    use super::*;
+
+    fn truth_rot() -> Rotation3<f64> {
+        Rotation3::from_euler_angles(0.3, 0.2, 0.1)
+    }
+
+    fn ground(x0: f64, y0: f64) -> Vec<Vector3<f64>> {
+        (0..30)
+            .map(|a| Vector3::new(x0 + (a % 6) as f64 * 3.0, y0 + (a / 6) as f64 * 3.0, 0.0))
+            .collect()
+    }
+
+    fn truth_center(i: usize) -> Vector3<f64> {
+        Vector3::new(i as f64, 15.0, 30.0)
+    }
+
+    /// 주 모델: 사진 0..10, 바닥 점. 부분 모델: 사진 10..10+n 을 정답에서 비행 축 둘레 25° 돌리고 3 m 옮긴 것.
+    fn setup(n_sub: usize) -> (Sparse, Sparse, Vec<Vector3<f64>>) {
+        let total = 10 + n_sub;
+        let mut main = Sparse {
+            poses: vec![None; total],
+            points: ground(0.0, 0.0),
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        };
+        for i in 0..10 {
+            main.poses[i] = Some(Pose::from_center(
+                truth_rot(),
+                &Point3::from(truth_center(i)),
+            ));
+        }
+        let mut sub = Sparse {
+            poses: vec![None; total],
+            points: ground(0.0, 12.0),
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        };
+        for i in 10..total {
+            sub.poses[i] = Some(Pose::from_center(
+                truth_rot(),
+                &Point3::from(truth_center(i)),
+            ));
+        }
+        let mean = Vector3::new(10.0 + n_sub as f64 / 2.0, 15.0, 30.0);
+        let r = Rotation3::from_axis_angle(&Vector3::x_axis(), 25f64.to_radians());
+        apply_sparse_sim(
+            &mut sub,
+            &Similarity {
+                s: 1.0,
+                r,
+                t: mean - r * mean + Vector3::new(2.0, -1.5, 1.0),
+            },
+        );
+        let gps = (0..total).map(truth_center).collect();
+        (main, sub, gps)
+    }
+
+    #[test]
+    fn detached_component_attaches_within_one_meter_and_two_degrees() {
+        let (mut main, sub, gps) = setup(12);
+        let (ok, med) = attach_detached(&mut main, sub, &gps, &[]).expect("attached");
+        assert!(ok >= 10 && med < 1.0, "{ok} {med}");
+        for i in 10..22 {
+            let p = main.poses[i].expect("pose");
+            let dc = (p.center().coords - truth_center(i)).norm();
+            let da = (p.rotation * truth_rot().inverse()).angle().to_degrees();
+            assert!(dc < 1.0 && da < 2.0, "photo {i}: {dc} m {da} deg");
+        }
+        assert_eq!(main.points.len(), 60);
+    }
+
+    #[test]
+    fn too_few_photos_or_gps_inliers_are_not_attached() {
+        let (mut main, sub, gps) = setup(5);
+        assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
+        assert!(main.poses[10..].iter().all(|p| p.is_none()));
+        // GPS 정상 대응 2 개뿐: 나머지는 50 m 어긋남.
+        let (mut main, sub, mut gps) = setup(12);
+        for g in gps.iter_mut().skip(12) {
+            g.y += 50.0 + g.x;
+        }
+        assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
+        assert!(main.poses[10..].iter().all(|p| p.is_none()));
+        assert_eq!(main.points.len(), 30);
+    }
+
+    fn relief(x: f64, y: f64) -> f64 {
+        3.0 * (x / 9.0).sin() + 2.0 * (y / 6.0).cos() + 0.04 * x
+    }
+
+    /// 기복 있는 바닥 점(격자 간격 0.6 m).
+    fn relief_points(x0: f64, x1: f64) -> Vec<Vector3<f64>> {
+        let mut v = Vec::new();
+        let mut x = x0;
+        while x < x1 {
+            for k in 0..100 {
+                let y = k as f64 * 0.6;
+                v.push(Vector3::new(x, y, relief(x, y)));
+            }
+            x += 0.6;
+        }
+        v
+    }
+
+    #[test]
+    fn scaled_rotated_component_recovers_similarity() {
+        let total = 10 + 12;
+        let center = |i: usize| Vector3::new(i as f64 * 3.0, 28.0, 30.0);
+        let mut main = Sparse {
+            poses: vec![None; total],
+            points: relief_points(0.0, 50.0),
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        };
+        for i in 0..10 {
+            main.poses[i] = Some(Pose::from_center(truth_rot(), &Point3::from(center(i))));
+        }
+        let mut sub = Sparse {
+            poses: vec![None; total],
+            points: relief_points(30.0, 60.0),
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        };
+        for i in 10..total {
+            sub.poses[i] = Some(Pose::from_center(truth_rot(), &Point3::from(center(i))));
+        }
+        // 정답에서 규모 1/1.08, 임의 축 4° 회전, 이동을 줘 어긋나게 만든다.
+        let mean = (10..total).map(center).sum::<Vector3<f64>>() / 12.0;
+        let axis = nalgebra::Unit::new_normalize(Vector3::new(1.0, 1.0, 0.5));
+        let r = Rotation3::from_axis_angle(&axis, 4f64.to_radians());
+        apply_sparse_sim(
+            &mut sub,
+            &Similarity {
+                s: 1.0 / 1.08,
+                r,
+                t: mean - r * mean / 1.08 + Vector3::new(1.5, -1.0, 0.5),
+            },
+        );
+        let gps: Vec<Vector3<f64>> = (0..total).map(center).collect();
+        attach_detached(&mut main, sub, &gps, &[]).expect("attached");
+        let c = |i: usize| main.poses[i].unwrap().center().coords;
+        let scale = (c(21) - c(10)).norm() / (center(21) - center(10)).norm();
+        assert!((scale - 1.0).abs() < 0.02, "scale {scale}");
+        for i in 10..total {
+            let p = main.poses[i].unwrap();
+            let dc = (p.center().coords - center(i)).norm();
+            let da = (p.rotation * truth_rot().inverse()).angle().to_degrees();
+            // 점 겹침이 20 m 폭뿐인 약한 형상이라 회전은 4° 안(실측 약 2.9°)으로만 확인한다.
+            assert!(dc < 1.0 && da < 4.0, "photo {i}: {dc} m {da} deg");
+        }
+    }
+
+    #[test]
+    fn closed_form_roll_matches_half_degree_search() {
+        let axis = nalgebra::Unit::new_normalize(Vector3::new(1.0, 0.2, -0.1));
+        let cases = [
+            (Vector3::new(0.1, 0.3, 0.95), Vector3::new(-0.2, 0.9, 0.4)),
+            (Vector3::new(0.0, 0.0, 1.0), Vector3::new(0.0, 0.5, 0.86)),
+            (Vector3::new(0.3, -0.7, 0.6), Vector3::new(0.1, 0.2, -0.97)),
+            (Vector3::new(0.0, 1.0, 0.0), Vector3::new(0.0, 0.0, 1.0)),
+        ];
+        for (a, b) in cases {
+            let (n_sub, n_main) = (a.normalize(), b.normalize());
+            let mut best = (f64::INFINITY, 0.0);
+            for step in 0..720 {
+                let th = step as f64 * 0.5f64.to_radians();
+                let r = Rotation3::from_axis_angle(&axis, th);
+                let ang = (r * n_sub).dot(&n_main).clamp(-1.0, 1.0).acos();
+                if ang < best.0 {
+                    best = (ang, th);
+                }
+            }
+            let th = roll_about_axis(&axis, &n_sub, &n_main);
+            let r = Rotation3::from_axis_angle(&axis, th);
+            let ang = (r * n_sub).dot(&n_main).clamp(-1.0, 1.0).acos();
+            assert!(ang <= best.0 + 1e-9, "{ang} > {}", best.0);
+            let d = (th - best.1).rem_euclid(std::f64::consts::TAU);
+            let d = d.min(std::f64::consts::TAU - d);
+            assert!(
+                d <= 0.25f64.to_radians() + 1e-9,
+                "각 차 {} deg",
+                d.to_degrees()
+            );
+        }
+    }
+
+    #[test]
+    fn icp_that_raises_overlap_residual_is_rejected() {
+        // 이미 겹친 점(잔차 0)에 GPS 앵커를 한쪽으로 크게 당겨 ICP 가 점 겹침을 해치는 닮음 변환을 내게 만든다.
+        let dst = relief_points(0.0, 30.0);
+        let src: Vec<Vector3<f64>> = dst.iter().step_by(3).copied().collect();
+        let anchors: Vec<(Vector3<f64>, Vector3<f64>)> = (0..40)
+            .map(|a| {
+                let c = Vector3::new(a as f64, 28.0, 30.0);
+                (c, c + Vector3::new(2.5, 0.0, 0.0))
+            })
+            .collect();
+        let before = overlap_residual(&src, &dst, None);
+        assert!(before < 1e-6, "{before}");
+        let sim = icp_similarity(&src, &dst, &anchors).expect("icp");
+        assert!(overlap_residual(&src, &dst, Some(&sim)) > before);
+        assert!(!overlap_not_worse(&src, &dst, &sim));
+        // 변환 없음은 받아들인다.
+        assert!(overlap_not_worse(&src, &dst, &Similarity::identity()));
     }
 }

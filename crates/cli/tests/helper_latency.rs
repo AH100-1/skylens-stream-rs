@@ -121,9 +121,13 @@ fn refined_realign_medians(report: &str) -> Vec<f64> {
 fn coarse_back_off_keeps_refined_seams_tight() {
     let (_, _, want, report) = run(false, "seam");
     let med = refined_realign_medians(&report);
+    // 기록 수는 정밀 구역이 서로 얼마나 이어지느냐에 따라 달라지므로 개수를 고정하지 않고 성질만 본다.
+    // 분리 성분을 붙이면 구역마다 사진이 거의 다 등록되어(30/30, 36/36, 24/24) 이웃 구역끼리 모두 맞춰지고,
+    // 겹치지 않는 구역 0 과 2 는 구역 1 을 거쳐 이어진 기록(0→2 via 1)이 하나 더 생긴다. 붙이지 않으면
+    // 등록이 10/30 수준이라 이웃 짝 하나만 남는다. 짝마다 많아야 한 번이므로 n(n−1)/2 이하이고, 1 개 이상이어야 한다.
     assert!(
-        !med.is_empty() && med.len() < want,
-        "정밀 재정렬 기록 부족: {med:?}"
+        !med.is_empty() && med.len() <= want * (want - 1) / 2,
+        "정밀 재정렬 기록 수: {med:?}"
     );
     for m in &med {
         assert!(*m < 1.0, "정밀 구역 이음 잔차 {m} m: {med:?}");
