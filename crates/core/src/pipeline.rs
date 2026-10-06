@@ -685,7 +685,7 @@ fn averaged_centers(
     k: &Intrinsics,
     rots: &[Option<Rotation3<f64>>],
     g: &Matrix3<f64>,
-) -> Option<Vec<Option<Vector3<f64>>>> {
+) -> Option<(Vec<Option<Vector3<f64>>>, AvgDiag)> {
     let n = imgs.len();
     let rel: Vec<RelativeTranslation> = pm
         .iter()
@@ -761,10 +761,24 @@ fn averaged_centers(
         }
     }
     let mut out = vec![None; n];
+    let mut raw = vec![None; n];
     for (a, &i) in idx.iter().enumerate() {
         out[i] = Some(s * src[a] + t);
+        raw[i] = Some(src[a]);
     }
-    Some(out)
+    let mut fin: Vec<f64> = (0..idx.len())
+        .map(|a| (s * src[a] + t - dst[a]).norm())
+        .collect();
+    fin.sort_by(f64::total_cmp);
+    let diag = AvgDiag {
+        raw,
+        s,
+        t,
+        kept: keep.iter().filter(|&&k| k).count(),
+        total: idx.len(),
+        median_m: fin[fin.len() / 2],
+    };
+    Some((out, diag))
 }
 
 /// 초벌 위치 전용 다듬기(번들 조정이 아니다): 회전을 고정하고 카메라 중심만 고친다.
@@ -991,6 +1005,21 @@ pub struct PreviewStages {
     pub placed: Vec<Option<Pose>>,
     /// 회전 평균 뒤 뺀 간선 수 / 전체.
     pub pruned: (usize, usize),
+    /// 위치 평균 뒤 GPS 축척·원점 맞춤 진단(위치 평균을 쓰지 않았거나 실패하면 None).
+    pub avg: Option<AvgDiag>,
+}
+
+/// 위치 평균 결과를 GPS 에 맞춘 단계의 진단(동작에는 쓰이지 않는다).
+#[derive(Clone, Debug)]
+pub struct AvgDiag {
+    /// 맞춤 전 중심(방향만 ENU 로 돌린 `g c`, 위치 평균의 자기 축척).
+    pub raw: Vec<Option<Vector3<f64>>>,
+    /// 맞춘 축척·이동(gps ≈ s·raw + t)과 마지막 바퀴에 남은 대응 수 / 전체, 잔차 중앙값(m).
+    pub s: f64,
+    pub t: Vector3<f64>,
+    pub kept: usize,
+    pub total: usize,
+    pub median_m: f64,
 }
 
 type RotsAndKeep = (Vec<Option<Rotation3<f64>>>, Vec<bool>);
@@ -1295,7 +1324,10 @@ fn sparse_init_with(
     let gl: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
     let mut placed: Option<Vec<Option<Vector3<f64>>>> = None;
     if method == PositionMethod::TranslationAveraging {
-        placed = averaged_centers(imgs, pm, gps, k, &rots, &g);
+        if let Some((c, d)) = averaged_centers(imgs, pm, gps, k, &rots, &g) {
+            placed = Some(c);
+            stages.avg = Some(d);
+        }
         if placed.is_none() && std::env::var("PIPE_DEBUG").is_ok() {
             eprintln!("debug translation averaging failed, GPS least squares instead");
         }
@@ -2097,6 +2129,48 @@ fn dump_own_pairs(dir: &str, rec: &RegionRec, tb: &[Track], sparse: &Sparse, r: 
     );
 }
 
+/// 환경 변수 `SKYLENS_ZONE_DUMP=<폴더>` 일 때 초벌 위치 단계 진단을 `zone_scale_{구역:02}.txt` 로 쓴다
+/// (사진마다 번호, GPS, 위치 평균 맞춤 전 중심, 맞춤 뒤 중심, 최종 초벌 중심; 정렬·출력에는 영향 없음).
+fn dump_zone_scale(
+    dir: &str,
+    region: usize,
+    gids: &[usize],
+    gps: &[Vector3<f64>],
+    st: &PreviewStages,
+    sparse: &Sparse,
+) {
+    let nan = Vector3::repeat(f64::NAN);
+    let f = |v: Option<Vector3<f64>>| {
+        let v = v.unwrap_or(nan);
+        format!("{} {} {}", v.x, v.y, v.z)
+    };
+    let mut o = String::new();
+    match &st.avg {
+        Some(a) => o.push_str(&format!(
+            "H {} {} {} {} {} {} {}\n",
+            a.s, a.kept, a.total, a.median_m, a.t.x, a.t.y, a.t.z
+        )),
+        None => o.push_str("H none\n"),
+    }
+    for (i, g) in gids.iter().enumerate() {
+        let raw = st.avg.as_ref().and_then(|a| a.raw[i]);
+        let placed = st.placed[i].map(|p| p.center().coords);
+        let fin = sparse.poses[i].map(|p| p.center().coords);
+        o.push_str(&format!(
+            "I {g} {} {} {} {}\n",
+            f(Some(gps[i])),
+            f(raw),
+            f(placed),
+            f(fin)
+        ));
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(
+        Path::new(dir).join(format!("zone_scale_{region:02}.txt")),
+        o,
+    );
+}
+
 /// 구역 하나의 진행 기록(메인 스레드 소유).
 struct RegionRec {
     region: Region,
@@ -2570,6 +2644,7 @@ pub fn run_pipeline_with(
         // 정밀 BA 시작점(`start`)은 초벌 BA 옵션과 무관하게 BA 전 모델이다.
         // 초벌 BA(선택, 기본 0회)는 그 사본(`init`)에만 적용한다.
         // 정지 검사는 구역 자기 위치끼리의 짝만 본다(앞 구역에서 온 도우미 사진의 움직임은 세지 않는다).
+        let mut zone_stages: Option<PreviewStages> = None;
         let own_pairs: Vec<(usize, usize)> = pair_ids
             .iter()
             .copied()
@@ -2592,7 +2667,10 @@ pub fn run_pipeline_with(
                         ..PreviewOpts::default()
                     },
                 )
-                .map(|r| r.0)
+                .map(|r| {
+                    zone_stages = Some(r.1);
+                    r.0
+                })
             })
             .and_then(|s| {
                 if own_registered(&s) < 3 {
@@ -2613,6 +2691,9 @@ pub fn run_pipeline_with(
         };
         // 초벌(미리보기)은 위의 광축 높이 분산 롤을 쓰고, 정밀 BA 시작점만 예전 롤 규칙으로 따로 만든다.
         let coarse_start = start;
+        if let (Ok(dir), Some(zs)) = (std::env::var("SKYLENS_ZONE_DUMP"), &zone_stages) {
+            dump_zone_scale(&dir, r.index, &gids, &gps, zs, &coarse_start);
+        }
         let start = sparse_init_with(
             &imgs,
             &pm,
