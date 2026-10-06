@@ -1246,16 +1246,8 @@ fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Opt
         let eig = nalgebra::SymmetricEigen::new(cov);
         let mx = (0..3).max_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))?;
         let axis = nalgebra::Unit::new_normalize(eig.eigenvectors.column(mx).into_owned());
-        let mut best = (f64::INFINITY, 0.0);
-        for step in 0..720 {
-            let th = step as f64 * 0.5f64.to_radians();
-            let r = Rotation3::from_axis_angle(&axis, th);
-            let a = (r * n_sub).dot(&n_main).clamp(-1.0, 1.0).acos();
-            if a < best.0 {
-                best = (a, th);
-            }
-        }
-        let r = Rotation3::from_axis_angle(&axis, best.1);
+        let th = roll_about_axis(&axis, &n_sub, &n_main);
+        let r = Rotation3::from_axis_angle(&axis, th);
         let sim = Similarity {
             s: 1.0,
             r,
@@ -1288,14 +1280,6 @@ fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Opt
             return None;
         }
     }
-    let mut res: Vec<f64> = (0..ids.len())
-        .map(|a| (cen[a] + t - gps[ids[a]]).norm())
-        .filter(|&r| r <= DETACHED_GPS_OK_M)
-        .collect();
-    if res.len() < DETACHED_MIN_GPS_OK {
-        return None;
-    }
-    res.sort_by(f64::total_cmp);
     apply_sparse_sim(
         &mut sub,
         &Similarity {
@@ -1319,7 +1303,11 @@ fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Opt
             .map(|(c, g)| (sim.apply_point(c) - g).norm())
             .collect();
         let n_ok = after.iter().filter(|&&d| d <= DETACHED_GPS_OK_M).count();
-        if sim_ok(&sim) && n_ok >= DETACHED_MIN_GPS_OK && n_ok * 10 >= g_ok.len() * 8 {
+        if sim_ok(&sim)
+            && n_ok >= DETACHED_MIN_GPS_OK
+            && n_ok * 10 >= g_ok.len() * 8
+            && overlap_not_worse(&sub.points, &s.points, &sim)
+        {
             apply_sparse_sim(&mut sub, &sim);
         }
     }
@@ -1339,6 +1327,66 @@ fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Opt
     s.obs.extend(sub.obs);
     s.ba_only.extend(sub.ba_only);
     Some((res.len(), res[res.len() / 2]))
+}
+
+/// 축 `axis` 둘레로 `n_sub` 를 돌려 `n_main` 에 가장 가깝게 만드는 각(rad): 두 법선에서 축 성분을 뺀 벡터 사이의 부호 있는 각.
+/// 둘 중 하나가 축과 거의 나란하면 정해지지 않으므로 0.
+fn roll_about_axis(
+    axis: &nalgebra::Unit<Vector3<f64>>,
+    n_sub: &Vector3<f64>,
+    n_main: &Vector3<f64>,
+) -> f64 {
+    let perp = |v: &Vector3<f64>| v - axis.as_ref() * v.dot(axis);
+    let (a, b) = (perp(n_sub), perp(n_main));
+    if a.norm() < 1e-9 || b.norm() < 1e-9 {
+        return 0.0;
+    }
+    axis.dot(&a.cross(&b)).atan2(a.dot(&b))
+}
+
+/// 부분 모델 점 `src` 와 주 모델 점 `dst` 의 겹침 잔차: `src` 점마다 가장 가까운 `dst` 점까지의 거리(상한 3 m)의 평균.
+/// `sim` 이 `None` 이면 변환 없이.
+fn overlap_residual(src: &[Vector3<f64>], dst: &[Vector3<f64>], sim: Option<&Similarity>) -> f64 {
+    const CELL: f64 = 3.0;
+    let key = |p: &Vector3<f64>| {
+        (
+            (p.x / CELL).floor() as i64,
+            (p.y / CELL).floor() as i64,
+            (p.z / CELL).floor() as i64,
+        )
+    };
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (j, p) in dst.iter().enumerate() {
+        grid.entry(key(p)).or_default().push(j);
+    }
+    let step = (src.len() / 4000).max(1);
+    let (mut sum, mut n) = (0.0, 0usize);
+    for p in src.iter().step_by(step) {
+        let q = sim.map_or(*p, |s| s.apply_point(p));
+        let (kx, ky, kz) = key(&q);
+        let mut best = CELL * CELL;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for &j in grid.get(&(kx + dx, ky + dy, kz + dz)).into_iter().flatten() {
+                        best = best.min((dst[j] - q).norm_squared());
+                    }
+                }
+            }
+        }
+        sum += best.sqrt();
+        n += 1;
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum / n as f64
+    }
+}
+
+/// ICP 보정이 점 겹침 잔차를 키우지 않는가(GPS 정상 대응 수만으로는 겹침이 나빠지는 보정을 못 거른다).
+fn overlap_not_worse(src: &[Vector3<f64>], dst: &[Vector3<f64>], sim: &Similarity) -> bool {
+    overlap_residual(src, dst, Some(sim)) <= overlap_residual(src, dst, None) + 1e-9
 }
 
 /// 보정 닮음 변환의 허용 범위: 규모 0.85~1.18, 회전 변화 20° 이내.
@@ -1440,7 +1488,6 @@ fn merge_detached_components(
     s: &mut Sparse,
     imgs: &[&ImgData],
     pm: &[PairMatch],
-    keep_edge: &[bool],
     rots: &[Option<Rotation3<f64>>],
     gps: &[Vector3<f64>],
     k: &Intrinsics,
@@ -1458,9 +1505,8 @@ fn merge_detached_components(
         x
     }
     let mut touched = vec![false; n];
-    // 회전 평균 뒤 가지치기는 주 성분 밖 사진의 간선을 모두 뺐으므로(`keep_edge`), 주 성분 밖 사진끼리의 짝을
+    // 회전 평균 뒤 가지치기는 주 성분 밖 사진의 간선을 모두 뺐으므로, 주 성분 밖 사진끼리의 짝을
     // 처음 거름(대응 수 하한)만 적용해 다시 모은다. 잘못된 짝은 부분 모델의 회전 평균이 따로 거른다.
-    let _ = keep_edge;
     let usable =
         |p: &PairMatch| rots[p.i].is_none() && rots[p.j].is_none() && p.inl.len() >= opts.min_inl;
     for p in pm.iter().filter(|p| usable(p)) {
@@ -1834,9 +1880,7 @@ fn sparse_init_with(
         );
     }
     if opts.merge_detached {
-        let merged = merge_detached_components(
-            &mut s, imgs, pm, &keep_edge, &rots, gps, k, method, tri, opts,
-        );
+        let merged = merge_detached_components(&mut s, imgs, pm, &rots, gps, k, method, tri, opts);
         if merged > 0 {
             s.rms = run_ba(&mut s, k, 10, Some(gps), 2.0, &[]);
             diag_poses("ba_merged", &s.poses);
@@ -4964,5 +5008,59 @@ mod detached_tests {
             // 점 겹침이 20 m 폭뿐인 약한 형상이라 회전은 4° 안(실측 약 2.9°)으로만 확인한다.
             assert!(dc < 1.0 && da < 4.0, "photo {i}: {dc} m {da} deg");
         }
+    }
+
+    #[test]
+    fn closed_form_roll_matches_half_degree_search() {
+        let axis = nalgebra::Unit::new_normalize(Vector3::new(1.0, 0.2, -0.1));
+        let cases = [
+            (Vector3::new(0.1, 0.3, 0.95), Vector3::new(-0.2, 0.9, 0.4)),
+            (Vector3::new(0.0, 0.0, 1.0), Vector3::new(0.0, 0.5, 0.86)),
+            (Vector3::new(0.3, -0.7, 0.6), Vector3::new(0.1, 0.2, -0.97)),
+            (Vector3::new(0.0, 1.0, 0.0), Vector3::new(0.0, 0.0, 1.0)),
+        ];
+        for (a, b) in cases {
+            let (n_sub, n_main) = (a.normalize(), b.normalize());
+            let mut best = (f64::INFINITY, 0.0);
+            for step in 0..720 {
+                let th = step as f64 * 0.5f64.to_radians();
+                let r = Rotation3::from_axis_angle(&axis, th);
+                let ang = (r * n_sub).dot(&n_main).clamp(-1.0, 1.0).acos();
+                if ang < best.0 {
+                    best = (ang, th);
+                }
+            }
+            let th = roll_about_axis(&axis, &n_sub, &n_main);
+            let r = Rotation3::from_axis_angle(&axis, th);
+            let ang = (r * n_sub).dot(&n_main).clamp(-1.0, 1.0).acos();
+            assert!(ang <= best.0 + 1e-9, "{ang} > {}", best.0);
+            let d = (th - best.1).rem_euclid(std::f64::consts::TAU);
+            let d = d.min(std::f64::consts::TAU - d);
+            assert!(
+                d <= 0.25f64.to_radians() + 1e-9,
+                "각 차 {} deg",
+                d.to_degrees()
+            );
+        }
+    }
+
+    #[test]
+    fn icp_that_raises_overlap_residual_is_rejected() {
+        // 이미 겹친 점(잔차 0)에 GPS 앵커를 한쪽으로 크게 당겨 ICP 가 점 겹침을 해치는 닮음 변환을 내게 만든다.
+        let dst = relief_points(0.0, 30.0);
+        let src: Vec<Vector3<f64>> = dst.iter().step_by(3).copied().collect();
+        let anchors: Vec<(Vector3<f64>, Vector3<f64>)> = (0..40)
+            .map(|a| {
+                let c = Vector3::new(a as f64, 28.0, 30.0);
+                (c, c + Vector3::new(2.5, 0.0, 0.0))
+            })
+            .collect();
+        let before = overlap_residual(&src, &dst, None);
+        assert!(before < 1e-6, "{before}");
+        let sim = icp_similarity(&src, &dst, &anchors).expect("icp");
+        assert!(overlap_residual(&src, &dst, Some(&sim)) > before);
+        assert!(!overlap_not_worse(&src, &dst, &sim));
+        // 변환 없음은 받아들인다.
+        assert!(overlap_not_worse(&src, &dst, &Similarity::identity()));
     }
 }
