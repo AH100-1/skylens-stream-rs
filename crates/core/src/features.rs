@@ -52,6 +52,35 @@ pub struct GrayImage {
 }
 
 impl GrayImage {
+    /// 2배 양선형 확대(화소 중심 정렬: 원래 (x,y) 는 확대 영상 (2x+0.5, 2y+0.5) 에 놓임).
+    pub fn upsample2(&self) -> Self {
+        let (w, h) = (self.width * 2, self.height * 2);
+        let mut out = Self::new(w, h);
+        let (mw, mh) = (self.width as isize - 1, self.height as isize - 1);
+        for y in 0..h {
+            let sy = (y as f32 + 0.5) / 2.0 - 0.5;
+            let y0 = sy.floor();
+            let fy = sy - y0;
+            let (ya, yb) = (
+                (y0 as isize).clamp(0, mh) as usize,
+                (y0 as isize + 1).clamp(0, mh) as usize,
+            );
+            for x in 0..w {
+                let sx = (x as f32 + 0.5) / 2.0 - 0.5;
+                let x0 = sx.floor();
+                let fx = sx - x0;
+                let (xa, xb) = (
+                    (x0 as isize).clamp(0, mw) as usize,
+                    (x0 as isize + 1).clamp(0, mw) as usize,
+                );
+                let top = self.at(xa, ya) * (1.0 - fx) + self.at(xb, ya) * fx;
+                let bot = self.at(xa, yb) * (1.0 - fx) + self.at(xb, yb) * fx;
+                out.data[y * w + x] = top * (1.0 - fy) + bot * fy;
+            }
+        }
+        out
+    }
+
     /// 0 으로 채운 영상. `width * height` 가 `usize` 를 넘으면 패닉한다.
     pub fn new(width: usize, height: usize) -> Self {
         let n = width
@@ -238,6 +267,11 @@ pub struct DetectorConfig {
     /// 주곡률 비 상한 r (가장자리 응답 제거, tr²/det < (r+1)²/r).
     pub edge_ratio: f32,
     pub max_features: usize,
+    /// 긴 변이 이 값 미만인 사진은 2배 양선형 확대 영상에서 검출한다(0 이면 끄기).
+    pub upscale_below: usize,
+    /// 참이면 긴 변이 `upscale_below` 미만인 사진에서 원래 검출 수와 상관없이 확대 특징을 상한까지 더한다.
+    /// 거짓(기본)이면 원래 검출이 상한의 절반 미만일 때만 채운다.
+    pub upscale_fill: bool,
 }
 
 impl Default for DetectorConfig {
@@ -249,6 +283,8 @@ impl Default for DetectorConfig {
             contrast: 0.01,
             edge_ratio: 10.0,
             max_features: 8192,
+            upscale_below: 800,
+            upscale_fill: false,
         }
     }
 }
@@ -549,10 +585,77 @@ fn describe_with(
 }
 
 /// DoG 극값 검출 + 방향 + 기술자. 입력은 이미 σ≈0.5 로 흐려진 영상으로 가정한다.
+///
+/// 긴 변이 `upscale_below` 미만이면서 원래 크기 검출이 목표 수(`max_features`)의 절반에 못 미칠 때만
+/// 2배 확대 영상(고유 흐림 σ≈1)에서도 검출해 모자란 만큼 채운다. 원래 크기 특징은 그대로 두고,
+/// 확대 쪽 특징은 원래 특징과 같은 자리(1 화소 이내·스케일비 1.5 이내)가 아닌 것만 응답 순으로 덧붙인다.
+/// 좌표·스케일은 원래 크기로 되돌리고 기술자는 확대 영상에서 같은 축척으로 계산한 값이다.
+/// (확대 쪽 특징으로 상위를 통째로 바꾸면 약한 특징이 강한 원래 특징을 밀어내 등록·포즈 정확도가 나빠졌다.)
 pub fn detect_and_describe(img: &GrayImage, cfg: &DetectorConfig) -> Vec<Feature> {
+    let mut feats = detect_core(img, cfg, 0.5);
+    if cfg.upscale_below == 0
+        || img.width.max(img.height) >= cfg.upscale_below
+        || feats.len() >= cfg.max_features
+        || (!cfg.upscale_fill && feats.len() * 2 >= cfg.max_features)
+    {
+        return feats;
+    }
+    let extra = detect_core(&img.upsample2(), cfg, 1.0);
+    let need = cfg.max_features - feats.len();
+    // 원래 특징을 격자(4 화소)에 넣어 이웃 조회.
+    let cell = 4.0f32;
+    let gw = (img.width as f32 / cell) as i64 + 2;
+    let gh = (img.height as f32 / cell) as i64 + 2;
+    let key = |x: f32, y: f32| {
+        (
+            ((x / cell).floor() as i64).clamp(-1, gw - 1),
+            ((y / cell).floor() as i64).clamp(-1, gh - 1),
+        )
+    };
+    type Spot = (f32, f32, f32);
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<Spot>> = Default::default();
+    for f in &feats {
+        grid.entry(key(f.kp.x, f.kp.y))
+            .or_default()
+            .push((f.kp.x, f.kp.y, f.kp.sigma));
+    }
+    let mut added = Vec::new();
+    for mut f in extra {
+        if added.len() >= need {
+            break;
+        }
+        // 확대 영상 화소 X 는 원래 영상 X/2 − 0.25 에 해당한다.
+        f.kp.x = f.kp.x / 2.0 - 0.25;
+        f.kp.y = f.kp.y / 2.0 - 0.25;
+        f.kp.sigma /= 2.0;
+        let (kx, ky) = key(f.kp.x, f.kp.y);
+        let dup = (kx - 1..=kx + 1).any(|i| {
+            (ky - 1..=ky + 1).any(|j| {
+                grid.get(&(i, j)).is_some_and(|v| {
+                    v.iter().any(|&(x, y, s)| {
+                        let r = (s / f.kp.sigma).max(f.kp.sigma / s);
+                        (x - f.kp.x).hypot(y - f.kp.y) <= 1.0 && r <= 1.5
+                    })
+                })
+            })
+        });
+        if !dup {
+            added.push(f);
+        }
+    }
+    feats.extend(added);
+    feats
+}
+
+fn detect_core(img: &GrayImage, cfg: &DetectorConfig, in_sigma: f32) -> Vec<Feature> {
     let s = cfg.scales;
     let kstep = 2f32.powf(1.0 / s as f32);
-    let mut base = gaussian_blur(img, (cfg.sigma0 * cfg.sigma0 - 0.25).max(0.01).sqrt());
+    let mut base = gaussian_blur(
+        img,
+        (cfg.sigma0 * cfg.sigma0 - in_sigma * in_sigma)
+            .max(0.01)
+            .sqrt(),
+    );
     let mut out = Vec::new();
     for o in 0..cfg.octaves {
         if base.width < 16 || base.height < 16 {
@@ -866,11 +969,13 @@ mod tests {
     /// 최근접/차근접 비율 검사 매칭 → (정답 2 px 이내 비율, 매칭 수, 원본 특징 수).
     fn match_accuracy(th: f32, sc: f32) -> (f32, usize, usize) {
         let (w, h) = (240usize, 240usize);
-        let a = detect_and_describe(
-            &texture_warped(w, h, 7, 0.0, 1.0),
-            &DetectorConfig::default(),
-        );
-        let b = detect_and_describe(&texture_warped(w, h, 7, th, sc), &DetectorConfig::default());
+        // 확대 없이 기술자 자체의 회전·축척 불변성을 본다.
+        let cfg = DetectorConfig {
+            upscale_below: 0,
+            ..DetectorConfig::default()
+        };
+        let a = detect_and_describe(&texture_warped(w, h, 7, 0.0, 1.0), &cfg);
+        let b = detect_and_describe(&texture_warped(w, h, 7, th, sc), &cfg);
         let (c, s) = (th.cos(), th.sin());
         let (mut good, mut n) = (0, 0);
         for fa in &a {
@@ -1126,5 +1231,105 @@ mod tests {
         );
         assert!(detect(&img, &DetectorConfig::default()).is_empty());
         assert!(detect_and_describe(&img, &DetectorConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn small_image_upscaled_keeps_original_coords() {
+        // 240x160 영상에 부화소 중심의 가우시안 덩어리 6x4 개. 확대 검출 결과 좌표는
+        // 원래 영상 범위 안이고, 덩어리 중심(정답)에서 1 px 이내에 점이 있어야 한다.
+        let (w, h) = (240usize, 160usize);
+        let centers: Vec<(f32, f32)> = (0..6)
+            .flat_map(|i| (0..4).map(move |j| (20.3 + 40.0 * i as f32, 20.7 + 40.0 * j as f32)))
+            .collect();
+        let mut img = GrayImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let mut v = 0.2;
+                for &(cx, cy) in &centers {
+                    let r2 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
+                    v += 0.5 * (-r2 / (2.0 * 3.0 * 3.0)).exp();
+                }
+                img.data[y * w + x] = v;
+            }
+        }
+        let off = DetectorConfig {
+            upscale_below: 0,
+            ..DetectorConfig::default()
+        };
+        let a = detect_and_describe(&img, &off);
+        let b = detect_and_describe(&img, &DetectorConfig::default());
+        eprintln!("upscale off {} on {}", a.len(), b.len());
+        assert!(b.len() >= centers.len(), "확대 검출 수 {}", b.len());
+        assert!(b
+            .iter()
+            .all(|f| (0.0..w as f32).contains(&f.kp.x) && (0.0..h as f32).contains(&f.kp.y)));
+        let near = centers
+            .iter()
+            .filter(|&&(cx, cy)| {
+                b.iter()
+                    .any(|f| ((f.kp.x - cx).powi(2) + (f.kp.y - cy).powi(2)).sqrt() <= 1.0)
+            })
+            .count();
+        assert_eq!(
+            near,
+            centers.len(),
+            "중심 1 px 이내 {near}/{}",
+            centers.len()
+        );
+    }
+
+    #[test]
+    fn small_image_upscaled_detects_more_on_textured_scene() {
+        // 합성 장면 한 장(320x240): 확대 검출 수가 끔 검출 수보다 많아야 한다.
+        let img = scene_image(320, 240);
+        let off = DetectorConfig {
+            upscale_below: 0,
+            ..DetectorConfig::default()
+        };
+        let a = detect_and_describe(&img, &off);
+        let b = detect_and_describe(&img, &DetectorConfig::default());
+        eprintln!("scene 320x240 upscale off {} on {}", a.len(), b.len());
+        assert!(b.len() > a.len(), "확대 {} <= 끔 {}", b.len(), a.len());
+    }
+
+    #[test]
+    fn upscale_fill_adds_features_only_when_requested() {
+        // 원래 검출이 상한의 절반 이상이면 기본은 확대 특징을 더하지 않고, upscale_fill 은 상한까지 더한다.
+        let img = scene_image(320, 240);
+        let off = DetectorConfig {
+            upscale_below: 0,
+            ..DetectorConfig::default()
+        };
+        let a = detect_and_describe(&img, &off);
+        let cap = a.len() * 3 / 2;
+        let dflt = DetectorConfig {
+            max_features: cap,
+            ..DetectorConfig::default()
+        };
+        let fill = DetectorConfig {
+            upscale_fill: true,
+            ..dflt
+        };
+        let d = detect_and_describe(&img, &dflt);
+        let f = detect_and_describe(&img, &fill);
+        eprintln!(
+            "orig {} cap {} default {} fill {}",
+            a.len(),
+            cap,
+            d.len(),
+            f.len()
+        );
+        assert_eq!(d.len(), a.len());
+        assert!(f.len() > a.len() && f.len() <= cap);
+        // 원래 크기 특징은 그대로 앞에 남는다.
+        for (x, y) in a.iter().zip(&f) {
+            assert_eq!((x.kp.x, x.kp.y), (y.kp.x, y.kp.y));
+        }
+        // 긴 변이 upscale_below 이상이면 켜도 바뀌지 않는다.
+        let big = DetectorConfig {
+            upscale_below: 300,
+            ..fill
+        };
+        assert_eq!(detect_and_describe(&img, &big).len(), a.len().min(cap));
     }
 }
