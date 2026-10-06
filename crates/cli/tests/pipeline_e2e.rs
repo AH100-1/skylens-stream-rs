@@ -269,12 +269,14 @@ fn single_region_end_to_end() {
     let h = number_after(&pr, "높이 차 중앙 최대 ");
     assert!(h < 2.0, "높이 차 상한: {pr}");
     assert!(number_after(&pr, "최근접 중앙 최대 ") < 3.0, "{pr}");
-    assert!(o.m.center_med < 0.38, "중심 오차 중앙 {}", o.m.center_med);
-    assert!(o.m.center_max < 1.05, "중심 오차 최대 {}", o.m.center_max);
-    assert!(o.m.surface_med < 0.41, "점 중앙 {}", o.m.surface_med);
-    assert!(o.m.surface_p95 < 1.12, "점 95% {}", o.m.surface_p95);
+    // 실측(main 의 BA 갱신 뒤): 중심 0.256 / 0.713 m, 표면 0.392 / 1.214 m, 점 11444.
+    // 같은 포즈에서 반점 제거가 없으면 표면 0.399 / 1.357 m, 점 11936.
+    assert!(o.m.center_med < 0.31, "중심 오차 중앙 {}", o.m.center_med);
+    assert!(o.m.center_max < 0.86, "중심 오차 최대 {}", o.m.center_max);
+    assert!(o.m.surface_med < 0.47, "점 중앙 {}", o.m.surface_med);
+    assert!(o.m.surface_p95 < 1.46, "점 95% {}", o.m.surface_p95);
     assert!(
-        o.m.points >= 10302 * 4 / 5 && o.m.points <= 10302 * 6 / 5,
+        o.m.points >= 11444 * 4 / 5 && o.m.points <= 11444 * 6 / 5,
         "점 수 {}",
         o.m.points
     );

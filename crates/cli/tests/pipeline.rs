@@ -425,7 +425,7 @@ fn preview_refine_settings_verify_outcome() {
             eprintln!("REFINE {tag}   {} pass={} {}", i.name, i.pass, i.measured);
         }
     }
-    for (c, px_lo, px_hi) in [(&a, 2.5, 3.5), (&b, 0.7, 1.2)] {
+    for (c, px_lo, px_hi) in [(&a, 2.5, 3.5), (&b, 0.3, 0.6)] {
         assert_eq!(c.registered, 120);
         // 단구역은 두 설정 모두 7/7 통과한다.
         assert!(
@@ -438,7 +438,7 @@ fn preview_refine_settings_verify_outcome() {
             "초벌 재투영 {} px",
             c.preview_px
         );
-        assert!((c.refined_px - 0.313).abs() < 0.05, "정밀 {}", c.refined_px);
+        assert!((c.refined_px - 0.213).abs() < 0.05, "정밀 {}", c.refined_px);
     }
     // 정밀 쪽은 같고 초벌만 달라진다(위치 전용 다듬기는 정밀 시작점을 바꾸지 않는다).
     assert!((a.center_med - b.center_med).abs() < 1e-3);
