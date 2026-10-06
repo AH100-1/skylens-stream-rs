@@ -481,6 +481,16 @@ fn displacement_outliers(
     kp_a: &[Vector2<f64>],
     kp_b: &[Vector2<f64>],
 ) -> Vec<bool> {
+    displacement_outliers_with_floor(matches, kp_a, kp_b, DISPLACEMENT_FLOOR)
+}
+
+/// `displacement_outliers` 와 같되 잔차 문턱 하한 비율을 인자로 받는다(시험에서 하한을 바꿔 볼 때 쓴다).
+fn displacement_outliers_with_floor(
+    matches: &[(usize, usize)],
+    kp_a: &[Vector2<f64>],
+    kp_b: &[Vector2<f64>],
+    floor: f64,
+) -> Vec<bool> {
     let mut out = vec![false; matches.len()];
     if matches.len() < 8 {
         return out;
@@ -617,7 +627,7 @@ fn displacement_outliers(
                 };
                 // 대상 점은 u = 0, 변위 0(뺀 값)이므로 예측 (f[0], f[3]) 가 곧 어긋남이다.
                 let r = (f[0] * f[0] + f[3] * f[3]).sqrt();
-                r > (4.0 * s).clamp(tol * DISPLACEMENT_FLOOR, 3.0 * tol)
+                r > (4.0 * s).clamp(tol * floor, 3.0 * tol)
             },
         )
         .collect();
@@ -1910,5 +1920,187 @@ mod tests {
         }
         eprintln!("uniform {:.4} s clumped {:.4} s", times[0], times[1]);
         assert!(times[1] <= 8.0 * times[0] + 0.05, "{times:?}");
+    }
+
+    /// F-382: 참 대응만(오대응 0) 있는 합성 대응 장면. `boxes` 가 참이면 지형 위에 5~15 m 높이 상자 10 개를
+    /// 더해 건물 모서리 같은 시차 단차를 만든다(꼭대기 면 점만 표본, 벽 점은 없음). 거짓이면 지형만(완만).
+    /// 영상마다 더 가까운 점이 2 화소 안에 있는 점은 가려진 것으로 보고 뺀다. 같은 정답 점의 두 영상 특징을 모두 잇는다.
+    fn step_scene(boxes: bool, keep_percent: u64, opts: &SceneOpts) -> Synthetic {
+        let scene = Scene::new(SceneConfig {
+            positions: opts.positions,
+            width: opts.width,
+            height: opts.height,
+            ..SceneConfig::default()
+        });
+        let x_end = 40.0 + opts.positions.saturating_sub(12) as f64;
+        // 상자: x 를 따라 좌우로 번갈아, 한 변 5~9 m, 높이 5~15 m.
+        let mut bx: Vec<(f64, f64, f64, f64, f64)> = Vec::new();
+        if boxes {
+            for i in 0..10u64 {
+                let h = hash(i + 0x57E9);
+                let u = |s: u32| ((h >> s) & 0xFFFF) as f64 / 65535.0;
+                let cx = -4.0 + (x_end + 8.0) * (i as f64 + 0.5) / 10.0;
+                let cy = if i % 2 == 0 { 1.0 } else { -1.0 } * (4.0 + 10.0 * u(0));
+                let half = 2.5 + 2.0 * u(16);
+                bx.push((cx, cy, half, half, 5.0 + 10.0 * u(32)));
+            }
+        }
+        let mut points = Vec::new();
+        let mut x = -10.0;
+        while x <= x_end {
+            let mut y = -30.0;
+            while y <= 30.0 {
+                let mut z = crate::synth::terrain_height(x, y);
+                for &(cx, cy, hx, hy, top) in &bx {
+                    if (x - cx).abs() <= hx && (y - cy).abs() <= hy {
+                        z = z.max(top);
+                    }
+                }
+                points.push(Point3::new(x, y, z));
+                y += 1.5;
+            }
+            x += 1.5;
+        }
+        let nv = scene.views.len();
+        let mut keypoints = vec![Vec::new(); nv];
+        let mut gt = vec![Vec::new(); nv];
+        let mut feat_of: Vec<HashMap<usize, usize>> = vec![HashMap::new(); nv];
+        for (i, v) in scene.views.iter().enumerate() {
+            let mut vis: Vec<(u64, usize, Vector2<f64>, f64)> = Vec::new();
+            for (p, x) in points.iter().enumerate() {
+                if let Some(px) = v.camera.project(x) {
+                    if v.camera.intrinsics.contains(&px) {
+                        let depth = v.camera.pose.transform(x).z;
+                        vis.push((hash((i as u64) << 32 | p as u64), p, px, depth));
+                    }
+                }
+            }
+            // 가림: 2 화소 칸(이웃 칸 포함)에 더 가까운 점이 있으면 뺀다.
+            let cell = |q: &Vector2<f64>| ((q.x / 2.0).floor() as i64, (q.y / 2.0).floor() as i64);
+            type Cell = (i64, i64);
+            type Seen = Vec<(Vector2<f64>, f64)>;
+            let mut near: HashMap<Cell, Seen> = HashMap::new();
+            for e in &vis {
+                near.entry(cell(&e.2)).or_default().push((e.2, e.3));
+            }
+            vis.retain(|e| {
+                let (cx, cy) = cell(&e.2);
+                !(cx - 1..=cx + 1).any(|gx| {
+                    (cy - 1..=cy + 1).any(|gy| {
+                        near.get(&(gx, gy)).is_some_and(|v| {
+                            v.iter()
+                                .any(|(q, d)| (q - e.2).norm() <= 2.0 && *d < e.3 - 0.5)
+                        })
+                    })
+                })
+            });
+            vis.sort_unstable_by_key(|e| e.0);
+            for (f, &(_, p, px, _)) in vis.iter().enumerate() {
+                keypoints[i].push(px);
+                gt[i].push(p);
+                feat_of[i].insert(p, f);
+            }
+        }
+        let cam_index = |c: CamId| CamId::ALL.iter().position(|&a| a == c).unwrap();
+        let views: Vec<(usize, usize)> = scene
+            .views
+            .iter()
+            .map(|v| (cam_index(v.cam), v.position))
+            .collect();
+        let cand = if opts.formation_pairs {
+            scheduled_pairs(&views, &PairSchedule::default())
+        } else {
+            candidate_pairs(&views, 5, 4, 16)
+        };
+        let mut pairs = Vec::new();
+        let mut inliers = 0;
+        for (a, b) in cand {
+            let m: Vec<(usize, usize)> = gt[a]
+                .iter()
+                .enumerate()
+                .filter_map(|(fa, &p)| feat_of[b].get(&p).map(|&fb| (fa, fb, p)))
+                .filter(|&(_, _, p)| {
+                    hash((a as u64) << 44 | (b as u64) << 24 | p as u64 | 1 << 63) % 100
+                        < keep_percent
+                })
+                .map(|(fa, fb, _)| (fa, fb))
+                .collect();
+            if m.len() < 16 {
+                continue;
+            }
+            inliers += m.len();
+            pairs.push(PairMatches {
+                image_a: a,
+                image_b: b,
+                matches: m,
+            });
+        }
+        Synthetic {
+            keypoints,
+            gt,
+            pairs,
+            outliers: 0,
+            inliers,
+        }
+    }
+
+    /// 하한 `floor` 에서 짝 종류별(같은 카메라, 카메라 간) 거른 참 대응 (거름, 전체).
+    fn floor_drop_counts(s: &Synthetic, floor: f64) -> [(usize, usize); 2] {
+        let mut r = [(0usize, 0usize); 2];
+        for p in &s.pairs {
+            let kind = (p.image_a % 3 != p.image_b % 3) as usize;
+            let flags = displacement_outliers_with_floor(
+                &p.matches,
+                &s.keypoints[p.image_a],
+                &s.keypoints[p.image_b],
+                floor,
+            );
+            for (&(fa, fb), &bad) in p.matches.iter().zip(&flags) {
+                if s.gt[p.image_a][fa] == s.gt[p.image_b][fb] {
+                    r[kind].0 += bad as usize;
+                    r[kind].1 += 1;
+                }
+            }
+        }
+        r
+    }
+
+    /// F-382: 높이 단차 장면과 완만한 장면에서 하한 1.0/0.25 의 참 대응 거름 비율.
+    #[test]
+    fn displacement_floor_on_depth_step_scene() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        let mut failures = Vec::new();
+        for keep in [100u64, 40] {
+            for (name, boxes) in [("flat", false), ("step", true)] {
+                let s = step_scene(boxes, keep, &opts);
+                let hi = floor_drop_counts(&s, 1.0);
+                let lo = floor_drop_counts(&s, 0.25);
+                for (k, kind) in ["same", "cross"].into_iter().enumerate() {
+                    let (rh, rl) = (
+                        hi[k].0 as f64 / hi[k].1.max(1) as f64,
+                        lo[k].0 as f64 / lo[k].1.max(1) as f64,
+                    );
+                    eprintln!(
+                        "keep {keep} {name} {kind}: floor 1.0 {}/{} ({:.4}) floor 0.25 {}/{} ({:.4}) delta {:+.4}",
+                        hi[k].0, hi[k].1, rh, lo[k].0, lo[k].1, rl, rl - rh
+                    );
+                    // 하한 0.25 의 거름 증가는 1.0 대비 1%p 이하, 절대값은 측정값(평지 0.2%, 단차 같은 카메라
+                    // 2.1%, 단차 카메라 간 8%) 아래여야 한다.
+                    let cap = match (boxes, k) {
+                        (false, _) => 0.002,
+                        (true, 0) => 0.021,
+                        (true, _) => 0.08,
+                    };
+                    if rl - rh > 0.01 || rl > cap {
+                        failures.push(format!("keep {keep} {name} {kind}: {rh} -> {rl}"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
     }
 }
