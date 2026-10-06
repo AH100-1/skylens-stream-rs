@@ -34,6 +34,7 @@ fn default_path_seed_verify() {
         if l.starts_with("diag gps_align")
             || l.starts_with("diag align roll")
             || l.starts_with("diag detached")
+            || l.starts_with("diag rig")
             || l.starts_with("diag align region")
         {
             eprintln!("{l}");

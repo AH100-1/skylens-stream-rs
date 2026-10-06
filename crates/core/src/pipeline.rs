@@ -929,6 +929,9 @@ pub struct PreviewOpts {
     pub refine_iters: usize,
     /// 떨어진 성분의 부분 모델에만 쓰는 위치 다듬기 반복 수. None 이면 `refine_iters` 를 따른다.
     pub detached_refine_iters: Option<usize>,
+    /// 장착(rig) 상대 회전: 카메라 번호별 (카메라 0 기준) 상대 회전. 있으면 떨어진 성분 붙이기의 롤을
+    /// 같은 위치의 주 모델 사진과의 장착 관계로 정한다. 없으면 바닥 법선으로 정한다.
+    pub rig_rel: Option<[Option<Rotation3<f64>>; 3]>,
     /// 다듬기 Huber 문턱(도).
     pub refine_huber_deg: f64,
     /// 다듬기 바깥 관측 제거 각(도), 두 번째 바퀴부터.
@@ -953,6 +956,7 @@ impl Default for PreviewOpts {
             merge_detached: true,
             refine_iters: 0,
             detached_refine_iters: None,
+            rig_rel: None,
             refine_huber_deg: 0.3,
             refine_drop_deg: 2.0,
             refine_anchor: 0.02,
@@ -1228,7 +1232,12 @@ fn ground_normal(points: &[Vector3<f64>]) -> Option<Vector3<f64>> {
 /// 상태지만 직선 비행에서는 비행 축 둘레 회전이 정해지지 않으므로, 두 모델의 바닥 평면 법선이 같도록 축 둘레
 /// 회전을 고른 뒤 GPS 중심으로 이동(과 규모는 그대로)을 맞춘다. 반환: (GPS 정상 대응 수, 정상 대응 잔차 중앙값 m).
 /// 사진이 6장 미만이거나 GPS 정상 대응이 3 미만이면 붙이지 않고 None.
-fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Option<(usize, f64)> {
+fn attach_detached(
+    s: &mut Sparse,
+    mut sub: Sparse,
+    gps: &[Vector3<f64>],
+    rig_targets: &[(usize, Rotation3<f64>)],
+) -> Option<(usize, f64)> {
     let ids: Vec<usize> = (0..sub.poses.len())
         .filter(|&i| sub.poses[i].is_some() && s.poses[i].is_none())
         .collect();
@@ -1241,6 +1250,7 @@ fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Opt
         .collect();
     let mean = cen.iter().sum::<Vector3<f64>>() / cen.len() as f64;
     // 롤: 비행 축(중심 주성분) 둘레로 돌려 바닥 법선을 주 모델 것에 맞춘다.
+    let mut roll_axis = None;
     if let (Some(n_main), Some(n_sub)) = (ground_normal(&s.points), ground_normal(&sub.points)) {
         let mut cov = Matrix3::zeros();
         for c in &cen {
@@ -1249,7 +1259,17 @@ fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Opt
         let eig = nalgebra::SymmetricEigen::new(cov);
         let mx = (0..3).max_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))?;
         let axis = nalgebra::Unit::new_normalize(eig.eigenvectors.column(mx).into_owned());
-        let th = roll_about_axis(&axis, &n_sub, &n_main);
+        roll_axis = Some(axis);
+        let th_rig = roll_from_rig(&axis, &sub, rig_targets);
+        let th_n = roll_about_axis(&axis, &n_sub, &n_main);
+        if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+            eprintln!(
+                "diag rig roll_deg rig {:?} normal {:.2}",
+                th_rig.map(|t| t.to_degrees()),
+                th_n.to_degrees()
+            );
+        }
+        let th = th_rig.unwrap_or(th_n);
         let r = Rotation3::from_axis_angle(&axis, th);
         let sim = Similarity {
             s: 1.0,
@@ -1314,6 +1334,28 @@ fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Opt
             apply_sparse_sim(&mut sub, &sim);
         }
     }
+    // 닮음 보정이 회전을 다시 돌렸을 수 있으므로, 장착 관계가 있으면 롤을 한 번 더 맞춘다.
+    if let Some(axis) = roll_axis {
+        if let Some(th) = roll_from_rig(&axis, &sub, rig_targets) {
+            let m = ids
+                .iter()
+                .map(|&i| sub.poses[i].unwrap().center().coords)
+                .sum::<Vector3<f64>>()
+                / ids.len() as f64;
+            let r = Rotation3::from_axis_angle(&axis, th);
+            apply_sparse_sim(
+                &mut sub,
+                &Similarity {
+                    s: 1.0,
+                    r,
+                    t: m - r * m,
+                },
+            );
+            if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+                eprintln!("diag rig post_icp roll_deg {:.2}", th.to_degrees());
+            }
+        }
+    }
     let mut res: Vec<f64> = ids
         .iter()
         .map(|&i| (sub.poses[i].unwrap().center().coords - gps[i]).norm())
@@ -1330,6 +1372,110 @@ fn attach_detached(s: &mut Sparse, mut sub: Sparse, gps: &[Vector3<f64>]) -> Opt
     s.obs.extend(sub.obs);
     s.ba_only.extend(sub.ba_only);
     Some((res.len(), res[res.len() / 2]))
+}
+
+/// 장착 관계로 정한 목표 자세(`rig_targets`: 사진 번호, 목표 회전)에 부분 모델 `sub` 의 사진 회전을 가장 가깝게
+/// 하는, 축 `axis` 둘레 회전각(rad). 목표가 3개 미만이면 None. 각 거리의 합(L1)을 0.1도 간격으로 훑어 고른다.
+fn roll_from_rig(
+    axis: &nalgebra::Unit<Vector3<f64>>,
+    sub: &Sparse,
+    rig_targets: &[(usize, Rotation3<f64>)],
+) -> Option<f64> {
+    let pairs: Vec<(Rotation3<f64>, Rotation3<f64>)> = rig_targets
+        .iter()
+        .filter_map(|(i, t)| sub.poses[*i].map(|p| (p.rotation, *t)))
+        .collect();
+    if pairs.len() < 3 {
+        return None;
+    }
+    let cost = |th: f64| -> f64 {
+        let inv = Rotation3::from_axis_angle(axis, th).inverse();
+        pairs
+            .iter()
+            .map(|(r, t)| (r * inv).rotation_to(t).angle())
+            .sum::<f64>()
+    };
+    let n = 3600;
+    let mut best = (f64::INFINITY, 0.0);
+    for k in 0..n {
+        let th = -std::f64::consts::PI + std::f64::consts::TAU * k as f64 / n as f64;
+        let c = cost(th);
+        if c < best.0 {
+            best = (c, th);
+        }
+    }
+    Some(best.1)
+}
+
+/// 회전들의 평균(쿼터니언 외적 행렬의 최대 고유벡터, 교과서 방식). 평균에서 가장 먼 쪽 절반 밖의 이상값
+/// (중앙 각거리의 3배 초과)을 한 번 빼고 다시 평균한다. 비어 있으면 None.
+fn mean_rotation(rs: &[Rotation3<f64>]) -> Option<Rotation3<f64>> {
+    fn avg(rs: &[Rotation3<f64>]) -> Rotation3<f64> {
+        let mut m = nalgebra::Matrix4::zeros();
+        for r in rs {
+            let q = nalgebra::UnitQuaternion::from_rotation_matrix(r);
+            m += q.coords * q.coords.transpose();
+        }
+        let eig = nalgebra::SymmetricEigen::new(m);
+        let k = (0..4)
+            .max_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]))
+            .unwrap_or(0);
+        let v = eig.eigenvectors.column(k).into_owned();
+        nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::from(v))
+            .to_rotation_matrix()
+    }
+    if rs.is_empty() {
+        return None;
+    }
+    let m0 = avg(rs);
+    let mut d: Vec<f64> = rs.iter().map(|r| r.rotation_to(&m0).angle()).collect();
+    let mut sd = d.clone();
+    sd.sort_by(f64::total_cmp);
+    let thr = (3.0 * sd[sd.len() / 2]).max(1.0_f64.to_radians());
+    let keep: Vec<Rotation3<f64>> = rs
+        .iter()
+        .zip(d.drain(..))
+        .filter(|(_, a)| *a <= thr)
+        .map(|(r, _)| *r)
+        .collect();
+    Some(if keep.is_empty() { m0 } else { avg(&keep) })
+}
+
+/// 모델 `s` 에서 같은 위치의 카메라 0 과 카메라 c(1, 2) 가 모두 등록된 곳의 상대 회전 `R_c R_0^T` 표본을
+/// `samples[c]` 에 보탠다. `views` 는 사진별 (카메라, 위치).
+fn collect_rig_samples(
+    s: &Sparse,
+    views: &[(usize, usize)],
+    samples: &mut [Vec<Rotation3<f64>>; 3],
+) {
+    let mut by_pos: BTreeMap<usize, [Option<Rotation3<f64>>; 3]> = BTreeMap::new();
+    for (i, &(c, p)) in views.iter().enumerate() {
+        if c < 3 {
+            if let Some(pose) = s.poses[i] {
+                by_pos.entry(p).or_default()[c] = Some(pose.rotation);
+            }
+        }
+    }
+    for rs in by_pos.values() {
+        if let Some(r0) = rs[0] {
+            for c in 1..3 {
+                if let Some(rc) = rs[c] {
+                    samples[c].push(rc * r0.inverse());
+                }
+            }
+        }
+    }
+}
+
+/// 표본에서 카메라별 장착 상대 회전을 낸다(카메라 0 은 항상 항등, 표본이 3개 미만인 카메라는 None).
+fn rig_from_samples(samples: &[Vec<Rotation3<f64>>; 3]) -> [Option<Rotation3<f64>>; 3] {
+    let mut out = [Some(Rotation3::identity()), None, None];
+    for c in 1..3 {
+        if samples[c].len() >= 3 {
+            out[c] = mean_rotation(&samples[c]);
+        }
+    }
+    out
 }
 
 /// 축 `axis` 둘레로 `n_sub` 를 돌려 `n_main` 에 가장 가깝게 만드는 각(rad): 두 법선에서 축 성분을 뺀 벡터 사이의 부호 있는 각.
@@ -1526,6 +1672,11 @@ fn merge_detached_components(
         comps.entry(r).or_default().push(v);
     }
     let diag = std::env::var("SKYLENS_REGION_DIAG").is_ok();
+    let mut view_of: HashMap<usize, (usize, usize)> = HashMap::new();
+    for p in pm {
+        view_of.insert(p.i, p.views.0);
+        view_of.insert(p.j, p.views.1);
+    }
     let mut merged = 0;
     for comp in comps.values() {
         if comp.len() < DETACHED_MIN_PHOTOS {
@@ -1590,8 +1741,34 @@ fn merge_detached_components(
             }
         }
         let cams: Vec<usize> = comp.iter().map(|&i| imgs_cam(pm, i)).collect();
-        let res = attach_detached(s, full, gps);
+        let mut rig_targets: Vec<(usize, Rotation3<f64>)> = Vec::new();
+        if let Some(rig) = &opts.rig_rel {
+            for &i in comp {
+                let Some(&(ci, pi)) = view_of.get(&i) else {
+                    continue;
+                };
+                let Some(rci) = rig.get(ci).copied().flatten() else {
+                    continue;
+                };
+                let partner = (0..n).find_map(|j| {
+                    let &(cj, pj) = view_of.get(&j)?;
+                    let rcj = rig.get(cj).copied().flatten()?;
+                    let pose = s.poses[j].as_ref()?;
+                    (pj == pi && cj != ci).then(|| rci * rcj.inverse() * pose.rotation)
+                });
+                if let Some(t) = partner {
+                    rig_targets.push((i, t));
+                }
+            }
+        }
+        let res = attach_detached(s, full, gps, &rig_targets);
         if diag {
+            eprintln!(
+                "diag rig targets {} of {} rig {:?}",
+                rig_targets.len(),
+                comp.len(),
+                opts.rig_rel.map(|r| r.map(|x| x.is_some()))
+            );
             match res {
                 Some((ok, med)) => eprintln!(
                     "diag detached size {} cams {:?} attached gps_ok {} resid_med {:.3}",
@@ -2976,6 +3153,7 @@ pub fn run_pipeline_with(
         Ok(())
     };
 
+    let mut rig_samples: [Vec<Rotation3<f64>>; 3] = Default::default();
     for r in &regions {
         // 끝난 정밀 결과를 먼저 반영해 이번 등록·정렬이 최신 모델을 기준으로 삼게 한다.
         while let Ok(m) = rx.try_recv() {
@@ -3155,6 +3333,19 @@ pub fn run_pipeline_with(
         };
         // 초벌(미리보기)은 위의 광축 높이 분산 롤을 쓰고, 정밀 BA 시작점만 예전 롤 규칙으로 따로 만든다.
         let coarse_start = start;
+        // 장착 상대 회전은 모든 위치·구역에서 같다: 초벌 모델에서 지금까지 모은 표본의 평균을 정밀 시작에 물려준다.
+        collect_rig_samples(&coarse_start, &views, &mut rig_samples);
+        let rig = rig_from_samples(&rig_samples);
+        if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+            eprintln!(
+                "diag rig region {} samples {:?} rel_deg {:?}",
+                r.index,
+                rig_samples.iter().map(|v| v.len()).collect::<Vec<_>>(),
+                rig.iter()
+                    .map(|x| x.map(|q| q.angle().to_degrees()))
+                    .collect::<Vec<_>>()
+            );
+        }
         diag_set(r.index, &gids, "start");
         let start = sparse_init_with(
             &imgs,
@@ -3168,6 +3359,7 @@ pub fn run_pipeline_with(
                 legacy_roll: false,
                 pair_vote: cfg.pair_vote,
                 detached_refine_iters: Some(cfg.preview_refine_iters),
+                rig_rel: Some(rig),
                 ..PreviewOpts::default()
             },
         )
@@ -4920,7 +5112,7 @@ mod detached_tests {
     #[test]
     fn detached_component_attaches_within_one_meter_and_two_degrees() {
         let (mut main, sub, gps) = setup(12);
-        let (ok, med) = attach_detached(&mut main, sub, &gps).expect("attached");
+        let (ok, med) = attach_detached(&mut main, sub, &gps, &[]).expect("attached");
         assert!(ok >= 10 && med < 1.0, "{ok} {med}");
         for i in 10..22 {
             let p = main.poses[i].expect("pose");
@@ -4934,14 +5126,14 @@ mod detached_tests {
     #[test]
     fn too_few_photos_or_gps_inliers_are_not_attached() {
         let (mut main, sub, gps) = setup(5);
-        assert!(attach_detached(&mut main, sub, &gps).is_none());
+        assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
         // GPS 정상 대응 2 개뿐: 나머지는 50 m 어긋남.
         let (mut main, sub, mut gps) = setup(12);
         for g in gps.iter_mut().skip(12) {
             g.y += 50.0 + g.x;
         }
-        assert!(attach_detached(&mut main, sub, &gps).is_none());
+        assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
         assert_eq!(main.points.len(), 30);
     }
@@ -5001,7 +5193,7 @@ mod detached_tests {
             },
         );
         let gps: Vec<Vector3<f64>> = (0..total).map(center).collect();
-        attach_detached(&mut main, sub, &gps).expect("attached");
+        attach_detached(&mut main, sub, &gps, &[]).expect("attached");
         let c = |i: usize| main.poses[i].unwrap().center().coords;
         let scale = (c(21) - c(10)).norm() / (center(21) - center(10)).norm();
         assert!((scale - 1.0).abs() < 0.02, "scale {scale}");
