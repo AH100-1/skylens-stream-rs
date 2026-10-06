@@ -5,6 +5,15 @@
 //!   임계 = max(3 × 잔차 중앙값, 바닥값).
 //! - [`gps_align`]: 카메라 중심을 GPS(동-북-위)에 1회 정렬, 잔차 3 m(또는 잡음 비례) 초과 대응
 //!   제외. 연직축 고정([`similarity_fixed_up`])·경로 폭 판정 포함.
+//!
+//! 호출 규약: 제품 경로(`sparse.rs` 의 GPS 정렬 두 곳)는 정밀 포즈 회전에서
+//! [`up_from_rotations`] 로 위 방향을 구해 `GpsAlignConfig::up` 에 넣고 [`align_to_enu_with`]
+//! 를 부른다(`gps_align_poses` 와 같은 구성이며 그 함수 자체는 파이프라인에서 쓰이지 않는다).
+//! SPEC §1 실측 편대(약 10 m 삼각형)의 둘째 주축 표준편차는 실제 배치(`SceneConfig::default()`)
+//! 에서 약 4.3 m, 시험 띠(AB 가 진행 방향과 나란한 배치)에서 약 4.4 m(GPS 잡음 σ 1 m 를 더하면
+//! 약 4.5 m)로 경로 폭 문턱(5 m)보다 0.6~0.7 m 좁다. 이 배치·잡음에서는 위 방향 없는
+//! [`gps_align`]·[`align_to_enu`] 가 `None` 이지만, 오프셋이 +10% 쯤 커지고 잡음 σ 1.5 m 가
+//! 겹치면 문턱에 닿으므로 판정에 기대지 말고 편대는 위 방향을 주는 경로로 정렬한다.
 
 use crate::geo::{geodetic_to_enu, Geodetic};
 use crate::math::{Matrix3, Vector3};
@@ -1101,19 +1110,137 @@ mod tests {
         v
     }
 
-    /// 실측 편대 띠: 위치 80곳 × 0.97 m 진행, 드론 3대 10 m 횡 간격, 고도 100 m ± 0.5 m.
+    /// SPEC §1 실측 편대 띠: 위치 80곳 × 0.97 m 진행, 드론 3대가 쌍 거리 9.8·10.5·10.6 m 의
+    /// 삼각형(진행 방향 x 에 변 AB 가 나란함), 고도 30 m ± 0.5 m.
     fn strip_enu(rng: &mut Rng) -> Vec<Vector3<f64>> {
+        // AB = 9.8, AC = 10.5, BC = 10.6 m 인 평면 삼각형.
+        let cx = (9.8f64 * 9.8 + 10.5 * 10.5 - 10.6 * 10.6) / (2.0 * 9.8);
+        let cy = (10.5f64 * 10.5 - cx * cx).sqrt();
+        let tri = [(0.0, 0.0), (9.8, 0.0), (cx, cy)];
+        let mx = tri.iter().map(|p| p.0).sum::<f64>() / 3.0;
+        let my = tri.iter().map(|p| p.1).sum::<f64>() / 3.0;
         let mut v = Vec::new();
         for i in 0..80 {
-            for d in 0..3 {
+            for p in &tri {
                 v.push(Vector3::new(
-                    i as f64 * 0.97,
-                    (d as f64 - 1.0) * 10.0,
-                    100.0 + 0.5 * rng.gauss(),
+                    i as f64 * 0.97 + p.0 - mx,
+                    p.1 - my,
+                    30.0 + 0.5 * rng.gauss(),
                 ));
             }
         }
         v
+    }
+
+    /// 편대 오프셋(x 앞, y 왼쪽)을 위치 `n` 곳 × `spacing` m 진행으로 늘어놓은 동-북-위 좌표.
+    fn layout_enu(off: &[[f64; 3]; 3], n: usize, spacing: f64) -> Vec<Vector3<f64>> {
+        (0..n)
+            .flat_map(|i| {
+                off.iter()
+                    .map(move |o| Vector3::new(i as f64 * spacing + o[0], o[1], 30.0 + o[2]))
+            })
+            .collect()
+    }
+
+    /// 점 집합의 둘째 주축 표준편차(`gps_align` 의 `spread_m[1]` 과 같은 정의).
+    fn second_axis_sd(pts: &[Vector3<f64>]) -> f64 {
+        let mu = pts.iter().sum::<Vector3<f64>>() / pts.len() as f64;
+        let mut cov = Matrix3::zeros();
+        for p in pts {
+            let d = p - mu;
+            cov += d * d.transpose();
+        }
+        cov /= pts.len() as f64;
+        let mut ev: Vec<f64> = cov
+            .symmetric_eigenvalues()
+            .iter()
+            .map(|&e| e.max(0.0).sqrt())
+            .collect();
+        ev.sort_by(|a, b| b.total_cmp(a));
+        ev[1]
+    }
+
+    /// F-361: 문서가 적은 편대 둘째 주축 표준편차를 실제 배치에서 계산해 맞춘다.
+    /// 실제 배치(`SceneConfig::default()`, R–L 변이 진행 방향에 수직)는 횡 좌표 −0.52·−4.99·+5.51 m
+    /// 라 약 4.3 m, 시험 띠(`strip_enu`, AB 가 진행 방향과 나란함)는 횡 0·0·9.34 m 라 약 4.4 m 이다.
+    /// 둘 다 문턱 5 m 까지 여유가 0.6~0.7 m 로 작으므로 그 값을 단언하고 출력한다.
+    #[test]
+    fn formation_second_axis_spread_matches_doc() {
+        let cfg = crate::synth::SceneConfig::default();
+        let real = second_axis_sd(&layout_enu(&cfg.offsets, cfg.positions, cfg.spacing));
+        let mut rng = Rng(1);
+        let strip = second_axis_sd(&strip_enu(&mut rng));
+        println!(
+            "second axis sd: real {real:.3} m (margin {:.3} m), strip {strip:.3} m (margin {:.3} m), threshold {TILT_MIN_SPREAD_M} m",
+            TILT_MIN_SPREAD_M - real,
+            TILT_MIN_SPREAD_M - strip
+        );
+        // 모듈 문서의 값.
+        assert!((real - 4.3).abs() < 0.1, "real {real}");
+        assert!((strip - 4.4).abs() < 0.1, "strip {strip}");
+        assert!(TILT_MIN_SPREAD_M - real > 0.5 && TILT_MIN_SPREAD_M - strip > 0.5);
+        // `align_to_enu` 가 내는 `spread_m[1]` 과도 0.1 m 안(잡음 σ 1 m 포함 ≈ 4.5 m).
+        let c = gps_case(&mut rng, strip_enu(&mut Rng(2)), 1.0, 0.0, 0.0, 0.0);
+        let cfgu = GpsAlignConfig {
+            up: Some(c.gt.r.inverse() * Vector3::new(0.0, 0.0, 1.0)),
+            ..Default::default()
+        };
+        let al = align_to_enu_with(&c.centers, &c.enu, &cfgu).unwrap();
+        let expect = (strip * strip + 1.0).sqrt();
+        println!("align spread_m {:?}, expected {expect:.3}", al.spread_m);
+        assert!((al.spread_m[1] - expect).abs() < 0.15, "{:?}", al.spread_m);
+    }
+
+    /// F-361: 오프셋 흔들림에서 위 방향 없는 판정(`None` ↔ 정렬)이 바뀌는지 잰다.
+    /// 전체 배율 0.9~1.1 과 오프셋별 독립 ±10%(x·y 각각, 200회)를 잡음 0·1·1.5 m 에서 본다.
+    /// 잡음 0 에서는 ±10% 어디서도 판정이 `None` 으로 같아야 하고, 잡음이 있으면 문턱 쪽으로 다가간 정도를 출력한다.
+    #[test]
+    fn formation_threshold_sensitivity() {
+        let base = crate::synth::SceneConfig::default();
+        let decide = |off: &[[f64; 3]; 3], sigma: f64, seed: u64| -> (f64, bool) {
+            let mut rng = Rng(seed);
+            let c = gps_case(
+                &mut rng,
+                layout_enu(off, base.positions, base.spacing),
+                sigma,
+                0.0,
+                0.0,
+                0.0,
+            );
+            let sd = second_axis_sd(&c.enu);
+            (sd, align_to_enu(&c.centers, &c.enu, 3.0).is_some())
+        };
+        for &sigma in &[0.0, 1.0, 1.5] {
+            for &k in &[0.9, 0.95, 1.0, 1.05, 1.1] {
+                let mut off = base.offsets;
+                for o in off.iter_mut() {
+                    o[0] *= k;
+                    o[1] *= k;
+                }
+                let (sd, ok) = decide(&off, sigma, 7);
+                println!("scale sigma {sigma} k {k:.2}: sd {sd:.3} aligned {ok}");
+                if sigma == 0.0 {
+                    assert!(!ok && sd < TILT_MIN_SPREAD_M, "k {k}: sd {sd}");
+                }
+            }
+            let mut rng = Rng(99);
+            let (mut flips, mut max_sd) = (0, 0.0f64);
+            for t in 0..200u64 {
+                let mut off = base.offsets;
+                for o in off.iter_mut() {
+                    o[0] *= 1.0 + 0.2 * (rng.uni() - 0.5);
+                    o[1] *= 1.0 + 0.2 * (rng.uni() - 0.5);
+                }
+                let (sd, ok) = decide(&off, sigma, 1000 + t);
+                max_sd = max_sd.max(sd);
+                flips += ok as usize;
+            }
+            println!("random ±10% sigma {sigma}: aligned {flips}/200, max sd {max_sd:.3}");
+            if sigma == 0.0 {
+                assert_eq!(flips, 0);
+                assert!(max_sd < TILT_MIN_SPREAD_M);
+            }
+        }
     }
 
     struct GpsCase {
@@ -1305,13 +1432,13 @@ mod tests {
         (w, yaw)
     }
 
-    /// 편대 카메라 회전(세계→카메라, 복원 좌표): 중심마다 방위 −60°·0°·+60° 를 돌려 쓰고
-    /// 아래로 60° 기울인다(SPEC §1 의 비스듬한 3방향 카메라). 카메라마다 σ `noise_deg` 의
+    /// 편대 카메라 회전(세계→카메라, 복원 좌표): 드론마다 SPEC §1 실측 방위 −3°·+125°·−116°
+    /// 를 쓰고 아래로 60° 기울인다(SPEC §1 의 58~62°). 카메라마다 σ `noise_deg` 의
     /// 임의 축 회전 잡음(구름 포함)을 넣는다.
     fn strip_rotations(rng: &mut Rng, c: &GpsCase, noise_deg: f64) -> Vec<Rotation3<f64>> {
         (0..c.centers.len())
             .map(|k| {
-                let a = [-60.0f64, 0.0, 60.0][k % 3].to_radians();
+                let a = [-3.0f64, 125.0, -116.0][k % 3].to_radians();
                 let t = 60f64.to_radians();
                 let d = Vector3::new(t.cos() * a.cos(), t.cos() * a.sin(), -t.sin());
                 let z = d;
@@ -1348,7 +1475,7 @@ mod tests {
         (sigma_axis / s2.sqrt()).to_degrees()
     }
 
-    /// F-099·F-152 기울기·위치: 실측 편대 띠(77 m × 20 m), 이상치 10%(10~50 m), 시드 20, 축당 σ 1·2 m.
+    /// F-099·F-152 기울기·위치: SPEC §1 실측 편대 띠(77 m × 폭 약 10 m 삼각형), 이상치 10%(10~50 m), 시드 20, 축당 σ 1·2 m.
     /// 위 방향은 주입하지 않고 정밀 포즈(카메라당 축별 0.1° 잡음)에서 [`up_from_rotations`] 로 구한다.
     /// 연직 고정이면 기울기 = 위 방향 추정 오차 ≈ 0.1°·√2/√240 ≈ 0.01° 수준이라
     /// 기준 < 0.1°(F-152 의 0.5° 보다 엄격, 이론의 약 10배 여유). 위치 < 2 m, 유지 ≥ 90%, 실패 0.
@@ -1361,13 +1488,11 @@ mod tests {
             assert!(u.1 < 0.1, "sigma {sigma}: tilt {}", u.1);
             assert!(u.2 < 2.0, "sigma {sigma}: pos {}", u.2);
             assert!(u.3 >= 0.9, "sigma {sigma}: keep {}", u.3);
-            // 자유 추정도 실패하지 않고 기울기 불확실성을 보고한다.
-            assert_eq!(w[1].5, 0);
-            assert!(w[1].4 > 0.1, "sigma {sigma}: tilt sigma {}", w[1].4);
-            // F-153: SPEC §3.4 문자 그대로(고정 3 m)는 σ 1 m 에서 정렬되고, σ 2 m 에서는
-            // 3차원 잔차 중앙 ≈ 1.54σ ≈ 3.1 m 라 정상이 절반 아래 → 20/20 `None` 이 기대 동작.
-            let want_none = if sigma > 1.5 { 20 } else { 0 };
-            assert_eq!(w[2].5, want_none, "sigma {sigma}: fixed 3 m None");
+            // F-095·F-198·F-361: 이 시험 띠의 둘째 주축 표준편차는 약 4.4 m(잡음 포함 약 4.5 m) < 5 m 라
+            // 위 방향 없는 자유 추정(잡음 비례 임계·고정 3 m 모두)은 20/20 `None` 이 기대 동작이다.
+            // 이 배치의 정렬은 `up_from_rotations` 로 구한 위 방향이 있어야 한다.
+            assert_eq!(w[1].5, 20, "sigma {sigma}: free None");
+            assert_eq!(w[2].5, 20, "sigma {sigma}: fixed 3 m None");
         }
     }
 
@@ -1421,7 +1546,7 @@ mod tests {
     }
 
     /// F-099 방위(연직축 둘레): 최소제곱 방위 오차는 잡음 한계 σ_ψ = σ_축 / √Σ r_i²
-    /// (띠 77 m × 20 m, 정상 216개, σ 2 m 에서 ≈ 0.33°)를 따라야 한다.
+    /// (SPEC §1 편대 띠, 정상 약 216개, 이론값은 시험이 시드별로 계산해 출력)를 따라야 한다.
     /// 시드별 정규화 오차 z = 오차 / σ_ψ 에 대해
     /// - 최대 |z| < 3.5 (가우스면 시드 하나가 넘을 확률 4.7e-4, 20개 중 하나라도 ≈ 0.9%),
     /// - 제곱평균 z ∈ [0.61, 1.41] (χ²₂₀ 의 0.5%·99.5% 분위 7.43·40.0 을 20 으로 나눈 제곱근),
@@ -1449,7 +1574,7 @@ mod tests {
     }
 
     /// F-095: 거의 일직선(600 m, 옆·위 흔들림 σ 0.3 m)이면 연직축 없이 `None`,
-    /// 연직축을 주면 정렬된다. 편대(폭 10 m 간격 3대)는 연직축 없이도 정렬된다.
+    /// 연직축을 주면 정렬된다. SPEC §1 삼각 편대(폭 약 10 m)는 연직축 없이는 `None`(폭 20 m 일렬만 통과).
     #[test]
     fn gps_alignment_straight_path_tilt_undetermined() {
         let ez = Vector3::new(0.0, 0.0, 1.0);
@@ -1480,6 +1605,15 @@ mod tests {
         let mut rng = Rng(1800);
         let s = strip_enu(&mut rng);
         let c = gps_case(&mut rng, s, 1.0, 0.0, 0.0, 0.0);
+        // 시험 띠(SPEC §1 삼각 편대): 둘째 주축 표준편차 약 4.4 m < 5 m 라 위 방향 없이는 `None`.
+        assert!(align_to_enu(&c.centers, &c.enu, 3.0).is_none());
+        // 폭 20 m 일렬(횡 −10/0/+10 m)은 문턱을 넘어 위 방향 없이도 정렬된다.
+        let wide: Vec<_> = (0..80)
+            .flat_map(|i| {
+                (0..3).map(move |d| Vector3::new(i as f64 * 0.97, (d as f64 - 1.0) * 10.0, 100.0))
+            })
+            .collect();
+        let c = gps_case(&mut rng, wide, 1.0, 0.0, 0.0, 0.0);
         let al = align_to_enu(&c.centers, &c.enu, 3.0).unwrap();
         assert!(al.spread_m[1] > TILT_MIN_SPREAD_M, "{:?}", al.spread_m);
         assert!(al.tilt_sigma_deg > 0.0 && al.tilt_sigma_deg.is_finite());
