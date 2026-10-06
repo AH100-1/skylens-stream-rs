@@ -993,6 +993,41 @@ pub struct PreviewStages {
     pub position_fallback: bool,
 }
 
+/// 진단용 단계 스냅숏(측정 시험이 단계별 자세 오차를 잰다). 켜지 않으면 아무것도 하지 않는다.
+pub struct StageSnap {
+    pub label: &'static str,
+    pub poses: Vec<Option<Pose>>,
+}
+
+static STAGE_DIAG: std::sync::Mutex<Option<Vec<StageSnap>>> = std::sync::Mutex::new(None);
+
+/// 단계 스냅숏 기록을 켠다(이전 기록은 비운다).
+pub fn stage_diag_enable() {
+    *STAGE_DIAG.lock().unwrap() = Some(Vec::new());
+}
+
+/// 지금까지 기록한 단계 스냅숏을 꺼내고 기록을 끈다.
+pub fn stage_diag_take() -> Vec<StageSnap> {
+    STAGE_DIAG.lock().unwrap().take().unwrap_or_default()
+}
+
+static DIAG_REFINED_START: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 진단 전용: 켜면 정밀 BA 시작점도 위치 다듬기(`preview_refine_iters`)를 거친다. 기본은 꺼짐.
+pub fn stage_diag_refined_start(on: bool) {
+    DIAG_REFINED_START.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn stage_diag(label: &'static str, poses: &[Option<Pose>]) {
+    if let Some(v) = STAGE_DIAG.lock().unwrap().as_mut() {
+        v.push(StageSnap {
+            label,
+            poses: poses.to_vec(),
+        });
+    }
+}
+
 type RotsAndKeep = (Vec<Option<Rotation3<f64>>>, Vec<bool>);
 
 /// 카메라 쌍 단위 회전 투표(`sparse::vote_keep`)로 간선을 거른다. 환경 변수 `SKYLENS_VOTE_STATS` 가
@@ -1213,6 +1248,13 @@ fn sparse_init_with(
     let t_stage = Instant::now();
     let (rots, keep_edge) = average_pruned(n, pm, opts)?;
     crate::timing::add("rotation_avg", t_stage.elapsed().as_secs_f64());
+    stage_diag(
+        "rot_avg",
+        &rots
+            .iter()
+            .map(|r| r.map(|r| Pose::from_center(r, &Point3::origin())))
+            .collect::<Vec<_>>(),
+    );
     let t_stage = Instant::now();
     let mut stages = PreviewStages {
         rots: rots.clone(),
@@ -1320,6 +1362,7 @@ fn sparse_init_with(
         poses[i] = Some(Pose::from_center(r, &Point3::from(c)));
     }
     stages.placed = poses.clone();
+    stage_diag("placed", &poses);
     if opts.snap {
         snap_poses_to_gps(&mut poses, gps, opts.vfix);
     }
@@ -1370,6 +1413,7 @@ fn sparse_init_with(
         crate::timing::timed("position_refine", || {
             refine_centers(&mut poses, k, &track_obs, opts)
         });
+        stage_diag("pos_refined", &poses);
     }
     let mut tri_eff = *tri;
     if let Some(d) = opts.tri_deg {
@@ -1416,6 +1460,7 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
     let (sim, _, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
     apply_sparse_sim(s, &sim);
+    stage_diag("gps_aligned", &s.poses);
     Some(sim)
 }
 
@@ -1534,6 +1579,9 @@ fn run_ba(
         }),
         ..BaOptions::default()
     };
+    if iters > 0 {
+        stage_diag("ba_in", &s.poses);
+    }
     let rep = bundle_adjust(&mut prob, &opts);
     if iters > 0 {
         for (a, &i) in ids.iter().enumerate() {
@@ -1543,6 +1591,7 @@ fn run_ba(
         for (e, p) in s.ba_only.iter_mut().zip(&prob.points[n_main..]) {
             e.0 = p.coords;
         }
+        stage_diag("ba_out", &s.poses);
     }
     if iters == 0 {
         rep.initial_rms
@@ -2424,6 +2473,11 @@ pub fn run_pipeline_with(
             &PreviewOpts {
                 legacy_roll: true,
                 pair_vote: cfg.pair_vote,
+                refine_iters: if DIAG_REFINED_START.load(std::sync::atomic::Ordering::Relaxed) {
+                    cfg.preview_refine_iters
+                } else {
+                    0
+                },
                 ..PreviewOpts::default()
             },
         )
