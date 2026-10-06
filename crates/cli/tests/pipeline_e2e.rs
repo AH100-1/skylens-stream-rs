@@ -13,9 +13,13 @@ use std::time::Instant;
 use skylens_core::geo::{geodetic_to_enu, Geodetic};
 use skylens_core::ply::read_ply_file;
 use skylens_core::synth::{Scene, SceneConfig};
+use skylens_core::verify::{
+    ALIGN_FIT_MAX_M, ALIGN_MIN_PAIRS, ALIGN_SCALE_TOL, HEIGHT_MEDIAN_MAX_M, NN_MEDIAN_MAX_M,
+    OVERLAP_MEDIAN_MAX_M,
+};
 
-/// README 의 `run` 공통 옵션(stride 제외).
-const RUN_OPTS: [&str; 12] = [
+/// README 의 `run` 공통 옵션(stride 제외, BA 반복은 따로 붙인다: README 값 15).
+const RUN_OPTS: [&str; 10] = [
     "--span",
     "48",
     "--ovl",
@@ -26,8 +30,6 @@ const RUN_OPTS: [&str; 12] = [
     "96",
     "--hfov",
     "65",
-    "--ba-iters",
-    "15",
 ];
 
 struct TempDir(PathBuf);
@@ -196,7 +198,7 @@ struct Outcome {
 }
 
 /// README 명령 그대로: synth → run → verify. 출력 폴더 구성도 확인한다.
-fn pipeline(tag: &str, stride: &str) -> Outcome {
+fn pipeline(tag: &str, stride: &str, ba_iters: &str) -> Outcome {
     let t = TempDir::new(tag);
     let (scene, out) = (t.0.join("scene"), t.0.join("out"));
     let (scene_s, out_s) = (scene.to_str().unwrap(), out.to_str().unwrap());
@@ -206,6 +208,7 @@ fn pipeline(tag: &str, stride: &str) -> Outcome {
 
     let mut args = vec!["run", scene_s, out_s, "--stride", stride];
     args.extend(RUN_OPTS);
+    args.extend(["--ba-iters", ba_iters]);
     let start = Instant::now();
     let (code, so, se) = cli(&args);
     let secs = start.elapsed().as_secs_f64();
@@ -244,7 +247,7 @@ fn expect_items(o: &Outcome, expected: &[(&str, &str)]) {
 /// 정밀 점 표면 거리 중앙 0.336/95% 0.932 m (점 10302개). 상한은 실측 x 1.2 (0.375, 1.021, 0.403, 1.118)를 넉넉히 올림.
 #[test]
 fn single_region_end_to_end() {
-    let o = pipeline("single", "2");
+    let o = pipeline("single", "2", "15");
     assert_eq!(o.m.registered, 120, "등록 수");
     assert_eq!(o.verify_code, 0, "{}", o.verify);
     expect_items(
@@ -277,18 +280,14 @@ fn single_region_end_to_end() {
     );
 }
 
-/// 구역 2개(README 둘째 명령, stride 1 → 80위치 × 3대 = 240장): refined_overlap 이 실제로 판정된다.
-/// 시험 전체 약 3 분(run 약 150 초). 실측(초벌 다듬기 5회 기본, 반점 제거 뒤): verify 7/7 종료 코드 0, 중심 오차 중앙 0.279/최대 3.152 m,
-/// 정밀 점 표면 거리 중앙 0.431/95% 1.336 m (점 18575개). 상한은 실측 x 1.2 안팎.
-/// preview_vs_refined 통과(최근접 0.970 m < 3, 높이 차 1.026 m < 2). preview_align 통과: 구역 간 점쌍을 구역의
-/// 모든 이미지 관측으로 만들어 점쌍 최소 1178 (정렬 창 12장만 쓰면 324), 스케일 차 0.26%, 잔차 중앙 최대 0.735 m. 초벌 재투영 0.673 px.
-#[test]
-fn two_region_end_to_end() {
-    let o = pipeline("two", "1");
+/// 구역 ≥ 2 에서 verify 의 구역 간 항목을 '해당 없음' 없이 판정하고, SPEC/verify 기준(`skylens_core::verify` 상수)으로 상한을 건다.
+fn assert_two_region_spec(o: &Outcome) {
     assert_eq!(o.m.registered, 240, "등록 수");
+    let (_, al) = item(&o.verify, "preview_align");
+    assert!(al.contains("정렬 기록 "), "{al}");
     assert_eq!(o.verify_code, 0, "{}", o.verify);
     expect_items(
-        &o,
+        o,
         &[
             ("registered", "PASS"),
             ("region_images", "PASS"),
@@ -301,14 +300,62 @@ fn two_region_end_to_end() {
     );
     let (_, ov) = item(&o.verify, "refined_overlap");
     assert!(!ov.contains("해당 없음"), "겹침이 판정돼야 함: {ov}");
-    assert!(number_after(&ov, "중앙 최대 ") < 0.3, "{ov}");
+    assert!(
+        number_after(&ov, "겹침 차 중앙 최대 ") < OVERLAP_MEDIAN_MAX_M,
+        "{ov}"
+    );
     let (_, pr) = item(&o.verify, "preview_vs_refined");
-    assert!(number_after(&pr, "높이 차 중앙 최대 ") < 2.0, "{pr}");
-    assert!(number_after(&pr, "최근접 중앙 최대 ") < 3.0, "{pr}");
+    assert!(
+        number_after(&pr, "높이 차 중앙 최대 ") < HEIGHT_MEDIAN_MAX_M,
+        "{pr}"
+    );
+    assert!(
+        number_after(&pr, "최근접 중앙 최대 ") < NN_MEDIAN_MAX_M,
+        "{pr}"
+    );
     let (_, pa) = item(&o.verify, "preview_align");
-    assert!(number_after(&pa, "점쌍 최소 ") >= 1000.0, "{pa}");
-    assert!(number_after(&pa, "구역 간 스케일 차 ") <= 1.0, "{pa}");
-    assert!(number_after(&pa, "잔차 중앙 최대 ") < 6.0, "{pa}");
+    assert!(number_after(&pa, "점쌍 최소 ") >= ALIGN_MIN_PAIRS, "{pa}");
+    assert!(
+        number_after(&pa, "구역 간 스케일 차 ") <= ALIGN_SCALE_TOL * 100.0,
+        "{pa}"
+    );
+    assert!(
+        number_after(&pa, "잔차 중앙 최대 ") < ALIGN_FIT_MAX_M,
+        "{pa}"
+    );
+}
+
+/// 구역 2개 구역 간 스케일 차 회귀 상한(%). 실측 0.55% 의 약 3.6배. SPEC 판정값(`ALIGN_SCALE_TOL`, 10%)과는 별개다.
+const TWO_REGION_SCALE_REGRESSION_PCT: f64 = 2.0;
+
+fn assert_two_region_scale_regression(o: &Outcome) {
+    let (_, pa) = item(&o.verify, "preview_align");
+    let s = number_after(&pa, "구역 간 스케일 차 ");
+    assert!(
+        s <= TWO_REGION_SCALE_REGRESSION_PCT,
+        "스케일 차 회귀 상한: {pa}"
+    );
+}
+
+/// README 둘째 명령에서 BA 반복만 10회로 줄인 경우(F-273: BA 반복별 수치). 구역 간 항목 기준은 15회와 같다.
+#[test]
+fn two_region_end_to_end_ba10() {
+    let o = pipeline("two_ba10", "1", "10");
+    assert_two_region_spec(&o);
+    assert_two_region_scale_regression(&o);
+}
+
+/// 구역 2개(README 둘째 명령, stride 1 → 80위치 × 3대 = 240장): refined_overlap 이 실제로 판정된다.
+/// 시험 전체 약 3 분(run 약 150 초). 실측(초벌 다듬기 5회 기본, 반점 제거 뒤): verify 7/7 종료 코드 0, 중심 오차 중앙 0.279/최대 3.152 m,
+/// 정밀 점 표면 거리 중앙 0.431/95% 1.336 m (점 18575개). 상한은 실측 x 1.2 안팎.
+/// preview_vs_refined 통과(최근접 0.970 m < 3, 높이 차 1.026 m < 2). preview_align 통과: 구역 간 점쌍을 구역의
+/// 모든 이미지 관측으로 만들어 점쌍 최소 1178 (정렬 창 12장만 쓰면 324), 스케일 차 0.26%, 잔차 중앙 최대 0.735 m. 초벌 재투영 0.673 px.
+/// 판정은 SPEC 상수(`assert_two_region_spec`)로, 스케일 차는 따로 실측 기반 회귀 상한(`TWO_REGION_SCALE_REGRESSION_PCT`)을 건다.
+#[test]
+fn two_region_end_to_end() {
+    let o = pipeline("two", "1", "15");
+    assert_two_region_spec(&o);
+    assert_two_region_scale_regression(&o);
     assert!(o.m.center_med < 0.34, "중심 오차 중앙 {}", o.m.center_med);
     assert!(o.m.center_max < 3.75, "중심 오차 최대 {}", o.m.center_max);
     assert!(o.m.surface_med < 0.52, "점 중앙 {}", o.m.surface_med);
