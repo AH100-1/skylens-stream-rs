@@ -32,6 +32,8 @@ pub struct DenseConfig {
     pub reproj_px: f64,
     /// 융합 상대 깊이 차 상한(기본 0.01).
     pub depth_rel: f64,
+    /// 이웃 시점 점수 설정(기본: 각 제한 없음).
+    pub neighbor: view_selection::NeighborConfig,
 }
 
 impl Default for DenseConfig {
@@ -42,6 +44,7 @@ impl Default for DenseConfig {
             min_views: 3,
             reproj_px: 1.0,
             depth_rel: 0.01,
+            neighbor: view_selection::NeighborConfig::default(),
         }
     }
 }
@@ -671,7 +674,8 @@ fn depth_stage(
         .collect();
 
     // 2. 이웃 선택·깊이 범위.
-    let neighbors = view_selection::select_neighbors(&vs, &sparse, cfg.neighbors);
+    let neighbors =
+        view_selection::select_neighbors_with(&vs, &sparse, cfg.neighbors, &cfg.neighbor);
 
     // 3. 사진별 깊이·법선.
     let maps: Vec<DepthMap> = (0..preps.len())
@@ -751,16 +755,16 @@ pub fn remove_speckles(map: &mut DepthMap, rel: f32, min_px: usize) -> usize {
 }
 
 /// 융합 전 깊이 지도 걸러내기 기본값: 반점 제거(상대 깊이차 0.007, 100 화소 미만).
-/// 100 화소는 480×270 에서 잰 값이다. 그보다 작은 지도에서는 면적 비례로 줄이되
+/// 100 화소는 480×270 에서 잰 값이고 문턱은 지도 면적에 비례한다. 작은 지도에서는 줄이되
 /// 하한 4 화소를 둔다(80×45 에서 100 화소면 지도의 3% 가 한 조각이라 참 표면까지 지워진다).
-/// 480×270 이상에서는 100 화소 그대로다.
+/// 큰 지도에서는 상한 없이 키운다(960×540 에서 400 화소가 100 화소보다 중앙·95% 가 모두 낫다).
 const SPECKLE_REL: f32 = 0.007;
 const SPECKLE_MIN_PX: usize = 100;
 const SPECKLE_MIN_PX_FLOOR: usize = 4;
 const SPECKLE_REF_AREA: usize = 480 * 270;
 
 fn speckle_min_px(w: usize, h: usize) -> usize {
-    (SPECKLE_MIN_PX * w * h / SPECKLE_REF_AREA).clamp(SPECKLE_MIN_PX_FLOOR, SPECKLE_MIN_PX)
+    (SPECKLE_MIN_PX * w * h / SPECKLE_REF_AREA).max(SPECKLE_MIN_PX_FLOOR)
 }
 
 /// 깊이 지도마다 반점 제거를 적용한다. (지워진 화소 수, 걸러내기 전 유효 화소 수).
@@ -1240,7 +1244,7 @@ mod tests {
 
     #[test]
     fn speckle_floor_scales_with_map_area() {
-        assert_eq!(speckle_min_px(960, 540), 100);
+        assert_eq!(speckle_min_px(960, 540), 400);
         assert_eq!(speckle_min_px(480, 270), 100);
         assert_eq!(speckle_min_px(240, 135), 25);
         assert_eq!(speckle_min_px(80, 45), SPECKLE_MIN_PX_FLOOR);
@@ -1281,6 +1285,105 @@ mod tests {
                 load.trim()
             );
             assert!(share <= fixed_share, "너비 {w}: {share} > {fixed_share}");
+        }
+    }
+
+    /// 반점 제거 효과 측정(무시 측정): 폭 × 추정기 × 문턱별 점 수·표면 거리, 지워진 화소의 성격.
+    /// 환경변수 SPECKLE_W(기본 960)로 폭을 바꾼다.
+    #[test]
+    #[ignore]
+    fn speckle_effect_by_width() {
+        let w: u32 = std::env::var("SPECKLE_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(960);
+        let h = w * 9 / 16;
+        let (s, views, sparse) = scene_views(8, w, h);
+        let cfg = DenseConfig {
+            max_width: w,
+            ..DenseConfig::default()
+        };
+        let estimators: [(&str, DepthEstimator, usize); 2] = [
+            ("스윕", sweep_depth, SWEEP_NEIGHBORS),
+            ("패치매치", patchmatch_depth, cfg.neighbors),
+        ];
+        for (name, est, take) in estimators {
+            let t = Instant::now();
+            let st =
+                depth_stage(&views, &sparse, &cfg, est, &SweepConfig::default(), take).unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            let (v, m, p, b) = depth_error(&s, &st);
+            eprintln!(
+                "SPK {name} {w}: depth valid {v:.3} relmed {m:.4} rel95 {p:.4} over5% {b:.4} secs {secs:.1}"
+            );
+            let variants: [(&str, f32, usize); 7] = [
+                ("제거 없음", 0.0, 0),
+                (
+                    "면적 비례(기본)",
+                    0.007,
+                    speckle_min_px(st.maps[0].w, st.maps[0].h).max(1),
+                ),
+                ("0.007·100(현재)", 0.007, 100),
+                ("0.007·25", 0.007, 25),
+                ("0.007·400", 0.007, 400),
+                ("0.014·100", 0.014, 100),
+                ("0.02·100", 0.02, 100),
+            ];
+            for (vn, rel, minpx) in variants {
+                let mut maps = st.maps.clone();
+                let valid_before: usize = maps
+                    .iter()
+                    .map(|m| {
+                        m.depth
+                            .iter()
+                            .filter(|d| d.is_finite() && **d > 0.0)
+                            .count()
+                    })
+                    .sum();
+                let (mut removed, mut removed_true, mut removed_far) = (0usize, 0usize, 0usize);
+                if minpx > 0 {
+                    for (i, m) in maps.iter_mut().enumerate() {
+                        let before = m.depth.clone();
+                        removed += remove_speckles(m, rel, minpx);
+                        let mut v = s.views[st.src[i]].clone();
+                        v.camera = st.preps[i].camera;
+                        let (_, gt) = s.render(&v);
+                        for k in 0..before.len() {
+                            if before[k] > 0.0 && m.depth[k] == 0.0 && gt[k].is_finite() {
+                                if ((before[k] - gt[k]) / gt[k]).abs() < 0.05 {
+                                    removed_true += 1;
+                                } else {
+                                    removed_far += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                let st2 = DepthStage {
+                    src: st.src.clone(),
+                    preps: st
+                        .preps
+                        .iter()
+                        .map(|v| DepthView {
+                            camera: v.camera,
+                            gray: Vec::new(),
+                            rgb: v.rgb.clone(),
+                            valid: Vec::new(),
+                        })
+                        .collect(),
+                    neighbors: st.neighbors.clone(),
+                    maps,
+                };
+                let cloud = fuse_stage(&st2, &cfg);
+                let (med, p95, over1) = dist_stats(&s, &cloud);
+                eprintln!(
+                    "SPK {name} {w} {vn}: points {} med {med:.4} p95 {p95:.4} over1m {over1:.4} removed {:.3} of_removed_true_surface(<5%) {:.3} far {:.3}",
+                    cloud.len(),
+                    removed as f64 / valid_before.max(1) as f64,
+                    removed_true as f64 / removed.max(1) as f64,
+                    removed_far as f64 / removed.max(1) as f64,
+                );
+            }
         }
     }
 

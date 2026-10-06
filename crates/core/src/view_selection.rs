@@ -27,6 +27,12 @@ pub const TARGET_ANGLE_DEG: f64 = 10.0;
 pub const SIGMA_BELOW_DEG: f64 = 5.0;
 /// 목표보다 큰 각 쪽 감점 폭(도).
 pub const SIGMA_ABOVE_DEG: f64 = 15.0;
+/// 이웃으로 인정하는 최소 광선 사이 각(도) 기본값: 0 = 제한 없음. 자세 오차가 있으면 깊이 오차가
+/// (회전 오차 / 각)으로 커지므로 [`NeighborConfig::min_angle_deg`] 를 8 로 올리면 좋아지지만
+/// 기선이 짧은 장면에서 이웃이 비므로 기본으로 바꾸지 않았다(시험 `dense_pose_noise` 참고).
+pub const MIN_ANGLE_DEG: f64 = 0.0;
+/// 사진별 최소 각 자동 결정에 쓰는 후보 각 분포 분위 기본값(0 = 끔). 0.5 로 켜면 기선 짧은 장면 시험 2개가 깨진다.
+pub const AUTO_MIN_QUANTILE: f64 = 0.0;
 /// 깊이 범위 분위(아래, 위).
 pub const DEPTH_QUANTILES: (f64, f64) = (0.05, 0.95);
 /// 깊이 범위 여유: 가까운 끝 × (1 − m), 먼 끝 × (1 + m).
@@ -50,17 +56,65 @@ pub struct SparsePoint {
     pub observers: Vec<usize>,
 }
 
-/// 광선 사이 각(라디안)에 대한 가중치.
-pub fn angle_weight(theta: f64) -> f64 {
-    let t0 = TARGET_ANGLE_DEG.to_radians();
-    let s = if theta < t0 {
-        SIGMA_BELOW_DEG
-    } else {
-        SIGMA_ABOVE_DEG
+/// 이웃 점수 설정. 기본값은 위 상수(최소 각 [`MIN_ANGLE_DEG`], 상한 180° 라 제외 없음)와 같다.
+///
+/// 자세 오차가 있을 때 두 시점 깊이 오차는 대략 (회전 오차 / 삼각측량 각) 이므로
+/// 최소 각을 올리고 최적 각을 키우면 작은 각 쌍이 점수를 못 얻는다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NeighborConfig {
+    /// 이 각(도)보다 작은 쌍 점은 점수 0.
+    pub min_angle_deg: f64,
+    /// 가중치가 1 인 목표 각(도).
+    pub target_angle_deg: f64,
+    /// 목표보다 작은 각 쪽 감점 폭(도).
+    pub sigma_below_deg: f64,
+    /// 목표보다 큰 각 쪽 감점 폭(도).
+    pub sigma_above_deg: f64,
+    /// 이 각(도)보다 큰 쌍 점은 점수 0.
+    pub max_angle_deg: f64,
+    /// 0 이 아니면 최소 각을 사진별로 낮춘다: 그 사진의 후보 이웃들의 평균 광선 각 분포에서
+    /// 이 분위(0~1)의 값과 `min_angle_deg` 중 작은 값을 그 사진의 최소 각으로 쓴다.
+    /// 기선이 짧은 장면에서는 분위 값이 작아 제한이 느슨해진다.
+    pub auto_min_quantile: f64,
+    /// 최소 각 등으로 걸러진 뒤 이웃이 이 수보다 적으면 걸러지기 전 점수 순으로 채운다(0 = 채우지 않음).
+    pub min_keep: usize,
+}
+
+impl Default for NeighborConfig {
+    fn default() -> Self {
+        Self {
+            min_angle_deg: MIN_ANGLE_DEG,
+            target_angle_deg: TARGET_ANGLE_DEG,
+            sigma_below_deg: SIGMA_BELOW_DEG,
+            sigma_above_deg: SIGMA_ABOVE_DEG,
+            max_angle_deg: 180.0,
+            auto_min_quantile: AUTO_MIN_QUANTILE,
+            min_keep: 0,
+        }
     }
-    .to_radians();
-    let d = (theta - t0) / s;
-    (-0.5 * d * d).exp()
+}
+
+impl NeighborConfig {
+    /// 광선 사이 각(라디안)에 대한 가중치. 최소·상한 밖이면 0.
+    pub fn angle_weight(&self, theta: f64) -> f64 {
+        if theta < self.min_angle_deg.to_radians() || theta > self.max_angle_deg.to_radians() {
+            return 0.0;
+        }
+        let t0 = self.target_angle_deg.to_radians();
+        let s = if theta < t0 {
+            self.sigma_below_deg
+        } else {
+            self.sigma_above_deg
+        }
+        .to_radians();
+        let d = (theta - t0) / s;
+        (-0.5 * d * d).exp()
+    }
+}
+
+/// 광선 사이 각(라디안)에 대한 가중치(기본 설정).
+pub fn angle_weight(theta: f64) -> f64 {
+    NeighborConfig::default().angle_weight(theta)
 }
 
 /// 축척 비 가중치: 두 화소 크기 a, b(> 0)에 대해 (min/max)².
@@ -82,13 +136,18 @@ fn footprint(view: &View, x: &Point3<f64>) -> Option<f64> {
 
 /// 두 사진이 함께 본 점 하나의 쌍 점수.
 pub fn pair_score(a: &View, b: &View, x: &Point3<f64>) -> f64 {
+    pair_score_with(a, b, x, &NeighborConfig::default())
+}
+
+/// [`pair_score`] 의 설정 지정판.
+pub fn pair_score_with(a: &View, b: &View, x: &Point3<f64>, cfg: &NeighborConfig) -> f64 {
     let (Some(fa), Some(fb)) = (footprint(a, x), footprint(b, x)) else {
         return 0.0;
     };
     let ra = a.cam.pose.center() - x;
     let rb = b.cam.pose.center() - x;
     let c = (ra.dot(&rb) / (ra.norm() * rb.norm())).clamp(-1.0, 1.0);
-    let s = angle_weight(c.acos()) * scale_weight(fa, fb);
+    let s = cfg.angle_weight(c.acos()) * scale_weight(fa, fb);
     if s.is_finite() {
         s
     } else {
@@ -101,35 +160,139 @@ pub fn pair_score(a: &View, b: &View, x: &Point3<f64>) -> f64 {
 /// 반환값 `out[i]` 는 `views[i]` 의 이웃들을 점수 내림차순으로 담은 `views` 안 위치(색인)다.
 /// 관측자 id 가 `views` 에 없으면 무시한다.
 pub fn select_neighbors(views: &[View], points: &[SparsePoint], k: usize) -> Vec<Vec<usize>> {
+    select_neighbors_with(views, points, k, &NeighborConfig::default())
+}
+
+/// [`select_neighbors`] 의 설정 지정판.
+pub fn select_neighbors_with(
+    views: &[View],
+    points: &[SparsePoint],
+    k: usize,
+    cfg: &NeighborConfig,
+) -> Vec<Vec<usize>> {
     let pos: HashMap<usize, usize> = views.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
     let n = views.len();
-    let mut score = vec![0.0f64; n * n];
-    let mut obs = Vec::new();
-    for p in points {
-        if !(p.xyz.x.is_finite() && p.xyz.y.is_finite() && p.xyz.z.is_finite()) {
-            continue;
+    let observed: Vec<Vec<usize>> = points
+        .iter()
+        .map(|p| {
+            if !(p.xyz.x.is_finite() && p.xyz.y.is_finite() && p.xyz.z.is_finite()) {
+                return Vec::new();
+            }
+            let mut obs: Vec<usize> = p
+                .observers
+                .iter()
+                .filter_map(|id| pos.get(id).copied())
+                .collect();
+            obs.sort_unstable();
+            obs.dedup();
+            obs
+        })
+        .collect();
+    // thr[i]: 사진 i 의 최소 각(도). 사진별 값이 필요 없으면 cfg 값 그대로.
+    let mut thr = vec![cfg.min_angle_deg; n];
+    if cfg.auto_min_quantile > 0.0 && cfg.min_angle_deg > 0.0 {
+        let mut sum = vec![0.0f64; n * n];
+        let mut cnt = vec![0u32; n * n];
+        for (p, obs) in points.iter().zip(&observed) {
+            for (a, &i) in obs.iter().enumerate() {
+                for &j in &obs[a + 1..] {
+                    let ra = views[i].cam.pose.center() - p.xyz;
+                    let rb = views[j].cam.pose.center() - p.xyz;
+                    let c = (ra.dot(&rb) / (ra.norm() * rb.norm())).clamp(-1.0, 1.0);
+                    let th = c.acos().to_degrees();
+                    if th.is_finite() {
+                        for (x, y) in [(i, j), (j, i)] {
+                            sum[x * n + y] += th;
+                            cnt[x * n + y] += 1;
+                        }
+                    }
+                }
+            }
         }
-        obs.clear();
-        obs.extend(p.observers.iter().filter_map(|id| pos.get(id).copied()));
-        obs.sort_unstable();
-        obs.dedup();
-        for (a, &i) in obs.iter().enumerate() {
-            for &j in &obs[a + 1..] {
-                let s = pair_score(&views[i], &views[j], &p.xyz);
-                score[i * n + j] += s;
-                score[j * n + i] += s;
+        for i in 0..n {
+            let mut ang: Vec<f64> = (0..n)
+                .filter(|&j| cnt[i * n + j] > 0)
+                .map(|j| sum[i * n + j] / cnt[i * n + j] as f64)
+                .collect();
+            if !ang.is_empty() {
+                ang.sort_by(f64::total_cmp);
+                thr[i] = cfg
+                    .min_angle_deg
+                    .min(quantile(&ang, cfg.auto_min_quantile.min(1.0)));
             }
         }
     }
+    let scores = |per_view: bool| {
+        let mut score = vec![0.0f64; n * n];
+        for (p, obs) in points.iter().zip(&observed) {
+            for (a, &i) in obs.iter().enumerate() {
+                for &j in &obs[a + 1..] {
+                    if per_view {
+                        let ci = NeighborConfig {
+                            min_angle_deg: thr[i],
+                            ..*cfg
+                        };
+                        let cj = NeighborConfig {
+                            min_angle_deg: thr[j],
+                            ..*cfg
+                        };
+                        score[i * n + j] += pair_score_with(&views[i], &views[j], &p.xyz, &ci);
+                        score[j * n + i] += pair_score_with(&views[j], &views[i], &p.xyz, &cj);
+                    } else {
+                        let s = pair_score_with(&views[i], &views[j], &p.xyz, cfg);
+                        score[i * n + j] += s;
+                        score[j * n + i] += s;
+                    }
+                }
+            }
+        }
+        score
+    };
+    let per_view = thr.iter().any(|&t| t != cfg.min_angle_deg);
+    let score = scores(per_view);
+    let fallback = (cfg.min_keep > 0 && cfg.min_angle_deg > 0.0).then(|| {
+        let open = NeighborConfig {
+            min_angle_deg: 0.0,
+            ..*cfg
+        };
+        let mut sc = vec![0.0f64; n * n];
+        for (p, obs) in points.iter().zip(&observed) {
+            for (a, &i) in obs.iter().enumerate() {
+                for &j in &obs[a + 1..] {
+                    let s = pair_score_with(&views[i], &views[j], &p.xyz, &open);
+                    sc[i * n + j] += s;
+                    sc[j * n + i] += s;
+                }
+            }
+        }
+        sc
+    });
+    let ranked = |sc: &[f64], i: usize| -> Vec<usize> {
+        let mut cand: Vec<(usize, f64)> = (0..n)
+            .filter(|&j| j != i && sc[i * n + j] > 0.0)
+            .map(|j| (j, sc[i * n + j]))
+            .collect();
+        cand.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        cand.into_iter().map(|(j, _)| j).collect()
+    };
     (0..n)
         .map(|i| {
-            let mut cand: Vec<(usize, f64)> = (0..n)
-                .filter(|&j| j != i && score[i * n + j] > 0.0)
-                .map(|j| (j, score[i * n + j]))
-                .collect();
-            cand.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            cand.truncate(k);
-            cand.into_iter().map(|(j, _)| j).collect()
+            let mut out = ranked(&score, i);
+            out.truncate(k);
+            if let Some(fb) = &fallback {
+                let want = cfg.min_keep.min(k);
+                if out.len() < want {
+                    for j in ranked(fb, i) {
+                        if out.len() >= want {
+                            break;
+                        }
+                        if !out.contains(&j) {
+                            out.push(j);
+                        }
+                    }
+                }
+            }
+            out
         })
         .collect()
 }
@@ -532,5 +695,106 @@ mod tests {
             let d0 = (first.position as i64 - c as i64).abs();
             assert!((d0 - pred).abs() <= 1, "1위 간격 {d0} 예측 {pred}");
         }
+    }
+
+    /// 한 점(원점)을 높이 30 m 에서 연직 하방으로 보는 카메라 4대(x = 0, 1, 2, 10 m).
+    /// 원점에서 본 광선 각: 0-1 1.9°, 1-2 1.9°, 0-2 3.8°, 2-3 14.6°, 1-3 16.5°, 0-3 18.4°.
+    fn tiny_scene() -> (Vec<View>, Vec<SparsePoint>) {
+        let k = Intrinsics::from_hfov(1600, 1200, 70f64.to_radians());
+        let r = Rotation3::from_matrix_unchecked(Matrix3::new(
+            1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0,
+        ));
+        let views: Vec<View> = [0.0, 1.0, 2.0, 10.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| View {
+                cam: Camera {
+                    intrinsics: k,
+                    pose: Pose::from_center(r, &Point3::new(x, 0.0, 30.0)),
+                },
+                id: 7 + i,
+            })
+            .collect();
+        let pts = vec![SparsePoint {
+            xyz: Point3::new(0.0, 0.0, 0.0),
+            observers: views.iter().map(|v| v.id).collect(),
+        }];
+        (views, pts)
+    }
+
+    #[test]
+    fn neighbor_config_options_on_tiny_scene() {
+        let (views, pts) = tiny_scene();
+        let sel = |cfg: NeighborConfig, k: usize| select_neighbors_with(&views, &pts, k, &cfg);
+        let base = NeighborConfig::default();
+
+        // 기본: 각 제한 없음, 모두 이웃(점수 순).
+        let all = sel(base, 3);
+        eprintln!("all {all:?}");
+        assert_eq!(all[3].len(), 3);
+        assert_eq!(all[0][0], 3);
+
+        // 최소 각 5°: 0, 1, 2 번은 3 번만 남는다.
+        let min5 = NeighborConfig {
+            min_angle_deg: 5.0,
+            ..base
+        };
+        let r = sel(min5, 3);
+        eprintln!("min5 {r:?}");
+        assert_eq!(r, vec![vec![3], vec![3], vec![3], vec![2, 1, 0]]);
+
+        // max_angle_deg 15°: 3 번과 0·1 번 쌍(18.4°, 16.5°)이 빠진다.
+        let max15 = NeighborConfig {
+            max_angle_deg: 15.0,
+            ..base
+        };
+        let r = sel(max15, 3);
+        eprintln!("max15 {r:?}");
+        assert_eq!(r[3], vec![2]);
+        assert_eq!(r[0], vec![2, 1]);
+        assert!(!r[0].contains(&3) && !r[1].contains(&3));
+
+        // auto_min_quantile 0.25: 0 번의 최소 각이 5° 에서 약 2.9° 로 내려가 2 번(3.8°)이 다시 들어온다.
+        let auto = NeighborConfig {
+            min_angle_deg: 5.0,
+            auto_min_quantile: 0.25,
+            ..base
+        };
+        let r = sel(auto, 3);
+        eprintln!("auto {r:?}");
+        assert_eq!(r[0], vec![3, 2]);
+        assert_eq!(r[3], vec![2, 1, 0]);
+
+        // min_keep 2: 이웃이 2 보다 적은 사진만 걸러지기 전 점수 순으로 채운다.
+        let keep = NeighborConfig {
+            min_angle_deg: 5.0,
+            min_keep: 2,
+            ..base
+        };
+        let r = sel(keep, 3);
+        eprintln!("keep {r:?}");
+        // 3 번은 이미 3 장(k) 이라 그대로(채우는 조건은 `<`: 같으면 채우지 않는다).
+        assert_eq!(r[3], vec![2, 1, 0]);
+        // 0 번은 [3] 뿐이라 min_keep(2)까지 한 장만 채운다: 3.8° 쌍인 2 번.
+        assert_eq!(r[0], vec![3, 2]);
+        assert_eq!(r[1].len(), 2);
+        assert_eq!(r[2].len(), 2);
+        assert_eq!(r[1][0], 3);
+        assert_eq!(r[2][0], 3);
+        // k 가 min_keep 보다 작으면 k 까지만.
+        let r1 = sel(keep, 1);
+        assert!(r1.iter().all(|v| v.len() == 1));
+        // 이미 min_keep 장이 걸러진 뒤에 있으면 더 채우지 않는다: 최소 각 1° 면 0 번은 1·2·3 모두 통과, k=2.
+        let r2 = sel(
+            NeighborConfig {
+                min_angle_deg: 1.0,
+                min_keep: 2,
+                ..base
+            },
+            2,
+        );
+        assert!(r2.iter().all(|v| v.len() == 2));
+        // min_keep = 0 이면 채우지 않는다.
+        assert_eq!(sel(min5, 3)[0], vec![3]);
     }
 }
