@@ -7,6 +7,8 @@ use skylens_core::ply::{write_ply_file, PointCloud, PointRecord};
 
 #[derive(Clone)]
 struct Fixture {
+    /// 장면 사진 수 (report registered.total).
+    total: usize,
     reg_preview: u32,
     reg_refined: u32,
     region_images: [u32; 2],
@@ -39,6 +41,7 @@ struct Fixture {
 impl Default for Fixture {
     fn default() -> Self {
         Fixture {
+            total: 240,
             reg_preview: 240,
             reg_refined: 240,
             region_images: [42, 48],
@@ -94,10 +97,15 @@ fn build(dir: &Path, f: &Fixture) {
     std::fs::write(
         dir.join("report.json"),
         format!(
-            r#"{{"registered":{{"total":240,"preview":{},"refined":{}}},
+            r#"{{"registered":{{"total":{},"preview":{},"refined":{}}},
 "reprojection_px":{{"preview":4.5,"refined":{}}},
 "regions":[{{"region":0,"positions":14,"images":{}}},{{"region":1,"positions":16,"images":{}}}]}}"#,
-            f.reg_preview, f.reg_refined, f.reproj_refined, f.region_images[0], f.region_images[1]
+            f.total,
+            f.reg_preview,
+            f.reg_refined,
+            f.reproj_refined,
+            f.region_images[0],
+            f.region_images[1]
         ),
     )
     .unwrap();
@@ -234,6 +242,7 @@ fn passing_output_exits_zero() {
     }
     assert!(out.contains("결과: 7/7 통과"), "{out}");
     assert!(out.contains("초벌 240/240, 정밀 240/240"), "{out}");
+    assert!(out.contains("초벌·정밀 모두 전체 등록 (240/240)"), "{out}");
     assert!(out.contains("정밀 0.700 px"), "{out}");
     assert!(out.contains("점쌍 최소 1000"), "{out}");
     assert!(out.contains("구역 간 스케일 차 10.00%"), "{out}");
@@ -714,4 +723,19 @@ fn deeply_nested_manifest_fails_without_crash() {
     assert!(out.contains("중첩 깊이 64 초과"), "{out}");
     assert!(bytes < 1 << 20, "출력 {bytes} B");
     assert!(secs < 1.0, "verify {secs:.2} s");
+}
+
+#[test]
+fn registered_criterion_shows_scene_photo_count() {
+    let f = Fixture {
+        total: 81,
+        reg_preview: 81,
+        reg_refined: 81,
+        ..Fixture::default()
+    };
+    let (code, out) = run("total81", &f);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("초벌 81/81, 정밀 81/81"), "{out}");
+    assert!(out.contains("초벌·정밀 모두 전체 등록 (81/81)"), "{out}");
+    assert!(!out.contains("(240/240)"), "{out}");
 }

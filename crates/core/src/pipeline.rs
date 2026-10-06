@@ -168,6 +168,57 @@ pub struct RegionStats {
     pub secs_dense: f64,
 }
 
+/// 짝 그래프(노드 `0..n`, 변 `pairs`)에서 구역 자기 사진(`own_from..n`)을 하나라도 가진 덩어리 수.
+fn pair_components(pairs: &[(usize, usize)], own_from: usize, n: usize) -> usize {
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    for &(i, j) in pairs {
+        if i < n && j < n {
+            let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+            parent[a] = b;
+        }
+    }
+    let roots: std::collections::BTreeSet<usize> =
+        (own_from..n).map(|x| find(&mut parent, x)).collect();
+    roots.len()
+}
+
+/// 구역 안 사진(`gids`: 3·위치+카메라)이 모두 등록되지 않았으면 issues 에 남길 문장.
+/// 예: "region 0: registered 27/81 (F 27/27, R 0/27, L 0/27), pair graph components 3".
+fn register_issue(
+    region: usize,
+    gids: &[usize],
+    flags: &[bool],
+    components: usize,
+) -> Option<String> {
+    let reg = flags.iter().filter(|&&f| f).count();
+    if reg >= gids.len() {
+        return None;
+    }
+    let mut tot = [0usize; 3];
+    let mut ok = [0usize; 3];
+    for (g, &f) in gids.iter().zip(flags) {
+        tot[g % 3] += 1;
+        ok[g % 3] += usize::from(f);
+    }
+    Some(format!(
+        "region {region}: registered {reg}/{} (F {}/{}, R {}/{}, L {}/{}), pair graph components {components}",
+        gids.len(),
+        ok[0],
+        tot[0],
+        ok[1],
+        tot[1],
+        ok[2],
+        tot[2]
+    ))
+}
+
 /// 실행 결과.
 #[derive(Clone, Debug, Default)]
 pub struct PipelineResult {
@@ -2443,6 +2494,17 @@ pub fn run_pipeline_with(
             st.images
         ));
         live.note(t_now(), "register", r.index);
+        if let Some(msg) = register_issue(
+            r.index,
+            &gids[n_help..],
+            &init.poses[n_help..]
+                .iter()
+                .map(|p| p.is_some())
+                .collect::<Vec<_>>(),
+            pair_components(&pair_ids, n_help, gids.len()),
+        ) {
+            skipped.push(msg);
+        }
         {
             let flags: Vec<bool> = init.poses.iter().map(|p| p.is_some()).collect();
             let tab = crate::pipeline_stream::missing_by_camera(&gids, &flags);
@@ -3861,5 +3923,38 @@ mod refit_anchor_tests {
         let line: Vec<Vector3<f64>> = (0..4).map(|i| Vector3::new(i as f64, 0.0, 0.0)).collect();
         assert!(mk(&[0, 1, 2, 3], &line).is_none());
         assert!(mk(&[0, 1, 2], &cs).is_some());
+    }
+}
+
+#[cfg(test)]
+mod register_issue_tests {
+    use super::*;
+
+    fn gids(n_pos: usize) -> Vec<usize> {
+        (0..3 * n_pos).collect()
+    }
+
+    #[test]
+    fn partial_registration_is_reported() {
+        let g = gids(27);
+        let flags: Vec<bool> = g.iter().map(|x| x % 3 == 0).collect();
+        let msg = register_issue(0, &g, &flags, 3).unwrap();
+        assert_eq!(
+            msg,
+            "region 0: registered 27/81 (F 27/27, R 0/27, L 0/27), pair graph components 3"
+        );
+    }
+
+    #[test]
+    fn full_registration_has_no_issue() {
+        let g = gids(5);
+        assert_eq!(register_issue(1, &g, &[true; 15], 1), None);
+    }
+
+    #[test]
+    fn components_count_only_groups_with_own_images() {
+        // 노드 0 = 도우미, 1..5 = 자기 사진. {0,1}, {2,3}, {4} → 자기 사진이 있는 덩어리 3.
+        assert_eq!(pair_components(&[(0, 1), (2, 3)], 1, 5), 3);
+        assert_eq!(pair_components(&[(0, 1), (1, 2), (2, 3), (3, 4)], 1, 5), 1);
     }
 }
