@@ -749,7 +749,7 @@ impl Manifest {
 
 /// 매니페스트 읽기에 쓰는 작은 JSON 값.
 #[derive(Clone, Debug, PartialEq)]
-enum Json {
+pub(crate) enum Json {
     Null,
     Bool(bool),
     Num(f64),
@@ -759,14 +759,14 @@ enum Json {
 }
 
 impl Json {
-    fn get(&self, key: &str) -> Option<&Json> {
+    pub(crate) fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Obj(kv) => kv.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
 
-    fn parse(text: &str) -> Result<Json, String> {
+    pub(crate) fn parse(text: &str) -> Result<Json, String> {
         let b = text.as_bytes();
         let mut i = 0;
         let v = Self::value(b, &mut i)?;

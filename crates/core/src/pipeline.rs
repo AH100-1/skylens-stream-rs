@@ -176,6 +176,8 @@ pub struct PipelineResult {
     pub align: Vec<AlignRecord>,
     /// (사진 이름, 정밀 카메라 중심 동-북-위 m).
     pub centers: Vec<(String, [f64; 3])>,
+    /// `centers` 와 같은 순서의 정밀 회전 쿼터니언 `[w, x, y, z]`(세계 → 카메라).
+    pub rotations: Vec<(String, [f64; 4])>,
 }
 
 struct ImgData {
@@ -1897,6 +1899,10 @@ struct RegionRec {
     gids: Vec<usize>,
     ta: Vec<Track>,
     coarse: PointCloud,
+    /// 초벌 모델의 사진 번호(초벌 때의 목록 사본; 정밀 다시 등록으로 gids 가 바뀌어도 그대로).
+    coarse_gids: Vec<usize>,
+    /// 초벌 모델의 사진별 포즈(coarse_gids 순서).
+    coarse_poses: Vec<Option<Pose>>,
     /// 지금 쓰는 초벌 → 기준 정밀 좌표 변환과 그 기준 구역.
     sim: Option<Similarity>,
     target: Option<usize>,
@@ -2518,9 +2524,11 @@ pub fn run_pipeline_with(
         recs.push(RegionRec {
             region: *r,
             stats: st,
+            coarse_gids: gids.clone(),
             gids,
             ta,
             coarse,
+            coarse_poses: init.poses.clone(),
             sim,
             target,
             own: None,
@@ -2792,6 +2800,45 @@ pub fn run_pipeline_with(
     for (g, c) in &centers {
         poses_txt += &format!("{} {} {} {}\n", name(*g), c[0], c[1], c[2]);
         res.centers.push((name(*g), *c));
+        let q = recs
+            .iter()
+            .find(|r| r.centers.get(g) == Some(c))
+            .and_then(|r| r.rposes.get(g))
+            .map(|p| crate::poses_io::entry("", p).quat_wxyz);
+        if let Some(q) = q {
+            res.rotations.push((name(*g), q));
+        }
+    }
+    {
+        use crate::poses_io::{entry, transform_pose, write_poses_file, PosesFile};
+        let k = k_opt.ok_or("내부 파라미터 없음")?;
+        for (rec, sim) in recs.iter().zip(&sims) {
+            let r = rec.region;
+            let refined: Vec<_> = rec
+                .gids
+                .iter()
+                .filter(|g| r.contains(*g / 3))
+                .filter_map(|g| {
+                    let p = rec.rposes.get(g)?;
+                    let p = rec.rsim.as_ref().map_or(*p, |s| transform_pose(s, p));
+                    Some(entry(&name(*g), &p))
+                })
+                .collect();
+            write_poses_file(out, "refined", r.index, &PosesFile::new(&k, true, refined))?;
+            let preview: Vec<_> = rec
+                .coarse_gids
+                .iter()
+                .zip(&rec.coarse_poses)
+                .filter(|(g, _)| r.contains(**g / 3))
+                .filter_map(|(g, p)| {
+                    let p = (*p)?;
+                    let p = sim.as_ref().map_or(p, |s| transform_pose(s, &p));
+                    Some(entry(&name(*g), &p))
+                })
+                .collect();
+            let f = PosesFile::new(&k, sim.is_some(), preview);
+            write_poses_file(out, "preview", r.index, &f)?;
+        }
     }
     std::fs::write(out.join("poses.txt"), poses_txt).map_err(|e| e.to_string())?;
     let (mut reg_prev, mut reg_ref) = (
