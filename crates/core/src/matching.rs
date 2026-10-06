@@ -76,6 +76,9 @@ pub struct PairSchedule {
     pub temporal: usize,
     pub pow2_max: usize,
     pub cross: CrossSchedule,
+    /// 촬영 전체(비행 전체)의 마지막 위치 번호. 있으면 끝 구역을 이 값으로 판정하고,
+    /// 없으면 넘겨받은 사진 집합의 마지막 위치로 판정한다(구역 사진 집합은 전체 끝이 아니다).
+    pub capture_max_pos: Option<usize>,
 }
 
 /// 끝 구역으로 보는 위치 칸 수(구역 하나의 크기).
@@ -87,6 +90,7 @@ impl Default for PairSchedule {
             temporal: PAIR_TEMPORAL,
             pow2_max: PAIR_POW2_MAX,
             cross: CrossSchedule::FORMATION,
+            capture_max_pos: None,
         }
     }
 }
@@ -105,10 +109,16 @@ impl PairSchedule {
 /// 같은 카메라 규칙은 [`candidate_pairs`] 와 같다. 결과 (i, j) 는 i < j, 중복 없음, 정렬됨.
 pub fn scheduled_pairs(views: &[(usize, usize)], sch: &PairSchedule) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    // 끝 구역 판정용: 사진 집합이 `left_min` 칸 이상 걸칠 때만 맨 끝 5 칸을 끝 구역으로 본다.
-    let (min_pos, max_pos) = views
-        .iter()
-        .fold((usize::MAX, 0), |(lo, hi), &(_, p)| (lo.min(p), hi.max(p)));
+    // 끝 구역 판정용: 촬영이 `left_min` 칸 이상 걸칠 때만 맨 끝 5 칸을 끝 구역으로 본다.
+    // 촬영 전체의 끝이 주어지면 그 값(시작은 0 칸)을, 아니면 사진 집합의 범위를 쓴다.
+    let (min_pos, max_pos) = sch.capture_max_pos.map_or_else(
+        || {
+            views
+                .iter()
+                .fold((usize::MAX, 0), |(lo, hi), &(_, p)| (lo.min(p), hi.max(p)))
+        },
+        |m| (0, m),
+    );
     for i in 0..views.len() {
         for j in 0..views.len() {
             if i == j {
@@ -2704,6 +2714,25 @@ mod tests {
         let win: Vec<(usize, usize)> = views.iter().copied().filter(|v| v.1 < 12).collect();
         let w = near(&win, &scheduled_pairs(&win, &PairSchedule::default()));
         assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn near_left_tail_uses_capture_max_pos() {
+        // 위치 0..=24 만 담은 구역 집합: 집합 끝(24)이 아니라 촬영 끝(40)으로 끝 구역을 판정한다.
+        let views: Vec<(usize, usize)> = (0..=24).flat_map(|p| [(0, p), (2, p)]).collect();
+        let near = |sch: &PairSchedule| {
+            scheduled_pairs(&views, sch)
+                .iter()
+                .filter(|&&(i, j)| views[i].0 != views[j].0 && views[i].1.abs_diff(views[j].1) < 20)
+                .count()
+        };
+        let own_end = near(&PairSchedule::default());
+        let capture = near(&PairSchedule {
+            capture_max_pos: Some(40),
+            ..PairSchedule::default()
+        });
+        assert!(own_end > 0);
+        assert_eq!(capture, 0);
     }
 
     #[test]

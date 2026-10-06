@@ -418,8 +418,18 @@ fn ransac_stats_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("SKYLENS_RANSAC_STATS").is_some())
 }
 
-fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> Vec<PairMatch> {
-    let pairs = scheduled_pairs(views, &PairSchedule::default());
+/// `capture_max_pos`: 촬영 전체의 마지막 위치 번호(끝 구역 판정용, 없으면 `views` 범위).
+fn match_pairs(
+    imgs: &[&ImgData],
+    views: &[(usize, usize)],
+    k: &Intrinsics,
+    capture_max_pos: Option<usize>,
+) -> Vec<PairMatch> {
+    let sch = PairSchedule {
+        capture_max_pos,
+        ..PairSchedule::default()
+    };
+    let pairs = scheduled_pairs(views, &sch);
     pairs
         .par_iter()
         .filter_map(|&(i, j)| {
@@ -2980,6 +2990,8 @@ pub fn run_pipeline_with(
     use std::sync::{mpsc, Arc};
 
     let n_pos = ds.positions.len();
+    // 끝 구역 판정에 쓰는 촬영 전체의 마지막 위치(구역 사진 집합의 끝이 아니다).
+    let cap_max = n_pos.checked_sub(1);
     let regions = split_regions(n_pos, ds.config.span, ds.config.ovl);
     let owns = own_ranges(&regions, n_pos);
     for sub in ["preview", "refined", "snapshots"] {
@@ -3282,7 +3294,7 @@ pub fn run_pipeline_with(
             .map(|g| ds.positions[g / 3].image_enu[g % 3])
             .collect();
         let t1 = Instant::now();
-        let pm = crate::timing::timed("matching", || match_pairs(&imgs, &views, &k));
+        let pm = crate::timing::timed("matching", || match_pairs(&imgs, &views, &k, cap_max));
         st.secs_matching = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
         let pair_ids: Vec<(usize, usize)> = pm.iter().map(|p| (p.i, p.j)).collect();
@@ -3539,8 +3551,9 @@ pub fn run_pipeline_with(
                         let imgs_f: Vec<&ImgData> = arcs_f.iter().map(|a| a.as_ref()).collect();
                         let views_f: Vec<(usize, usize)> =
                             gf.iter().map(|g| (g % 3, g / 3)).collect();
-                        let pm_f =
-                            crate::timing::timed("matching", || match_pairs(&imgs_f, &views_f, &k));
+                        let pm_f = crate::timing::timed("matching", || {
+                            match_pairs(&imgs_f, &views_f, &k, cap_max)
+                        });
                         diag_set(region.index, &gf, "full");
                         if let Ok(sf) = sparse_init_roll(
                             &imgs_f,
@@ -3895,7 +3908,7 @@ mod diag {
             .iter()
             .map(|g| ds.positions[g / 3].image_enu[g % 3])
             .collect();
-        let pm = match_pairs(&imgs, &views, &k);
+        let pm = match_pairs(&imgs, &views, &k, None);
         let mut out = Vec::new();
         for opts in list {
             let (init, st) = sparse_init_with(
@@ -4123,7 +4136,7 @@ mod diag {
             .iter()
             .map(|g| ds.positions[g / 3].image_enu[g % 3])
             .collect();
-        let pm = match_pairs(&imgs, &views, &k);
+        let pm = match_pairs(&imgs, &views, &k, None);
         let init = sparse_init(
             &imgs,
             &pm,
