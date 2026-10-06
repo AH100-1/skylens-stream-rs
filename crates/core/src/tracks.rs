@@ -28,6 +28,9 @@ use std::collections::HashMap;
 
 /// 국소 변위 일관성 기준 문턱(화소): 960x540 영상 기준. 영상 크기에 비례해 늘린다.
 const DISPLACEMENT_TOLERANCE: f64 = 40.0;
+/// 잔차 문턱 하한 비율(기준 문턱 대비). 이웃 변위가 잘 맞으면(MAD 작음) 문턱을 기준의 1/4(960 폭에서 10 px)까지
+/// 낮춰, 옆 격자 점으로 일관되게 바뀐 대응처럼 그래프만으로는 안 보이는 오대응을 짝 단계에서 거른다.
+const DISPLACEMENT_FLOOR: f64 = 0.25;
 /// 기준 영상 크기(화소).
 const DISPLACEMENT_REF_WIDTH: f64 = 960.0;
 const DISPLACEMENT_REF_HEIGHT: f64 = 540.0;
@@ -247,24 +250,81 @@ pub fn build_tracks(
         }
         ConflictPolicy::Split => {
             // 인접 목록(CSR: 오프셋 + 평탄 배열, 노드마다 정렬)으로 간선마다 공통 이웃 수를 센다.
-            let mut start = vec![0usize; n + 1];
-            for &(u, v) in &edges {
-                start[u + 1] += 1;
-                start[v + 1] += 1;
-            }
-            for i in 0..n {
-                start[i + 1] += start[i];
-            }
-            let mut fill = start.clone();
-            let mut flat = vec![0usize; 2 * edges.len()];
-            for &(u, v) in &edges {
-                flat[fill[u]] = v;
-                fill[u] += 1;
-                flat[fill[v]] = u;
-                fill[v] += 1;
-            }
-            for i in 0..n {
-                flat[start[i]..start[i + 1]].sort_unstable();
+            // 간선 투표: 한 노드가 같은 영상의 서로 다른 특징 둘 이상과 이어지면(갈래) 적어도 하나는 오대응이다.
+            // 지지도(공통 이웃 수)가 가장 큰 간선만 남기고, 가장 큰 지지도가 1 이상인 채 동률이면 모두 끊는다
+            // (일관되게 바뀐 점과 참 대응이 둘 다 삼각형을 이루는 경우). 지지도 0 동률은 아래 순서 규칙에 맡긴다.
+            let (mut start, mut flat);
+            loop {
+                start = vec![0usize; n + 1];
+                for &(u, v) in &edges {
+                    start[u + 1] += 1;
+                    start[v + 1] += 1;
+                }
+                for i in 0..n {
+                    start[i + 1] += start[i];
+                }
+                let mut fill = start.clone();
+                flat = vec![0usize; 2 * edges.len()];
+                for &(u, v) in &edges {
+                    flat[fill[u]] = v;
+                    fill[u] += 1;
+                    flat[fill[v]] = u;
+                    fill[v] += 1;
+                }
+                for i in 0..n {
+                    flat[start[i]..start[i + 1]].sort_unstable();
+                }
+                let sup: Vec<usize> = edges
+                    .iter()
+                    .map(|&(u, v)| {
+                        common_count(&flat[start[u]..start[u + 1]], &flat[start[v]..start[v + 1]])
+                    })
+                    .collect();
+                let mut cut = vec![false; edges.len()];
+                let mut any = false;
+                // 노드 x 의 이웃 중 같은 영상끼리 모아 갈래를 찾는다(간선 (x, y), x < y 기준 양쪽에서 본다).
+                let mut by_node: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+                for (e, &(u, v)) in edges.iter().enumerate() {
+                    by_node.entry(u).or_default().push((v, e));
+                    by_node.entry(v).or_default().push((u, e));
+                }
+                for list in by_node.values() {
+                    let mut i = 0;
+                    while i < list.len() {
+                        let img = node_image[list[i].0];
+                        let mut j = i;
+                        while j < list.len() && node_image[list[j].0] == img {
+                            j += 1;
+                        }
+                        if j - i > 1 {
+                            let best = list[i..j].iter().map(|&(_, e)| sup[e]).max().unwrap();
+                            let top = list[i..j].iter().filter(|&&(_, e)| sup[e] == best).count();
+                            for &(_, e) in &list[i..j] {
+                                let drop = if sup[e] < best {
+                                    best > 0
+                                } else {
+                                    top > 1 && best > 0
+                                };
+                                if drop && !cut[e] {
+                                    cut[e] = true;
+                                    any = true;
+                                }
+                            }
+                        }
+                        i = j;
+                    }
+                }
+                if !any {
+                    break;
+                }
+                let mut k = 0;
+                edges.retain(|_| {
+                    k += 1;
+                    if cut[k - 1] {
+                        stats.conflicts += 1;
+                    }
+                    !cut[k - 1]
+                });
             }
             let nb = |x: usize| &flat[start[x]..start[x + 1]];
             let mut order: Vec<(usize, usize, usize)> = edges
@@ -443,7 +503,18 @@ fn displacement_outliers(
     }
     let tol = DISPLACEMENT_TOLERANCE * size;
     // 칸당 평균 8 점쯤 되도록 격자 칸을 정한다(점 분포 범위 기준).
-    let area = ((max_x - min_x) * (max_y - min_y)).max(1e-12);
+    // 범위는 5~95% 분위로 잡는다: 대부분이 좁은 곳에 몰리고 몇 개만 멀어도 칸이 커져 이차 시간이 되지 않게.
+    let q_range = |sel: fn(&Vector2<f64>) -> f64| {
+        let mut v: Vec<f64> = pos.iter().map(|q| sel(&q.0)).collect();
+        let (lo, hi) = (v.len() / 20, v.len() - 1 - v.len() / 20);
+        let a = *v.select_nth_unstable_by(lo, |a, b| a.total_cmp(b)).1;
+        let b = *v.select_nth_unstable_by(hi, |a, b| a.total_cmp(b)).1;
+        (b - a).max(0.0)
+    };
+    let full = ((max_x - min_x) * (max_y - min_y)).max(1e-12);
+    let quant = (q_range(|p| p.x) * q_range(|p| p.y) / 0.81).max(1e-12);
+    // 분포가 고르면 기존 칸 크기(수치 불변), 소수 이상점이 범위를 16 배 넘게 키울 때만 분위 범위를 쓴다.
+    let area = if full > 16.0 * quant { quant } else { full };
     let cell = (area * 8.0 / pos.len() as f64)
         .sqrt()
         .max(size * 4.0)
@@ -546,7 +617,7 @@ fn displacement_outliers(
                 };
                 // 대상 점은 u = 0, 변위 0(뺀 값)이므로 예측 (f[0], f[3]) 가 곧 어긋남이다.
                 let r = (f[0] * f[0] + f[3] * f[3]).sqrt();
-                r > (4.0 * s).clamp(tol, 3.0 * tol)
+                r > (4.0 * s).clamp(tol * DISPLACEMENT_FLOOR, 3.0 * tol)
             },
         )
         .collect();
@@ -1022,6 +1093,7 @@ mod tests {
         // 무작위 오대응의 두 점은 대개 멀어 겹치는 영상이 적으므로 5% 까지는 남을 수 있다고 본다.
         assert!(pd >= 0.95, "Drop 순도 {pd}");
         assert!(ps >= 0.99, "Split 순도 {ps}");
+        assert!(cs >= 0.95, "Split 완전도 {cs}");
         assert!(sd.conflicts > 0);
         // Split 완전도: 오대응 간선은 공통 이웃이 없어 마지막에 처리되고 충돌로 건너뛰므로
         // 참 관측은 거의 모두 제 트랙에 모인다: 98% 이상.
@@ -1192,17 +1264,45 @@ mod tests {
     }
 
     #[test]
+    fn consistent_swaps_at_low_recall() {
+        // 대응 재현율 30/50% 에서 정답 점 1% 를 일관되게 바꾼 경우: 순도 ≥ 0.99, 완전도 ≥ 0.95.
+        for keep in [30, 50] {
+            for seed in 1..=2 {
+                let s = synthetic_seeded(0, keep, 1, seed);
+                assert!(s.outliers > 0);
+                let (p, c, _, _) = run_policy(&s, ConflictPolicy::Split);
+                eprintln!("keep {keep} seed {seed}: purity {p:.4} completeness {c:.4}");
+                assert!(p >= 0.99, "keep {keep} seed {seed} 순도 {p}");
+                assert!(c >= 0.95, "keep {keep} seed {seed} 완전도 {c}");
+            }
+        }
+    }
+
+    #[test]
     fn consistent_swaps_stay_pure() {
         // 정답 점 1% 를 옆 격자 점과 모든 짝에서 일관되게 바꾼다(반복 무늬형 오대응).
-        let s = synthetic(0, 100, 1);
-        assert!(s.outliers > 0);
-        let (pd, cd, sd, _) = run_policy(&s, ConflictPolicy::Drop);
-        let (ps, cs, ss, _) = run_policy(&s, ConflictPolicy::Split);
-        eprintln!(
-            "consistent 1% outliers {}: Drop tracks {} purity {pd:.4} completeness {cd:.4} | Split tracks {} purity {ps:.4} completeness {cs:.4}",
-            s.outliers, sd.tracks, ss.tracks
-        );
-        assert!(ps >= 0.99, "Split 순도 {ps}");
+        // 시드 1~5 × 재현율 30/40/50% 모두에서 Split 순도 >= 0.99, 완전도 >= 0.95.
+        let mut failures = Vec::new();
+        for keep in [30, 40, 50, 100] {
+            let seeds = if keep == 100 { 0..=0 } else { 1..=5 };
+            for seed in seeds {
+                let s = synthetic_seeded(0, keep, 1, seed);
+                assert!(s.outliers > 0);
+                let (pd, cd, _, _) = run_policy(&s, ConflictPolicy::Drop);
+                let (ps, cs, _, _) = run_policy(&s, ConflictPolicy::Split);
+                eprintln!(
+                    "keep {keep} seed {seed} outliers {}: Drop purity {pd:.4} completeness {cd:.4} | Split purity {ps:.4} completeness {cs:.4}",
+                    s.outliers
+                );
+                if ps < 0.99 {
+                    failures.push(format!("keep {keep} seed {seed}: Split 순도 {ps}"));
+                }
+                if cs < 0.95 {
+                    failures.push(format!("keep {keep} seed {seed}: Split 완전도 {cs}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]
@@ -1616,5 +1716,199 @@ mod tests {
             eprintln!("keep {keep}: overlap {frac:.4} expected {want:.4} of {total}");
             assert!((frac - want).abs() <= 0.05, "{frac} vs {want}");
         }
+    }
+
+    /// 에피폴라 선 근처 오대응 추가: 짝마다 대응의 `per_mille`(천분율) 을 골라, 영상 a 광선 위 깊이
+    /// 0.7~1.3 배 점의 영상 b 투영 `near_px`(960 폭 기준 화소, 폭에 비례) 안 특징으로 바꿔 잇는다.
+    fn add_epipolar_mismatches(s: &mut Synthetic, opts: &SceneOpts, per_mille: u64, near_px: f64) {
+        let scene = Scene::new(SceneConfig {
+            positions: opts.positions,
+            width: opts.width,
+            height: opts.height,
+            ..SceneConfig::default()
+        });
+        let x_end = 40.0 + opts.positions.saturating_sub(12) as f64;
+        let mut points = Vec::new();
+        let mut x = -10.0;
+        while x <= x_end {
+            let mut y = -30.0;
+            while y <= 30.0 {
+                points.push(Point3::new(x, y, scene.surface_height(x, y)));
+                y += 1.5;
+            }
+            x += 1.5;
+        }
+        let tol = near_px * opts.width as f64 / 960.0;
+        for pi in 0..s.pairs.len() {
+            let (a, b) = (s.pairs[pi].image_a, s.pairs[pi].image_b);
+            let (ca, cb) = (&scene.views[a].camera, &scene.views[b].camera);
+            let n = s.pairs[pi].matches.len();
+            let k = (n as u64 * per_mille / 1000) as usize;
+            for t in 0..k {
+                let h = hash((a as u64) << 40 ^ (b as u64) << 20 ^ t as u64 ^ 0xE91);
+                let mi = (h % n as u64) as usize;
+                let (fa, fb) = s.pairs[pi].matches[mi];
+                if s.gt[a][fa] != s.gt[b][fb] {
+                    continue;
+                }
+                let depth = ca.pose.transform(&points[s.gt[a][fa]]).z;
+                // 광선 위 깊이 0.7~1.3 배 점들의 영상 b 투영(선분) 에서 `tol` 안 특징 중 해시로 하나를 고른다.
+                let proj: Vec<Vector2<f64>> = (0..13)
+                    .filter_map(|d| {
+                        let q = ca.unproject(&s.keypoints[a][fa], depth * (0.7 + 0.05 * d as f64));
+                        cb.project(&q)
+                    })
+                    .collect();
+                let cands: Vec<usize> = (0..s.keypoints[b].len())
+                    .filter(|&j| {
+                        s.gt[b][j] != s.gt[b][fb]
+                            && proj.iter().any(|q| (s.keypoints[b][j] - q).norm() <= tol)
+                    })
+                    .collect();
+                let best =
+                    (!cands.is_empty()).then(|| (0.0, cands[(h >> 24) as usize % cands.len()]));
+                if let Some((_, j)) = best {
+                    if s.gt[b][j] != s.gt[b][fb] {
+                        s.pairs[pi].matches[mi] = (fa, j);
+                        s.outliers += 1;
+                        s.inliers -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 같은 카메라 / 카메라 간 짝의 참 대응 손실: (손실, 전체) 쌍. 참 대응 = 두 끝의 정답 점이 같은 것.
+    fn pair_kind_loss(s: &Synthetic, tracks: &[Track]) -> [(usize, usize); 2] {
+        let mut track_of: HashMap<(usize, usize), usize> = HashMap::new();
+        for (ti, t) in tracks.iter().enumerate() {
+            for o in &t.observations {
+                track_of.insert((o.image, o.feature), ti);
+            }
+        }
+        let mut r = [(0usize, 0usize); 2];
+        for p in &s.pairs {
+            let kind = (p.image_a % 3 != p.image_b % 3) as usize;
+            for &(fa, fb) in &p.matches {
+                if s.gt[p.image_a][fa] != s.gt[p.image_b][fb] {
+                    continue;
+                }
+                r[kind].1 += 1;
+                let (x, y) = (
+                    track_of.get(&(p.image_a, fa)),
+                    track_of.get(&(p.image_b, fb)),
+                );
+                if x.is_none() || x != y {
+                    r[kind].0 += 1;
+                }
+            }
+        }
+        r
+    }
+
+    /// 잘못 합친 비율: 서로 다른 정답 점의 관측 쌍을 한 트랙에 둔 트랙 수 / 전체 트랙 수.
+    fn wrong_merge_rate(s: &Synthetic, tracks: &[Track]) -> f64 {
+        let bad = tracks
+            .iter()
+            .filter(|t| {
+                let mut c: HashMap<usize, usize> = HashMap::new();
+                for o in &t.observations {
+                    *c.entry(s.gt[o.image][o.feature]).or_default() += 1;
+                }
+                let top = c.values().max().copied().unwrap_or(0);
+                // 다수 정답 점이 아닌 관측이 둘 이상이면 잘못 합친 것으로 센다.
+                t.observations.len() - top >= 1
+            })
+            .count();
+        bad as f64 / tracks.len().max(1) as f64
+    }
+
+    /// F-263/F-125/F-265: 편대 기본 장면(44 위치, SceneConfig::default 배치) 에서 에피폴라 근처 오대응과
+    /// 일관된 바꿈 오대응, 유지 30·50% 의 순도·완전도·잘못 합친 비율·짝 종류별 참 대응 손실.
+    #[test]
+    fn epipolar_near_and_repeated_pattern_mismatches() {
+        let opts = SceneOpts {
+            positions: 44,
+            formation_pairs: true,
+            ..SceneOpts::default()
+        };
+        let mut failures = Vec::new();
+        for (mode, keep, seed) in [
+            ("epi", 30u64, 1u64),
+            ("epi", 50, 1),
+            ("swap", 30, 1),
+            ("swap", 50, 1),
+        ] {
+            let mut s = if mode == "swap" {
+                synthetic_scene(0, keep, 1, seed, &opts)
+            } else {
+                synthetic_scene(0, keep, 0, seed, &opts)
+            };
+            if mode == "epi" {
+                add_epipolar_mismatches(&mut s, &opts, 20, 2.0);
+            }
+            let cfg = TrackConfig::default();
+            let (tracks, st) = build_tracks(&s.pairs, &s.keypoints, &cfg);
+            let (pu, co) = purity_completeness(&s, &tracks);
+            let wm = wrong_merge_rate(&s, &tracks);
+            let [same, cross] = pair_kind_loss(&s, &tracks);
+            let (ls, lc) = (
+                same.0 as f64 / same.1.max(1) as f64,
+                cross.0 as f64 / cross.1.max(1) as f64,
+            );
+            eprintln!(
+                "{mode} keep {keep}: outliers {} inconsistent {} purity {pu:.4} completeness {co:.4} wrong-merge {wm:.4} loss same {}/{} ({ls:.4}) cross {}/{} ({lc:.4})",
+                s.outliers, st.inconsistent, same.0, same.1, cross.0, cross.1
+            );
+            assert!(s.outliers > 0);
+            let (pmin, wmax) = (0.99, 0.01);
+            if pu < pmin || co < 0.95 || wm > wmax || lc > 0.015 {
+                failures.push(format!(
+                    "{mode} keep {keep}: pu {pu} co {co} wm {wm} cross {lc}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// F-264: 대응이 한 곳에 몰린 짝의 시간이 고르게 퍼진 짝의 몇 배 이내(이전 21 배).
+    #[test]
+    fn clumped_pair_time_is_near_uniform() {
+        let n = 8000usize;
+        let kp = |clump: bool| -> Vec<Vector2<f64>> {
+            (0..n)
+                .map(|i| {
+                    let h = hash(i as u64 + 77);
+                    let (u, v) = (
+                        (h & 0xFFFF) as f64 / 65536.0,
+                        (h >> 16 & 0xFFFF) as f64 / 65536.0,
+                    );
+                    if clump && i != 0 {
+                        Vector2::new(100.0 + 40.0 * u, 100.0 + 40.0 * v)
+                    } else if clump {
+                        Vector2::new(1900.0, 1000.0)
+                    } else {
+                        Vector2::new(1920.0 * u, 1080.0 * v)
+                    }
+                })
+                .collect()
+        };
+        let m: Vec<(usize, usize)> = (0..n).map(|i| (i, i)).collect();
+        let mut times = [0.0f64; 2];
+        for (i, clump) in [false, true].into_iter().enumerate() {
+            let a = kp(clump);
+            let b: Vec<Vector2<f64>> = a.iter().map(|p| p + Vector2::new(5.0, 3.0)).collect();
+            let best = (0..3)
+                .map(|_| {
+                    let t0 = std::time::Instant::now();
+                    let out = displacement_outliers(&m, &a, &b);
+                    assert_eq!(out.iter().filter(|&&x| x).count(), 0);
+                    t0.elapsed().as_secs_f64()
+                })
+                .fold(f64::MAX, f64::min);
+            times[i] = best;
+        }
+        eprintln!("uniform {:.4} s clumped {:.4} s", times[0], times[1]);
+        assert!(times[1] <= 8.0 * times[0] + 0.05, "{times:?}");
     }
 }
