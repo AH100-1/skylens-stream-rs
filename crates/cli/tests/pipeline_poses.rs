@@ -9,9 +9,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use skylens_core::align::umeyama;
 use skylens_core::geo::{geodetic_to_enu, Geodetic};
 use skylens_core::math::rotation_angle_between;
-use skylens_core::nalgebra::{Matrix3, Rotation3};
+use skylens_core::nalgebra::{Matrix3, Rotation3, Vector3};
 use skylens_core::poses_io::{rotation_of, PosesFile};
 
 const RUN_OPTS: [&str; 12] = [
@@ -158,8 +159,8 @@ fn rotation_errors(pairs: &[(Rotation3<f64>, Rotation3<f64>)]) -> (Vec<f64>, Vec
     (raw, aligned)
 }
 
-/// 단구역 합성 장면. 실측(4코어 측정 기계): 회전 오차 정렬 전 중앙 1.140/최대 1.592 도, 정렬 후 중앙 0.388/최대 1.135 도,
-/// 중심 오차 중앙 0.312/최대 0.851 m. 상한은 실측 x 1.2.
+/// 단구역 합성 장면. 실측(4코어 측정 기계): 회전 오차 정렬 전 중앙 1.140/최대 1.592 도, 정렬 후 중앙 0.309/최대 0.488 도,
+/// 중심 오차 중앙 0.256/최대 0.713 m. 상한은 실측 x 1.2.
 #[test]
 fn refined_pose_rotation_and_center_errors() {
     let t = TempDir::new("single");
@@ -224,14 +225,15 @@ fn refined_pose_rotation_and_center_errors() {
         median(&pa),
         max(&pa)
     );
-    // 실측: 정렬 후 중앙 0.491/최대 4.081 도.
-    assert!(median(&pa) < 0.6, "초벌 회전 오차 중앙 {}", median(&pa));
-    assert!(max(&pa) < 4.9, "초벌 회전 오차 최대 {}", max(&pa));
+    // 실측: 정렬 후 중앙 0.258/최대 0.593 도. 상한은 실측 x 1.2.
+    assert!(median(&pa) < 0.31, "초벌 회전 오차 중앙 {}", median(&pa));
+    assert!(max(&pa) < 0.72, "초벌 회전 오차 최대 {}", max(&pa));
 }
 
 /// 기본 합성 장면(위치 수 기본값) + `--span 12 --coarse-back off`: 구역마다 초벌 포즈 파일의 사진 이름과 포즈가 짝이 맞아야 한다.
 /// 정밀 다시 등록으로 구역 사진 목록이 바뀌어도 초벌 포즈는 초벌 때의 사진 번호와 짝지어 쓴다.
 /// 같은 사진의 정밀 중심(출력 좌표)과 초벌 중심의 차이 중앙값을 구역별로 단언한다.
+/// 또 초벌 중심을 정답과 직접 비교해 초벌 모델 자체 오차와 초벌 -> 정밀 정렬 잔차를 나눈다.
 #[test]
 fn coarse_back_off_preview_poses_stay_paired() {
     let t = TempDir::new("off");
@@ -259,6 +261,8 @@ fn coarse_back_off_preview_poses_stay_paired() {
     let (code, so, se) = cli(&args);
     assert_eq!(code, 0, "{so}{se}");
 
+    let truth = truth_poses(&scene);
+    let shift = truth_to_output_shift(&scene);
     let registered: Vec<usize> = so
         .lines()
         .filter(|l| l.starts_with("region "))
@@ -286,11 +290,23 @@ fn coarse_back_off_preview_poses_stay_paired() {
         let f = out.join("poses").join(format!("preview_{k:02}.json"));
         let pf = PosesFile::from_json(&std::fs::read_to_string(&f).unwrap()).unwrap();
         let mut d = Vec::new();
+        // 같은 사진(정밀 모델에도 등록된 것)의 정답 대비 중심 오차: 초벌(출력 좌표 그대로)·정밀.
+        let (mut direct_shared, mut refined_shared) = (Vec::new(), Vec::new());
+        // 초벌 전 사진의 (초벌 중심, 정답 중심).
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        let dist =
+            |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt();
         for e in &pf.poses {
+            let tc = &truth[&e.name].1;
+            let tco = [0, 1, 2].map(|i| tc[i] + shift[i]);
+            src.push(Vector3::from(e.center));
+            dst.push(Vector3::from(tco));
             // 정밀 모델에 등록되지 않은 사진은 비교에서 뺀다.
             let Some(r) = refined.get(&e.name) else {
                 continue;
             };
+            direct_shared.push(dist(e.center, tco));
+            refined_shared.push(dist(r.center, tco));
             d.push(
                 (0..3)
                     .map(|i| (e.center[i] - r.center[i]).powi(2))
@@ -300,12 +316,36 @@ fn coarse_back_off_preview_poses_stay_paired() {
         }
         // 초벌 포즈 수는 초벌 등록 수(`region k positions P registered R/N`)와 같아야 한다.
         assert_eq!(pf.poses.len(), n_reg, "구역 {k} 초벌 포즈 수");
+        // 초벌 모델 자체 오차: 초벌 중심을 정답 중심에 유사변환으로 맞춘 뒤(전 사진) 남는 거리.
+        let sim = umeyama(&src, &dst);
         if !pf.aligned {
             // 초벌이 정밀 모델과 겹치는 사진이 없어 정렬되지 못한 구역은 좌표가 달라 비교하지 않는다.
-            eprintln!("POSES off preview_{k:02} n {} not aligned", pf.poses.len());
+            let (own_med, own_max) = sim.as_ref().map_or((f64::NAN, f64::NAN), |sm| {
+                let e: Vec<f64> = src
+                    .iter()
+                    .zip(&dst)
+                    .map(|(a, b)| (sm.apply_point(a) - b).norm())
+                    .collect();
+                (median(&e), max(&e))
+            });
+            eprintln!(
+                "POSES off preview_{k:02} n {} not aligned | coarse-own(sim-aligned to truth) med {own_med:.3} max {own_max:.3} m (nan = degenerate fit)",
+                pf.poses.len()
+            );
             continue;
         }
+        let sim = sim.expect("초벌 유사변환");
+        let own: Vec<f64> = src
+            .iter()
+            .zip(&dst)
+            .map(|(a, b)| (sim.apply_point(a) - b).norm())
+            .collect();
         assert!(!d.is_empty(), "구역 {k} 비교 가능한 사진 없음");
+        eprintln!(
+            "POSES off preview_{k:02} shared {} of {} | coarse-own(sim-aligned to truth, all {}) med {:.3} max {:.3} m scale {:.3} | coarse-as-output vs truth(shared) med {:.3} max {:.3} m | refined vs truth(shared) med {:.3} max {:.3} m",
+            d.len(), pf.poses.len(), own.len(), median(&own), max(&own), sim.s,
+            median(&direct_shared), max(&direct_shared), median(&refined_shared), max(&refined_shared)
+        );
         let (md, mx) = (median(&d), max(&d));
         eprintln!(
             "POSES off preview_{k:02} n {} aligned {} center-vs-refined med {md:.3} max {mx:.3} m",
@@ -314,5 +354,30 @@ fn coarse_back_off_preview_poses_stay_paired() {
         );
         // 실측(4코어): 구역 1 중앙 3.37~3.56 m, 구역 2 중앙 1.57 m. 사진 짝이 엇갈리면 구역 1 이 9.5 m, 구역 0 은 포즈가 6장만 남는다. 상한은 실측 x 1.2.
         assert!(md < 4.3, "구역 {k} 초벌-정밀 중심 차 중앙 {md} m");
+        // 오차 분리(정답 직접 비교). 초벌 사진은 모두 정밀에도 등록되어(공유 = 전부) 구역 1 은 32/32, 구역 2 는 10/10 이다.
+        // 정밀 중심은 정답과 중앙 0.64/0.88 m, 최대 1.01 m 로 가깝다. 초벌 모델 자체는 유사변환 후 중앙 0.74/0.56 m,
+        // 최대 1.23/1.22 m 라 `on`(0.66/0.48 m)과 같은 수준이다(축척 1.019/0.970). 그런데 정렬된 출력으로는 정답과
+        // 중앙 3.68/1.89 m, 최대 6.35/2.74 m 어긋난다. 곧 초벌 대 정밀 차(3.37/1.57 m)의 대부분은 초벌 모델이 아니라
+        // 초벌 -> 정밀 정렬 잔차다. 상한은 구역별 실측 x 1.2: (자체 중앙, 자체 최대, 출력 중앙, 출력 최대, 공유 수).
+        // 구역 0 은 사진 14장이 정렬되지 못하고 유사변환도 퇴화라 비교하지 않는다.
+        let (own_med, own_max, out_med, out_max, n_shared) = match k {
+            1 => (0.89, 1.48, 4.42, 7.62, 32),
+            2 => (0.67, 1.46, 2.27, 3.29, 10),
+            _ => panic!("구역 {k} 상한 없음"),
+        };
+        assert_eq!(d.len(), n_shared, "구역 {k} 공유 사진 수");
+        assert!(
+            median(&own) < own_med,
+            "구역 {k} 초벌 자체 오차 중앙 {} m",
+            median(&own)
+        );
+        assert!(
+            max(&own) < own_max,
+            "구역 {k} 초벌 자체 오차 최대 {} m",
+            max(&own)
+        );
+        let (dm, dx) = (median(&direct_shared), max(&direct_shared));
+        assert!(dm < out_med, "구역 {k} 정답 대비 초벌 중심 중앙 {dm} m");
+        assert!(dx < out_max, "구역 {k} 정답 대비 초벌 중심 최대 {dx} m");
     }
 }
