@@ -833,7 +833,7 @@ fn region_cloud_impl(
     let t_fuse = std::time::Instant::now();
     let cloud = fuse_stage(&st, cfg);
     crate::timing::add("fusion", t_fuse.elapsed().as_secs_f64());
-    record_view_diag(&st, &cloud, cfg);
+    record_view_diag(&st, &cloud, cfg, views, sparse_points);
     cloud
 }
 
@@ -852,6 +852,14 @@ pub struct ViewDiagRecord {
     /// 그 순서를 따라가며 점이 현재 기준 사진의 깊이와 맞는지(재투영·상대 깊이) 보고 정한다.
     /// 어느 사진과도 맞지 않으면 `usize::MAX`.
     pub point_view: Vec<usize>,
+    /// 밀집 단계에 들어온 사진(입력 순서, 준비 전 원본 영상과 자세).
+    pub views: Vec<DenseView>,
+    /// 밀집 단계에 들어온 희소 점.
+    pub sparse: Vec<[f64; 3]>,
+    /// 융합에 쓰인 깊이 맵(반점 제거 뒤, `cams` 순서).
+    pub maps: Vec<DepthMap>,
+    /// 이 단계의 밀집 설정.
+    pub cfg: DenseConfig,
 }
 
 static VIEW_DIAG: std::sync::Mutex<Option<Vec<ViewDiagRecord>>> = std::sync::Mutex::new(None);
@@ -866,7 +874,13 @@ pub fn view_diag_take() -> Vec<ViewDiagRecord> {
     VIEW_DIAG.lock().unwrap().take().unwrap_or_default()
 }
 
-fn record_view_diag(st: &DepthStage, cloud: &PointCloud, cfg: &DenseConfig) {
+fn record_view_diag(
+    st: &DepthStage,
+    cloud: &PointCloud,
+    cfg: &DenseConfig,
+    views: &[DenseView],
+    sparse_points: &[[f64; 3]],
+) {
     if VIEW_DIAG.lock().unwrap().is_none() {
         return;
     }
@@ -923,6 +937,10 @@ fn record_view_diag(st: &DepthStage, cloud: &PointCloud, cfg: &DenseConfig) {
         neighbors: st.neighbors.clone(),
         points: cloud.points.iter().map(|p| p.xyz).collect(),
         point_view,
+        views: views.to_vec(),
+        sparse: sparse_points.to_vec(),
+        maps: st.maps.clone(),
+        cfg: *cfg,
     };
     if let Some(v) = VIEW_DIAG.lock().unwrap().as_mut() {
         v.push(rec);
