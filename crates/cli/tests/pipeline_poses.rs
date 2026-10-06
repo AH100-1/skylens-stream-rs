@@ -14,6 +14,11 @@ use skylens_core::math::rotation_angle_between;
 use skylens_core::nalgebra::{Matrix3, Rotation3};
 use skylens_core::poses_io::{rotation_of, PosesFile};
 
+/// 회전 목표(정렬 후 오차, 도): 중앙 0.2, 최대 1. 현재 실측은 중앙 0.388/최대 1.135 로 아직 못 미친다.
+/// 아래 상한 단언은 회귀 방지용이고, 목표 대비 현재 값은 `#[ignore]` 시험 `rotation_target_gap` 이 찍는다.
+const TARGET_ROT_MED_DEG: f64 = 0.2;
+const TARGET_ROT_MAX_DEG: f64 = 1.0;
+
 const RUN_OPTS: [&str; 12] = [
     "--span",
     "48",
@@ -156,6 +161,149 @@ fn rotation_errors(pairs: &[(Rotation3<f64>, Rotation3<f64>)]) -> (Vec<f64>, Vec
         .map(|(o, t)| rotation_angle_between(&(o * g.inverse()), t).to_degrees())
         .collect();
     (raw, aligned)
+}
+
+/// 합성 장면을 만들고 `run` 한다. `span` 은 `RUN_OPTS` 의 SPAN 을 덮어쓴다.
+fn synth_and_run(t: &TempDir, stride: &str, span: &str) -> (PathBuf, PathBuf) {
+    let (scene, out) = (t.0.join("scene"), t.0.join("out"));
+    let (scene_s, out_s) = (scene.to_str().unwrap(), out.to_str().unwrap());
+    let (code, so, se) = cli(&["synth", scene_s, "320", "180"]);
+    assert_eq!(code, 0, "{so}{se}");
+    let mut args = vec!["run", scene_s, out_s, "--stride", stride];
+    args.extend(RUN_OPTS);
+    let at = args.iter().position(|a| *a == "--span").unwrap() + 1;
+    args[at] = span;
+    let (code, so, se) = cli(&args);
+    assert_eq!(code, 0, "{so}{se}");
+    (scene, out)
+}
+
+/// `poses/{kind}_*.json` 을 파일별로(이름순) 읽는다.
+fn read_files(out: &Path, kind: &str) -> Vec<PosesFile> {
+    let mut files: Vec<_> = std::fs::read_dir(out.join("poses"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&format!("{kind}_")) && n.ends_with(".json"))
+        })
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|f| PosesFile::from_json(&std::fs::read_to_string(f).unwrap()).unwrap())
+        .collect()
+}
+
+/// 단구역 정밀 포즈의 정렬 후 회전 오차 (중앙, 최대).
+fn single_region_aligned_rotation() -> (f64, f64) {
+    let t = TempDir::new("target");
+    let (scene, out) = synth_and_run(&t, "2", "48");
+    let truth = truth_poses(&scene);
+    let (refined, _) = read_kind(&out, "refined");
+    let pairs: Vec<_> = refined
+        .iter()
+        .map(|(n, e)| (rotation_of(e), truth[n].0))
+        .collect();
+    let (_, aligned) = rotation_errors(&pairs);
+    (median(&aligned), max(&aligned))
+}
+
+/// 회전 목표(중앙 0.2°·최대 1°) 대비 현재 값을 찍는다. 목표 미달이라 단언하지 않는 측정 시험.
+#[test]
+#[ignore = "측정용: cargo test --release -p skylens-stream --test pipeline_poses -- --ignored --nocapture"]
+fn rotation_target_gap() {
+    let (m, x) = single_region_aligned_rotation();
+    eprintln!(
+        "POSES target rot med {TARGET_ROT_MED_DEG} max {TARGET_ROT_MAX_DEG} deg; measured med {m:.4} max {x:.4} deg; met {}",
+        m <= TARGET_ROT_MED_DEG && x <= TARGET_ROT_MAX_DEG
+    );
+}
+
+/// 2구역(stride 2 → 40위치, SPAN 24 → 구역 [0,26), [22,40)): 구역별 포즈 파일 2쌍, 구역별 포즈 수,
+/// 겹침 사진(두 구역 모두에 있는 사진)의 구역 간 회전 차·중심 차.
+#[test]
+fn two_region_pose_files_and_overlap_consistency() {
+    let t = TempDir::new("two");
+    let (scene, out) = synth_and_run(&t, "2", "24");
+    let truth = truth_poses(&scene);
+    let refined = read_files(&out, "refined");
+    let preview = read_files(&out, "preview");
+    assert_eq!(refined.len(), 2, "정밀 포즈 파일 수");
+    assert_eq!(preview.len(), 2, "초벌 포즈 파일 수");
+    for k in 0..2 {
+        assert!(out.join(format!("poses/refined_{k:02}.json")).is_file());
+        assert!(out.join(format!("poses/preview_{k:02}.json")).is_file());
+    }
+    let counts: Vec<usize> = refined.iter().map(|f| f.poses.len()).collect();
+    let pcounts: Vec<usize> = preview.iter().map(|f| f.poses.len()).collect();
+    let aligned: Vec<bool> = preview.iter().map(|f| f.aligned).collect();
+    eprintln!(
+        "POSES2 refined counts {counts:?} preview counts {pcounts:?} preview aligned {aligned:?}"
+    );
+    assert!(refined.iter().all(|f| f.aligned), "정밀 포즈는 정렬됨");
+    // 실측: 구역별 포즈 수 [78, 54], 초벌도 같다(정렬 true 2개).
+    assert_eq!(counts, [78, 54], "구역별 정밀 포즈 수");
+    assert_eq!(pcounts, [78, 54], "구역별 초벌 포즈 수");
+    assert_eq!(aligned, [true, true], "초벌 정렬 성공");
+    let all: std::collections::BTreeSet<&str> = refined
+        .iter()
+        .flat_map(|f| f.poses.iter().map(|e| e.name.as_str()))
+        .collect();
+    assert!(all.len() >= 115, "전체 등록 수 {}", all.len());
+
+    let b: BTreeMap<&str, &skylens_core::poses_io::PoseEntry> = refined[1]
+        .poses
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
+    let mut rot = Vec::new();
+    let mut cen = Vec::new();
+    let shift = truth_to_output_shift(&scene);
+    let mut truth_c = Vec::new();
+    for a in &refined[0].poses {
+        if let Some(e) = b.get(a.name.as_str()) {
+            rot.push(rotation_angle_between(&rotation_of(a), &rotation_of(e)).to_degrees());
+            cen.push(
+                (0..3)
+                    .map(|k| (a.center[k] - e.center[k]).powi(2))
+                    .sum::<f64>()
+                    .sqrt(),
+            );
+            let tc = truth[&a.name].1;
+            for e in [a, *e] {
+                truth_c.push(
+                    (0..3)
+                        .map(|k| (e.center[k] - (tc[k] + shift[k])).powi(2))
+                        .sum::<f64>()
+                        .sqrt(),
+                );
+            }
+        }
+    }
+    eprintln!(
+        "POSES2 overlap n {} rot diff med {:.4} max {:.4} deg, center diff med {:.3} max {:.3} m, truth center err med {:.3} max {:.3} m",
+        rot.len(),
+        median(&rot),
+        max(&rot),
+        median(&cen),
+        max(&cen),
+        median(&truth_c),
+        max(&truth_c)
+    );
+    // 실측(4코어 측정 기계): 겹침 12장, 구역 간 회전 차 중앙 0.900/최대 7.734 도, 중심 차 중앙 0.530/최대 0.712 m,
+    // 정답 대비 중심 오차 중앙 0.385/최대 0.923 m. 상한은 실측 x 1.2.
+    assert_eq!(rot.len(), 12, "겹침 사진 수");
+    assert!(median(&rot) < 1.08, "겹침 회전 차 중앙 {}", median(&rot));
+    assert!(max(&rot) < 9.3, "겹침 회전 차 최대 {}", max(&rot));
+    assert!(median(&cen) < 0.64, "겹침 중심 차 중앙 {}", median(&cen));
+    assert!(max(&cen) < 0.86, "겹침 중심 차 최대 {}", max(&cen));
+    assert!(
+        max(&truth_c) < 1.11,
+        "겹침 중심 오차 최대 {}",
+        max(&truth_c)
+    );
 }
 
 /// 단구역 합성 장면. 실측(4코어 측정 기계): 회전 오차 정렬 전 중앙 0.652/최대 1.535 도, 정렬 후 중앙 0.388/최대 1.135 도,
