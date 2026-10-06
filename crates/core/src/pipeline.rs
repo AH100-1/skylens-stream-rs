@@ -4259,8 +4259,9 @@ mod choose_roll_tests {
     }
 
     /// 수평 퍼짐 가정이 틀린 장면(비행 내내 일정하게 기운 카메라 장착)에서 GPS 해가 이겨야 하는지 재는 표.
-    /// 세계 = GPS 좌표계(모델과 같은 틀)라 정답 롤은 0°. 격자: 비행 축(x) 300 m, 옆으로 3열(폭 W), 높이 흩어짐 ±0.4 m.
-    /// 카메라 광축은 비행 축 수직 방향으로 ±3° 흩어지고 전체가 `bank` 만큼 기울었다.
+    /// 세계 = GPS 좌표계(모델과 같은 틀)라 정답 회전은 항등(롤 0°). 격자: 비행 축(x) 0~270 m(30 m 간격 10단계), 옆으로 3열(폭 W), 높이 흩어짐 ±0.4 m.
+    /// 카메라 광축은 비행 축 수직 방향으로 `bank` 를 중심으로 -6°~+6°(3° 간격 5단계) 흩어진다.
+    /// 오차 열 두 종류: `err_*` 는 후보 회전 전체의 회전각(방위·피치 오차 포함), `roll_*` 는 그중 비행 축(x) 둘레 성분만 뽑은 롤 오차.
     fn splitmix64(state: &mut u64) -> u64 {
         *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = *state;
@@ -4277,6 +4278,9 @@ mod choose_roll_tests {
         err_gps: f64,
         err_roll: f64,
         err_chosen: f64,
+        roll_gps: f64,
+        roll_roll: f64,
+        roll_chosen: f64,
     }
 
     fn sweep_case(width: f64, noise: f64, bank_deg: f64, trials: u64) -> SweepRow {
@@ -4308,6 +4312,9 @@ mod choose_roll_tests {
             err_gps: 0.0,
             err_roll: 0.0,
             err_chosen: 0.0,
+            roll_gps: 0.0,
+            roll_roll: 0.0,
+            roll_chosen: 0.0,
         };
         for seed in 0..trials {
             let mut st = 0x9E37_79B9_7F4A_7C15u64 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
@@ -4324,6 +4331,11 @@ mod choose_roll_tests {
             let c = roll_candidates(&sim, &truth, &dst, &inl, &rots).unwrap();
             let (chosen, rolled) = choose_roll(&sim, &truth, &dst, &inl, &rots);
             let ang = |s: &Similarity| s.r.angle().to_degrees();
+            // 정답이 항등이므로 s.r 자체가 오차 회전. 비행 축(x) 둘레 성분(twist)만 뽑는다.
+            let roll = |s: &Similarity| {
+                let q = nalgebra::UnitQuaternion::from_rotation_matrix(&s.r);
+                (2.0 * q.i.atan2(q.w.abs())).to_degrees().abs()
+            };
             row.gps_wins += usize::from(!rolled);
             row.min_ratio = row.min_ratio.min(c.rms_gps / c.rms_roll);
             // 두 후보 중 롤 오차가 더 큰 쪽을 골랐으면 틀린 선택.
@@ -4332,6 +4344,9 @@ mod choose_roll_tests {
             row.err_gps += ang(&sim) / trials as f64;
             row.err_roll += ang(&c.rolled) / trials as f64;
             row.err_chosen += ang(&chosen) / trials as f64;
+            row.roll_gps += roll(&sim) / trials as f64;
+            row.roll_roll += roll(&c.rolled) / trials as f64;
+            row.roll_chosen += roll(&chosen) / trials as f64;
         }
         row
     }
@@ -4340,7 +4355,7 @@ mod choose_roll_tests {
     fn bank_sweep_table() {
         const TRIALS: u64 = 200;
         eprintln!(
-            "noise width bank | gps_win/{TRIALS} wrong min_ratio ratio err_gps err_roll err_chosen"
+            "noise width bank | gps_win/{TRIALS} wrong min_ratio ratio | 전체 회전각 err_gps err_roll err_chosen | x축 둘레 롤 roll_gps roll_roll roll_chosen"
         );
         for noise in [0.0, 0.5, 2.4] {
             for width in [12.0, 30.0, 60.0, 120.0] {
@@ -4348,8 +4363,17 @@ mod choose_roll_tests {
                     let t = if noise == 0.0 { 1 } else { TRIALS };
                     let r = sweep_case(width, noise, bank, t);
                     eprintln!(
-                        "{noise:.1} {width:5.0} {bank:.0} | {:2} {:2} {:.3} {:.3} {:.3} {:.3} {:.3}",
-                        r.gps_wins, r.wrong, r.min_ratio, r.ratio, r.err_gps, r.err_roll, r.err_chosen
+                        "{noise:.1} {width:5.0} {bank:.0} | {:2} {:2} {:.3} {:.3} | {:.3} {:.3} {:.3} | {:.3} {:.3} {:.3}",
+                        r.gps_wins,
+                        r.wrong,
+                        r.min_ratio,
+                        r.ratio,
+                        r.err_gps,
+                        r.err_roll,
+                        r.err_chosen,
+                        r.roll_gps,
+                        r.roll_roll,
+                        r.roll_chosen
                     );
                     if noise > 0.0 && bank == 0.0 {
                         // 기울기가 없으면 어떤 폭·잡음에서도 GPS 해로 잘못 넘어가지 않는다(최소 비 0.96 > 0.95).
@@ -4357,7 +4381,7 @@ mod choose_roll_tests {
                         assert!(r.min_ratio > ROLL_GPS_KEEP_RATIO);
                     }
                     if noise == 2.4 && width == 120.0 && bank == 4.0 {
-                        // 옆 퍼짐이 크고 4° 기운 비행: 잡음 2.4 m 에서도 GPS 해를 고르고 롤 오차가 1° 미만.
+                        // 옆 퍼짐이 크고 4° 기운 비행: 잡음 2.4 m 에서도 GPS 해를 고르고 전체 회전각 오차가 1° 미만.
                         assert_eq!(r.gps_wins as u64, TRIALS);
                         assert!(r.err_chosen < 1.0 && r.err_roll > 3.9);
                     }
