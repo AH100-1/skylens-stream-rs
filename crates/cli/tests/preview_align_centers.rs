@@ -116,6 +116,7 @@ const MAX_TRUTH_SPREAD: f64 = 1.0;
 /// 정밀 트랙 관측마다 정답 카메라에서 표면으로 쏜 교점의 중앙값(성분별)과 가장 먼 교점까지 거리.
 struct Row {
     coarse: Vector3<f64>,
+    refined: Vector3<f64>,
     obs: Vec<(u32, [f64; 2])>,
     truth: Option<(Vector3<f64>, f64)>,
 }
@@ -130,9 +131,10 @@ fn read_rows(path: &Path) -> Vec<Row> {
         .skip(1)
         .map(|l| {
             let p: Vec<&str> = l.split('|').collect();
-            let (c, o) = (nums(p[1]), nums(p[6]));
+            let (c, r, o) = (nums(p[1]), nums(p[2]), nums(p[6]));
             Row {
                 coarse: Vector3::new(c[0], c[1], c[2]),
+                refined: Vector3::new(r[0], r[1], r[2]),
                 obs: o.chunks(4).map(|c| (c[0] as u32, [c[2], c[3]])).collect(),
                 truth: None,
             }
@@ -342,6 +344,12 @@ fn preview_align_centers() {
                 .filter(|x| x.truth.is_some_and(|t| t.1 < MAX_TRUTH_SPREAD))
                 .map(|x| (sim.apply_point(&x.coarse) - x.truth.unwrap().0).norm())
                 .collect();
+            // 바닥: 정밀 점 자체의 정답 대비 오차(정렬이 이보다 좋아질 수는 없다).
+            let floor: Vec<f64> = rows
+                .iter()
+                .filter(|x| x.truth.is_some_and(|t| t.1 < MAX_TRUTH_SPREAD))
+                .map(|x| (x.refined - x.truth.unwrap().0).norm())
+                .collect();
             let ce: Vec<f64> = cs
                 .iter()
                 .filter_map(|(g, c, _)| {
@@ -368,8 +376,8 @@ fn preview_align_centers() {
                 )
             });
             eprintln!(
-                "ALIGN | {:<24} | region {region} | point err m med/p90 {} (n {}) | coarse center err m med/p90 {} (best similarity med {best:.3}) | center gap to refined med {:.3} | scale {:.4} | verify nn med max {nn} m, height diff med max {hd} m",
-                c.name, stat(&pe), pe.len(), stat(&ce), quant(&cr, 0.5), sim.s
+                "ALIGN | {:<24} | region {region} | point err m med/p90 {} (n {}, refined floor {}) | coarse center err m med/p90 {} (best similarity med {best:.3}) | center gap to refined med {:.3} | scale {:.4} | verify nn med max {nn} m, height diff med max {hd} m",
+                c.name, stat(&pe), pe.len(), stat(&floor), stat(&ce), quant(&cr, 0.5), sim.s
             );
         }
     }
