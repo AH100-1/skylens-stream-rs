@@ -504,19 +504,11 @@ fn normalizer(p: &[Vector2<f64>]) -> Matrix3<f64> {
     Matrix3::new(s, 0.0, -s * c.x, 0.0, s, -s * c.y, 0.0, 0.0, 1.0)
 }
 
-/// 정규화 8점 알고리즘으로 기본 행렬 F (x2ᵀ F x1 = 0, 픽셀 좌표)를 구한다.
-/// 점이 8개 미만이거나, 길이가 다르거나, 유한하지 않은 좌표가 있거나,
-/// 해가 하나로 정해지지 않으면(영공간 2차원 이상: 동일선상 점, 순수 회전 등) None.
-/// 어느 한 영상의 점 분포가 짧은 축/긴 축 표준편차 비 0.02 미만(잡음 섞인 동일선상)이어도 None.
-/// 결과는 계수 2, 프로베니우스 노름 1.
-pub fn fundamental_8pt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matrix3<f64>> {
-    if x1.len() < 8 || x1.len() != x2.len() || !all_finite(x1) || !all_finite(x2) {
-        return None;
-    }
-    // 잡음 섞인 동일선상 배치는 고윳값 비 검사로 걸러지지 않는다(둘째 고윳값이 잡음 크기만큼 커진다).
-    if nearly_collinear(x1) || nearly_collinear(x2) {
-        return None;
-    }
+/// 정규화 좌표(Hartley)로 만든 8점 설계 행렬의 AᵀA (9×9)와 두 영상의 정규화 변환.
+fn normalized_design(
+    x1: &[Vector2<f64>],
+    x2: &[Vector2<f64>],
+) -> (SMatrix<f64, 9, 9>, Matrix3<f64>, Matrix3<f64>) {
     let (t1, t2) = (normalizer(x1), normalizer(x2));
     // AᵀA (9×9) 의 최소 고유벡터가 최소제곱 해.
     let mut ata = SMatrix::<f64, 9, 9>::zeros();
@@ -536,6 +528,48 @@ pub fn fundamental_8pt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matri
         ]);
         ata += row * row.transpose();
     }
+    (ata, t1, t2)
+}
+
+/// [`design_singular_ratio`] 가 이보다 작으면 [`is_degenerate_configuration`] 이 참.
+/// 합성 장면 실측: 잡음 0~1 px 의 동일선상 ≤ 1.8e-3, 평면 ≤ 2.2e-3, 일반 배치·편대(건물 10%) ≥ 4.9e-3 이라 사이 값을 쓴다.
+pub const DEGENERATE_SINGULAR_RATIO: f64 = 3.5e-3;
+
+/// 정규화 설계 행렬의 (둘째로 작은 특이값) / (가장 큰 특이값). 픽셀 단위·영상 크기와 무관한 무차원 값이다.
+/// 값이 작을수록 영공간이 2차원 이상(동일선상·평면·순수 회전)에 가깝다. 8점 미만·비유한 입력은 None.
+pub fn design_singular_ratio(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<f64> {
+    if x1.len() < 8 || x1.len() != x2.len() || !all_finite(x1) || !all_finite(x2) {
+        return None;
+    }
+    let (ata, _, _) = normalized_design(x1, x2);
+    let mut ev: Vec<f64> = ata.symmetric_eigen().eigenvalues.iter().copied().collect();
+    ev.sort_by(f64::total_cmp);
+    (ev[8] > 0.0).then(|| (ev[1].max(0.0) / ev[8]).sqrt())
+}
+
+/// 대응 배치가 F 를 정하지 못하는 퇴화(동일선상·평면·순수 회전, 잡음 포함)에 가까우면 참.
+/// 픽셀 크기와 무관한 [`design_singular_ratio`] < [`DEGENERATE_SINGULAR_RATIO`] 로 판정하는 **진단**이다.
+/// 8점 풀이는 거부 규칙으로 쓰지 않는다: 평면 짝도 호모그래피 선택([`select_two_view_model`])과
+/// 평면 표시([`FundamentalFit::is_planar`])가 처리하며, 지면+건물 짝의 정상 짝을 지켜야 한다.
+/// 점이 8개 미만이거나 유한하지 않으면 거짓이 아니라 참(판정 불가는 퇴화로 본다).
+pub fn is_degenerate_configuration(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> bool {
+    design_singular_ratio(x1, x2).is_none_or(|r| r < DEGENERATE_SINGULAR_RATIO)
+}
+
+/// 정규화 8점 알고리즘으로 기본 행렬 F (x2ᵀ F x1 = 0, 픽셀 좌표)를 구한다.
+/// 점이 8개 미만이거나, 길이가 다르거나, 유한하지 않은 좌표가 있거나,
+/// 해가 하나로 정해지지 않으면(영공간 2차원 이상: 동일선상 점, 순수 회전 등) None.
+/// 어느 한 영상의 점 분포가 짧은 축/긴 축 표준편차 비 0.02 미만(잡음 섞인 동일선상)이어도 None.
+/// 결과는 계수 2, 프로베니우스 노름 1.
+pub fn fundamental_8pt(x1: &[Vector2<f64>], x2: &[Vector2<f64>]) -> Option<Matrix3<f64>> {
+    if x1.len() < 8 || x1.len() != x2.len() || !all_finite(x1) || !all_finite(x2) {
+        return None;
+    }
+    // 잡음 섞인 동일선상 배치는 고윳값 비 검사로 걸러지지 않는다(둘째 고윳값이 잡음 크기만큼 커진다).
+    if nearly_collinear(x1) || nearly_collinear(x2) {
+        return None;
+    }
+    let (ata, t1, t2) = normalized_design(x1, x2);
     let eig = ata.symmetric_eigen();
     let k = eig.eigenvalues.imin();
     // 둘째로 작은 고윳값도 0 에 가까우면 영공간이 2차원 이상이라 F 가 정해지지 않는다.
@@ -1742,6 +1776,93 @@ mod tests {
         assert_eq!(correct, m.len(), "틀린 짝 {}", m.len() - correct);
         assert_eq!(m.len(), 90, "매칭 수 {}", m.len());
         assert!(m.iter().all(|&(i, _)| i >= 10));
+    }
+
+    /// 평면·편대 장면에서 RANSAC 정상 짝 수와 평면 표시: (장면, 시드, 정상 수, 평면 표시).
+    fn scene_inlier_counts() -> Vec<(String, u64, usize, bool)> {
+        use crate::synth::CamId;
+        let cfg = RansacConfig::default();
+        let mut out = vec![];
+        let mut add = |name: String, seed: u64, x1: &[Vector2<f64>], x2: &[Vector2<f64>]| {
+            let r = ransac_fundamental(x1, x2, &cfg).expect("RANSAC None");
+            let n = r.inliers.iter().filter(|&&b| b).count();
+            out.push((name, seed, n, r.is_planar()));
+        };
+        for seed in 1..=3u64 {
+            let (x1, x2) = planar_correspondences(200, 0.5, seed);
+            add("평면 z=0".into(), seed, &x1, &x2);
+            for (cam, gap, bld) in [(CamId::F, 4, 0.0), (CamId::F, 4, 0.1), (CamId::R, 1, 0.0)] {
+                let (x1, x2, ..) = formation_pair(cam, gap, 300, bld, 0.5, seed);
+                add(format!("편대 {cam:?} {gap}칸 건물 {bld}"), seed, &x1, &x2);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn noisy_collinear_and_planar_are_degenerate_by_singular_ratio() {
+        // 잡음 σ 0, 0.5, 1 px: 동일선상·평면은 퇴화, 일반 배치·편대(건물 10%)는 퇴화가 아니다.
+        use crate::synth::CamId;
+        let th = DEGENERATE_SINGULAR_RATIO;
+        for sigma in [0.0, 0.5, 1.0] {
+            let (mut line_max, mut plane_max) = (0f64, 0f64);
+            let (mut gen_min, mut form_min) = (f64::MAX, f64::MAX);
+            for seed in 1..=5u64 {
+                let (l1, l2) = noisy_lines(sigma, seed);
+                line_max = line_max.max(design_singular_ratio(&l1, &l2).unwrap());
+                assert!(is_degenerate_configuration(&l1, &l2), "선 σ {sigma} {seed}");
+                let (p1, p2) = planar_correspondences(200, sigma, seed);
+                plane_max = plane_max.max(design_singular_ratio(&p1, &p2).unwrap());
+                assert!(
+                    is_degenerate_configuration(&p1, &p2),
+                    "평면 σ {sigma} {seed}"
+                );
+                let (g1, g2, ..) = correspondences(200, sigma, 0.0, seed);
+                gen_min = gen_min.min(design_singular_ratio(&g1, &g2).unwrap());
+                assert!(
+                    !is_degenerate_configuration(&g1, &g2),
+                    "일반 σ {sigma} {seed}"
+                );
+                let (f1, f2, ..) = formation_pair(CamId::F, 4, 200, 0.1, sigma, seed);
+                form_min = form_min.min(design_singular_ratio(&f1, &f2).unwrap());
+                assert!(
+                    !is_degenerate_configuration(&f1, &f2),
+                    "편대 σ {sigma} {seed}"
+                );
+            }
+            eprintln!(
+                "σ {sigma}: 선 최대 {line_max:.3e} 평면 최대 {plane_max:.3e} 일반 최소 {gen_min:.3e} 편대 최소 {form_min:.3e} 문턱 {th:.1e}"
+            );
+            assert!(line_max < 2.0e-3 && plane_max < 2.5e-3, "σ {sigma}");
+            assert!(gen_min > 2.0e-2 && form_min > 4.5e-3, "σ {sigma}");
+        }
+        // 점 부족·비유한은 판정 불가 = 퇴화.
+        let (g1, g2, ..) = correspondences(50, 0.5, 0.0, 1);
+        assert!(is_degenerate_configuration(&g1[..7], &g2[..7]));
+    }
+
+    #[test]
+    fn planar_and_formation_inlier_counts_are_unchanged() {
+        // 퇴화 지표 추가 전(제품 main)에 같은 시험을 돌려 얻은 정상 짝 수. 평면 표시도 같다.
+        let expected: [(&str, u64, usize, bool); 12] = [
+            ("평면 z=0", 1, 200, true),
+            ("편대 F 4칸 건물 0", 1, 300, true),
+            ("편대 F 4칸 건물 0.1", 1, 299, false),
+            ("편대 R 1칸 건물 0", 1, 300, true),
+            ("평면 z=0", 2, 200, true),
+            ("편대 F 4칸 건물 0", 2, 300, true),
+            ("편대 F 4칸 건물 0.1", 2, 300, false),
+            ("편대 R 1칸 건물 0", 2, 299, true),
+            ("평면 z=0", 3, 200, true),
+            ("편대 F 4칸 건물 0", 3, 300, true),
+            ("편대 F 4칸 건물 0.1", 3, 300, false),
+            ("편대 R 1칸 건물 0", 3, 300, true),
+        ];
+        let got = scene_inlier_counts();
+        assert_eq!(got.len(), expected.len());
+        for ((n, s, c, p), (en, es, ec, ep)) in got.iter().zip(expected) {
+            assert_eq!((n.as_str(), *s, *c, *p), (en, es, ec, ep));
+        }
     }
 
     #[test]
