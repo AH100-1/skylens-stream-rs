@@ -1566,6 +1566,29 @@ mod tests {
             .collect()
     }
 
+    /// [`strip_rotations`] 와 같되 드론마다 지그재그 왕복을 한다: 사진 k 의 드론은 k % 3,
+    /// 구간은 (k / 3) % 2 이고 구간마다 방위를 ±35° 번갈아 돌린다(정확히 180° 반대면 카메라
+    /// x 축이 한 직선이라 위 방향이 정해지지 않으므로 옆바람 보정 각을 둔다).
+    fn shuttle_rotations(rng: &mut Rng, c: &GpsCase, noise_deg: f64) -> Vec<Rotation3<f64>> {
+        (0..c.centers.len())
+            .map(|k| {
+                let leg = if (k / 3) % 2 == 0 { 35.0 } else { -35.0 };
+                let a = ([-3.0f64, 125.0, -116.0][k % 3] + leg).to_radians();
+                let t = 60f64.to_radians();
+                let z = Vector3::new(t.cos() * a.cos(), t.cos() * a.sin(), -t.sin());
+                let x = z.cross(&Vector3::z()).normalize();
+                let y = z.cross(&x);
+                let r_enu = Rotation3::from_matrix_unchecked(Matrix3::from_rows(&[
+                    x.transpose(),
+                    y.transpose(),
+                    z.transpose(),
+                ]));
+                let noise = Rotation3::from_scaled_axis(rng.gvec(noise_deg.to_radians()));
+                noise * r_enu * c.gt.r
+            })
+            .collect()
+    }
+
     /// 연직축을 고정한 최소제곱 방위의 이론 표준편차(도): 정상 대응의 참 위치가
     /// 수평 중심에서 떨어진 거리 r_i 로 σ_ψ = σ_축 / √Σ r_i².
     /// (수평 회전 δψ 는 점 i 를 r_i·δψ 만큼 접선 방향으로 옮기고, 접선 방향 잡음은 축당 σ.)
@@ -1680,6 +1703,9 @@ mod tests {
                 let tilt = up.angle(&up_true).to_degrees();
                 let chk = up_cross_check(&rots, &labels).unwrap();
                 assert_eq!(chk.labels, vec![0, 1, 2]);
+                // 이 배치는 묶음마다 방위가 한 방향뿐이라 대체(x 축 기울기 평균) 갈래만 돈다.
+                // 자기 위 방향 갈래는 `up_cross_check_own_branch_on_shuttle_layout` 에서 본다.
+                assert!(chk.up_own.iter().all(|u| u.is_none()));
                 assert!(chk.diff_deg.iter().all(|d| d.is_some()));
                 let d = chk.max_diff_deg.unwrap();
                 worst[i].0 = worst[i].0.max(d);
@@ -1708,6 +1734,85 @@ mod tests {
         let rots = strip_rotations(&mut rng, &c, 0.1);
         assert!(up_cross_check(&rots, &[0]).is_none());
         assert!(up_cross_check(&rots, &vec![0; rots.len()]).is_none());
+    }
+
+    /// F-440: 묶음마다 방위가 둘 이상인 지그재그 왕복 배치에서는 `up_own` 이 `Some` 이라
+    /// 자기 위 방향 갈래(`up_own` 과 `up_rest` 의 각)가 돈다. 한 기체(라벨 0)에만 구름 ±2°.
+    /// 단언: 모든 묶음의 `up_own`·`up_rest` 가 `Some`, 어긋남이 두 위 방향의 각과 정확히 같음
+    /// (x 축 평균 갈래와 구별), 구름 없음 < 0.1°, 구름 2° 에서 0.3° 초과·구름 낀 묶음이 가장 큼,
+    /// 구름 부호를 바꿔도 어긋남 크기가 같음.
+    #[test]
+    fn up_cross_check_own_branch_on_shuttle_layout() {
+        let ez = Vector3::new(0.0, 0.0, 1.0);
+        let mut none_max = 0.0f64;
+        let (mut roll_min, mut roll_max) = (f64::INFINITY, 0.0f64);
+        let mut other_max = 0.0f64;
+        let mut sign_gap = 0.0f64;
+        for seed in 0..20u64 {
+            let mut diffs = [[0.0f64; 3]; 3];
+            for (i, &roll) in [0.0f64, 2.0, -2.0].iter().enumerate() {
+                let mut rng = Rng(1300 + seed);
+                let s = strip_enu(&mut rng);
+                let c = gps_case(&mut rng, s, 2.0, 0.1, 10.0, 50.0);
+                let mut rots = shuttle_rotations(&mut rng, &c, 0.1);
+                let labels: Vec<usize> = (0..rots.len()).map(|k| k % 3).collect();
+                let rz = Rotation3::from_axis_angle(&Vector3::z_axis(), roll.to_radians());
+                for (r, &l) in rots.iter_mut().zip(&labels) {
+                    if l == 0 {
+                        *r = rz * *r;
+                    }
+                }
+                let chk = up_cross_check(&rots, &labels).unwrap();
+                assert_eq!(chk.labels, vec![0, 1, 2]);
+                assert!(
+                    chk.up_own.iter().all(|u| u.is_some()),
+                    "seed {seed}: up_own"
+                );
+                assert!(
+                    chk.up_rest.iter().all(|u| u.is_some()),
+                    "seed {seed}: up_rest"
+                );
+                for (g, slot) in diffs[i].iter_mut().enumerate() {
+                    let want = chk.up_own[g]
+                        .unwrap()
+                        .angle(&chk.up_rest[g].unwrap())
+                        .to_degrees();
+                    let got = chk.diff_deg[g].unwrap();
+                    assert!((got - want).abs() < 1e-9, "seed {seed} g {g}: {got} {want}");
+                    *slot = got;
+                }
+                // 구름 없는 묶음의 자기 위 방향은 참값에 가깝다(0.1°·√2/√80 ≈ 0.016° 수준).
+                let up_true = c.gt.r.inverse() * ez;
+                if roll == 0.0 {
+                    for u in chk.up_own.iter().flatten() {
+                        assert!(u.angle(&up_true).to_degrees() < 0.1, "seed {seed}");
+                    }
+                    none_max = none_max.max(chk.max_diff_deg.unwrap());
+                } else {
+                    let d0 = chk.diff_deg[0].unwrap();
+                    roll_min = roll_min.min(d0);
+                    roll_max = roll_max.max(d0);
+                    // 구름 있는 묶음의 자기 위 방향은 어긋나 있다.
+                    assert!(
+                        chk.up_own[0].unwrap().angle(&up_true).to_degrees() > 0.3,
+                        "seed {seed}"
+                    );
+                }
+            }
+            sign_gap = sign_gap.max((diffs[1][0] - diffs[2][0]).abs());
+            // 나머지 묶음의 `up_rest` 에는 구름 낀 묶음이 섞여 있어 그쪽도 어긋나 보이지만 더 작다.
+            assert!(
+                diffs[1][0] > diffs[1][1] && diffs[1][0] > diffs[1][2],
+                "seed {seed}"
+            );
+            other_max = other_max.max(diffs[1][1]).max(diffs[1][2]);
+        }
+        eprintln!(
+            "shuttle: no roll max {none_max:.3} deg, roll 2 deg own diff min {roll_min:.3} max {roll_max:.3} deg, other groups max {other_max:.3}, sign gap {sign_gap:.3}"
+        );
+        assert!(none_max < 0.1, "no roll {none_max}");
+        assert!(roll_min > UP_CROSS_WARN_DEG, "2 deg min {roll_min}");
+        assert!(sign_gap < 0.15, "sign gap {sign_gap}");
     }
 
     /// F-099 방위(연직축 둘레): 최소제곱 방위 오차는 잡음 한계 σ_ψ = σ_축 / √Σ r_i²
