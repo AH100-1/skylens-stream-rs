@@ -49,7 +49,7 @@ pub struct PipelineConfig {
     pub max_features: usize,
     /// 긴 변 800 미만 사진에서 확대 특징을 상한까지 더한다(기본 끔: 원래 검출이 상한 절반 미만일 때만).
     pub upscale_fill: bool,
-    /// 회전 평균 전에 카메라 쌍 단위 회전 투표로 간선을 거른다(기본 끔).
+    /// 회전 평균 전에 카메라 쌍 단위 회전 투표로 간선을 거른다(기본 켬).
     pub pair_vote: bool,
     /// 밀집 깊이 맵 폭(px).
     pub dense_width: usize,
@@ -131,7 +131,7 @@ impl Default for PipelineConfig {
         Self {
             max_features: 1500,
             upscale_fill: false,
-            pair_vote: false,
+            pair_vote: true,
             dense_width: 160,
             dense_method: DenseMethod::Sweep,
             hfov_deg: 65.0,
@@ -1080,6 +1080,26 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
             }
         }
     }
+    DIAG_CTX.with(|c| {
+        let c = c.borrow();
+        let Some((region, gids, tag)) = c.as_ref() else {
+            return;
+        };
+        for (p, kp) in pm.iter().zip(&keep) {
+            let m = p.rot.matrix();
+            eprintln!(
+                "diag pair region {region} {tag} gid {} {} inl {} keep {} {}",
+                gids[p.i],
+                gids[p.j],
+                p.inl.len(),
+                u8::from(*kp),
+                m.iter()
+                    .map(|v| format!("{v:.9}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    });
     Ok((rots, keep))
 }
 
@@ -1212,6 +1232,7 @@ fn sparse_init_with(
     let (rots, keep_edge) = average_pruned(n, pm, opts)?;
     crate::timing::add("rotation_avg", t_stage.elapsed().as_secs_f64());
     let t_stage = Instant::now();
+    diag_stage("rots", &rots, None);
     let mut stages = PreviewStages {
         rots: rots.clone(),
         pruned: (keep_edge.iter().filter(|&&k| !k).count(), pm.len()),
@@ -1317,6 +1338,7 @@ fn sparse_init_with(
         poses[i] = Some(Pose::from_center(r, &Point3::from(c)));
     }
     stages.placed = poses.clone();
+    diag_poses("placed", &poses);
     if opts.snap {
         snap_poses_to_gps(&mut poses, gps, opts.vfix);
     }
@@ -1387,6 +1409,15 @@ fn sparse_init_with(
     let t_stage = Instant::now();
     s.rms = run_ba(&mut s, k, 0, None, 2.0, &[]);
     crate::timing::add("ba_preview", t_stage.elapsed().as_secs_f64());
+    diag_poses("ba_first", &s.poses);
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        eprintln!(
+            "diag first_ba rms {:.3} points {} obs {}",
+            s.rms,
+            s.points.len(),
+            s.obs.len()
+        );
+    }
     if pre_ba.0 > 0 {
         // 짧은 GPS 사전항 BA: 초벌 포즈·점의 스케일·기울기·깊이를 정밀 쪽으로 당긴다.
         let after = crate::timing::timed("ba_preview", || {
@@ -1400,6 +1431,131 @@ fn sparse_init_with(
     Ok((s, stages))
 }
 
+/// 두 롤 후보(GPS 닮음 해, 수평 퍼짐 해)의 정상 대응 정렬 잔차(RMS)를 비교할 때, GPS 해 잔차가
+/// 수평 퍼짐 해 잔차의 이 비율 미만일 때만 GPS 해를 쓴다. 그 밖(차가 5 % 이내거나 퍼짐 해가 더 작음)은 수평 퍼짐 해.
+/// 측정한 정상 구역의 GPS 중심 퍼짐 비(둘째/첫째 주성분 표준편차)는 0.09~0.24 로 직선 판정 문턱을
+/// 가르지 못해 문턱 대신 잔차로 고른다(구역별 실측 표 기준).
+/// 0.95 의 근거(`choose_roll_tests::bank_sweep_table`, 옆 퍼짐 12~120 m × 기울기 0/1/2/4° × 잡음 0/0.5/2.4 m,
+/// 조건당 200회): 기울기 0° 에서 비 GPS/퍼짐 의 최소가 0.960(평균 0.994)이라 0.95 는 기울지 않은 비행에서
+/// 한 번도 GPS 해로 넘어가지 않는 가장 큰 값에 가깝고, 실데이터 최소 사례(0.966)도 그 위에 있다.
+/// 문턱을 올리면 기울기 0° 에서 GPS 해(롤 오차 1~4°)로 잘못 넘어가므로 올리지 않았다. 대신 기울기 2° 이하·
+/// 옆 퍼짐이 작거나 잡음이 큰 구역에서는 기운 비행을 놓치고 퍼짐 해를 쓴다(표의 wrong 열).
+const ROLL_GPS_KEEP_RATIO: f64 = 0.95;
+
+/// 비행 축 둘레 회전 후보 둘 중 하나를 고른다: (a) GPS 닮음 해 그대로, (b) 초기 정렬과 같은 규칙
+/// (`roll_by_level_spread`: 카메라 광축 높이 분산 최소)으로 비행 축 둘레 회전만 다시 고르고 이동은 정상 대응
+/// 무게중심으로 맞춘 해. 두 해의 정상 대응 정렬 잔차가 비슷하면 GPS 가 롤을 정하지 못하는 것이므로 (b),
+/// GPS 해 잔차가 뚜렷이 작으면 (a). `rots` 는 정렬 전 모델의 (세계→카메라) 회전. 반환 bool 은 (b) 선택 여부.
+fn choose_roll(
+    sim: &Similarity,
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    inl: &[bool],
+    rots: &[Rotation3<f64>],
+) -> (Similarity, bool) {
+    let Some(c) = roll_candidates(sim, src, dst, inl, rots) else {
+        return (*sim, false);
+    };
+    let keep_gps = c.rms_gps < ROLL_GPS_KEEP_RATIO * c.rms_roll;
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        eprintln!(
+            "diag align roll spread_ratio {:.4} rms_gps {:.3} rms_roll {:.3} chosen {}",
+            c.spread_ratio,
+            c.rms_gps,
+            c.rms_roll,
+            if keep_gps { "gps" } else { "roll" }
+        );
+    }
+    if keep_gps {
+        (*sim, false)
+    } else {
+        (c.rolled, true)
+    }
+}
+
+/// `choose_roll` 이 비교하는 두 후보와 그 정렬 잔차.
+struct RollCandidates {
+    spread_ratio: f64,
+    rolled: Similarity,
+    rms_gps: f64,
+    rms_roll: f64,
+}
+
+fn roll_candidates(
+    sim: &Similarity,
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    inl: &[bool],
+    rots: &[Rotation3<f64>],
+) -> Option<RollCandidates> {
+    let pts: Vec<Vector3<f64>> = dst
+        .iter()
+        .zip(inl)
+        .filter(|(_, &b)| b)
+        .map(|(p, _)| *p)
+        .collect();
+    if pts.len() < 3 || rots.is_empty() {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let mean = pts.iter().sum::<Vector3<f64>>() / n;
+    let mut cov = Matrix3::zeros();
+    for p in &pts {
+        let d = p - mean;
+        cov += d * d.transpose();
+    }
+    let eig = nalgebra::SymmetricEigen::new(cov / n);
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&a, &b| eig.eigenvalues[b].total_cmp(&eig.eigenvalues[a]));
+    let (l1, l2) = (
+        eig.eigenvalues[order[0]].max(0.0),
+        eig.eigenvalues[order[1]].max(0.0),
+    );
+    if l1 <= 1e-12 {
+        return None;
+    }
+    let ratio = l2.sqrt() / l1.sqrt();
+    let axis = nalgebra::Unit::new_normalize(eig.eigenvectors.column(order[0]).into_owned());
+    // 비행 축이 연직에 가까우면 둘레 회전이 곧 방위라 손대지 않는다.
+    if axis.z.abs() > 0.98 {
+        return None;
+    }
+    let g = *sim.r.matrix();
+    let theta = roll_by_level_spread(&axis, &g, rots)?;
+    let r = Rotation3::from_axis_angle(&axis, theta) * sim.r;
+    let (mut cs, mut cd, mut m) = (Vector3::zeros(), Vector3::zeros(), 0.0);
+    for ((a, b), &ok) in src.iter().zip(dst).zip(inl) {
+        if ok {
+            cs += a;
+            cd += b;
+            m += 1.0;
+        }
+    }
+    let (cs, cd) = (cs / m, cd / m);
+    let rolled = Similarity {
+        s: sim.s,
+        r,
+        t: cd - sim.s * (r * cs),
+    };
+    let rms = |c: &Similarity| -> f64 {
+        let ss: f64 = src
+            .iter()
+            .zip(dst)
+            .zip(inl)
+            .filter(|(_, &ok)| ok)
+            .map(|((a, b), _)| (c.apply_point(a) - b).norm_squared())
+            .sum();
+        (ss / m).sqrt()
+    };
+    let (rms_gps, rms_roll) = (rms(sim), rms(&rolled));
+    Some(RollCandidates {
+        spread_ratio: ratio,
+        rolled,
+        rms_gps,
+        rms_roll,
+    })
+}
+
 /// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
 /// BA 는 자유 좌표계에서 움직이므로 정밀 모델을 다시 GPS 좌표계로 돌려놓는다.
 fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity> {
@@ -1411,9 +1567,125 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
         .map(|&i| s.poses[i].unwrap().center().coords)
         .collect();
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
-    let (sim, _, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    let (sim, inl, med) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    let rots: Vec<Rotation3<f64>> = ids.iter().map(|&i| s.poses[i].unwrap().rotation).collect();
+    let (sim, rolled) = choose_roll(&sim, &src, &dst, &inl, &rots);
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        eprintln!(
+            "diag gps_align rolled {rolled} n {} inliers {} scale {:.4} inlier_med {:.3}",
+            src.len(),
+            inl.iter().filter(|&&b| b).count(),
+            sim.s,
+            med
+        );
+    }
     apply_sparse_sim(s, &sim);
     Some(sim)
+}
+
+thread_local! {
+    /// 진단용: (구역, 사진 번호 목록, 호출 이름). `SKYLENS_REGION_DIAG` 가 있을 때만 호출 쪽이 채운다.
+    static DIAG_CTX: std::cell::RefCell<Option<(usize, Vec<usize>, &'static str)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn diag_set(region: usize, gids: &[usize], tag: &'static str) {
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        DIAG_CTX.with(|c| *c.borrow_mut() = Some((region, gids.to_vec(), tag)));
+    }
+}
+
+/// 단계별 사진 자세(회전 열 우선 9개, 중심)를 표준 오류로 낸다. 문맥이 없으면 아무것도 하지 않는다.
+fn diag_stage(phase: &str, rots: &[Option<Rotation3<f64>>], centers: Option<&[Option<Pose>]>) {
+    DIAG_CTX.with(|c| {
+        let c = c.borrow();
+        let Some((region, gids, tag)) = c.as_ref() else {
+            return;
+        };
+        for (i, r) in rots.iter().enumerate() {
+            let Some(r) = r else { continue };
+            let ctr = centers
+                .and_then(|p| p[i].as_ref())
+                .map_or(Vector3::zeros(), |p| p.center().coords);
+            eprintln!(
+                "diag stage region {region} {tag} {phase} gid {} {} {:.4} {:.4} {:.4}",
+                gids[i],
+                r.matrix()
+                    .iter()
+                    .map(|v| format!("{v:.9}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                ctr.x,
+                ctr.y,
+                ctr.z
+            );
+        }
+    });
+}
+
+fn diag_poses(phase: &str, poses: &[Option<Pose>]) {
+    let rots: Vec<Option<Rotation3<f64>>> = poses.iter().map(|p| p.map(|p| p.rotation)).collect();
+    diag_stage(phase, &rots, Some(poses));
+}
+
+/// 환경 변수 `SKYLENS_REGION_DIAG` 가 있을 때만 쓰는 진단 출력(표준 오류): 구역 정밀 모델의 사진별 회전과
+/// GPS 정렬 요약(정렬 뒤 잔차 3 m 이하 사진 수, GPS 중심 퍼짐의 표준편차 세 값, 잔차 중앙·최대).
+fn region_diag(
+    region: usize,
+    rs: &Sparse,
+    gps: &[Vector3<f64>],
+    gids: &[usize],
+    in_region: &[bool],
+    gps_aligned: bool,
+) {
+    let ids: Vec<usize> = (0..rs.poses.len())
+        .filter(|&i| rs.poses[i].is_some())
+        .collect();
+    let mut res = Vec::new();
+    let mut pts = Vec::new();
+    for &i in &ids {
+        let p = rs.poses[i].unwrap();
+        let m = p.rotation.matrix();
+        eprintln!(
+            "diag rot region {region} gid {} own {} {} {:.4} {:.4} {:.4}",
+            gids[i],
+            u8::from(in_region[i]),
+            m.iter()
+                .map(|v| format!("{v:.9}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            p.center().x,
+            p.center().y,
+            p.center().z
+        );
+        res.push((p.center().coords - gps[i]).norm());
+        pts.push(gps[i]);
+    }
+    let n = pts.len().max(1) as f64;
+    let mu = pts.iter().sum::<Vector3<f64>>() / n;
+    let mut cov = nalgebra::Matrix3::zeros();
+    for q in &pts {
+        let d = q - mu;
+        cov += d * d.transpose();
+    }
+    cov /= n;
+    let mut ev: Vec<f64> = cov
+        .symmetric_eigenvalues()
+        .iter()
+        .map(|&e| e.max(0.0).sqrt())
+        .collect();
+    ev.sort_by(|a, b| b.total_cmp(a));
+    let used = res.iter().filter(|&&r| r <= 3.0).count();
+    let mut sorted = res.clone();
+    sorted.sort_by(f64::total_cmp);
+    let med = sorted.get(sorted.len() / 2).copied().unwrap_or(f64::NAN);
+    let max = sorted.last().copied().unwrap_or(f64::NAN);
+    eprintln!(
+        "diag align region {region} gps_aligned {gps_aligned} registered {} own {} used_le3m {used} gps_spread_sd {:.3} {:.3} {:.3} resid_med {med:.3} resid_max {max:.3}",
+        ids.len(),
+        ids.iter().filter(|&&i| in_region[i]).count(),
+        ev[0], ev[1], ev[2]
+    );
 }
 
 /// 희소 모델 전체(포즈·점·BA 전용 점)에 닮음 변환을 적용한다.
@@ -2362,6 +2634,7 @@ pub fn run_pipeline_with(
             .filter(|&(i, j)| i >= n_help && j >= n_help)
             .collect();
         let own_registered = |s: &Sparse| s.poses[n_help..].iter().filter(|p| p.is_some()).count();
+        diag_set(r.index, &gids, "coarse");
         let start = match check_motion(&gps, &views, &own_pairs)
             .and_then(|_| {
                 sparse_init_with(
@@ -2399,6 +2672,7 @@ pub fn run_pipeline_with(
         };
         // 초벌(미리보기)은 위의 광축 높이 분산 롤을 쓰고, 정밀 BA 시작점만 예전 롤 규칙으로 따로 만든다.
         let coarse_start = start;
+        diag_set(r.index, &gids, "start");
         let start = sparse_init_with(
             &imgs,
             &pm,
@@ -2415,6 +2689,7 @@ pub fn run_pipeline_with(
         )
         .map(|r| r.0)
         .unwrap_or_else(|_| coarse_start.clone());
+        DIAG_CTX.with(|c| *c.borrow_mut() = None);
         let init = if cfg.preview_ba_iters > 0 {
             let mut p = coarse_start.clone();
             p.rms = crate::timing::timed("ba_preview", || {
@@ -2590,6 +2865,7 @@ pub fn run_pipeline_with(
                             gf.iter().map(|g| (g % 3, g / 3)).collect();
                         let pm_f =
                             crate::timing::timed("matching", || match_pairs(&imgs_f, &views_f, &k));
+                        diag_set(region.index, &gf, "full");
                         if let Ok(sf) = sparse_init_roll(
                             &imgs_f,
                             &pm_f,
@@ -2643,8 +2919,24 @@ pub fn run_pipeline_with(
                 rs.rms = crate::timing::timed("ba_refined", || {
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
-                if !anchored && (anchor.is_none() || full.is_some()) {
+                if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+                    let g = full.as_ref().map_or(&gids_t, |f| &f.0);
+                    diag_set(region.index, g, "refined");
+                    diag_poses("ba_refined", &rs.poses);
+                    eprintln!(
+                        "diag refined_ba region {} rms {:.3} anchored {anchored} full {}",
+                        region.index,
+                        rs.rms,
+                        full.is_some()
+                    );
+                }
+                let gps_aligned = !anchored && (anchor.is_none() || full.is_some());
+                if gps_aligned {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
+                }
+                if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+                    let g = full.as_ref().map_or(&gids_t, |f| &f.0);
+                    region_diag(region.index, &rs, &gps, g, &in_region, gps_aligned);
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {
                     dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod)
@@ -3861,5 +4153,245 @@ mod refit_anchor_tests {
         let line: Vec<Vector3<f64>> = (0..4).map(|i| Vector3::new(i as f64, 0.0, 0.0)).collect();
         assert!(mk(&[0, 1, 2, 3], &line).is_none());
         assert!(mk(&[0, 1, 2], &cs).is_some());
+    }
+}
+
+#[cfg(test)]
+mod choose_roll_tests {
+    use super::*;
+
+    fn tilt_deg(sim: &Similarity) -> f64 {
+        (sim.r * Vector3::z())
+            .dot(&Vector3::z())
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees()
+    }
+
+    fn line_points() -> Vec<Vector3<f64>> {
+        (0..24)
+            .map(|i| {
+                let t = i as f64;
+                Vector3::new(
+                    t * 4.0,
+                    ((i * 7) % 5) as f64 * 0.5 - 1.0,
+                    ((i * 3) % 4) as f64 * 0.3 - 0.45,
+                )
+            })
+            .collect()
+    }
+
+    /// 같은 장착(아래 보기)에 광축이 비행 축 수직 방향으로만 흩어진 모델 회전(세계→카메라).
+    fn mount_rots() -> Vec<Rotation3<f64>> {
+        (0..24)
+            .map(|i| {
+                let b = ((i % 5) as f64 - 2.0) * 3f64.to_radians();
+                let optical = Vector3::new(0.0, b.sin(), -b.cos());
+                // 광축 optical 이 카메라 z 가 되는 회전의 역(카메라→세계)을 만든다.
+                let zc = optical;
+                let xc = Vector3::x();
+                let yc = zc.cross(&xc);
+                Rotation3::from_matrix_unchecked(Matrix3::from_columns(&[xc, yc, zc])).inverse()
+            })
+            .collect()
+    }
+
+    fn grid_points() -> Vec<Vector3<f64>> {
+        (0..24)
+            .map(|i| {
+                Vector3::new(
+                    (i % 6) as f64 * 12.0,
+                    (i / 6) as f64 * 12.0,
+                    (i % 3) as f64 * 0.4,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn line_gps_rolls_to_level() {
+        let pts = line_points();
+        let tilted = Similarity {
+            s: 1.0,
+            r: Rotation3::from_axis_angle(&Vector3::x_axis(), 13f64.to_radians()),
+            t: Vector3::zeros(),
+        };
+        let inl = vec![true; pts.len()];
+        assert!(tilt_deg(&tilted) > 12.0);
+        let (fixed, col) = choose_roll(&tilted, &pts, &pts, &inl, &mount_rots());
+        assert!(col);
+        assert!(tilt_deg(&fixed) < 1.0, "tilt {}", tilt_deg(&fixed));
+        // 원점·대응이 같은 점집합이라 정상 대응 무게중심은 제자리에 대응한다.
+        let n = pts.len() as f64;
+        let c = pts.iter().sum::<Vector3<f64>>() / n;
+        assert!((fixed.apply_point(&c) - c).norm() < 1e-9);
+    }
+
+    #[test]
+    fn consistent_gps_is_kept() {
+        // 정렬이 GPS 와 잘 맞으면(잔차 0) 기울어진 회전이어도 GPS 해를 그대로 둔다.
+        let pts = grid_points();
+        let sim = Similarity {
+            s: 1.0,
+            r: Rotation3::from_axis_angle(&Vector3::x_axis(), 13f64.to_radians()),
+            t: Vector3::new(1.0, 2.0, 3.0),
+        };
+        let dst: Vec<Vector3<f64>> = pts.iter().map(|p| sim.apply_point(p)).collect();
+        let inl = vec![true; pts.len()];
+        let (out, rolled) = choose_roll(&sim, &pts, &dst, &inl, &mount_rots());
+        assert!(!rolled);
+        assert_eq!(out, sim);
+    }
+
+    #[test]
+    fn gps_matches_untilted_points_but_tilted_rotation_prefers_level_roll() {
+        // GPS 점이 기울지 않은 점집합과 같아 롤을 되돌리면 잔차가 오히려 줄어드는 경우: 수평 퍼짐 해를 고른다.
+        let pts = grid_points();
+        let sim = Similarity {
+            s: 1.0,
+            r: Rotation3::from_axis_angle(&Vector3::x_axis(), 13f64.to_radians()),
+            t: Vector3::zeros(),
+        };
+        let inl = vec![true; pts.len()];
+        let (out, rolled) = choose_roll(&sim, &pts, &pts, &inl, &mount_rots());
+        assert!(rolled);
+        assert!(tilt_deg(&out) < 1.0, "tilt {}", tilt_deg(&out));
+    }
+
+    /// 수평 퍼짐 가정이 틀린 장면(비행 내내 일정하게 기운 카메라 장착)에서 GPS 해가 이겨야 하는지 재는 표.
+    /// 세계 = GPS 좌표계(모델과 같은 틀)라 정답 회전은 항등(롤 0°). 격자: 비행 축(x) 0~270 m(30 m 간격 10단계), 옆으로 3열(폭 W), 높이 흩어짐 ±0.4 m.
+    /// 카메라 광축은 비행 축 수직 방향으로 `bank` 를 중심으로 -6°~+6°(3° 간격 5단계) 흩어진다.
+    /// 오차 열 두 종류: `err_*` 는 후보 회전 전체의 회전각(방위·피치 오차 포함), `roll_*` 는 그중 비행 축(x) 둘레 성분만 뽑은 롤 오차.
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    struct SweepRow {
+        gps_wins: usize,
+        wrong: usize,
+        min_ratio: f64,
+        ratio: f64,
+        err_gps: f64,
+        err_roll: f64,
+        err_chosen: f64,
+        roll_gps: f64,
+        roll_roll: f64,
+        roll_chosen: f64,
+    }
+
+    fn sweep_case(width: f64, noise: f64, bank_deg: f64, trials: u64) -> SweepRow {
+        let bank = bank_deg.to_radians();
+        let rots: Vec<Rotation3<f64>> = (0..30)
+            .map(|i| {
+                let b = bank + ((i % 5) as f64 - 2.0) * 3f64.to_radians();
+                let zc = Vector3::new(0.0, b.sin(), -b.cos());
+                let xc = Vector3::x();
+                let yc = zc.cross(&xc);
+                Rotation3::from_matrix_unchecked(Matrix3::from_columns(&[xc, yc, zc])).inverse()
+            })
+            .collect();
+        let truth: Vec<Vector3<f64>> = (0..30)
+            .map(|i| {
+                Vector3::new(
+                    (i / 3) as f64 * 30.0,
+                    ((i % 3) as f64 - 1.0) * 0.5 * width,
+                    ((i * 7) % 5) as f64 * 0.2 - 0.4,
+                )
+            })
+            .collect();
+        let inl = vec![true; truth.len()];
+        let mut row = SweepRow {
+            gps_wins: 0,
+            wrong: 0,
+            min_ratio: f64::MAX,
+            ratio: 0.0,
+            err_gps: 0.0,
+            err_roll: 0.0,
+            err_chosen: 0.0,
+            roll_gps: 0.0,
+            roll_roll: 0.0,
+            roll_chosen: 0.0,
+        };
+        for seed in 0..trials {
+            let mut st = 0x9E37_79B9_7F4A_7C15u64 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
+            let mut unit = || (splitmix64(&mut st) >> 11) as f64 / (1u64 << 53) as f64;
+            let mut gauss = || {
+                let (u1, u2) = (unit().max(1e-300), unit());
+                (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+            };
+            let dst: Vec<Vector3<f64>> = truth
+                .iter()
+                .map(|p| p + Vector3::new(gauss(), gauss(), gauss()) * noise)
+                .collect();
+            let sim = crate::align::umeyama(&truth, &dst).unwrap();
+            let c = roll_candidates(&sim, &truth, &dst, &inl, &rots).unwrap();
+            let (chosen, rolled) = choose_roll(&sim, &truth, &dst, &inl, &rots);
+            let ang = |s: &Similarity| s.r.angle().to_degrees();
+            // 정답이 항등이므로 s.r 자체가 오차 회전. 비행 축(x) 둘레 성분(twist)만 뽑는다.
+            let roll = |s: &Similarity| {
+                let q = nalgebra::UnitQuaternion::from_rotation_matrix(&s.r);
+                (2.0 * q.i.atan2(q.w.abs())).to_degrees().abs()
+            };
+            row.gps_wins += usize::from(!rolled);
+            row.min_ratio = row.min_ratio.min(c.rms_gps / c.rms_roll);
+            // 두 후보 중 롤 오차가 더 큰 쪽을 골랐으면 틀린 선택.
+            row.wrong += usize::from(ang(&chosen) > ang(&sim).min(ang(&c.rolled)) + 1e-9);
+            row.ratio += c.rms_gps / c.rms_roll / trials as f64;
+            row.err_gps += ang(&sim) / trials as f64;
+            row.err_roll += ang(&c.rolled) / trials as f64;
+            row.err_chosen += ang(&chosen) / trials as f64;
+            row.roll_gps += roll(&sim) / trials as f64;
+            row.roll_roll += roll(&c.rolled) / trials as f64;
+            row.roll_chosen += roll(&chosen) / trials as f64;
+        }
+        row
+    }
+
+    #[test]
+    fn bank_sweep_table() {
+        const TRIALS: u64 = 200;
+        eprintln!(
+            "noise width bank | gps_win/{TRIALS} wrong min_ratio ratio | 전체 회전각 err_gps err_roll err_chosen | x축 둘레 롤 roll_gps roll_roll roll_chosen"
+        );
+        for noise in [0.0, 0.5, 2.4] {
+            for width in [12.0, 30.0, 60.0, 120.0] {
+                for bank in [0.0, 1.0, 2.0, 4.0] {
+                    let t = if noise == 0.0 { 1 } else { TRIALS };
+                    let r = sweep_case(width, noise, bank, t);
+                    eprintln!(
+                        "{noise:.1} {width:5.0} {bank:.0} | {:2} {:2} {:.3} {:.3} | {:.3} {:.3} {:.3} | {:.3} {:.3} {:.3}",
+                        r.gps_wins,
+                        r.wrong,
+                        r.min_ratio,
+                        r.ratio,
+                        r.err_gps,
+                        r.err_roll,
+                        r.err_chosen,
+                        r.roll_gps,
+                        r.roll_roll,
+                        r.roll_chosen
+                    );
+                    if noise > 0.0 && bank == 0.0 {
+                        // 기울기가 없으면 어떤 폭·잡음에서도 GPS 해로 잘못 넘어가지 않는다(최소 비 0.96 > 0.95).
+                        assert_eq!(r.gps_wins, 0, "width {width} noise {noise}");
+                        assert!(r.min_ratio > ROLL_GPS_KEEP_RATIO);
+                    }
+                    if noise == 2.4 && width == 120.0 && bank == 4.0 {
+                        // 옆 퍼짐이 크고 4° 기운 비행: 잡음 2.4 m 에서도 GPS 해를 고르고 전체 회전각 오차가 1° 미만.
+                        assert_eq!(r.gps_wins as u64, TRIALS);
+                        assert!(r.err_chosen < 1.0 && r.err_roll > 3.9);
+                    }
+                    if noise == 0.0 && bank >= 2.0 {
+                        // 잡음이 없으면 GPS 해가 정확하고 수평 퍼짐 해는 기울기만큼 틀린다.
+                        assert_eq!(r.gps_wins, 1, "width {width} bank {bank}");
+                        assert!(r.err_chosen < 1e-6 && r.err_roll > 0.9 * bank);
+                    }
+                }
+            }
+        }
     }
 }
