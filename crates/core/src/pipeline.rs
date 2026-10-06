@@ -1846,6 +1846,32 @@ fn region_align(
     Some((r.sim, s.len(), r.median))
 }
 
+/// 환경 변수 `SKYLENS_ALIGN_CENTERS`: 자기 구역 정렬에 카메라 중심 쌍을 넣는 선택 옵션(기본 끔).
+/// `only` 는 중심 쌍만, `w<가중>`(예 `w5`)은 점 쌍과 함께 중심 쌍을 그 가중으로 넣는다.
+fn align_centers_mode() -> Option<crate::stream::CenterAlign> {
+    let v = std::env::var("SKYLENS_ALIGN_CENTERS").ok()?;
+    if v == "only" {
+        return Some(crate::stream::CenterAlign::CentersOnly);
+    }
+    let w: f64 = v.strip_prefix('w')?.parse().ok()?;
+    (w.is_finite() && w > 0.0).then_some(crate::stream::CenterAlign::Weighted(w))
+}
+
+/// 자기 구역 사진의 (초벌 중심, 정밀 중심) 쌍(같은 사진 번호, 둘 다 있는 것만).
+fn own_center_pairs(rec: &RegionRec, r: &Region) -> Vec<(Vector3<f64>, Vector3<f64>)> {
+    let mut out = Vec::new();
+    for (g, p) in rec.coarse_gids.iter().zip(&rec.coarse_poses) {
+        let pos = g / 3;
+        if pos < r.lo || pos >= r.hi {
+            continue;
+        }
+        if let (Some(p), Some(q)) = (p, rec.rposes.get(g)) {
+            out.push((p.center().coords, q.center().coords));
+        }
+    }
+    out
+}
+
 /// 자기 구역 초벌 → 정밀 정렬(SPEC §3.7). 기본은 기존 `align_region`(트리밍).
 /// 모드 1 은 같은 점쌍에 공유 이미지 양방향 합의를, 모드 2 는 점쌍 수집 범위도 양쪽으로 넓힌다.
 fn own_align(
@@ -1854,6 +1880,7 @@ fn own_align(
     r: &Region,
     ovl: usize,
     n_pos: usize,
+    centers: &[(Vector3<f64>, Vector3<f64>)],
 ) -> (Option<Similarity>, AlignRecord) {
     let mode = region_sim3_mode();
     let base = crate::stream::align_window(r, ovl, n_pos);
@@ -1868,11 +1895,21 @@ fn own_align(
         } else {
             (r.lo, r.hi)
         };
+        let fit = |pairs: &[(Vector3<f64>, Vector3<f64>)]| match align_centers_mode() {
+            Some(m) if centers.len() >= 3 => {
+                let (sim, ar) = crate::stream::align_region_centers(r, pairs, centers, m);
+                if sim.is_some() {
+                    return (sim, ar);
+                }
+                align_region(r, pairs)
+            }
+            _ => align_region(r, pairs),
+        };
         let mut pairs = point_pairs(ta, tb, pos, scope);
-        let (mut sim, mut ar) = align_region(r, &pairs);
+        let (mut sim, mut ar) = fit(&pairs);
         if sim.is_none() {
             pairs = point_pairs(ta, tb, pos, (r.lo, r.hi));
-            (sim, ar) = align_region(r, &pairs);
+            (sim, ar) = fit(&pairs);
         }
         return (sim, ar);
     }
@@ -2153,6 +2190,37 @@ fn dump_own_pairs(dir: &str, rec: &RegionRec, tb: &[Track], sparse: &Sparse, r: 
     }
     let d = own_pair_diag(&rec.ta, tb, r.index, scope, &px, &cc, &cr);
     let _ = std::fs::create_dir_all(dir);
+    // 적용한 정렬 `S s R(행 우선 9) t(3)` 과 자기 구역 사진의 초벌·정밀 중심 `C 사진번호 초벌(3) 정밀(3)`.
+    {
+        use std::fmt::Write;
+        let mut o = String::new();
+        if let Some(s) = &rec.sim {
+            let m = s.r.matrix();
+            let _ = write!(o, "S {:.12}", s.s);
+            for i in 0..3 {
+                for j in 0..3 {
+                    let _ = write!(o, " {:.12}", m[(i, j)]);
+                }
+            }
+            let _ = writeln!(o, " {:.9} {:.9} {:.9}", s.t.x, s.t.y, s.t.z);
+        }
+        for (g, c) in &cc {
+            if let Some(q) = cr
+                .get(g)
+                .filter(|_| (*g as usize / 3) >= r.lo && (*g as usize / 3) < r.hi)
+            {
+                let _ = writeln!(
+                    o,
+                    "C {g} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                    c.x, c.y, c.z, q.x, q.y, q.z
+                );
+            }
+        }
+        let _ = std::fs::write(
+            Path::new(dir).join(format!("own_extra_{:02}.txt", r.index)),
+            o,
+        );
+    }
     let _ = std::fs::write(
         Path::new(dir).join(format!("own_pairs_{:02}.txt", r.index)),
         d.to_text(),
@@ -2374,7 +2442,14 @@ pub fn run_pipeline_with(
         // 자기 구역 초벌 → 정밀 정렬(SPEC §3.7).
         let r = rec.region;
         let (sim, ar) = crate::timing::timed("align_ghost", || {
-            own_align(&rec.ta, &tb, &r, ds.config.ovl, n_pos)
+            own_align(
+                &rec.ta,
+                &tb,
+                &r,
+                ds.config.ovl,
+                n_pos,
+                &own_center_pairs(rec, &r),
+            )
         });
         if let Some(s) = &sim {
             realigns.push(ReAlign {

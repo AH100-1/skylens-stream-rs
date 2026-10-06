@@ -88,23 +88,56 @@ fn finite(v: &Vector3<f64>) -> bool {
 /// 길이 불일치, 3점 미만, NaN/무한, 원본 분산 0, 공분산 계수 < 2(일직선 등 퇴화)이면 `None`.
 /// det(Σ) < 0 이면 최소 특이값 부호를 뒤집어 반사 대신 고유 회전을 돌려준다.
 pub fn umeyama(src: &[Vector3<f64>], dst: &[Vector3<f64>]) -> Option<Similarity> {
+    umeyama_weighted(src, dst, None)
+}
+
+/// 가중 Umeyama 닮음 변환: 대응 i 의 가중 `w[i]`(≥ 0, 유한)로 `Σ wᵢ|dstᵢ - (s·R·srcᵢ + t)|²` 를 최소화한다.
+/// `w` 가 `None` 이면 [`umeyama`] 와 같다. 가중이 0 인 대응은 사실상 빠지므로 유효 대응이 3개 미만이면 `None`.
+pub fn umeyama_weighted(
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    w: Option<&[f64]>,
+) -> Option<Similarity> {
     let n = src.len();
     if n != dst.len() || n < 3 {
         return None;
     }
+    if let Some(w) = w {
+        if w.len() != n || w.iter().any(|x| !(x.is_finite() && *x >= 0.0)) {
+            return None;
+        }
+        if w.iter().filter(|&&x| x > 0.0).count() < 3 {
+            return None;
+        }
+    }
+    let wt = |i: usize| w.map_or(1.0, |w| w[i]);
     if !src.iter().chain(dst.iter()).all(finite) {
         return None;
     }
-    let nf = n as f64;
-    let mu_s = src.iter().sum::<Vector3<f64>>() / nf;
-    let mu_d = dst.iter().sum::<Vector3<f64>>() / nf;
+    let nf: f64 = (0..n).map(wt).sum();
+    if nf <= 0.0 {
+        return None;
+    }
+    let mu_s = src
+        .iter()
+        .enumerate()
+        .map(|(i, a)| a * wt(i))
+        .sum::<Vector3<f64>>()
+        / nf;
+    let mu_d = dst
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b * wt(i))
+        .sum::<Vector3<f64>>()
+        / nf;
     let mut var_s = 0.0;
     let mut cov = Matrix3::zeros();
-    for (a, b) in src.iter().zip(dst) {
+    for (i, (a, b)) in src.iter().zip(dst).enumerate() {
         let da = a - mu_s;
         let db = b - mu_d;
-        var_s += da.norm_squared();
-        cov += db * da.transpose();
+        let wi = wt(i);
+        var_s += wi * da.norm_squared();
+        cov += (db * da.transpose()) * wi;
     }
     var_s /= nf;
     cov /= nf;
@@ -1067,6 +1100,50 @@ mod tests {
     }
 
     /// 이상치가 있으면 단순 Umeyama 는 크게 틀리고, 트리밍은 바로잡는다(음성 대조).
+    /// 가중 Umeyama 는 정확한 대응에서 가중과 무관하게 정답 닮음을 복원하고, 가중 1 이면 가중 없는 해와 같다.
+    #[test]
+    fn weighted_umeyama_recovers_truth() {
+        let truth = Similarity {
+            s: 1.7,
+            r: Rotation3::from_euler_angles(0.3, -0.5, 1.1),
+            t: Vector3::new(3.0, -2.0, 7.5),
+        };
+        let src: Vec<Vector3<f64>> = (0..40)
+            .map(|i| {
+                let f = i as f64;
+                Vector3::new((f * 0.7).sin() * 9.0, (f * 1.3).cos() * 6.0, f * 0.4 - 3.0)
+            })
+            .collect();
+        let dst: Vec<Vector3<f64>> = src.iter().map(|p| truth.apply_point(p)).collect();
+        let w: Vec<f64> = (0..40)
+            .map(|i| if i % 5 == 0 { 20.0 } else { 0.3 + i as f64 })
+            .collect();
+        let est = umeyama_weighted(&src, &dst, Some(&w)).unwrap();
+        for p in &src {
+            assert!((est.apply_point(p) - truth.apply_point(p)).norm() < 1e-9);
+        }
+        assert!((est.s - 1.7).abs() < 1e-9);
+        let ones = vec![1.0; 40];
+        let a = umeyama_weighted(&src, &dst, Some(&ones)).unwrap();
+        let b = umeyama(&src, &dst).unwrap();
+        assert!((a.s - b.s).abs() < 1e-12 && (a.t - b.t).norm() < 1e-9);
+        // 가중이 있는 오차는 가중 큰 쪽으로 끌린다: 한 점만 틀리게 하고 그 가중을 키우면 해가 달라진다.
+        let mut bad = dst.clone();
+        bad[0] += Vector3::new(5.0, 0.0, 0.0);
+        let lo = umeyama_weighted(&src, &bad, Some(&ones)).unwrap();
+        let mut w2 = ones.clone();
+        w2[0] = 100.0;
+        let hi = umeyama_weighted(&src, &bad, Some(&w2)).unwrap();
+        assert!(
+            (hi.apply_point(&src[0]) - bad[0]).norm() < (lo.apply_point(&src[0]) - bad[0]).norm()
+        );
+        // 유효 대응 3개 미만은 None.
+        let mut w3 = vec![0.0; 40];
+        w3[0] = 1.0;
+        w3[1] = 1.0;
+        assert!(umeyama_weighted(&src, &dst, Some(&w3)).is_none());
+    }
+
     #[test]
     fn plain_umeyama_fails_with_outliers() {
         let mut rng = Rng(7);

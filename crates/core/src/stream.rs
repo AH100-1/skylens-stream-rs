@@ -265,6 +265,76 @@ pub fn align_region(
     (fit.map(|f| f.0), rec)
 }
 
+/// 초벌 → 정밀 정렬에 카메라 중심 쌍을 함께 넣는 방식(선택 옵션, 기본 끔).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CenterAlign {
+    /// 중심 쌍만으로 닮음 변환을 푼다(점 쌍은 잔차 기록에만 쓴다).
+    CentersOnly,
+    /// 점 쌍 트리밍(5회)에 중심 쌍을 가중 `w` 로 함께 넣는다. 중심 쌍은 트리밍하지 않는다.
+    Weighted(f64),
+}
+
+/// [`align_region`] 에 같은 사진의 카메라 중심 쌍 `(초벌 중심, 정밀 중심)` 을 더한 정렬.
+/// `Weighted(w)`: 강건 첫 추정의 안쪽 점 쌍(가중 1)과 중심 쌍(가중 w)으로 가중 Umeyama 를 풀고,
+/// 점 쌍 잔차 문턱 `max(3·중앙값, 바닥)` 으로 안쪽을 다시 고르기를 `TRIM_ITERS` 번 되풀이한다.
+/// 퇴화하면 `None`(호출 쪽이 점만 쓰는 정렬로 되돌아간다).
+pub fn align_region_centers(
+    region: &Region,
+    pairs: &[(Vector3<f64>, Vector3<f64>)],
+    centers: &[(Vector3<f64>, Vector3<f64>)],
+    mode: CenterAlign,
+) -> (Option<Similarity>, AlignRecord) {
+    let (src, dst): (Vec<_>, Vec<_>) = pairs.iter().copied().unzip();
+    let (cs, cd): (Vec<_>, Vec<_>) = centers.iter().copied().unzip();
+    let med_of = |sim: &Similarity| -> f64 {
+        let mut r: Vec<f64> = src
+            .iter()
+            .zip(&dst)
+            .map(|(a, b)| (sim.apply_point(a) - b).norm())
+            .collect();
+        if r.is_empty() {
+            return f64::NAN;
+        }
+        r.sort_by(f64::total_cmp);
+        r[r.len() / 2]
+    };
+    let sim = match mode {
+        CenterAlign::CentersOnly => umeyama(&cs, &cd),
+        CenterAlign::Weighted(w) => robust_fit(&src, &dst).and_then(|f| {
+            let mut inl = f.1;
+            let mut sim = f.0;
+            for _ in 0..TRIM_ITERS {
+                let mut s2 = cs.clone();
+                let mut d2 = cd.clone();
+                let mut wt = vec![w; cs.len()];
+                for i in (0..src.len()).filter(|&i| inl[i]) {
+                    s2.push(src[i]);
+                    d2.push(dst[i]);
+                    wt.push(1.0);
+                }
+                sim = crate::align::umeyama_weighted(&s2, &d2, Some(&wt))?;
+                let res: Vec<f64> = src
+                    .iter()
+                    .zip(&dst)
+                    .map(|(a, b)| (sim.apply_point(a) - b).norm())
+                    .collect();
+                let mut sorted = res.clone();
+                sorted.sort_by(f64::total_cmp);
+                let thr = (3.0 * sorted[sorted.len() / 2]).max(TRIM_FLOOR_M);
+                inl = res.iter().map(|&r| r <= thr).collect();
+            }
+            Some(sim)
+        }),
+    };
+    let rec = AlignRecord {
+        region: region.index,
+        pairs: pairs.len(),
+        fit_median_m: sim.as_ref().map(med_of),
+        scale: sim.as_ref().map(|s| s.s),
+    };
+    (sim, rec)
+}
+
 /// 구역별 변환(`None` = 정렬 실패)을 초벌 점군에 적용한다. 실패 구역은 `None`.
 pub fn apply_alignments(
     prelim: &[PointCloud],
