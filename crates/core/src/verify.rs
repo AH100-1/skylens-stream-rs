@@ -14,8 +14,8 @@
 //! 항목별 판정 근거:
 //! - `registered`: 파일 이름 위치 범위의 합집합이 0..끝 위치를 빈틈없이 덮는지 본다. 전체 위치 수 N 은
 //!   출력에 없다(끝 구역 이름이 줄거나 파일이 사라져도 남은 이름은 이어진다). 그래서 report 가 없으면
-//!   빈틈이 있을 때만 FAIL, 빈틈이 없으면 "판정 불가". report 가 있으면 `registered.total == 3×N`
-//!   (N = 이름의 끝 위치), 구역 수 = ⌈N/SPAN⌉, 초벌·정밀 등록 수 = total 을 함께 요구한다.
+//!   빈틈이 있을 때만 FAIL, 빈틈이 없으면 "판정 불가". report 가 있으면 report 구역 목록과 출력 구역 번호 집합·
+//!   `positions == hi−lo` 가 같고 등록 수 = total 이어야 한다(total 은 입력 위치 수 기준이라 이름 끝과 비교 안 함).
 //! - `region_images`: 위치 범위 구조 검사(사진 수는 출력에 없음). 구역마다 초벌·정밀 이름의 범위가 같고
 //!   (hi > lo), 구역 번호가 0..K 로 이어지며 구역 0 이 0 에서 시작하고, 구역 0·1 에서 SPAN·OVL 을
 //!   추정해(SPAN = (구역 0 끝 + 구역 1 시작)/2, OVL = (구역 0 끝 − 구역 1 시작)/2) 구역 k 가
@@ -380,7 +380,7 @@ fn structure_check(p: &Ranges, r: &Ranges) -> (Vec<String>, usize, Option<Layout
 
 /// 항목 1 판정. 파일 이름만으로는 전체 위치 수 N 을 알 수 없으므로(끝 구역이 사라져도 이름 hi 는
 /// 줄어든 채 이어진다) report 가 없으면 빈틈이 있을 때만 FAIL 이고 빈틈이 없으면 판정 불가다.
-/// report 가 있으면 `registered.total == 3×N`, 이름의 끝 위치 = N, 구역 수 = ⌈N/SPAN⌉ 도 요구한다.
+/// report 가 있으면 report 구역 목록과 출력 구역 번호 집합·범위 길이가 같아야 한다.
 fn registered_item(
     criterion: &'static str,
     report: &ReportJson,
@@ -432,27 +432,12 @@ fn registered_item(
         ReportJson::Read(Err(e)) => mk(false, true, format!("오류: {e}")),
         ReportJson::Read(Ok(j)) => {
             let res = check_registered(j);
-            let total = num(j, &["registered", "total"]).unwrap_or(f64::NAN);
-            if (total / 3.0).fract() != 0.0 || !total.is_finite() {
-                bad.push(format!("registered.total {total} 가 3 의 배수가 아님"));
-            } else {
-                let n = (total / 3.0) as usize;
-                if n != top {
-                    bad.push(format!(
-                        "registered.total {total} = 3×{n} 인데 이름의 끝 위치는 {top} (끝 구역 손실 의심)"
-                    ));
-                }
-                let (_, k_count, layout) = structure_check(p, r);
-                if let Some(l) = layout {
-                    let want = n.div_ceil(l.span);
-                    if want != k_count {
-                        bad.push(format!(
-                            "구역 수 {k_count} ≠ ⌈{n}/SPAN {}⌉ = {want}",
-                            l.span
-                        ));
-                    }
-                }
+            // report 의 구역 목록(번호·위치 수)이 기준: 출력 구역 파일이 빠졌거나 범위가 잘렸으면 FAIL.
+            // total 은 입력 위치 수 기준이라 출력 구역이 전체를 덮는지와는 따로 본다.
+            if j.get("regions").and_then(Json::as_array).is_none() {
+                bad.push("report.json 에 regions 없음".into());
             }
+            bad.extend(report_regions_match(j, p));
             match res {
                 Ok((ok, m)) => {
                     if !ok {
@@ -1779,7 +1764,7 @@ mod tests {
         let rep = report_json(26, &[(0, 0, 14), (1, 10, 26)]);
         let it = item_of(&out_dir(&short, &short, Some(&rep)), ITEM_REGISTERED);
         assert!(it.decided && !it.pass, "{}", it.measured);
-        assert!(it.measured.contains("끝 위치는 20"), "{}", it.measured);
+        assert!(it.measured.contains("positions 16"), "{}", it.measured);
     }
 
     #[test]
@@ -1789,7 +1774,11 @@ mod tests {
         let rep = report_json(80, &FULL);
         let it = item_of(&out_dir(cut, cut, Some(&rep)), ITEM_REGISTERED);
         assert!(it.decided && !it.pass, "{}", it.measured);
-        assert!(it.measured.contains("3×80"), "{}", it.measured);
+        assert!(
+            it.measured.contains("report 에만 있는 구역 [6]"),
+            "{}",
+            it.measured
+        );
         // 구역 수 대조: 이름 끝이 N 인데 끝 구역 하나가 빠진 경우도 FAIL(구역 5 가 N 까지 이어짐).
         let it = item_of(&out_dir(&FULL, &FULL, Some(&rep)), ITEM_REGISTERED);
         assert!(it.decided && it.pass, "{}", it.measured);
@@ -1799,10 +1788,12 @@ mod tests {
     }
 
     #[test]
-    fn registered_report_total_must_match_names() {
-        let rep = report_json(79, &FULL);
-        let it = item_of(&out_dir(&FULL, &FULL, Some(&rep)), ITEM_REGISTERED);
-        assert!(!it.pass, "{}", it.measured);
+    fn registered_report_total_is_input_based() {
+        // total 은 입력 위치 수 기준이라 이름 끝(26)과 달라도 구역 목록이 맞으면 통과한다.
+        let two = [(0, 0, 14), (1, 10, 26)];
+        let rep = report_json(80, &two);
+        let it = item_of(&out_dir(&two, &two, Some(&rep)), ITEM_REGISTERED);
+        assert!(it.decided && it.pass, "{}", it.measured);
         let mut bad = report_json(80, &FULL);
         bad = bad.replace(r#""positions":14"#, r#""positions":13"#);
         let it = item_of(&out_dir(&FULL, &FULL, Some(&bad)), ITEM_REGION_IMAGES);

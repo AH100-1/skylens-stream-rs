@@ -525,27 +525,31 @@ fn sloped_ground_with_different_extent_passes() {
     assert!(out.contains("높이 차 중앙 최대 1.990 m"), "{out}");
 }
 
-/// F-089: SPEC §2 출력만 있는 폴더(report.json 없음) → 1·2 는 파일 이름에서 계산해 PASS,
-/// 3(재투영)만 판정 불가, 4~7 은 측정값으로 PASS, 종료 코드 2.
+/// F-089: SPEC §2 출력만 있는 폴더(report.json 없음) → 2 는 파일 이름 구조로 PASS,
+/// 1(전체 위치 수 없음)·3(재투영)은 판정 불가, 4~7 은 측정값으로 PASS, 종료 코드 2.
 #[test]
 fn spec_outputs_only_decides_from_files() {
     let (code, out) = run_with("noreport", &Fixture::default(), |d| {
         std::fs::remove_file(d.join("report.json")).unwrap();
     });
     assert_eq!(code, 2, "{out}");
-    let line = out
-        .lines()
-        .find(|l| l.starts_with("| refined_reprojection |"))
-        .unwrap();
-    assert!(line.contains("| 판정 불가 |"), "{out}");
-    for it in ITEMS.iter().filter(|i| **i != "refined_reprojection") {
+    for name in ["registered", "refined_reprojection"] {
+        let line = out
+            .lines()
+            .find(|l| l.starts_with(&format!("| {name} |")))
+            .unwrap();
+        assert!(line.contains("| 판정 불가 |"), "{out}");
+    }
+    for it in ITEMS
+        .iter()
+        .filter(|i| !["registered", "refined_reprojection"].contains(i))
+    {
         assert_eq!(status(&out, it), "PASS", "{it}\n{out}");
     }
-    assert!(out.contains("결과: 6/7 통과"), "{out}");
-    assert!(out.contains("판정 불가: 1개"), "{out}");
-    // 위치 0..26 (pos0-14, pos10-26 합집합) × 3 = 78장, 구역 위치 수 14·16.
-    assert!(out.contains("초벌 78/78, 정밀 78/78"), "{out}");
-    assert!(out.contains("[0:14→42장 1:16→48장]"), "{out}");
+    assert!(out.contains("결과: 5/7 통과"), "{out}");
+    assert!(out.contains("판정 불가: 2개"), "{out}");
+    assert!(out.contains("0..26 빈틈 없음"), "{out}");
+    assert!(out.contains("SPAN 12, OVL 2"), "{out}");
     assert!(out.contains("최근접 중앙 최대 1.990 m"), "{out}");
 }
 
@@ -574,7 +578,10 @@ fn report_json_removal_keeps_verdicts() {
         let (_, without) = run_with(&format!("{tag}_n"), &f, |d| {
             std::fs::remove_file(d.join("report.json")).unwrap();
         });
-        for it in ITEMS.iter().filter(|i| **i != "refined_reprojection") {
+        for it in ITEMS
+            .iter()
+            .filter(|i| !["registered", "refined_reprojection"].contains(i))
+        {
             assert_eq!(status(&with, it), status(&without, it), "{tag} {it}");
         }
     }
