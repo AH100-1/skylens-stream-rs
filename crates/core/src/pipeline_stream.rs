@@ -162,6 +162,15 @@ pub fn realign_refined(
     cross_align(old.1, newest.1, overlap_window(old.0, newest.0))
 }
 
+/// 최종 초벌 출력에 쓸 변환: 자기 정밀 구역 좌표로 옮기는 `own` 뒤에, 그 정밀 구역이 받은
+/// 누적 재정렬 변환 `rsim`(최신 정밀 좌표계로)을 이어 붙인다. `own` 이 없으면(정렬 실패) `None`.
+pub fn preview_final_sim(own: Option<Similarity>, rsim: Option<Similarity>) -> Option<Similarity> {
+    match (own, rsim) {
+        (Some(o), Some(r)) => Some(r.compose(&o)),
+        (o, _) => o,
+    }
+}
+
 /// 카메라(0..3)마다 등록된 사진 수와 빠진 위치 목록. `gids[a]` = 전역 사진 번호(3·위치+카메라).
 pub fn missing_by_camera(gids: &[usize], registered: &[bool]) -> [(usize, Vec<usize>); 3] {
     let mut out: [(usize, Vec<usize>); 3] = Default::default();
@@ -178,6 +187,26 @@ pub fn missing_by_camera(gids: &[usize], registered: &[bool]) -> [(usize, Vec<us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_final_sim_chains_own_then_cumulative() {
+        use crate::math::Vector3;
+        let own = Similarity {
+            s: 2.0,
+            r: crate::nalgebra::Rotation3::identity(),
+            t: Vector3::new(1.0, 0.0, 0.0),
+        };
+        let cum = Similarity {
+            s: 1.0,
+            r: crate::nalgebra::Rotation3::identity(),
+            t: Vector3::new(0.0, 5.0, 0.0),
+        };
+        let p = Vector3::new(1.0, 1.0, 1.0);
+        let f = preview_final_sim(Some(own), Some(cum)).unwrap();
+        assert!((f.apply_point(&p) - cum.apply_point(&own.apply_point(&p))).norm() < 1e-12);
+        assert_eq!(preview_final_sim(Some(own), None).unwrap().t, own.t);
+        assert!(preview_final_sim(None, Some(cum)).is_none());
+    }
 
     #[test]
     fn missing_table_counts_per_camera() {

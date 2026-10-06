@@ -2727,7 +2727,9 @@ pub fn run_pipeline_with(
     let kept: Vec<Region> = recs.iter().map(|r| r.region).collect();
     let sims: Vec<Option<Similarity>> = recs
         .iter()
-        .map(|r| r.own.as_ref().and_then(|o| o.0))
+        .map(|r| {
+            crate::pipeline_stream::preview_final_sim(r.own.as_ref().and_then(|o| o.0), r.rsim)
+        })
         .collect();
     let records: Vec<AlignRecord> = recs
         .iter()
