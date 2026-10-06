@@ -1289,6 +1289,65 @@ mod tests {
         )
     }
 
+    /// 퇴화 입력별 결과: 짝 1·2개, 한 점에 몰린 짝, 무한·전부 NaN, 길이 불일치, 일직선(x·대각선) 은 모두 None.
+    #[test]
+    fn robust_fit_degenerate_inputs_are_none() {
+        let region = split_regions(14, 12, 2)[0];
+        let pt = |i: usize| Vector3::new(i as f64, (i * i % 7) as f64, (i % 3) as f64);
+        let pairs_of = |n: usize| -> Vec<(Vector3<f64>, Vector3<f64>)> {
+            (0..n).map(|i| (pt(i), 2.0 * pt(i))).collect()
+        };
+        // 짝 1·2개: 3개 미만이라 변환을 만들지 않는다.
+        for n in [1usize, 2] {
+            let (sim, rec) = align_region(&region, &pairs_of(n));
+            assert!(sim.is_none(), "짝 {n}");
+            assert_eq!((rec.pairs, rec.fit_median_m, rec.scale), (n, None, None));
+        }
+        // 짝 3개 정상(일직선 아님)은 정확히 s = 2.
+        let (sim, _) = align_region(&region, &pairs_of(3));
+        assert!((sim.expect("정상 3짝").s - 2.0).abs() < 1e-9);
+        // 전부 한 점.
+        let same = vec![(Vector3::new(1.0, 2.0, 3.0), Vector3::new(4.0, 5.0, 6.0)); 20];
+        assert!(align_region(&region, &same).0.is_none());
+        // 대각선 위 20점(방향 (1,2,3)).
+        let diag: Vec<_> = (0..20)
+            .map(|i| {
+                let p = Vector3::new(1.0, 2.0, 3.0) * i as f64;
+                (p, 2.0 * p)
+            })
+            .collect();
+        assert!(align_region(&region, &diag).0.is_none());
+        // 무한 한 점, 전부 NaN.
+        let mut inf = pairs_of(30);
+        inf[4].1.z = f64::INFINITY;
+        assert!(align_region(&region, &inf).0.is_none());
+        let nan = vec![(Vector3::repeat(f64::NAN), Vector3::repeat(f64::NAN)); 20];
+        assert!(align_region(&region, &nan).0.is_none());
+        // 길이 불일치.
+        let (s, d): (Vec<_>, Vec<_>) = pairs_of(10).into_iter().unzip();
+        assert!(robust_fit(&s, &d[..9]).is_none());
+    }
+
+    /// 일직선 위 20점에 직선 밖 점 둘을 더하면 평면이 정해져 변환이 나오고 정답 s = 2.
+    #[test]
+    fn robust_fit_near_line_with_offplane_point_is_exact() {
+        let mut pairs: Vec<(Vector3<f64>, Vector3<f64>)> = (0..20)
+            .map(|i| {
+                let p = Vector3::new(i as f64, 0.0, 0.0);
+                (p, 2.0 * p)
+            })
+            .collect();
+        let off = Vector3::new(5.0, 0.0, 5.0);
+        pairs.push((off, 2.0 * off));
+        let off2 = Vector3::new(7.0, 4.0, 0.0);
+        pairs.push((off2, 2.0 * off2));
+        let (s, d): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        let (sim, _, _) = robust_fit(&s, &d).expect("평면이 정해지면 변환이 나온다");
+        assert!((sim.s - 2.0).abs() < 1e-9, "{}", sim.s);
+        let q = Vector3::new(3.0, -2.0, 6.0);
+        assert!((sim.apply_point(&q) - 2.0 * q).norm() < 1e-8);
+    }
+
     #[test]
     fn prelim_alignment_against_truth() {
         let n_pos = 40;
@@ -1614,6 +1673,58 @@ mod tests {
         )
         .unwrap();
         assert!(check_snapshots(&summary).iter().any(|s| s.contains("NaN")));
+    }
+
+    /// 초벌 > 정밀(구역 1 초벌 6000점, 정밀 600점) 3구역: 정수 단계 2 → 3 에서 줄어들어 위반으로 보고된다.
+    #[test]
+    fn snapshot_integer_step_decrease_is_reported() {
+        let grid = |n: usize, x0: f64| PointCloud {
+            points: (0..n)
+                .map(|i| {
+                    rec(Vector3::new(
+                        x0 + (i % 60) as f64 * 0.5,
+                        (i / 60) as f64 * 0.5,
+                        0.0,
+                    ))
+                })
+                .collect(),
+        };
+        let refined = vec![grid(600, 0.0), grid(600, 100.0), grid(600, 200.0)];
+        let prelim = vec![
+            Some(grid(600, 0.0)),
+            Some(grid(6000, 300.0)),
+            Some(grid(600, 500.0)),
+        ];
+        let summary =
+            for_each_snapshot(
+                &prelim,
+                &refined,
+                GHOST_RADIUS_M,
+                DECIMATE_EVERY,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let pts: Vec<usize> = summary.entries.iter().map(|e| e.points).collect();
+        assert_eq!(pts, vec![100, 1100, 300, 300]);
+        let issues = check_snapshots(&summary);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0].contains("1100") && issues[0].contains("300"),
+            "{issues:?}"
+        );
+        // 초벌 전부가 정밀과 겹치면 2단계부터 새 영역 0 이 보고된다.
+        let overlap = vec![
+            Some(grid(600, 0.0)),
+            Some(grid(600, 0.0)),
+            Some(grid(600, 0.0)),
+        ];
+        let refined2 = vec![grid(600, 0.0), grid(600, 0.0), grid(600, 0.0)];
+        let sm = for_each_snapshot(&overlap, &refined2, GHOST_RADIUS_M, DECIMATE_EVERY, |_| {
+            Ok(())
+        })
+        .unwrap();
+        let iss = check_snapshots(&sm);
+        assert!(iss.iter().any(|s| s.contains("새 영역 0")), "{iss:?}");
     }
 
     fn unique_dir(tag: &str) -> std::path::PathBuf {
