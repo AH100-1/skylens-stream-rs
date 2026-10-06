@@ -2485,7 +2485,7 @@ fn rig_pairs(
     max_l: usize,
 ) -> Vec<RelPair> {
     let Some(rel) = rel_l else { return Vec::new() };
-    if !(sigma_deg > 0.0) {
+    if sigma_deg.is_nan() || sigma_deg <= 0.0 {
         return Vec::new();
     }
     let n_l = (0..gids.len())

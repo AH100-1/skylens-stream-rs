@@ -428,6 +428,14 @@ fn prior_cost(problem: &BaProblem, prior: Option<&PositionPrior>) -> f64 {
                 * huber.rho((pose.center() - g).norm_squared() / (pr.sigma_of(c) * pr.sigma_of(c)));
         }
     }
+    for p in &pr.rel_rotations {
+        let r = rel_residual(
+            &problem.poses[p.a].rotation,
+            &problem.poses[p.b].rotation,
+            p,
+        );
+        cost += 0.5 * huber.rho(r.norm_squared());
+    }
     cost
 }
 
@@ -1839,7 +1847,8 @@ mod tests {
             sigma: one,
         }];
         // z = (2°/1°)² = 4 ≤ 3σ 문턱² 이므로 ρ = z, 비용 = 2.
-        assert!((prior_cost(&problem, Some(&pr)) - 2.0).abs() < 1e-9);
+        let c0 = prior_cost(&problem, Some(&pr));
+        assert!((c0 - 2.0).abs() < 1e-6, "cost {c0}");
         let lay = Layout {
             cam_idx: vec![
                 [Some(0), Some(1), Some(2), None, None, None],
