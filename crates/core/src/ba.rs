@@ -11,6 +11,8 @@
 //!   잔차 (c_i − g_i)/σ 를 Huber(huber_k, 단위 σ) 로 더한다. 사전항이 있으면 축척 게이지
 //!   고정을 끈다(사전항이 축척·위치를 정한다). 카메라 블록 6×6 대각 항으로만 더해지므로
 //!   슈어 구조와 희소성은 그대로다. `free_gauge` 이면 고정 카메라도 두지 않는다.
+//! - 상대 회전 사전항(선택, `PositionPrior::rel_rotations`): 카메라 쌍 R_b ≈ rel·R_a 잔차
+//!   Log(R_b R_aᵀ relᵀ)/σ 를 같은 Huber 로 더한다. 두 카메라의 회전 블록에만 걸리고 수치 미분이다.
 //! - 입력 검증: 포즈·그룹 길이 불일치, 범위 밖 그룹 번호, 유한하지 않은 포즈·내부 파라미터는
 //!   아무것도 고치지 않고 `BaStop::InvalidInput` 으로 돌려준다. 범위 밖 점·카메라 번호,
 //!   유한하지 않은 픽셀·점 좌표의 관측은 제외하고 수를 보고한다(비유한 점은 그대로 둔다).
@@ -102,6 +104,22 @@ pub struct PositionPrior {
     pub huber_k: f64,
     /// 참이면(기본) `fixed_cameras` 를 무시하고 포즈를 고정하지 않는다.
     pub free_gauge: bool,
+    /// 카메라 쌍의 상대 회전 약한 사전항(기본 없음). 위치 사전항과 같은 Huber 문턱을 쓴다.
+    pub rel_rotations: Vec<RelRotationPrior>,
+}
+
+/// 카메라 `a`, `b` 의 상대 회전 사전항: R_b ≈ `rel`·R_a, 잔차 Log(R_b R_aᵀ relᵀ)/σ (σ 는 rad).
+/// 같은 기체의 고정 장착이 아니라 약한 중심값이므로 σ 는 도 단위 수 개로 넉넉히 준다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RelRotationPrior {
+    pub a: usize,
+    pub b: usize,
+    pub rel: Rotation3<f64>,
+    pub sigma: f64,
+}
+
+fn rel_residual(ra: &Rotation3<f64>, rb: &Rotation3<f64>, p: &RelRotationPrior) -> Vector3<f64> {
+    (rb * ra.inverse() * p.rel.inverse()).scaled_axis() / p.sigma
 }
 
 impl PositionPrior {
@@ -113,6 +131,7 @@ impl PositionPrior {
             sigmas: Vec::new(),
             huber_k: 3.0,
             free_gauge: true,
+            rel_rotations: Vec::new(),
         }
     }
 
@@ -457,6 +476,49 @@ fn add_prior(
     }
 }
 
+/// 상대 회전 사전항을 정규방정식에 더한다(두 카메라의 회전 3+3 자유도, 수치 미분).
+fn add_rel_rotations(
+    problem: &BaProblem,
+    lay: &Layout,
+    prior: &PositionPrior,
+    a: &mut DMatrix<f64>,
+    gc: &mut DVector<f64>,
+) {
+    let huber = Loss::Huber(prior.huber_k);
+    const EPS: f64 = 1e-6;
+    for p in &prior.rel_rotations {
+        let (ra, rb) = (problem.poses[p.a].rotation, problem.poses[p.b].rotation);
+        let r = rel_residual(&ra, &rb, p);
+        let w = huber.weight(r.norm_squared());
+        let mut j = SMatrix::<f64, 3, 6>::zeros();
+        for k in 0..6 {
+            let mut d = Vector3::zeros();
+            d[k % 3] = EPS;
+            let at = |s: f64| {
+                let e = Rotation3::new(d * s);
+                if k < 3 {
+                    rel_residual(&(e * ra), &rb, p)
+                } else {
+                    rel_residual(&ra, &(e * rb), p)
+                }
+            };
+            j.set_column(k, &((at(1.0) - at(-1.0)) / (2.0 * EPS)));
+        }
+        let cols: Vec<(usize, usize)> = (0..6)
+            .filter_map(|k| {
+                let cam = if k < 3 { p.a } else { p.b };
+                lay.cam_idx[cam][k % 3].map(|i| (k, i))
+            })
+            .collect();
+        for &(ka, ia) in &cols {
+            gc[ia] += w * j.column(ka).dot(&r);
+            for &(kb, ib) in &cols {
+                a[(ia, ib)] += w * j.column(ka).dot(&j.column(kb));
+            }
+        }
+    }
+}
+
 struct PointBlock {
     c: Matrix3<f64>,
     g: Vector3<f64>,
@@ -483,6 +545,7 @@ fn linearize(
     let mut gc = DVector::<f64>::zeros(lay.n);
     if let Some(pr) = prior {
         add_prior(problem, lay, pr, &mut a, &mut gc);
+        add_rel_rotations(problem, lay, pr, &mut a, &mut gc);
     }
     let mut points = Vec::with_capacity(tracks.len());
     for &p in tracks {
@@ -659,6 +722,13 @@ fn prior_is_valid(problem: &BaProblem, opts: &BaOptions) -> bool {
             && p.sigma > 0.0
             && p.huber_k.is_finite()
             && p.huber_k > 0.0
+            && p.rel_rotations.iter().all(|r| {
+                r.a < problem.poses.len()
+                    && r.b < problem.poses.len()
+                    && r.a != r.b
+                    && r.sigma.is_finite()
+                    && r.sigma > 0.0
+            })
     })
 }
 
@@ -1741,6 +1811,63 @@ mod tests {
             );
         }
         println!("worst on: {worst_on:?}");
+    }
+
+    #[test]
+    fn rel_rotation_prior_cost_and_gradient() {
+        let rot = |x: f64, y: f64, z: f64| Rotation3::new(Vector3::new(x, y, z));
+        let poses = vec![
+            Pose::new(rot(0.1, -0.2, 0.3), Vector3::zeros()),
+            Pose::new(rot(0.5, 0.1, -0.4), Vector3::zeros()),
+        ];
+        let problem = BaProblem {
+            groups: Vec::new(),
+            poses,
+            camera_group: vec![0, 0],
+            points: Vec::new(),
+            observations: Vec::new(),
+        };
+        let one = 1f64.to_radians();
+        // 목표를 정확히 2° 어긋나게 둔다: R_b R_aᵀ = exp(2° 축) · rel.
+        let rel = problem.poses[1].rotation * problem.poses[0].rotation.inverse();
+        let off = Rotation3::new(Vector3::new(2.0 * one, 0.0, 0.0));
+        let mut pr = PositionPrior::new(vec![None, None]);
+        pr.rel_rotations = vec![RelRotationPrior {
+            a: 0,
+            b: 1,
+            rel: off.inverse() * rel,
+            sigma: one,
+        }];
+        // z = (2°/1°)² = 4 ≤ 3σ 문턱² 이므로 ρ = z, 비용 = 2.
+        assert!((prior_cost(&problem, Some(&pr)) - 2.0).abs() < 1e-9);
+        let lay = Layout {
+            cam_idx: vec![
+                [Some(0), Some(1), Some(2), None, None, None],
+                [Some(3), Some(4), Some(5), None, None, None],
+            ],
+            intr_idx: Vec::new(),
+            n: 6,
+        };
+        let mut a = DMatrix::<f64>::zeros(6, 6);
+        let mut gc = DVector::<f64>::zeros(6);
+        add_rel_rotations(&problem, &lay, &pr, &mut a, &mut gc);
+        for k in 0..6 {
+            let mut d = Vector3::zeros();
+            d[k % 3] = 1e-6;
+            let bump = |sgn: f64| {
+                let mut q = problem.clone();
+                let e = Rotation3::new(d * sgn);
+                let i = k / 3;
+                q.poses[i] = Pose::new(e * q.poses[i].rotation, q.poses[i].translation);
+                prior_cost(&q, Some(&pr))
+            };
+            let num = (bump(1.0) - bump(-1.0)) / 2e-6;
+            assert!(
+                (num - gc[k]).abs() < 1e-4 * (1.0 + num.abs()),
+                "k {k} {num} {}",
+                gc[k]
+            );
+        }
     }
 
     #[test]

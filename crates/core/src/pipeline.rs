@@ -75,6 +75,11 @@ pub struct PipelineConfig {
     pub preview_ba_iters: usize,
     /// 초벌 위치 전용 다듬기 반복 수(회전 고정, 카메라 중심만). 0 이면 끈다. BA 가 아니다.
     pub preview_refine_iters: usize,
+    /// 정밀 BA 의 F–L 상대 회전 약한 사전항 σ(도). 0 이면 끈다.
+    /// 초벌 모델들에서 여러 위치로 평균낸 상대 회전을 중심으로 하며 고정 묶음이 아니다.
+    pub rig_ba_sigma_deg: f64,
+    /// 구역 안 등록된 L 사진이 이 수 이하일 때만 `rig_ba_sigma_deg` 사전항을 켠다.
+    pub rig_ba_max_l: usize,
     /// 구역 복원에만 넣는 보조 사진 범위(출력·점수·등록 집계에서 제외).
     pub helper: HelperConfig,
 }
@@ -144,6 +149,8 @@ impl Default for PipelineConfig {
             gps_sigma_v: 2.0,
             preview_ba_iters: 0,
             preview_refine_iters: 5,
+            rig_ba_sigma_deg: 0.0,
+            rig_ba_max_l: 8,
             helper: HelperConfig::default(),
         }
     }
@@ -2461,6 +2468,56 @@ fn run_ba(
     prior_sigma: f64,
     fixed: &[usize],
 ) -> f64 {
+    run_ba_rel(s, k, iters, gps, prior_sigma, fixed, &[])
+}
+
+/// F–L 사진 쌍(사진 번호 a, b), 상대 회전 R_b ≈ rel·R_a, σ(rad).
+type RelPair = (usize, usize, Rotation3<f64>, f64);
+
+/// 구역 안 L 사진이 `max_l` 장 이하일 때 같은 위치의 F–L 쌍마다 상대 회전 사전항 후보를 만든다.
+/// `rel_l` 은 초벌 모델 표본 평균(카메라 0 기준 L). 꺼져 있거나 문턱을 넘으면 빈 목록.
+fn rig_pairs(
+    s: &Sparse,
+    gids: &[usize],
+    in_region: &[bool],
+    rel_l: Option<Rotation3<f64>>,
+    sigma_deg: f64,
+    max_l: usize,
+) -> Vec<RelPair> {
+    let Some(rel) = rel_l else { return Vec::new() };
+    if !(sigma_deg > 0.0) {
+        return Vec::new();
+    }
+    let n_l = (0..gids.len())
+        .filter(|&i| gids[i] % 3 == 2 && in_region[i] && s.poses[i].is_some())
+        .count();
+    if n_l == 0 || n_l > max_l {
+        return Vec::new();
+    }
+    let at: HashMap<usize, usize> = gids.iter().enumerate().map(|(i, &g)| (g, i)).collect();
+    let mut out = Vec::new();
+    for (i, &g) in gids.iter().enumerate() {
+        if g % 3 != 2 || s.poses[i].is_none() {
+            continue;
+        }
+        if let Some(&f) = at.get(&(g - 2)) {
+            if s.poses[f].is_some() {
+                out.push((f, i, rel, sigma_deg.to_radians()));
+            }
+        }
+    }
+    out
+}
+
+fn run_ba_rel(
+    s: &mut Sparse,
+    k: &Intrinsics,
+    iters: usize,
+    gps: Option<&[Vector3<f64>]>,
+    prior_sigma: f64,
+    fixed: &[usize],
+    rel: &[RelPair],
+) -> f64 {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
         .collect();
@@ -2505,6 +2562,17 @@ fn run_ba(
             let mut pr =
                 PositionPrior::new(ids.iter().map(|&i| Some(Point3::from(g[i]))).collect());
             pr.sigma = prior_sigma;
+            pr.rel_rotations = rel
+                .iter()
+                .filter_map(|&(a, b, r, sg)| {
+                    Some(crate::ba::RelRotationPrior {
+                        a: *loc.get(&a)?,
+                        b: *loc.get(&b)?,
+                        rel: r,
+                        sigma: sg,
+                    })
+                })
+                .collect();
             pr
         }),
         ..BaOptions::default()
@@ -3538,6 +3606,12 @@ pub fn run_pipeline_with(
             let (gps, dw, iters, dmethod) =
                 (gps.clone(), cfg.dense_width, cfg.ba_iters, cfg.dense_method);
             let psig = cfg.prior_sigma();
+            let rig_l = rig[2];
+            let rig_max_l = cfg.rig_ba_max_l;
+            let rig_sigma_deg = std::env::var("SKYLENS_RIG_BA_SIGMA_DEG")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(cfg.rig_ba_sigma_deg);
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
             // 초벌이 뒤쪽 보조를 빼고 등록했으면 정밀 작업이 그 사진을 읽어 구역 전체를 다시 등록한다.
@@ -3638,8 +3712,19 @@ pub fn run_pipeline_with(
                         anchored = true;
                     }
                 }
+                let rel_pairs = {
+                    let g = full.as_ref().map_or(&gids_t, |f| &f.0);
+                    rig_pairs(&rs, g, &in_region, rig_l, rig_sigma_deg, rig_max_l)
+                };
+                if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+                    eprintln!(
+                        "diag rig_ba region {} pairs {} sigma_deg {rig_sigma_deg}",
+                        region.index,
+                        rel_pairs.len()
+                    );
+                }
                 rs.rms = crate::timing::timed("ba_refined", || {
-                    run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
+                    run_ba_rel(&mut rs, &k, iters, Some(&gps), psig, &fixed, &rel_pairs)
                 });
                 if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
                     let g = full.as_ref().map_or(&gids_t, |f| &f.0);
