@@ -2204,6 +2204,50 @@ fn roll_candidates(
     })
 }
 
+/// 정밀 모델은 이미 앞 단계에서 GPS 좌표계로 정렬돼 있다. 회전을 바꾸지 않고 이동만 맞춘 해(`keep`)의 정렬 잔차가
+/// 고른 해의 `KEEP_FRAME_TOL` 배 이내이면 `Some(keep)`. 지금은 진단 출력에만 쓴다.
+const KEEP_FRAME_TOL: f64 = 1.05;
+
+fn keep_frame_similarity(
+    chosen: &Similarity,
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+    inl: &[bool],
+) -> Option<Similarity> {
+    let (mut cs, mut cd, mut m) = (Vector3::zeros(), Vector3::zeros(), 0.0);
+    for ((a, b), &ok) in src.iter().zip(dst).zip(inl) {
+        if ok {
+            cs += a;
+            cd += b;
+            m += 1.0;
+        }
+    }
+    if m < 3.0 {
+        return None;
+    }
+    let (cs, cd) = (cs / m, cd / m);
+    let keep = Similarity {
+        s: chosen.s,
+        r: Rotation3::identity(),
+        t: cd - chosen.s * cs,
+    };
+    let rms = |c: &Similarity| -> f64 {
+        let ss: f64 = src
+            .iter()
+            .zip(dst)
+            .zip(inl)
+            .filter(|(_, &ok)| ok)
+            .map(|((a, b), _)| (c.apply_point(a) - b).norm_squared())
+            .sum();
+        (ss / m).sqrt()
+    };
+    let (rk, rc) = (rms(&keep), rms(chosen));
+    if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+        eprintln!("diag gps_align keep rms_keep {rk:.3} rms_chosen {rc:.3}");
+    }
+    (rk <= KEEP_FRAME_TOL * rc).then_some(keep)
+}
+
 /// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
 /// BA 는 자유 좌표계에서 움직이므로 정밀 모델을 다시 GPS 좌표계로 돌려놓는다.
 fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity> {
@@ -2230,6 +2274,8 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
         }
     }
     let (sim, rolled) = choose_roll(&sim, &src, &dst, &inl, &rots);
+    // 진단 전용: 회전을 바꾸지 않은 해의 정렬 잔차를 낸다(적용하지 않음).
+    let _ = keep_frame_similarity(&sim, &src, &dst, &inl);
     if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
         eprintln!(
             "diag gps_align rolled {rolled} n {} inliers {} scale {:.4} inlier_med {:.3}",
