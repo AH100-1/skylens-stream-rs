@@ -1260,6 +1260,39 @@ fn sparse_init_roll(
     .map(|r| r.0)
 }
 
+fn recs_gids(full: &Option<(Vec<usize>, usize)>, base: &[usize]) -> Vec<usize> {
+    full.as_ref().map_or_else(|| base.to_vec(), |f| f.0.clone())
+}
+
+/// 진단용: 환경 변수 `SKYLENS_DUMP_STAGES` 폴더에 단계별 포즈(색인 i, 회전 9개 행 우선, 이동 3개)를 쓴다.
+/// 기본 동작은 바뀌지 않는다. `gids` 가 있으면 색인 대신 사진 번호를 쓴다.
+fn dump_stage(tag: &str, gids: Option<&[usize]>, poses: &[Option<Pose>]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let Some(dir) = std::env::var_os("SKYLENS_DUMP_STAGES") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let mut txt = String::new();
+    for (i, p) in poses.iter().enumerate() {
+        let Some(p) = p else { continue };
+        let m = p.rotation.matrix();
+        txt += &format!("{}", gids.map_or(i, |g| g[i]));
+        for a in 0..3 {
+            for b in 0..3 {
+                txt += &format!(" {:.12e}", m[(a, b)]);
+            }
+        }
+        txt += &format!(
+            " {:.12e} {:.12e} {:.12e}\n",
+            p.translation.x, p.translation.y, p.translation.z
+        );
+    }
+    let n = CALLS.fetch_add(1, Ordering::SeqCst);
+    let _ = std::fs::write(dir.join(format!("{tag}_{n:03}_{}.txt", poses.len())), txt);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sparse_init_with(
     imgs: &[&ImgData],
@@ -1381,6 +1414,7 @@ fn sparse_init_with(
         poses[i] = Some(Pose::from_center(r, &Point3::from(c)));
     }
     stages.placed = poses.clone();
+    dump_stage("placed", None, &poses);
     if opts.snap {
         snap_poses_to_gps(&mut poses, gps, opts.vfix);
     }
@@ -1461,6 +1495,7 @@ fn sparse_init_with(
         }
         s.rms = after;
     }
+    dump_stage("preview", None, &s.poses);
     Ok((s, stages))
 }
 
@@ -2624,6 +2659,7 @@ pub fn run_pipeline_with(
                 None
             };
             let gids_coarse = if split { gids_t.clone() } else { Vec::new() };
+            let gids_dump = gids_t.clone();
             let (maxf, upf, position, region) =
                 (cfg.max_features, cfg.upscale_fill, cfg.position, *r);
             let tri_t = TriConfig::from_config(cfg);
@@ -2704,9 +2740,19 @@ pub fn run_pipeline_with(
                         anchored = true;
                     }
                 }
+                dump_stage(
+                    "refined_pre",
+                    Some(&recs_gids(&full, &gids_dump)),
+                    &rs.poses,
+                );
                 rs.rms = crate::timing::timed("ba_refined", || {
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
+                dump_stage(
+                    "refined_post",
+                    Some(&recs_gids(&full, &gids_dump)),
+                    &rs.poses,
+                );
                 if !anchored && (anchor.is_none() || full.is_some()) {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
                 }
@@ -2867,6 +2913,31 @@ pub fn run_pipeline_with(
         reg_ref.extend(rec.centers.keys().copied());
     }
     res.up_cross = up_cross_report(&recs);
+    // 진단용: SKYLENS_DUMP_RPOSES 가 있으면 구역별 정밀 포즈(구역 좌표계)를 그 폴더에 쓴다.
+    if let Some(dir) = std::env::var_os("SKYLENS_DUMP_RPOSES") {
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        for rec in &recs {
+            let mut gids: Vec<usize> = rec.rposes.keys().copied().collect();
+            gids.sort_unstable();
+            let mut txt = String::new();
+            for g in gids {
+                let p = &rec.rposes[&g];
+                let m = p.rotation.matrix();
+                txt += &format!("{} {}", name(g), g);
+                for i in 0..3 {
+                    for j in 0..3 {
+                        txt += &format!(" {:.12e}", m[(i, j)]);
+                    }
+                }
+                txt += &format!(
+                    " {:.12e} {:.12e} {:.12e}\n",
+                    p.translation.x, p.translation.y, p.translation.z
+                );
+            }
+            let _ = std::fs::write(dir.join(format!("region{}.txt", rec.region.index)), txt);
+        }
+    }
     if let Some(m) = res.up_cross.max_diff_deg {
         let msg = format!(
             "위 방향 교차 검사: 카메라 폴더 묶음 사이 최대 어긋남 {m:.3}° (문턱 {}°)",
