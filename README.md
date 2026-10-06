@@ -73,7 +73,8 @@ skylens-stream --help
 ### 합성 장면으로 한 번 돌려 보기
 
 `synth` → `run` → `verify` 를 끝까지 잇는다. 카메라 사이 겹침이 12~40 위치 떨어진 짝에서 생기므로 구역을 40위치 이상(`--span 48`)으로 잡는다.
-같은 명령을 `crates/cli/tests/pipeline_e2e.rs` 가 프로세스로 돌려 아래 수치에 상한을 건다(`cargo test --release -p skylens-stream --test pipeline_e2e`, 구역 2개 시험 포함 약 3~6 분).
+인자 없이도 돈다: `skylens-stream synth d/in && skylens-stream run d/in d/out && skylens-stream verify d/out` 는 구역 3개(`--span 12`)로 verify 7/7, 종료 코드 0 이다(구역 밖 앞·뒤 보조 사진이 다른 카메라 짝을 이어 준다. `--helper-front`·`--helper-back`·`--helper-back-step` 으로 범위를 바꾼다). 이 경로는 `crates/cli/tests/default_path.rs` 가 지킨다.
+같은 명령을 `crates/cli/tests/pipeline_e2e.rs` 가 프로세스로 돌려(구역 2개는 BA 15회·10회 둘 다) 구역 간 항목에 verify 기준 상한을 걸고, 구역 3개 기본 경로는 `default_path.rs` 가 같은 기준으로 판정한다(`cargo test --release -p skylens-stream --test pipeline_e2e`, 구역 2개 시험 포함 약 3~6 분).
 
 ```bash
 skylens-stream synth scene 320 180
@@ -332,6 +333,9 @@ skylens-stream synth <output dir> [width height]
 # Exit code: 1 if any FAIL, 2 if no FAIL but some undecided, 0 if all PASS
 # Registered images, region images and reprojection error are decided only when report.json is in the output folder
 skylens-stream verify <output dir>
+
+# With no options: synth -> run -> verify gives 3 regions, 7/7, exit 0 (helper photos outside each region link the cameras; see --helper-front/--helper-back/--helper-back-step)
+skylens-stream synth d/in && skylens-stream run d/in d/out && skylens-stream verify d/out
 
 # Run a synthetic scene end to end (synth -> run -> verify); cross-camera overlap only appears between positions 12-40 apart, so use regions of 40+ positions (--span 48)
 skylens-stream synth scene 320 180

@@ -12,14 +12,14 @@
 //! | `--ba-points M` | 3000 | 번들 조정 문제의 점 수 |
 //! | `--full` | | SPEC 기준 규모: `--positions 80 --width 960 --height 540 --repeat 3 --ba-points 20000` 과 같다 |
 //! | `--quick` | | 기본값과 같다(예전 이름, 그대로 받는다) |
-//!
-//! 순서 규칙: `--full`·`--quick` 은 어디에 두든 먼저 적용하고, 개별 인자(`--positions` 등)가 그 위에 덮어쓴다.
-//! `--positions 20 --full` 과 `--full --positions 20` 은 모두 위치 20·960×540 이다. 둘 다 주면 뒤에 준 묶음이 이긴다.
-//! 해석은 `benches/support/args.rs`, 순서 시험은 `tests/perf_structure.rs`.
 //! | `--json PATH` | | 표를 JSON 으로도 쓴다(`{cores, threads, mode, rows[{name, items, unit, median_s, min_s, note}]}`) |
 //! | `--mode M` | `pipeline` | `pipeline`(구간 전체), `ba-scale`(번들 조정 실제 규모), `detect`(1920×1080 한 장 검출) |
 //! | `--ba-tracks N` | 100000 | `ba-scale` 의 트랙(점) 수 |
 //! | `--ba-iters K` | 3 | `ba-scale` 의 LM 반복 수(조기 종료 없이 K 회) |
+//!
+//! 순서 규칙: `--full`·`--quick` 은 어디에 두든 먼저 적용하고, 개별 인자(`--positions` 등)가 그 위에 덮어쓴다.
+//! `--positions 20 --full` 과 `--full --positions 20` 은 모두 위치 20·960×540 이다. 둘 다 주면 뒤에 준 묶음이 이긴다.
+//! 해석은 `benches/support/args.rs`, 순서 시험은 `tests/perf_structure.rs`.
 //!
 //! 예상 시간(4 코어 측정 기계, 부하 없음 기준 어림): 인자 없음(24장, 480×270) 약 1 분 안,
 //! `--full`(240장, 960×540, 짝 3663 전부, 반복 3) 수십 분 — 짝을 줄이려면 `--max-pairs` 를 함께 준다,
