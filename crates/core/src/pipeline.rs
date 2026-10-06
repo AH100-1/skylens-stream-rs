@@ -1892,6 +1892,211 @@ fn pair_debug(ta: &[Track], tb: &[Track], region: usize, w: (usize, usize)) {
     );
 }
 
+/// 자기 구역 정렬에 쓰인 점 쌍 하나(진단용).
+#[derive(Clone, Debug)]
+pub struct OwnPairRow {
+    /// 쌍을 맺은 관측의 (사진 번호, 특징 번호)와 화소 좌표(특징점 번호 규약).
+    pub image: u32,
+    pub feature: u32,
+    pub pixel: [f64; 2],
+    /// 초벌 점(초벌 좌표)·정밀 점(정밀 좌표).
+    pub coarse: [f64; 3],
+    pub refined: [f64; 3],
+    /// 강건 맞춤 변환 뒤 |변환(초벌) - 정밀| (m)와 강건 안쪽 여부.
+    pub resid_m: f64,
+    pub inlier: bool,
+    /// 초벌·정밀 트랙의 서로 다른 사진 수.
+    pub photos_coarse: usize,
+    pub photos_refined: usize,
+    /// 트랙 관측 광선 사이 최대 각(도). 중심을 모르는 사진은 뺀다.
+    pub angle_coarse_deg: f64,
+    pub angle_refined_deg: f64,
+    /// 정밀 트랙의 모든 관측 (사진 번호, 특징 번호, 화소 좌표).
+    pub refined_obs: Vec<(u32, u32, [f64; 2])>,
+}
+
+/// 자기 구역 정렬의 점 쌍 진단. 정렬 결과에는 영향이 없다.
+#[derive(Clone, Debug)]
+pub struct OwnPairDiag {
+    pub region: usize,
+    /// 점 쌍 수집에 쓴 위치 범위.
+    pub scope: (usize, usize),
+    /// 같은 점 쌍에 강건 맞춤을 다시 한 변환과 잔차 중앙값(m). 퇴화면 None.
+    pub fit: Option<(Similarity, f64)>,
+    pub rows: Vec<OwnPairRow>,
+}
+
+fn track_angle_deg(
+    xyz: &Vector3<f64>,
+    obs: &[(u32, u32)],
+    centers: &HashMap<u32, Vector3<f64>>,
+) -> f64 {
+    let rays: Vec<Vector3<f64>> = obs
+        .iter()
+        .filter_map(|o| {
+            let d = xyz - centers.get(&o.0)?;
+            (d.norm() > 1e-9).then(|| d.normalize())
+        })
+        .collect();
+    let mut best = 0.0f64;
+    for a in 0..rays.len() {
+        for b in a + 1..rays.len() {
+            best = best.max(rays[a].angle(&rays[b]).to_degrees());
+        }
+    }
+    best
+}
+
+fn distinct_photos(t: &Track) -> usize {
+    t.obs
+        .iter()
+        .map(|o| o.0)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// 자기 구역 정렬(기본 모드)이 쓰는 점 쌍을 `point_pairs` 와 같은 순서·같은 규칙으로 다시 모아
+/// 초벌·정밀 좌표, 잔차, 안쪽 여부, 관측 사진 수, 삼각측량 각을 낸다.
+/// `px`: (사진, 특징) → 화소 좌표(정밀 모델 관측). `centers_*`: 사진 번호 → 카메라 중심.
+pub fn own_pair_diag(
+    ta: &[Track],
+    tb: &[Track],
+    region: usize,
+    scope: (usize, usize),
+    px: &HashMap<(u32, u32), [f64; 2]>,
+    centers_coarse: &HashMap<u32, Vector3<f64>>,
+    centers_refined: &HashMap<u32, Vector3<f64>>,
+) -> OwnPairDiag {
+    let in_win = |img: u32| {
+        let p = (img / 3) as usize;
+        p >= scope.0 && p < scope.1
+    };
+    let mut by_obs: HashMap<(u32, u32), usize> = HashMap::new();
+    for (j, t) in tb.iter().enumerate() {
+        for &o in &t.obs {
+            if in_win(o.0) {
+                by_obs.entry(o).or_insert(j);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut idx: Vec<(usize, usize, (u32, u32))> = Vec::new();
+    for (i, t) in ta.iter().enumerate() {
+        for &o in &t.obs {
+            if !in_win(o.0) {
+                continue;
+            }
+            if let Some(&j) = by_obs.get(&o) {
+                if seen.insert((i, j)) {
+                    idx.push((i, j, o));
+                }
+            }
+        }
+    }
+    let src: Vec<Vector3<f64>> = idx.iter().map(|&(i, _, _)| ta[i].xyz).collect();
+    let dst: Vec<Vector3<f64>> = idx.iter().map(|&(_, j, _)| tb[j].xyz).collect();
+    let fit = crate::stream::robust_fit(&src, &dst);
+    let rows = idx
+        .iter()
+        .enumerate()
+        .map(|(n, &(i, j, o))| {
+            let (a, b) = (&ta[i], &tb[j]);
+            let (resid, inl) = fit.as_ref().map_or((f64::NAN, false), |f| {
+                ((f.0.apply_point(&a.xyz) - b.xyz).norm(), f.1[n])
+            });
+            OwnPairRow {
+                image: o.0,
+                feature: o.1,
+                pixel: px.get(&o).copied().unwrap_or([f64::NAN; 2]),
+                coarse: [a.xyz.x, a.xyz.y, a.xyz.z],
+                refined: [b.xyz.x, b.xyz.y, b.xyz.z],
+                resid_m: resid,
+                inlier: inl,
+                photos_coarse: distinct_photos(a),
+                photos_refined: distinct_photos(b),
+                angle_coarse_deg: track_angle_deg(&a.xyz, &a.obs, centers_coarse),
+                angle_refined_deg: track_angle_deg(&b.xyz, &b.obs, centers_refined),
+                refined_obs: b
+                    .obs
+                    .iter()
+                    .filter_map(|ob| px.get(ob).map(|p| (ob.0, ob.1, *p)))
+                    .collect(),
+            }
+        })
+        .collect();
+    OwnPairDiag {
+        region,
+        scope,
+        fit: fit.map(|f| (f.0, f.2)),
+        rows,
+    }
+}
+
+impl OwnPairDiag {
+    /// 줄 단위 문자열. 머리 줄 `# region R scope LO HI fit S MED`(맞춤 실패면 `fit none`) 다음에 쌍마다 한 줄:
+    /// `image feature px py | coarse xyz | refined xyz | resid inlier | photos_c photos_r | ang_c ang_r | obs…`.
+    pub fn to_text(&self) -> String {
+        use std::fmt::Write;
+        let mut o = String::new();
+        let fit = self
+            .fit
+            .as_ref()
+            .map_or("none".to_string(), |(s, m)| format!("{:.6} {:.6}", s.s, m));
+        let _ = writeln!(
+            o,
+            "# region {} scope {} {} fit {fit}",
+            self.region, self.scope.0, self.scope.1
+        );
+        for r in &self.rows {
+            let _ = write!(
+                o,
+                "{} {} {:.6} {:.6} | {:.5} {:.5} {:.5} | {:.5} {:.5} {:.5} | {:.5} {} | {} {} | {:.4} {:.4} |",
+                r.image, r.feature, r.pixel[0], r.pixel[1],
+                r.coarse[0], r.coarse[1], r.coarse[2],
+                r.refined[0], r.refined[1], r.refined[2],
+                r.resid_m, u8::from(r.inlier), r.photos_coarse, r.photos_refined,
+                r.angle_coarse_deg, r.angle_refined_deg
+            );
+            for (im, f, p) in &r.refined_obs {
+                let _ = write!(o, " {im} {f} {:.6} {:.6}", p[0], p[1]);
+            }
+            o.push('\n');
+        }
+        o
+    }
+}
+
+/// 환경 변수 `SKYLENS_PAIR_DUMP=<폴더>` 일 때 자기 구역 정렬 점 쌍 진단을 `own_pairs_{구역:02}.txt` 로 쓴다
+/// (기본 모드·구역 전체 범위일 때만; 정렬 결과에는 영향 없음).
+fn dump_own_pairs(dir: &str, rec: &RegionRec, tb: &[Track], sparse: &Sparse, r: &Region) {
+    if region_sim3_mode() != 0 || std::env::var("SKYLENS_PAIR_SCOPE").as_deref() == Ok("window") {
+        return;
+    }
+    let scope = (r.lo, r.hi);
+    let mut px: HashMap<(u32, u32), [f64; 2]> = HashMap::new();
+    for o in &sparse.obs {
+        for &(i, f, p) in o {
+            px.insert((rec.gids[i] as u32, f as u32), [p.x, p.y]);
+        }
+    }
+    let mut cr: HashMap<u32, Vector3<f64>> = HashMap::new();
+    for (g, p) in &rec.rposes {
+        cr.insert(*g as u32, p.center().coords);
+    }
+    let mut cc: HashMap<u32, Vector3<f64>> = HashMap::new();
+    for (g, p) in rec.coarse_gids.iter().zip(&rec.coarse_poses) {
+        if let Some(p) = p {
+            cc.insert(*g as u32, p.center().coords);
+        }
+    }
+    let d = own_pair_diag(&rec.ta, tb, r.index, scope, &px, &cc, &cr);
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(
+        Path::new(dir).join(format!("own_pairs_{:02}.txt", r.index)),
+        d.to_text(),
+    );
+}
+
 /// 구역 하나의 진행 기록(메인 스레드 소유).
 struct RegionRec {
     region: Region,
@@ -2125,6 +2330,9 @@ pub fn run_pipeline_with(
                 &preview_name(&r),
                 &crate::stream::apply_cloud(s, &rec.coarse),
             )?;
+        }
+        if let Ok(dir) = std::env::var("SKYLENS_PAIR_DUMP") {
+            dump_own_pairs(&dir, rec, &tb, &m.sparse, &r);
         }
         rec.own = Some((sim, ar));
         rec.refined = Some((tb, m.cloud));
