@@ -293,13 +293,25 @@ fn preview_align_centers() {
             );
             assert_eq!(code, 0, "{so}{se}");
         }
+        // 실행이 끝나지 않았으면(출력 없음) 해당 값은 n/a.
         let (_, vout, _) = cli(&["verify", out.to_str().unwrap()], &[]);
-        let pr = item(&vout, "preview_vs_refined");
-        let (nn, hd) = (
-            number_after(&pr, "최근접 중앙 최대 "),
-            number_after(&pr, "높이 차 중앙 최대 "),
-        );
+        let (nn, hd) = if vout.contains("| preview_vs_refined |") {
+            let pr = item(&vout, "preview_vs_refined");
+            (
+                format!("{:.3}", number_after(&pr, "최근접 중앙 최대 ")),
+                format!("{:.3}", number_after(&pr, "높이 차 중앙 최대 ")),
+            )
+        } else {
+            ("n/a".to_string(), "n/a".to_string())
+        };
         for region in [1usize, 2] {
+            if !dump.join(format!("own_extra_{region:02}.txt")).exists() {
+                eprintln!(
+                    "ALIGN | {:<24} | region {region} | n/a (not finished)",
+                    c.name
+                );
+                continue;
+            }
             let mut rows = read_rows(&dump.join(format!("own_pairs_{region:02}.txt")));
             // 사진 번호 → 구역 안 쌍만 정답 광선 교점을 붙인다.
             for row in rows.iter_mut() {
@@ -356,7 +368,7 @@ fn preview_align_centers() {
                 )
             });
             eprintln!(
-                "ALIGN | {:<24} | region {region} | point err m med/p90 {} (n {}) | coarse center err m med/p90 {} (best similarity med {best:.3}) | center gap to refined med {:.3} | scale {:.4} | verify nn med max {nn:.3} m, height diff med max {hd:.3} m",
+                "ALIGN | {:<24} | region {region} | point err m med/p90 {} (n {}) | coarse center err m med/p90 {} (best similarity med {best:.3}) | center gap to refined med {:.3} | scale {:.4} | verify nn med max {nn} m, height diff med max {hd} m",
                 c.name, stat(&pe), pe.len(), stat(&ce), quant(&cr, 0.5), sim.s
             );
         }
