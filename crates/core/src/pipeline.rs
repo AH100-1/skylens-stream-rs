@@ -75,6 +75,38 @@ pub struct PipelineConfig {
     pub preview_ba_iters: usize,
     /// 초벌 위치 전용 다듬기 반복 수(회전 고정, 카메라 중심만). 0 이면 끈다. BA 가 아니다.
     pub preview_refine_iters: usize,
+    /// 구역 복원에만 넣는 보조 사진 범위(출력·점수·등록 집계에서 제외).
+    pub helper: HelperConfig,
+}
+
+/// 구역 복원용 보조 사진 규칙. 구역의 소유 위치·출력 대상은 바꾸지 않고, 다른 카메라 짝(F-197)이
+/// 구역 창 밖의 사진과만 겹치는 문제를 메운다. 보조 사진은 등록·BA 에만 쓰이고 밀집·출력 대상이 아니다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HelperConfig {
+    /// 구역 앞쪽 F 보조 범위: 위치 [lo-front_span, lo-1]. 0 이면 끈다.
+    pub front_span: usize,
+    /// 구역 뒤쪽 R·L 보조 범위: 위치 [hi, lo+back_span] (구역 시작 기준 위치 차 최대 back_span). 0 이면 끈다.
+    pub back_span: usize,
+    /// 뒤쪽 보조 위치 간격(1 이면 모든 위치).
+    pub back_step: usize,
+    /// 초벌 등록에도 뒤쪽 보조를 넣을지. 거짓이면 초벌은 구역 시작 이전·구역 안 사진만 읽고(미래 위치를 기다리지 않음),
+    /// 정밀 작업이 뒤쪽 보조 사진을 직접 읽어 구역 전체로 다시 등록한 뒤 BA 를 한다.
+    pub coarse_back: bool,
+}
+
+impl Default for HelperConfig {
+    /// 기본: 앞쪽 F 40위치, 뒤쪽 R·L [hi, lo+40] 전부(간격 1).
+    /// 짝 일정 F(p)–R/L(p+20..=p+40, 4칸 간격)이 구역 [lo,hi) 밖으로 닿는 범위다. 구역이 41위치 이상이면 뒤쪽 보조는 없다.
+    /// 간격을 4 로 두면 F(p) 는 p 와 4 로 나눈 나머지가 같은 위치의 R·L 하고만 짝이 되어, 구역 끝 위치 hi 와
+    /// 나머지가 다른 F 는 다른 카메라 짝이 없다. 그래서 간격 1 이 기본이다.
+    fn default() -> Self {
+        Self {
+            front_span: HELPER_SPAN,
+            back_span: HELPER_SPAN,
+            back_step: 1,
+            coarse_back: true,
+        }
+    }
 }
 
 impl PipelineConfig {
@@ -112,6 +144,7 @@ impl Default for PipelineConfig {
             gps_sigma_v: 2.0,
             preview_ba_iters: 0,
             preview_refine_iters: 5,
+            helper: HelperConfig::default(),
         }
     }
 }
@@ -1397,6 +1430,20 @@ fn apply_sparse_sim(s: &mut Sparse, sim: &Similarity) {
     }
 }
 
+/// 다시 등록한 희소 모델 `rs` 의 사진 중심을 고정 자세 중심에 맞추는 닮음 변환(Umeyama).
+/// 대응이 3쌍 미만이거나 중심이 한 점·한 직선에 가까우면 `None`.
+fn refit_anchor_sim(rs: &Sparse, mapped: &[(usize, Pose)]) -> Option<Similarity> {
+    let src: Vec<Vector3<f64>> = mapped
+        .iter()
+        .filter_map(|(j, _)| rs.poses[*j].as_ref().map(|p| p.center().coords))
+        .collect();
+    if src.len() != mapped.len() {
+        return None;
+    }
+    let dst: Vec<Vector3<f64>> = mapped.iter().map(|(_, p)| p.center().coords).collect();
+    crate::align::umeyama(&src, &dst)
+}
+
 /// 다음 구역의 정밀 BA 를 직전 정밀 모델 기준으로 시작할지. 3구역 측정(재투영 RMS 0.81/0.51 px 대 0.28/0.32 px)에서
 /// 초벌 기반 닮음 변환의 잔차(1.7~3.1 m)가 커서 오히려 나빠져 기본은 끈다.
 const ANCHOR_NEXT_REGION: bool = false;
@@ -1891,6 +1938,8 @@ struct RefinedMsg {
     sparse: Sparse,
     cloud: PointCloud,
     secs: f64,
+    /// 정밀 작업이 뒤쪽 보조까지 넣어 다시 등록했을 때의 (사진 목록, 보조 수). 없으면 초벌과 같다.
+    full: Option<(Vec<usize>, usize)>,
 }
 
 /// 기준을 정밀 작업 스레드에 보내고 기록한다(`None` 이면 기준 없이 시작).
@@ -1937,6 +1986,34 @@ fn write_decimated(out: &Path, name: &str, cloud: &PointCloud) -> Result<(), Str
 /// 짝 규칙상 R(p)·L(p) 는 F(p-40..=p-12) 와 겹치므로 구역 첫 12 위치의 R·L 은 구역 바로 앞 F 까지 필요하다.
 const HELPER_SPAN: usize = 40;
 const HELPER_MIN: usize = 1;
+
+/// 구역 사진 목록: 보조 사진(앞쪽 F, 뒤쪽 R·L)이 앞에, 소유 위치 사진(위치 순, 카메라 F·R·L)이 뒤에 온다.
+/// 반환: (전역 사진 번호 3·위치+카메라, 보조 사진 수).
+///
+/// 구역 뒤쪽 R·L 은 F(p+20..) 쪽 짝을 위해 구역 밖 뒤 위치 사진을 보조로 넣는다(F(p)–R/L(p+20..=p+40)).
+fn region_gids(r: &Region, n_pos: usize, hc: &HelperConfig) -> (Vec<usize>, usize) {
+    let helper_lo = r.lo.saturating_sub(hc.front_span);
+    let helper_hi = if r.lo >= HELPER_MIN {
+        r.lo - HELPER_MIN + 1
+    } else {
+        0
+    };
+    // 뒤쪽 보조는 구역 시작 위치 기준 위치 차 +back_span 까지만: 구역이 이미 그보다 길면(span 48) 필요 없다.
+    let back_hi = (r.hi + hc.back_span)
+        .min(r.lo + hc.back_span + 1)
+        .min(n_pos);
+    let back_pos = (r.hi..back_hi).step_by(hc.back_step.max(1));
+    let helpers: Vec<usize> = (helper_lo..helper_hi.max(helper_lo))
+        .map(|p| 3 * p)
+        .chain(back_pos.flat_map(|p| [3 * p + 1, 3 * p + 2]))
+        .collect();
+    let n_help = helpers.len();
+    let gids = helpers
+        .into_iter()
+        .chain((r.lo..r.hi).flat_map(|p| (0..3).map(move |c| 3 * p + c)))
+        .collect();
+    (gids, n_help)
+}
 
 /// 끝까지 돌린다. 출력 폴더에 preview·refined·snapshots·manifest.json·report.json·poses.txt 를 쓴다.
 ///
@@ -2001,6 +2078,10 @@ pub fn run_pipeline_with(
      -> Result<(), String> {
         let k = m.slot;
         let rec = &mut recs[k];
+        if let Some((g, nh)) = m.full.clone() {
+            rec.gids = g;
+            rec.n_help = nh;
+        }
         let tb = to_tracks(&m.sparse, &rec.gids);
         for (a, g) in rec.gids.iter().enumerate().skip(rec.n_help) {
             if let Some(p) = m.sparse.poses[a] {
@@ -2050,11 +2131,19 @@ pub fn run_pipeline_with(
                 send_anchor(&mut recs[k + 1], &tx, a, k, t_now(), events);
             }
         }
+        let own_reg = m.sparse.poses[recs[k].n_help..]
+            .iter()
+            .filter(|p| p.is_some())
+            .count();
         events.push(format!(
-            "{:.1}s refined region {} rms {:.3} done",
+            "{:.1}s refined region {} rms {:.3} done (images {} helper {} own registered {}/{})",
             t_now(),
             r.index,
-            m.sparse.rms
+            m.sparse.rms,
+            recs[k].gids.len(),
+            recs[k].n_help,
+            own_reg,
+            3 * (r.hi - r.lo)
         ));
         let n_realign0 = realigns.len();
         // 이미 내보낸, 아직 정밀이 없는 초벌 구역을 새 정밀 모델 좌표로 다시 맞춘다.
@@ -2167,20 +2256,39 @@ pub fn run_pipeline_with(
         events.push(format!("{:.1}s arrive region {}", t_now(), r.index));
         // 구역 시작 쪽 R·L 은 F(p-40..=p-20) 와만 겹친다(F-197). 구역 밖 앞쪽 F 사진을 보조로 넣어
         // 구역 첫 위치들의 카메라 간 짝이 끊기지 않게 한다. 보조 사진은 출력·점수에 넣지 않는다.
-        let helper_lo = r.lo.saturating_sub(HELPER_SPAN);
-        let helper_hi = if r.lo >= HELPER_MIN {
-            r.lo - HELPER_MIN + 1
+        let (gids_full, n_help_full) = region_gids(r, n_pos, &cfg.helper);
+        let split = !cfg.helper.coarse_back && gids_full.iter().any(|g| g / 3 >= r.hi);
+        let (gids, n_help) = if split {
+            region_gids(
+                r,
+                n_pos,
+                &HelperConfig {
+                    back_span: 0,
+                    ..cfg.helper
+                },
+            )
         } else {
-            0
+            (gids_full.clone(), n_help_full)
         };
-        let helpers: Vec<usize> = (helper_lo..helper_hi.max(helper_lo))
-            .map(|p| 3 * p)
-            .collect();
-        let n_help = helpers.len();
-        let gids: Vec<usize> = helpers
-            .into_iter()
-            .chain((r.lo..r.hi).flat_map(|p| (0..3).map(move |c| 3 * p + c)))
-            .collect();
+        let last_pos = gids.iter().map(|g| g / 3).max().unwrap_or(r.hi - 1);
+        let lead = last_pos as i64 - r.hi as i64;
+        events.push(format!(
+            "{:.1}s region {} images {} (own {} + helper {}) last position - hi {}{}",
+            t_now(),
+            r.index,
+            gids.len(),
+            gids.len() - n_help,
+            n_help,
+            lead,
+            if split {
+                format!(
+                    " (refined adds back helper {})",
+                    gids_full.len() - gids.len()
+                )
+            } else {
+                String::new()
+            }
+        ));
         let t0 = Instant::now();
         let need: Vec<usize> = gids
             .iter()
@@ -2217,8 +2325,10 @@ pub fn run_pipeline_with(
                     Err(e) => load_err = Some(e),
                 }
             }
-            if *p >= r.lo {
+            if r.contains(*p) {
                 live.note(t_now(), "arrive_position", *p);
+            } else if *p >= r.hi {
+                live.note(t_now(), "arrive_helper", *p);
             }
         }
         if let Some(e) = load_err {
@@ -2249,7 +2359,7 @@ pub fn run_pipeline_with(
         let own_pairs: Vec<(usize, usize)> = pair_ids
             .iter()
             .copied()
-            .filter(|&(i, j)| gids[i] / 3 >= r.lo && gids[j] / 3 >= r.lo)
+            .filter(|&(i, j)| i >= n_help && j >= n_help)
             .collect();
         let own_registered = |s: &Sparse| s.poses[n_help..].iter().filter(|p| p.is_some()).count();
         let start = match check_motion(&gps, &views, &own_pairs)
@@ -2433,24 +2543,107 @@ pub fn run_pipeline_with(
             let psig = cfg.prior_sigma();
             let gids_t = recs[slot].gids.clone();
             let in_region: Vec<bool> = gids_t.iter().map(|g| r.contains(g / 3)).collect();
+            // 초벌이 뒤쪽 보조를 빼고 등록했으면 정밀 작업이 그 사진을 읽어 구역 전체를 다시 등록한다.
+            let extra = if split {
+                let have: std::collections::HashSet<usize> = gids_t.iter().copied().collect();
+                let paths: Vec<(usize, std::path::PathBuf)> = gids_full
+                    .iter()
+                    .filter(|g| !have.contains(g))
+                    .map(|&g| (g, ds.positions[g / 3].images[g % 3].clone()))
+                    .collect();
+                let full_gps: Vec<Vector3<f64>> = gids_full
+                    .iter()
+                    .map(|g| ds.positions[g / 3].image_enu[g % 3])
+                    .collect();
+                Some((gids_full.clone(), n_help_full, paths, full_gps))
+            } else {
+                None
+            };
+            let gids_coarse = if split { gids_t.clone() } else { Vec::new() };
+            let (maxf, upf, position, region) =
+                (cfg.max_features, cfg.upscale_fill, cfg.position, *r);
+            let tri_t = TriConfig::from_config(cfg);
+            let mut cached: HashMap<usize, Arc<ImgData>> =
+                gids_t.iter().copied().zip(arcs.iter().cloned()).collect();
             in_flight += 1;
             std::thread::spawn(move || {
                 let anchor = anchor_rx.recv().ok().flatten();
                 let t = Instant::now();
-                let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
                 let mut rs = init;
+                let mut full: Option<(Vec<usize>, usize)> = None;
+                let mut arcs = arcs;
+                let mut gps = gps;
+                let mut in_region = in_region;
+                if let Some((gf, nhf, paths, gps_f)) = extra {
+                    let loaded: Vec<Option<(usize, Arc<ImgData>)>> = paths
+                        .par_iter()
+                        .map(|(g, pth)| load(pth, maxf, upf).ok().map(|d| (*g, Arc::new(d))))
+                        .collect();
+                    for (g, d) in loaded.into_iter().flatten() {
+                        cached.insert(g, d);
+                    }
+                    if gf.iter().all(|g| cached.contains_key(g)) {
+                        let arcs_f: Vec<Arc<ImgData>> =
+                            gf.iter().map(|g| cached[g].clone()).collect();
+                        let imgs_f: Vec<&ImgData> = arcs_f.iter().map(|a| a.as_ref()).collect();
+                        let views_f: Vec<(usize, usize)> =
+                            gf.iter().map(|g| (g % 3, g / 3)).collect();
+                        let pm_f =
+                            crate::timing::timed("matching", || match_pairs(&imgs_f, &views_f, &k));
+                        if let Ok(sf) = sparse_init_roll(
+                            &imgs_f,
+                            &pm_f,
+                            &gps_f,
+                            &k,
+                            position,
+                            &tri_t,
+                            (0, 2.0),
+                            true,
+                        ) {
+                            in_region = gf.iter().map(|g| region.contains(g / 3)).collect();
+                            rs = sf;
+                            arcs = arcs_f;
+                            gps = gps_f;
+                            full = Some((gf, nhf));
+                        }
+                    }
+                }
+                let imgs: Vec<&ImgData> = arcs.iter().map(|a| a.as_ref()).collect();
                 let mut fixed: Vec<usize> = Vec::new();
-                if let Some(an) = &anchor {
+                let mut anchored = false;
+                if let (Some(an), None) = (&anchor, &full) {
                     apply_sparse_sim(&mut rs, &an.sim);
                     for (i, p) in &an.fixed {
                         rs.poses[*i] = Some(*p);
                         fixed.push(*i);
                     }
+                    anchored = true;
+                } else if let (Some(an), Some((gf, _))) = (&anchor, &full) {
+                    // 다시 등록한 목록은 색인이 초벌과 다르므로 고정 사진을 gid 로 다시 찾는다.
+                    let at: HashMap<usize, usize> =
+                        gf.iter().enumerate().map(|(j, g)| (*g, j)).collect();
+                    let mapped: Vec<(usize, Pose)> = an
+                        .fixed
+                        .iter()
+                        .filter_map(|(i, p)| {
+                            let j = *at.get(gids_coarse.get(*i)?)?;
+                            rs.poses[j].is_some().then_some((j, *p))
+                        })
+                        .collect();
+                    // 새 좌표계 기준으로 (새 등록 중심 → 고정 자세 중심) 닮음 변환을 다시 구한다.
+                    if let Some(sim) = refit_anchor_sim(&rs, &mapped) {
+                        apply_sparse_sim(&mut rs, &sim);
+                        for (j, p) in mapped {
+                            rs.poses[j] = Some(p);
+                            fixed.push(j);
+                        }
+                        anchored = true;
+                    }
                 }
                 rs.rms = crate::timing::timed("ba_refined", || {
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
-                if anchor.is_none() {
+                if !anchored && (anchor.is_none() || full.is_some()) {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
                 }
                 let cloud = crate::timing::timed("refined_dense_total", || {
@@ -2461,6 +2654,7 @@ pub fn run_pipeline_with(
                     sparse: rs,
                     cloud,
                     secs: t.elapsed().as_secs_f64(),
+                    full,
                 });
             });
         }
@@ -3552,5 +3746,120 @@ mod refine_tests {
         refine_centers(&mut poses, &k, &tracks, &opts);
         let after = err(&poses);
         assert!(after < 0.7 * before, "{before} -> {after}");
+    }
+
+    #[test]
+    fn region_pair_schedule_has_cross_camera_pairs() {
+        // 기본 장면 27위치·span 12·ovl 2: 장면 전체 일정에서 다른 카메라 짝이 있는 사진은
+        // 구역 안 일정에서도 다른 카메라 짝이 하나 이상 있어야 한다(보조 사진을 끄면 그렇지 않다).
+        let n_pos = 27;
+        let sched = PairSchedule::default();
+        let scene: Vec<(usize, usize)> = (0..3 * n_pos).map(|g| (g % 3, g / 3)).collect();
+        let scene_pairs = scheduled_pairs(&scene, &sched);
+        let has_cross = |pairs: &[(usize, usize)], views: &[(usize, usize)], a: usize| {
+            pairs
+                .iter()
+                .any(|&(i, j)| (i == a || j == a) && views[i].0 != views[j].0)
+        };
+        let on = HelperConfig::default();
+        let off = HelperConfig { back_span: 0, ..on };
+        for (hc, expect_all) in [(on, true), (off, false)] {
+            let mut all = true;
+            for r in split_regions(n_pos, 12, 2) {
+                let (gids, n_help) = region_gids(&r, n_pos, &hc);
+                let views: Vec<(usize, usize)> = gids.iter().map(|g| (g % 3, g / 3)).collect();
+                let pairs = scheduled_pairs(&views, &sched);
+                // 소유 사진은 3 × 위치 수, 보조 사진은 소유 위치 밖에만 있다.
+                assert_eq!(gids.len() - n_help, 3 * (r.hi - r.lo));
+                assert!(gids[..n_help].iter().all(|g| !r.contains(g / 3)));
+                for (a, g) in gids.iter().enumerate().skip(n_help) {
+                    if has_cross(&scene_pairs, &scene, *g) {
+                        all &= has_cross(&pairs, &views, a);
+                    }
+                }
+            }
+            assert_eq!(all, expect_all);
+        }
+    }
+}
+
+#[cfg(test)]
+mod refit_anchor_tests {
+    use super::*;
+
+    fn sparse_with(poses: Vec<Option<Pose>>) -> Sparse {
+        Sparse {
+            poses,
+            points: vec![],
+            obs: vec![],
+            ba_only: vec![],
+            rms: 0.0,
+        }
+    }
+
+    fn centers() -> Vec<Vector3<f64>> {
+        vec![
+            Vector3::new(0.0, 0.0, 50.0),
+            Vector3::new(10.0, 2.0, 52.0),
+            Vector3::new(20.0, -3.0, 49.0),
+            Vector3::new(5.0, 14.0, 51.0),
+            Vector3::new(15.0, 9.0, 55.0),
+        ]
+    }
+
+    #[test]
+    fn refit_anchor_sim_recovers_known_sim3() {
+        let truth = Similarity {
+            s: 1.3,
+            r: Rotation3::from_euler_angles(0.2, -0.4, 1.1),
+            t: Vector3::new(30.0, -12.0, 4.0),
+        };
+        let rot = Rotation3::from_axis_angle(&Vector3::x_axis(), 3.0);
+        let cs = centers();
+        let poses: Vec<Option<Pose>> = cs
+            .iter()
+            .map(|c| Some(Pose::from_center(rot, &Point3::from(*c))))
+            .collect();
+        let rs = sparse_with(poses);
+        let mapped: Vec<(usize, Pose)> = cs
+            .iter()
+            .enumerate()
+            .map(|(j, c)| {
+                (
+                    j,
+                    Pose::from_center(rot, &Point3::from(truth.apply_point(c))),
+                )
+            })
+            .collect();
+        let est = refit_anchor_sim(&rs, &mapped).unwrap();
+        assert!((est.s - 1.3).abs() < 1e-6);
+        let da = (est.r.matrix() - truth.r.matrix()).norm();
+        assert!(da < 1e-6, "da={da}");
+        assert!((est.t - truth.t).norm() < 1e-6);
+        for c in &cs {
+            assert!((est.apply_point(c) - truth.apply_point(c)).norm() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn refit_anchor_sim_rejects_too_few_or_degenerate() {
+        let rot = Rotation3::identity();
+        let cs = centers();
+        let mk = |idx: &[usize], cs2: &[Vector3<f64>]| {
+            let rs = sparse_with(
+                cs2.iter()
+                    .map(|c| Some(Pose::from_center(rot, &Point3::from(*c))))
+                    .collect(),
+            );
+            let mapped: Vec<(usize, Pose)> = idx
+                .iter()
+                .map(|&j| (j, Pose::from_center(rot, &Point3::from(cs2[j] * 2.0))))
+                .collect();
+            refit_anchor_sim(&rs, &mapped)
+        };
+        assert!(mk(&[0, 1], &cs).is_none());
+        let line: Vec<Vector3<f64>> = (0..4).map(|i| Vector3::new(i as f64, 0.0, 0.0)).collect();
+        assert!(mk(&[0, 1, 2, 3], &line).is_none());
+        assert!(mk(&[0, 1, 2], &cs).is_some());
     }
 }
