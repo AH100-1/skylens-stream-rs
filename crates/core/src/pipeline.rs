@@ -2066,6 +2066,11 @@ fn sparse_init_with(
             diag_poses("ba_merged", &s.poses);
         }
     }
+    // 등록 못 한 사진을 모델 점과의 2D–3D 대응으로 구제한다.
+    if rescue_unregistered(&mut s, imgs, pm, k) > 0 {
+        s.rms = run_ba(&mut s, k, 10, Some(gps), 2.0, &[]);
+        diag_poses("ba_rescued", &s.poses);
+    }
     if pre_ba.0 > 0 {
         // 짧은 GPS 사전항 BA: 초벌 포즈·점의 스케일·기울기·깊이를 정밀 쪽으로 당긴다.
         let after = crate::timing::timed("ba_preview", || {
@@ -2077,6 +2082,357 @@ fn sparse_init_with(
         s.rms = after;
     }
     Ok((s, stages))
+}
+
+/// 잎사귀 사진 구제: 등록 못 한 사진의 최소 내점 수와 중앙 재투영 오차 상한(px).
+const RESCUE_MIN_INLIERS: usize = 20;
+const RESCUE_MAX_MEDIAN_PX: f64 = 1.5;
+/// 구제 RANSAC 내점 문턱(px)과 반복 수.
+const RESCUE_INLIER_PX: f64 = 3.0;
+const RESCUE_ITERS: usize = 400;
+
+/// 다항식(낮은 차수부터) 곱.
+fn poly_mul(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let mut r = vec![0.0; a.len() + b.len() - 1];
+    for (i, x) in a.iter().enumerate() {
+        for (j, y) in b.iter().enumerate() {
+            r[i + j] += x * y;
+        }
+    }
+    r
+}
+
+fn poly_add(a: &[f64], b: &[f64], sb: f64) -> Vec<f64> {
+    let mut r = vec![0.0; a.len().max(b.len())];
+    for (i, x) in a.iter().enumerate() {
+        r[i] += x;
+    }
+    for (i, y) in b.iter().enumerate() {
+        r[i] += sb * y;
+    }
+    r
+}
+
+/// 실근(동반 행렬 고유값).
+fn real_roots(c: &[f64]) -> Vec<f64> {
+    let mut n = c.len();
+    while n > 1 && c[n - 1].abs() < 1e-14 * c.iter().fold(0.0f64, |m, x| m.max(x.abs())) {
+        n -= 1;
+    }
+    if n < 2 {
+        return Vec::new();
+    }
+    let deg = n - 1;
+    let mut m = DMatrix::<f64>::zeros(deg, deg);
+    for i in 1..deg {
+        m[(i, i - 1)] = 1.0;
+    }
+    for i in 0..deg {
+        m[(i, deg - 1)] = -c[i] / c[deg];
+    }
+    m.complex_eigenvalues()
+        .iter()
+        .filter(|z| z.im.abs() < 1e-6 * (1.0 + z.re.abs()))
+        .map(|z| z.re)
+        .collect()
+}
+
+/// 세 점 절대 자세(Grunert 방식 P3P): 세계 점 `p` 와 단위 시선 `f` → 후보 (세계→카메라) 자세 최대 4 개.
+fn p3p(p: &[Vector3<f64>; 3], f: &[Vector3<f64>; 3]) -> Vec<Pose> {
+    let a2 = (p[1] - p[2]).norm_squared();
+    let b2 = (p[0] - p[2]).norm_squared();
+    let c2 = (p[0] - p[1]).norm_squared();
+    if a2 < 1e-12 || b2 < 1e-12 || c2 < 1e-12 {
+        return Vec::new();
+    }
+    let (ca, cb, cc) = (f[1].dot(&f[2]), f[0].dot(&f[2]), f[0].dot(&f[1]));
+    // d2 = u d1, d3 = v d1. v² = 2 cb v + Q(u), v = N(u)/D(u).
+    let k = b2 / c2;
+    let q = [k - 1.0, -2.0 * k * cc, k];
+    let n = poly_add(&poly_add(&[a2, 0.0, -b2], &q, a2 - b2), &[], 0.0);
+    let d = [2.0 * b2 * cb, -2.0 * b2 * ca];
+    let nn = poly_mul(&n, &n);
+    let nd = poly_mul(&n, &d);
+    let dd = poly_mul(&d, &d);
+    let qdd = poly_mul(&q, &dd);
+    let quartic = poly_add(&poly_add(&nn, &nd, -2.0 * cb), &qdd, -1.0);
+    let mut out = Vec::new();
+    for u in real_roots(&quartic) {
+        if u <= 0.0 {
+            continue;
+        }
+        let dv = d[0] + d[1] * u;
+        if dv.abs() < 1e-12 {
+            continue;
+        }
+        let v = (n[0] + n[1] * u + n[2] * u * u) / dv;
+        let den = 1.0 + v * v - 2.0 * v * cb;
+        if v <= 0.0 || den <= 1e-12 {
+            continue;
+        }
+        let d1 = b2.sqrt() / den.sqrt();
+        let xc = [f[0] * d1, f[1] * (u * d1), f[2] * (v * d1)];
+        // 강체 맞춤(Kabsch): p_i → xc_i.
+        let pc = (p[0] + p[1] + p[2]) / 3.0;
+        let xm = (xc[0] + xc[1] + xc[2]) / 3.0;
+        let mut h = Matrix3::zeros();
+        for i in 0..3 {
+            h += (xc[i] - xm) * (p[i] - pc).transpose();
+        }
+        let svd = h.svd(true, true);
+        let (Some(uu), Some(vt)) = (svd.u, svd.v_t) else {
+            continue;
+        };
+        let sgn = (uu * vt).determinant().signum();
+        let r = uu * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, sgn)) * vt;
+        let rot = Rotation3::from_matrix_unchecked(r);
+        out.push(Pose::new(rot, xm - r * pc));
+    }
+    out
+}
+
+/// 대응 (세계 점, 픽셀) 의 재투영 오차(px). 카메라 뒤는 무한대.
+fn pnp_errors(pose: &Pose, k: &Intrinsics, corr: &[(Vector3<f64>, Vector2<f64>)]) -> Vec<f64> {
+    let cam = Camera {
+        intrinsics: *k,
+        pose: *pose,
+    };
+    corr.iter()
+        .map(|(x, px)| {
+            cam.project(&Point3::from(*x))
+                .map_or(f64::INFINITY, |q| (q - px).norm())
+        })
+        .collect()
+}
+
+/// 자세만 줄이는 Levenberg-Marquardt(재투영 오차 제곱합, 유한 차분 야코비안).
+fn refine_pose_only(pose: &Pose, k: &Intrinsics, corr: &[(Vector3<f64>, Vector2<f64>)]) -> Pose {
+    let cost = |p: &Pose| -> f64 {
+        pnp_errors(p, k, corr)
+            .iter()
+            .map(|e| if e.is_finite() { e * e } else { 1e6 })
+            .sum()
+    };
+    let resid = |p: &Pose| -> Vec<f64> {
+        let cam = Camera {
+            intrinsics: *k,
+            pose: *p,
+        };
+        corr.iter()
+            .flat_map(|(x, px)| {
+                let r = cam
+                    .project(&Point3::from(*x))
+                    .map_or(Vector2::new(1e3, 1e3), |q| q - px);
+                [r.x, r.y]
+            })
+            .collect()
+    };
+    let step = |p: &Pose, d: &nalgebra::SVector<f64, 6>| -> Pose {
+        let dr = Rotation3::from_scaled_axis(Vector3::new(d[0], d[1], d[2]));
+        Pose::new(
+            dr * p.rotation,
+            p.translation + Vector3::new(d[3], d[4], d[5]),
+        )
+    };
+    let mut cur = *pose;
+    let mut c0 = cost(&cur);
+    let mut lambda = 1e-3;
+    for _ in 0..20 {
+        let r0 = resid(&cur);
+        let m = r0.len();
+        let mut jac = DMatrix::<f64>::zeros(m, 6);
+        for a in 0..6 {
+            let mut d = nalgebra::SVector::<f64, 6>::zeros();
+            d[a] = 1e-6;
+            let r1 = resid(&step(&cur, &d));
+            for i in 0..m {
+                jac[(i, a)] = (r1[i] - r0[i]) / 1e-6;
+            }
+        }
+        let rv = nalgebra::DVector::from_vec(r0);
+        let jtj = jac.transpose() * &jac;
+        let g = jac.transpose() * rv;
+        let mut improved = false;
+        for _ in 0..8 {
+            let mut a = jtj.clone();
+            for i in 0..6 {
+                a[(i, i)] += lambda * (1.0 + jtj[(i, i)]);
+            }
+            let Some(sol) = a.lu().solve(&(-&g)) else {
+                lambda *= 10.0;
+                continue;
+            };
+            let d = nalgebra::SVector::<f64, 6>::from_column_slice(sol.as_slice());
+            let cand = step(&cur, &d);
+            let c1 = cost(&cand);
+            if c1 < c0 {
+                let done = (c0 - c1) < 1e-9 * c0.max(1e-12);
+                cur = cand;
+                c0 = c1;
+                lambda = (lambda * 0.3).max(1e-9);
+                improved = true;
+                if done {
+                    return cur;
+                }
+                break;
+            }
+            lambda *= 10.0;
+        }
+        if !improved {
+            break;
+        }
+    }
+    cur
+}
+
+/// 2D–3D 대응에서 절대 자세: P3P 최소 표본 RANSAC → 내점으로 자세만 정밀화. 반환은 (자세, 내점 색인).
+/// 내점이 `min_inl` 미만이거나 내점 재투영 오차 중앙값이 `max_med` 초과면 None.
+fn pnp_ransac(
+    k: &Intrinsics,
+    corr: &[(Vector3<f64>, Vector2<f64>)],
+    min_inl: usize,
+    max_med: f64,
+    seed: u64,
+) -> Option<(Pose, Vec<usize>)> {
+    let n = corr.len();
+    if n < min_inl.max(4) {
+        return None;
+    }
+    let bearing: Vec<Vector3<f64>> = corr
+        .iter()
+        .map(|(_, px)| {
+            let q = k.to_normalized(px);
+            Vector3::new(q.x, q.y, 1.0).normalize()
+        })
+        .collect();
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut best: Option<(usize, Pose)> = None;
+    for _ in 0..RESCUE_ITERS {
+        let mut idx = [0usize; 3];
+        for s in 0..3 {
+            loop {
+                let c = (next() % n as u64) as usize;
+                if !idx[..s].contains(&c) {
+                    idx[s] = c;
+                    break;
+                }
+            }
+        }
+        let p = [corr[idx[0]].0, corr[idx[1]].0, corr[idx[2]].0];
+        let f = [bearing[idx[0]], bearing[idx[1]], bearing[idx[2]]];
+        for pose in p3p(&p, &f) {
+            let cnt = pnp_errors(&pose, k, corr)
+                .iter()
+                .filter(|&&e| e < RESCUE_INLIER_PX)
+                .count();
+            if best.as_ref().is_none_or(|b| cnt > b.0) {
+                best = Some((cnt, pose));
+            }
+        }
+    }
+    let (cnt, mut pose) = best?;
+    if cnt < min_inl {
+        return None;
+    }
+    for _ in 0..3 {
+        let inl: Vec<usize> = pnp_errors(&pose, k, corr)
+            .iter()
+            .enumerate()
+            .filter(|(_, &e)| e < RESCUE_INLIER_PX)
+            .map(|(i, _)| i)
+            .collect();
+        if inl.len() < 6 {
+            return None;
+        }
+        let sub: Vec<_> = inl.iter().map(|&i| corr[i]).collect();
+        pose = refine_pose_only(&pose, k, &sub);
+    }
+    let errs = pnp_errors(&pose, k, corr);
+    let inl: Vec<usize> = (0..n).filter(|&i| errs[i] < RESCUE_INLIER_PX).collect();
+    let mut e: Vec<f64> = inl.iter().map(|&i| errs[i]).collect();
+    e.sort_by(f64::total_cmp);
+    let med = e.get(e.len() / 2).copied()?;
+    (inl.len() >= min_inl && med <= max_med).then_some((pose, inl))
+}
+
+/// 등록 못 한 사진을 모델의 3D 점과의 2D–3D 대응으로 되살린다(짝 일정은 그대로: 이미 맞춘 짝의 특징 짝만 쓴다).
+/// 되살린 사진 수를 돌려준다.
+fn rescue_unregistered(
+    s: &mut Sparse,
+    imgs: &[&ImgData],
+    pm: &[PairMatch],
+    k: &Intrinsics,
+) -> usize {
+    let mut feat_pt: HashMap<(usize, usize), usize> = HashMap::new();
+    for (pi, o) in s.obs.iter().enumerate() {
+        for &(i, f, _) in o {
+            feat_pt.entry((i, f)).or_insert(pi);
+        }
+    }
+    let mut rescued = 0;
+    #[allow(clippy::needless_range_loop)]
+    for u in 0..imgs.len() {
+        if s.poses[u].is_some() {
+            continue;
+        }
+        // 대응: (점 번호, 내 특징 번호) — 같은 점·같은 특징은 한 번만.
+        let mut got: Vec<(usize, usize)> = Vec::new();
+        let mut seen_pt = std::collections::HashSet::new();
+        let mut seen_ft = std::collections::HashSet::new();
+        for p in pm {
+            let (o, mine) = if p.i == u {
+                (p.j, false)
+            } else if p.j == u {
+                (p.i, true)
+            } else {
+                continue;
+            };
+            if s.poses[o].is_none() {
+                continue;
+            }
+            for &(a, b) in &p.inl {
+                let (fu, fo) = if mine { (b, a) } else { (a, b) };
+                if let Some(&pt) = feat_pt.get(&(o, fo)) {
+                    if seen_pt.insert(pt) && seen_ft.insert(fu) {
+                        got.push((pt, fu));
+                    }
+                }
+            }
+        }
+        let corr: Vec<(Vector3<f64>, Vector2<f64>)> = got
+            .iter()
+            .map(|&(pt, fu)| {
+                let kp = imgs[u].feats[fu].kp;
+                (
+                    s.points[pt],
+                    Vector2::new(kp.x as f64 + 0.5, kp.y as f64 + 0.5),
+                )
+            })
+            .collect();
+        let found = pnp_ransac(k, &corr, RESCUE_MIN_INLIERS, RESCUE_MAX_MEDIAN_PX, u as u64);
+        if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+            eprintln!(
+                "diag rescue photo {u} corr {} inliers {:?}",
+                corr.len(),
+                found.as_ref().map(|f| f.1.len())
+            );
+        }
+        let Some((pose, inl)) = found else { continue };
+        s.poses[u] = Some(pose);
+        for i in inl {
+            let (pt, fu) = got[i];
+            s.obs[pt].push((u, fu, corr[i].1));
+        }
+        rescued += 1;
+    }
+    rescued
 }
 
 /// 두 롤 후보(GPS 닮음 해, 수평 퍼짐 해)의 정상 대응 정렬 잔차(RMS)를 비교할 때, GPS 해 잔차가
@@ -5258,5 +5614,88 @@ mod detached_tests {
         assert!(!overlap_not_worse(&src, &dst, &sim));
         // 변환 없음은 받아들인다.
         assert!(overlap_not_worse(&src, &dst, &Similarity::identity()));
+    }
+}
+
+#[cfg(test)]
+mod rescue_tests {
+    use super::*;
+
+    fn lcg(s: &mut u64) -> f64 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*s >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+
+    fn truth() -> Pose {
+        let r = Rotation3::from_euler_angles(0.05, -0.04, 0.3)
+            * Rotation3::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI);
+        Pose::from_center(r, &Point3::new(3.0, -2.0, 40.0))
+    }
+
+    /// 대응 `n` 개: 점은 높이 `relief` 안에서 퍼지고, `out` 비율은 엉뚱한 픽셀.
+    fn make(
+        n: usize,
+        relief: f64,
+        out: f64,
+        noise: f64,
+        seed: u64,
+    ) -> Vec<(Vector3<f64>, Vector2<f64>)> {
+        let k = Intrinsics::from_hfov(1000, 750, 1.2);
+        let cam = Camera {
+            intrinsics: k,
+            pose: truth(),
+        };
+        let mut s = seed;
+        let mut v = Vec::new();
+        while v.len() < n {
+            let x = Vector3::new(
+                lcg(&mut s) * 40.0 - 20.0,
+                lcg(&mut s) * 30.0 - 15.0,
+                lcg(&mut s) * relief,
+            );
+            let Some(mut q) = cam.project(&Point3::from(x)) else {
+                continue;
+            };
+            if !k.contains(&q) {
+                continue;
+            }
+            q += Vector2::new(lcg(&mut s) - 0.5, lcg(&mut s) - 0.5) * 2.0 * noise;
+            if lcg(&mut s) < out {
+                q = Vector2::new(lcg(&mut s) * 1000.0, lcg(&mut s) * 750.0);
+            }
+            v.push((x, q));
+        }
+        v
+    }
+
+    fn check(relief: f64) {
+        let k = Intrinsics::from_hfov(1000, 750, 1.2);
+        let corr = make(300, relief, 0.3, 0.4, 7);
+        let (pose, inl) = pnp_ransac(&k, &corr, 20, 1.5, 1).expect("pose");
+        let t = truth();
+        let dr = crate::math::rotation_angle_between(&pose.rotation, &t.rotation).to_degrees();
+        let dc = (pose.center() - t.center()).norm();
+        assert!(dr < 0.2, "rot {dr}");
+        assert!(dc < 0.2, "center {dc}");
+        assert!(inl.len() >= 180, "inliers {}", inl.len());
+    }
+
+    #[test]
+    fn absolute_pose_with_outliers() {
+        check(10.0);
+    }
+
+    #[test]
+    fn absolute_pose_planar_points() {
+        check(0.0);
+    }
+
+    #[test]
+    fn too_few_or_all_wrong_correspondences_give_none() {
+        let k = Intrinsics::from_hfov(1000, 750, 1.2);
+        assert!(pnp_ransac(&k, &make(10, 5.0, 0.0, 0.3, 3), 20, 1.5, 1).is_none());
+        assert!(pnp_ransac(&k, &make(120, 5.0, 1.0, 0.3, 4), 20, 1.5, 1).is_none());
     }
 }
