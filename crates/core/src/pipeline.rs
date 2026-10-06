@@ -176,6 +176,70 @@ pub struct PipelineResult {
     pub align: Vec<AlignRecord>,
     /// (사진 이름, 정밀 카메라 중심 동-북-위 m).
     pub centers: Vec<(String, [f64; 3])>,
+    /// 위 방향 교차 검사(구역별 카메라 폴더 묶음 사이 어긋남). 동작(포즈)에는 쓰지 않는다.
+    pub up_cross: UpCrossReport,
+}
+
+/// 위 방향 교차 검사 보고: 구역마다 카메라 폴더 묶음별 어긋남(도)과 전체 최댓값.
+#[derive(Clone, Debug, Default)]
+pub struct UpCrossReport {
+    /// (구역 번호, 묶음 라벨 = 카메라 번호, 묶음별 어긋남 도). 검사할 수 없던 구역은 없다.
+    pub regions: Vec<(usize, Vec<usize>, Vec<Option<f64>>)>,
+    /// 모든 구역·묶음의 최대 어긋남(도). 구한 값이 없으면 `None`.
+    pub max_diff_deg: Option<f64>,
+    /// 최대 어긋남이 [`crate::align::UP_CROSS_WARN_DEG`] 를 넘었는가.
+    pub exceeds: bool,
+}
+
+impl UpCrossReport {
+    /// report.json 의 `up_cross_check` 값(JSON 객체 문자열).
+    fn to_json(&self) -> String {
+        let num = |d: &Option<f64>| d.map_or("null".to_string(), |v| format!("{v:.4}"));
+        let regions = self
+            .regions
+            .iter()
+            .map(|(r, labels, diffs)| {
+                format!(
+                    "{{\"region\": {r}, \"cameras\": [{}], \"diff_deg\": [{}]}}",
+                    labels
+                        .iter()
+                        .map(|l| format!("\"{}\"", crate::dataset::CAMERAS[*l % 3]))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    diffs.iter().map(num).collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{{\"threshold_deg\": {}, \"max_diff_deg\": {}, \"exceeds\": {}, \"regions\": [{regions}]}}",
+            crate::align::UP_CROSS_WARN_DEG,
+            num(&self.max_diff_deg),
+            self.exceeds
+        )
+    }
+}
+
+/// 구역별 정밀 포즈를 사진 번호 % 3(카메라 폴더)로 묶어 위 방향 교차 검사를 한다.
+fn up_cross_report(recs: &[RegionRec]) -> UpCrossReport {
+    let mut out = UpCrossReport::default();
+    for rec in recs {
+        let mut gids: Vec<usize> = rec.rposes.keys().copied().collect();
+        gids.sort_unstable();
+        let rots: Vec<Rotation3<f64>> = gids.iter().map(|g| rec.rposes[g].rotation).collect();
+        let labels: Vec<usize> = gids.iter().map(|g| g % 3).collect();
+        if let Some(c) = crate::align::up_cross_check(&rots, &labels) {
+            out.max_diff_deg = match (out.max_diff_deg, c.max_diff_deg) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            out.regions.push((rec.region.index, c.labels, c.diff_deg));
+        }
+    }
+    out.exceeds = out
+        .max_diff_deg
+        .is_some_and(|d| d > crate::align::UP_CROSS_WARN_DEG);
+    out
 }
 
 struct ImgData {
@@ -2802,6 +2866,18 @@ pub fn run_pipeline_with(
         reg_prev.extend(rec.registered_prev.iter().copied());
         reg_ref.extend(rec.centers.keys().copied());
     }
+    res.up_cross = up_cross_report(&recs);
+    if let Some(m) = res.up_cross.max_diff_deg {
+        let msg = format!(
+            "위 방향 교차 검사: 카메라 폴더 묶음 사이 최대 어긋남 {m:.3}° (문턱 {}°)",
+            crate::align::UP_CROSS_WARN_DEG
+        );
+        res.issues.push(if res.up_cross.exceeds {
+            format!("{msg} 초과: 한 카메라의 짐벌 구름 치우침이 의심된다")
+        } else {
+            msg
+        });
+    }
     for rec in recs.iter() {
         let st = &rec.stats;
         println!(
@@ -2820,7 +2896,7 @@ pub fn run_pipeline_with(
     };
     let q = |s: &str| s.replace('\\', "/").replace('"', "'");
     let report = format!(
-        "{{\"registered\": {{\"total\": {}, \"preview\": {}, \"refined\": {}}}, \"reprojection_px\": {{\"preview\": {:.4}, \"refined\": {:.4}}}, \"regions\": [{}], \"realign_count\": {}, \"realigns\": [{}], \"overlap_center_diff_median_m\": {}, \"events\": [{}]}}\n",
+        "{{\"registered\": {{\"total\": {}, \"preview\": {}, \"refined\": {}}}, \"reprojection_px\": {{\"preview\": {:.4}, \"refined\": {:.4}}}, \"regions\": [{}], \"realign_count\": {}, \"realigns\": [{}], \"overlap_center_diff_median_m\": {}, \"up_cross_check\": {}, \"events\": [{}]}}\n",
         ds.image_count(),
         reg_prev.len(),
         reg_ref.len(),
@@ -2844,6 +2920,7 @@ pub fn run_pipeline_with(
             .collect::<Vec<_>>()
             .join(", "),
         overlap_med.map_or("null".to_string(), |m| format!("{m:.4}")),
+        res.up_cross.to_json(),
         events
             .iter()
             .map(|e| format!("\"{}\"", q(e)))
