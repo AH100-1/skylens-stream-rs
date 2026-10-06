@@ -1281,16 +1281,28 @@ mod tests {
     #[test]
     fn consistent_swaps_stay_pure() {
         // 정답 점 1% 를 옆 격자 점과 모든 짝에서 일관되게 바꾼다(반복 무늬형 오대응).
-        let s = synthetic(0, 100, 1);
-        assert!(s.outliers > 0);
-        let (pd, cd, sd, _) = run_policy(&s, ConflictPolicy::Drop);
-        let (ps, cs, ss, _) = run_policy(&s, ConflictPolicy::Split);
-        eprintln!(
-            "consistent 1% outliers {}: Drop tracks {} purity {pd:.4} completeness {cd:.4} | Split tracks {} purity {ps:.4} completeness {cs:.4}",
-            s.outliers, sd.tracks, ss.tracks
-        );
-        assert!(ps >= 0.99, "Split 순도 {ps}");
-        assert!(cs >= 0.95, "Split 완전도 {cs}");
+        // 시드 1~5 × 재현율 30/40/50% 모두에서 Split 순도 >= 0.99, 완전도 >= 0.95.
+        let mut failures = Vec::new();
+        for keep in [30, 40, 50, 100] {
+            let seeds = if keep == 100 { 0..=0 } else { 1..=5 };
+            for seed in seeds {
+                let s = synthetic_seeded(0, keep, 1, seed);
+                assert!(s.outliers > 0);
+                let (pd, cd, _, _) = run_policy(&s, ConflictPolicy::Drop);
+                let (ps, cs, _, _) = run_policy(&s, ConflictPolicy::Split);
+                eprintln!(
+                    "keep {keep} seed {seed} outliers {}: Drop purity {pd:.4} completeness {cd:.4} | Split purity {ps:.4} completeness {cs:.4}",
+                    s.outliers
+                );
+                if ps < 0.99 {
+                    failures.push(format!("keep {keep} seed {seed}: Split 순도 {ps}"));
+                }
+                if cs < 0.95 {
+                    failures.push(format!("keep {keep} seed {seed}: Split 완전도 {cs}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]
