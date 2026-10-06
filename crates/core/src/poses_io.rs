@@ -69,13 +69,16 @@ impl PosesFile {
         }
     }
 
+    /// JSON 으로 쓴다. 회전·중심에 비유한 값이 있는 포즈는 JSON 수치로 쓸 수 없어 건너뛴다
+    /// (호출부가 쓰기 오류를 파이프라인 전체 실패로 올리므로, 카메라 한 대 때문에 파일 전체를 잃지 않게 한다).
     pub fn to_json(&self) -> String {
         let (fx, fy, cx, cy, w, h) = self.intrinsics;
         let rows: Vec<String> = self
             .poses
             .iter()
+            .filter(|e| e.quat_wxyz.iter().chain(&e.center).all(|v| v.is_finite()))
             .map(|e| {
-                let n = e.name.replace('\\', "/").replace('"', "'");
+                let n = json_escape(&e.name);
                 format!(
                     "    {{\"image\": \"{n}\", \"quat_wxyz\": [{:?}, {:?}, {:?}, {:?}], \"center_enu\": [{:?}, {:?}, {:?}]}}",
                     e.quat_wxyz[0], e.quat_wxyz[1], e.quat_wxyz[2], e.quat_wxyz[3],
@@ -142,6 +145,20 @@ impl PosesFile {
     }
 }
 
+/// JSON 문자열 본문 이스케이프: `"` `\\` 와 제어 문자(U+0000–U+001F)는 `\\uXXXX`, 나머지(한글 포함)는 그대로.
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
 /// `poses/` 폴더를 만들고 `{kind}_{k:02}.json` 을 쓴다.
 pub fn write_poses_file(
     out: &Path,
@@ -192,6 +209,48 @@ mod tests {
         let b = q.transform(&Point3::from(sim.apply_point(&x.coords)));
         assert!((b - a * sim.s).norm() < 1e-9);
         assert!((q.center().coords - sim.apply_point(&p.center().coords)).norm() < 1e-9);
+    }
+
+    #[test]
+    fn names_roundtrip_with_quotes_backslashes_hangul_and_controls() {
+        let p = pose();
+        let k = Intrinsics::from_hfov(320, 180, 65f64.to_radians());
+        let names = [
+            "a\"b.jpg",
+            "dir\\sub\\c.jpg",
+            "사진_하늘 01.jpg",
+            "t\tn\nr\r\u{1}\u{1f}.jpg",
+            "\\\"\\",
+        ];
+        let f = PosesFile::new(&k, true, names.iter().map(|n| entry(n, &p)).collect());
+        let text = f.to_json();
+        assert!(text.contains("a\\\"b.jpg") && text.contains("dir\\\\sub"));
+        assert!(text.contains("사진_하늘 01.jpg") && text.contains("\\u0001"));
+        let back = PosesFile::from_json(&text).unwrap();
+        assert_eq!(back.poses.len(), 5);
+        for (e, n) in back.poses.iter().zip(names) {
+            assert_eq!(e.name, n);
+        }
+        assert_eq!(back, f);
+    }
+
+    #[test]
+    fn non_finite_pose_is_skipped_and_file_stays_readable() {
+        let p = pose();
+        let k = Intrinsics::from_hfov(320, 180, 65f64.to_radians());
+        let mut bad = entry("bad", &p);
+        bad.center[1] = f64::NAN;
+        let mut bad_q = entry("bad_q", &p);
+        bad_q.quat_wxyz[2] = f64::INFINITY;
+        let f = PosesFile::new(&k, true, vec![entry("a", &p), bad, bad_q, entry("b", &p)]);
+        let text = f.to_json();
+        assert!(!text.contains("NaN") && !text.contains("inf"));
+        let back = PosesFile::from_json(&text).unwrap();
+        let got: Vec<&str> = back.poses.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(got, ["a", "b"]);
+        for i in 0..3 {
+            assert!((back.poses[1].center[i] - [10.0, -4.5, 80.25][i]).abs() < 1e-9);
+        }
     }
 
     #[test]
