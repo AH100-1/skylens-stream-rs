@@ -693,6 +693,88 @@ pub fn up_from_rotations(rotations: &[Rotation3<f64>]) -> Option<Vector3<f64>> {
     Some(up.normalize())
 }
 
+/// 위 방향 교차 검사의 경고 문턱(도). 한 묶음(기체·카메라 폴더)의 구름 치우침이 이 값을
+/// 넘으면 [`UpCrossCheck::exceeds`] 가 참이다.
+pub const UP_CROSS_WARN_DEG: f64 = 0.3;
+
+/// 묶음별 위 방향 교차 검사 결과([`up_cross_check`]).
+#[derive(Debug, Clone)]
+pub struct UpCrossCheck {
+    /// 묶음 라벨(오름차순).
+    pub labels: Vec<usize>,
+    /// 묶음 자기 회전만으로 구한 위 방향. 방위가 한 방향뿐이면 `None`.
+    pub up_own: Vec<Option<Vector3<f64>>>,
+    /// 그 묶음을 뺀 나머지 전체로 구한 위 방향. 나머지의 방위가 모자라면 `None`.
+    pub up_rest: Vec<Option<Vector3<f64>>>,
+    /// 묶음별 어긋남(도). 자기 위 방향이 있으면 `up_own` 과 `up_rest` 의 각 차, 없으면
+    /// (방위가 한 방향뿐인 기체) 그 묶음 카메라 x 축이 `up_rest` 에 수직인 면에서 벗어난
+    /// 부호 있는 각의 평균 절댓값(카메라 구름 r 이면 약 r·cos(아래 기울기)). 못 구하면 `None`.
+    pub diff_deg: Vec<Option<f64>>,
+    /// `diff_deg` 의 최댓값(도). 구한 묶음이 없으면 `None`.
+    pub max_diff_deg: Option<f64>,
+}
+
+impl UpCrossCheck {
+    /// 어긋남이 `threshold_deg` (보통 [`UP_CROSS_WARN_DEG`]) 를 넘는 묶음이 있는가.
+    pub fn exceeds(&self, threshold_deg: f64) -> bool {
+        self.max_diff_deg.is_some_and(|d| d > threshold_deg)
+    }
+}
+
+/// 카메라 묶음(`labels[i]` 는 `rotations[i]` 의 묶음 라벨)별로 위 방향을 따로 구해
+/// 묶음 사이의 어긋남을 돌려주는 순수 함수. [`up_from_rotations`] 의 동작은 바꾸지 않는다.
+/// 세 기체가 따로 날아 짐벌 구름 치우침이 다를 때 한 기체의 치우침이 전체 위 방향에
+/// 섞여 들어오는 것을 알아채기 위한 검사다. 길이가 다르거나 묶음이 둘 미만이면 `None`.
+pub fn up_cross_check(rotations: &[Rotation3<f64>], labels: &[usize]) -> Option<UpCrossCheck> {
+    if rotations.len() != labels.len() {
+        return None;
+    }
+    let mut ids: Vec<usize> = labels.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() < 2 {
+        return None;
+    }
+    let (mut up_own, mut up_rest, mut diff_deg) = (Vec::new(), Vec::new(), Vec::new());
+    for &g in &ids {
+        let pick = |inside: bool| -> Vec<Rotation3<f64>> {
+            rotations
+                .iter()
+                .zip(labels)
+                .filter(|(_, &l)| (l == g) == inside)
+                .map(|(r, _)| *r)
+                .collect()
+        };
+        let own_rots = pick(true);
+        let own = up_from_rotations(&own_rots);
+        let rest = up_from_rotations(&pick(false));
+        let d = match (own, rest) {
+            (Some(a), Some(b)) => Some(a.angle(&b).to_degrees()),
+            (None, Some(b)) => {
+                let t: Vec<f64> = own_rots
+                    .iter()
+                    .map(|r| Vector3::from(r.matrix().transpose().column(0)))
+                    .filter(finite)
+                    .map(|x| x.dot(&b).clamp(-1.0, 1.0).asin())
+                    .collect();
+                (!t.is_empty()).then(|| (t.iter().sum::<f64>() / t.len() as f64).abs().to_degrees())
+            }
+            _ => None,
+        };
+        up_own.push(own);
+        up_rest.push(rest);
+        diff_deg.push(d);
+    }
+    let max_diff_deg = diff_deg.iter().flatten().copied().reduce(f64::max);
+    Some(UpCrossCheck {
+        labels: ids,
+        up_own,
+        up_rest,
+        diff_deg,
+        max_diff_deg,
+    })
+}
+
 /// [`up_from_rotations`] 의 방위 퍼짐 문턱(둘째/최대 고유값). 0.05 는 방위가 약 ±13° 이상
 /// 퍼진 것에 해당한다.
 pub const UP_MIN_HEADING_SPREAD: f64 = 0.05;
@@ -1571,6 +1653,61 @@ mod tests {
         assert_eq!(al.tilt_sigma_deg, 0.0);
         let up_true = c.gt.r.inverse() * ez;
         assert!((al.sim.r * up_true).angle(&ez).to_degrees() < 0.1);
+    }
+
+    /// F-199: 한 기체 카메라에만 일정한 구름(광축 둘레 회전)이 있을 때 묶음별 교차 검사.
+    /// SPEC 삼각 편대 띠, σ 2 m 와 같은 시드 20. 구름 0.5/1/2° 의 최악 어긋남과 전체
+    /// 위 방향 기울기를 출력한다(구름 민감도 표). 구름이 없으면 어긋남·기울기 < 0.1°.
+    #[test]
+    fn up_cross_check_flags_single_drone_roll() {
+        let ez = Vector3::new(0.0, 0.0, 1.0);
+        let mut worst = [(0.0f64, 0.0f64, f64::INFINITY); 4];
+        for (i, &roll) in [0.0f64, 0.5, 1.0, 2.0].iter().enumerate() {
+            for seed in 0..20u64 {
+                let mut rng = Rng(1300 + seed);
+                let s = strip_enu(&mut rng);
+                let c = gps_case(&mut rng, s, 2.0, 0.1, 10.0, 50.0);
+                let mut rots = strip_rotations(&mut rng, &c, 0.1);
+                let labels: Vec<usize> = (0..rots.len()).map(|k| k % 3).collect();
+                let rz = Rotation3::from_axis_angle(&Vector3::z_axis(), roll.to_radians());
+                for (r, &l) in rots.iter_mut().zip(&labels) {
+                    if l == 0 {
+                        *r = rz * *r;
+                    }
+                }
+                let up_true = c.gt.r.inverse() * ez;
+                let up = up_from_rotations(&rots).unwrap();
+                let tilt = up.angle(&up_true).to_degrees();
+                let chk = up_cross_check(&rots, &labels).unwrap();
+                assert_eq!(chk.labels, vec![0, 1, 2]);
+                assert!(chk.diff_deg.iter().all(|d| d.is_some()));
+                let d = chk.max_diff_deg.unwrap();
+                worst[i].0 = worst[i].0.max(d);
+                worst[i].1 = worst[i].1.max(tilt);
+                // 가장 작은 어긋남(구름 있을 때 모든 시드에서 경고가 나는지 확인).
+                worst[i].2 = worst[i].2.min(d);
+            }
+            eprintln!(
+                "roll {roll} deg: cross diff max {:.3} min {:.3} deg, overall up tilt max {:.3} deg",
+                worst[i].0, worst[i].2, worst[i].1
+            );
+        }
+        // 구름 없음: 어긋남·기울기 < 0.1°.
+        assert!(worst[0].0 < 0.1, "no roll diff {}", worst[0].0);
+        assert!(worst[0].1 < 0.1, "no roll tilt {}", worst[0].1);
+        // 구름이 있으면 어긋남이 구름과 함께 커지고 2° 에서는 모든 시드가 문턱을 넘는다.
+        assert!(worst[1].2 < worst[2].2 && worst[2].2 < worst[3].2);
+        // 문턱 0.3° 는 1° 이상 구름을 모든 시드에서 잡고, 0.5° 는 시드에 따라 갈린다(0.22~0.31°).
+        assert!(worst[2].2 > UP_CROSS_WARN_DEG, "1 deg min {}", worst[2].2);
+        assert!(worst[3].2 > UP_CROSS_WARN_DEG, "2 deg min {}", worst[3].2);
+        assert!(worst[3].0 < 1.2 * 1.116, "2 deg max {}", worst[3].0);
+        // 라벨 길이 불일치·묶음 하나뿐이면 검사하지 않는다.
+        let mut rng = Rng(7);
+        let s = strip_enu(&mut rng);
+        let c = gps_case(&mut rng, s, 1.0, 0.0, 0.0, 0.0);
+        let rots = strip_rotations(&mut rng, &c, 0.1);
+        assert!(up_cross_check(&rots, &[0]).is_none());
+        assert!(up_cross_check(&rots, &vec![0; rots.len()]).is_none());
     }
 
     /// F-099 방위(연직축 둘레): 최소제곱 방위 오차는 잡음 한계 σ_ψ = σ_축 / √Σ r_i²
