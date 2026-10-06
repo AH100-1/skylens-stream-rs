@@ -1899,7 +1899,9 @@ struct RegionRec {
     gids: Vec<usize>,
     ta: Vec<Track>,
     coarse: PointCloud,
-    /// 초벌 모델의 사진별 포즈(gids 순서).
+    /// 초벌 모델의 사진 번호(초벌 때의 목록 사본; 정밀 다시 등록으로 gids 가 바뀌어도 그대로).
+    coarse_gids: Vec<usize>,
+    /// 초벌 모델의 사진별 포즈(coarse_gids 순서).
     coarse_poses: Vec<Option<Pose>>,
     /// 지금 쓰는 초벌 → 기준 정밀 좌표 변환과 그 기준 구역.
     sim: Option<Similarity>,
@@ -2522,6 +2524,7 @@ pub fn run_pipeline_with(
         recs.push(RegionRec {
             region: *r,
             stats: st,
+            coarse_gids: gids.clone(),
             gids,
             ta,
             coarse,
@@ -2823,7 +2826,7 @@ pub fn run_pipeline_with(
                 .collect();
             write_poses_file(out, "refined", r.index, &PosesFile::new(&k, true, refined))?;
             let preview: Vec<_> = rec
-                .gids
+                .coarse_gids
                 .iter()
                 .zip(&rec.coarse_poses)
                 .filter(|(g, _)| r.contains(**g / 3))

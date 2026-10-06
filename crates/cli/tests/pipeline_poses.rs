@@ -158,7 +158,7 @@ fn rotation_errors(pairs: &[(Rotation3<f64>, Rotation3<f64>)]) -> (Vec<f64>, Vec
     (raw, aligned)
 }
 
-/// 단구역 합성 장면. 실측(4코어 측정 기계): 회전 오차 정렬 전 중앙 0.652/최대 1.535 도, 정렬 후 중앙 0.388/최대 1.135 도,
+/// 단구역 합성 장면. 실측(4코어 측정 기계): 회전 오차 정렬 전 중앙 1.140/최대 1.592 도, 정렬 후 중앙 0.388/최대 1.135 도,
 /// 중심 오차 중앙 0.312/최대 0.851 m. 상한은 실측 x 1.2.
 #[test]
 fn refined_pose_rotation_and_center_errors() {
@@ -204,6 +204,9 @@ fn refined_pose_rotation_and_center_errors() {
         "POSES refined n {} rot raw med {rm:.4} max {rx:.4} deg, aligned med {am:.4} max {ax:.4} deg, center med {cm:.3} max {cx:.3} m",
         refined.len()
     );
+    // 정렬 전 상한: 실측 중앙 1.140/최대 1.592 도에 여유.
+    assert!(rm < 1.4, "정렬 전 회전 오차 중앙 {rm} 도");
+    assert!(rx < 1.95, "정렬 전 회전 오차 최대 {rx} 도");
     assert!(am < 0.47, "정렬 후 회전 오차 중앙 {am} 도");
     assert!(ax < 1.4, "정렬 후 회전 오차 최대 {ax} 도");
     assert!(cm < 0.40, "중심 오차 중앙 {cm} m");
@@ -224,4 +227,92 @@ fn refined_pose_rotation_and_center_errors() {
     // 실측: 정렬 후 중앙 0.491/최대 4.081 도.
     assert!(median(&pa) < 0.6, "초벌 회전 오차 중앙 {}", median(&pa));
     assert!(max(&pa) < 4.9, "초벌 회전 오차 최대 {}", max(&pa));
+}
+
+/// 기본 합성 장면(위치 수 기본값) + `--span 12 --coarse-back off`: 구역마다 초벌 포즈 파일의 사진 이름과 포즈가 짝이 맞아야 한다.
+/// 정밀 다시 등록으로 구역 사진 목록이 바뀌어도 초벌 포즈는 초벌 때의 사진 번호와 짝지어 쓴다.
+/// 같은 사진의 정밀 중심(출력 좌표)과 초벌 중심의 차이 중앙값을 구역별로 단언한다.
+#[test]
+fn coarse_back_off_preview_poses_stay_paired() {
+    let t = TempDir::new("off");
+    let (scene, out) = (t.0.join("scene"), t.0.join("out"));
+    let (scene_s, out_s) = (scene.to_str().unwrap(), out.to_str().unwrap());
+    let (code, so, se) = cli(&["synth", scene_s, "320", "180"]);
+    assert_eq!(code, 0, "{so}{se}");
+    let args = [
+        "run",
+        scene_s,
+        out_s,
+        "--span",
+        "12",
+        "--coarse-back",
+        "off",
+        "--max-features",
+        "800",
+        "--dense-width",
+        "96",
+        "--hfov",
+        "65",
+        "--ba-iters",
+        "15",
+    ];
+    let (code, so, se) = cli(&args);
+    assert_eq!(code, 0, "{so}{se}");
+
+    let registered: Vec<usize> = so
+        .lines()
+        .filter(|l| l.starts_with("region "))
+        .map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let i = w.iter().position(|x| *x == "registered").unwrap();
+            w[i + 1].split('/').next().unwrap().parse().unwrap()
+        })
+        .collect();
+    let mut refined = BTreeMap::new();
+    let mut n_regions = 0;
+    for k in 0.. {
+        let f = out.join("poses").join(format!("refined_{k:02}.json"));
+        let Ok(txt) = std::fs::read_to_string(&f) else {
+            break;
+        };
+        n_regions += 1;
+        for e in PosesFile::from_json(&txt).unwrap().poses {
+            refined.entry(e.name.clone()).or_insert(e);
+        }
+    }
+    assert!(n_regions >= 3, "구역 수 {n_regions}");
+    assert_eq!(registered.len(), n_regions);
+    for (k, &n_reg) in registered.iter().enumerate() {
+        let f = out.join("poses").join(format!("preview_{k:02}.json"));
+        let pf = PosesFile::from_json(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let mut d = Vec::new();
+        for e in &pf.poses {
+            // 정밀 모델에 등록되지 않은 사진은 비교에서 뺀다.
+            let Some(r) = refined.get(&e.name) else {
+                continue;
+            };
+            d.push(
+                (0..3)
+                    .map(|i| (e.center[i] - r.center[i]).powi(2))
+                    .sum::<f64>()
+                    .sqrt(),
+            );
+        }
+        // 초벌 포즈 수는 초벌 등록 수(`region k positions P registered R/N`)와 같아야 한다.
+        assert_eq!(pf.poses.len(), n_reg, "구역 {k} 초벌 포즈 수");
+        if !pf.aligned {
+            // 초벌이 정밀 모델과 겹치는 사진이 없어 정렬되지 못한 구역은 좌표가 달라 비교하지 않는다.
+            eprintln!("POSES off preview_{k:02} n {} not aligned", pf.poses.len());
+            continue;
+        }
+        assert!(!d.is_empty(), "구역 {k} 비교 가능한 사진 없음");
+        let (md, mx) = (median(&d), max(&d));
+        eprintln!(
+            "POSES off preview_{k:02} n {} aligned {} center-vs-refined med {md:.3} max {mx:.3} m",
+            pf.poses.len(),
+            pf.aligned
+        );
+        // 실측(4코어): 구역 1 중앙 3.37~3.56 m, 구역 2 중앙 1.57 m. 사진 짝이 엇갈리면 구역 1 이 9.5 m, 구역 0 은 포즈가 6장만 남는다. 상한은 실측 x 1.2.
+        assert!(md < 4.3, "구역 {k} 초벌-정밀 중심 차 중앙 {md} m");
+    }
 }
