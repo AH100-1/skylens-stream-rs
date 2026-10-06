@@ -1358,6 +1358,38 @@ fn attach_detached(
             }
         }
     }
+    // 3축 보정: 롤 하나로 줄지 않는 기울기가 남아 목표와의 각거리 중앙값이 문턱을 넘으면, 목표에 가장 가까운
+    // 회전 하나(목표^-1·자세 의 평균)를 성분 중심 둘레로 걸어 세 축을 함께 맞춘다. 보정 뒤에도 넘으면 아래에서 거부한다.
+    if rig_targets.len() >= 3
+        && rig_median_deg(&sub, rig_targets).is_some_and(|m| m > DETACHED_RIG_MAX_DEG)
+    {
+        let qs: Vec<Rotation3<f64>> = rig_targets
+            .iter()
+            .filter_map(|(i, t)| sub.poses[*i].map(|p| t.inverse() * p.rotation))
+            .collect();
+        if let Some(q) = mean_rotation(&qs) {
+            let m = ids
+                .iter()
+                .map(|&i| sub.poses[i].unwrap().center().coords)
+                .sum::<Vector3<f64>>()
+                / ids.len() as f64;
+            apply_sparse_sim(
+                &mut sub,
+                &Similarity {
+                    s: 1.0,
+                    r: q,
+                    t: m - q * m,
+                },
+            );
+            if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+                eprintln!(
+                    "diag rig tilt_fix deg {:.2} med_after {:.2}",
+                    q.angle().to_degrees(),
+                    rig_median_deg(&sub, rig_targets).unwrap_or(f64::NAN)
+                );
+            }
+        }
+    }
     let mut res: Vec<f64> = ids
         .iter()
         .map(|&i| (sub.poses[i].unwrap().center().coords - gps[i]).norm())
@@ -1368,15 +1400,9 @@ fn attach_detached(
         return None;
     }
     // 장착 관계 검사: 목표 자세가 있는 사진의 회전이 목표에서 3° 넘게 벗어나면(롤이 틀린 성분) 붙이지 않는다.
-    let mut rig_err: Vec<f64> = rig_targets
-        .iter()
-        .filter_map(|(i, t)| sub.poses[*i].map(|p| p.rotation.rotation_to(t).angle().to_degrees()))
-        .collect();
-    if !rig_err.is_empty() {
-        rig_err.sort_by(f64::total_cmp);
-        let med = rig_err[rig_err.len() / 2];
+    if let Some(med) = rig_median_deg(&sub, rig_targets) {
         if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
-            eprintln!("diag rig check n {} med_deg {:.2}", rig_err.len(), med);
+            eprintln!("diag rig check med_deg {med:.2}");
         }
         if med > DETACHED_RIG_MAX_DEG {
             return None;
@@ -1389,6 +1415,19 @@ fn attach_detached(
     s.obs.extend(sub.obs);
     s.ba_only.extend(sub.ba_only);
     Some((res.len(), res[res.len() / 2]))
+}
+
+/// 부분 모델 자세와 장착 목표 회전의 각거리(도) 중앙값. 목표가 없으면 None.
+fn rig_median_deg(sub: &Sparse, rig_targets: &[(usize, Rotation3<f64>)]) -> Option<f64> {
+    let mut e: Vec<f64> = rig_targets
+        .iter()
+        .filter_map(|(i, t)| sub.poses[*i].map(|p| p.rotation.rotation_to(t).angle().to_degrees()))
+        .collect();
+    if e.is_empty() {
+        return None;
+    }
+    e.sort_by(f64::total_cmp);
+    Some(e[e.len() / 2])
 }
 
 /// 장착 관계로 정한 목표 자세(`rig_targets`: 사진 번호, 목표 회전)에 부분 모델 `sub` 의 사진 회전을 가장 가깝게
@@ -5157,6 +5196,37 @@ mod detached_tests {
         assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
         assert_eq!(main.points.len(), 30);
+    }
+
+    #[test]
+    fn tilted_component_is_corrected_on_three_axes_by_rig_targets() {
+        // 비행 축(x)이 아닌 y 축으로 9° 기울어 붙으려는 5장 성분: 롤 하나로는 못 고치지만 목표 3개 이상이면 3축 보정으로 3° 안.
+        let tilt = Rotation3::from_axis_angle(&Vector3::y_axis(), 9f64.to_radians());
+        let targets: Vec<(usize, Rotation3<f64>)> = (10..15).map(|i| (i, truth_rot())).collect();
+        let (mut main, mut sub, gps) = setup(5);
+        let m = Vector3::new(12.5, 15.0, 30.0);
+        apply_sparse_sim(
+            &mut sub,
+            &Similarity {
+                s: 1.0,
+                r: tilt,
+                t: m - tilt * m,
+            },
+        );
+        let before = sub.poses[10]
+            .unwrap()
+            .rotation
+            .rotation_to(&truth_rot())
+            .angle()
+            .to_degrees();
+        assert!(before > 8.0, "before {before}");
+        attach_detached(&mut main, sub, &gps, &targets).expect("attached");
+        for i in 10..15 {
+            let p = main.poses[i].unwrap();
+            let da = (p.rotation * truth_rot().inverse()).angle().to_degrees();
+            let dc = (p.center().coords - truth_center(i)).norm();
+            assert!(da <= 3.0 && dc < 2.0, "photo {i}: {dc} m {da} deg");
+        }
     }
 
     #[test]
