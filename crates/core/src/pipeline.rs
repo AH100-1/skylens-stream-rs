@@ -989,6 +989,8 @@ pub struct PreviewStages {
     pub placed: Vec<Option<Pose>>,
     /// 회전 평균 뒤 뺀 간선 수 / 전체.
     pub pruned: (usize, usize),
+    /// 위치 평균을 요청했으나 실패해 GPS 최소제곱으로 되돌아갔는지.
+    pub position_fallback: bool,
 }
 
 type RotsAndKeep = (Vec<Option<Rotation3<f64>>>, Vec<bool>);
@@ -1297,6 +1299,7 @@ fn sparse_init_with(
         if placed.is_none() && std::env::var("PIPE_DEBUG").is_ok() {
             eprintln!("debug translation averaging failed, GPS least squares instead");
         }
+        stages.position_fallback = placed.is_none();
     }
     let placed: Vec<Option<Vector3<f64>>> = match placed {
         Some(c) => c,
@@ -1694,6 +1697,7 @@ fn interpolated_cloud(
         min_ratio: 0.3,
         min_groups: 1,
         same_group_views: None,
+        ..FusionConfig::default()
     };
     fuse(&views, &maps, cfg)
 }
@@ -2362,6 +2366,7 @@ pub fn run_pipeline_with(
             .filter(|&(i, j)| i >= n_help && j >= n_help)
             .collect();
         let own_registered = |s: &Sparse| s.poses[n_help..].iter().filter(|p| p.is_some()).count();
+        let mut ta_fallback = false;
         let start = match check_motion(&gps, &views, &own_pairs)
             .and_then(|_| {
                 sparse_init_with(
@@ -2378,7 +2383,10 @@ pub fn run_pipeline_with(
                         ..PreviewOpts::default()
                     },
                 )
-                .map(|r| r.0)
+                .map(|r| {
+                    ta_fallback = r.1.position_fallback;
+                    r.0
+                })
             })
             .and_then(|s| {
                 if own_registered(&s) < 3 {
@@ -2397,6 +2405,12 @@ pub fn run_pipeline_with(
                 continue;
             }
         };
+        if ta_fallback {
+            skipped.push(format!(
+                "구역 {} 위치 평균 실패: GPS 최소제곱으로 대체",
+                r.index
+            ));
+        }
         // 초벌(미리보기)은 위의 광축 높이 분산 롤을 쓰고, 정밀 BA 시작점만 예전 롤 규칙으로 따로 만든다.
         let coarse_start = start;
         let start = sparse_init_with(

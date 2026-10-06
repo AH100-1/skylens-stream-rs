@@ -19,6 +19,11 @@ struct Case {
     center_med: f64,
     center_max: f64,
     surface_med: f64,
+    /// report.json 의 초벌·정밀 재투영 오차(px).
+    preview_px: f64,
+    refined_px: f64,
+    /// 실행 중 낸 알림(위치 평균 실패 후 GPS 최소제곱으로 되돌아가면 "위치 평균 실패" 가 들어간다).
+    issues: Vec<String>,
     report: skylens_core::verify::Report,
 }
 
@@ -39,13 +44,24 @@ fn run_case_with(
     position: PositionMethod,
     preview_ba: usize,
 ) -> Case {
+    run_case_full(stride, ba_iters, method, position, preview_ba, 5)
+}
+
+fn run_case_full(
+    stride: usize,
+    ba_iters: usize,
+    method: DenseMethod,
+    position: PositionMethod,
+    preview_ba: usize,
+    preview_refine: usize,
+) -> Case {
     // 시험은 한 프로세스에서 병렬로 돌고 일부는 인자가 같으므로, 시험 이름(스레드 이름)을 경로에 넣어 작업 폴더를 분리한다.
     let tag = std::thread::current()
         .name()
         .unwrap_or("main")
         .replace("::", "_");
     let root = std::env::temp_dir().join(format!(
-        "skylens_pipe_{}_{tag}_{stride}_{ba_iters}_{method:?}_{position:?}_{preview_ba}",
+        "skylens_pipe_{}_{tag}_{stride}_{ba_iters}_{method:?}_{position:?}_{preview_ba}_{preview_refine}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&root);
@@ -74,6 +90,7 @@ fn run_case_with(
         ba_iters,
         position,
         preview_ba_iters: preview_ba,
+        preview_refine_iters: preview_refine,
         ..PipelineConfig::default()
     };
     let t = std::time::Instant::now();
@@ -93,6 +110,10 @@ fn run_case_with(
         assert!(output.join(d).is_dir(), "{d}");
     }
     assert!(output.join("snapshots/manifest.json").is_file());
+    let rj = std::fs::read_to_string(output.join("report.json")).unwrap();
+    let rp = &rj[rj.find("\"reprojection_px\"").expect("reprojection_px")..];
+    let preview_px = number_after(rp, "\"preview\": ");
+    let refined_px = number_after(rp, "\"refined\": ");
     let report = verify_dir(&output);
     eprintln!("{}", report.to_table());
     eprintln!("verify exit code {}", report.exit_code());
@@ -153,6 +174,9 @@ fn run_case_with(
         center_med: med,
         center_max: max,
         surface_med: sm,
+        preview_px,
+        refined_px,
+        issues: res.issues.clone(),
         report,
     }
 }
@@ -210,7 +234,7 @@ fn synthetic_single_region_end_to_end() {
     assert_eq!(c.registered, 3 * 40, "등록 수");
     assert!(c.center_med < 1.5, "중심 오차 중앙 {}", c.center_med);
     assert!(c.center_max < 6.0, "중심 오차 최대 {}", c.center_max);
-    // 밀집 경유 후 측정 0.342 m (기준 <= 1.0 m).
+    // 밀집 경유 후 측정 0.336 m (기준 <= 1.0 m).
     assert!(c.surface_med <= 1.0, "표면 거리 중앙 {}", c.surface_med);
     for n in [
         "registered",
@@ -220,8 +244,8 @@ fn synthetic_single_region_end_to_end() {
     ] {
         check_item(&c, n, true);
     }
-    // 기본 설정(초벌 BA 0회) 실측: verify 7/7.
-    // preview_align 통과: 점쌍 2746, 잔차 중앙 최대 3.932 m (목표 < 6 m).
+    // 기본 설정(초벌 BA 0회, 다듬기 5회) 실측: verify 7/7.
+    // preview_align 통과: 점쌍 6282, 잔차 중앙 최대 0.580 m (목표 < 6 m).
     check_item(&c, "preview_align", true);
     let pa = c.report.item("preview_align").unwrap();
     assert!(
@@ -232,7 +256,7 @@ fn synthetic_single_region_end_to_end() {
     // 구역 1개: 이웃 겹침은 해당 없음.
     let ov = c.report.item("refined_overlap").unwrap();
     assert!(ov.measured.contains("해당 없음"), "{}", ov.measured);
-    // 통과: 최근접 중앙 1.416 m (< 3 m), 높이 차 중앙 1.553 m (< 2 m). 초벌 점 광선 각 20도 이상만 남김.
+    // 통과(초벌 다듬기 5회): 최근접 중앙 최대 0.450 m (< 3 m), 높이 차 중앙 최대 0.237 m (< 2 m). 초벌 점 광선 각 20도 이상만 남김.
     check_item(&c, "preview_vs_refined", true);
     let pr = c.report.item("preview_vs_refined").unwrap();
     assert!(
@@ -273,7 +297,7 @@ fn synthetic_two_region_end_to_end() {
         "{}",
         ov.measured
     );
-    // 통과(초벌 중심 다듬기 5회): 높이 차 중앙 최대 1.048 m, 최근접 0.943 m (목표 높이 차 < 2 m, 최근접 < 3 m).
+    // 통과(초벌 중심 다듬기 5회): 높이 차 중앙 최대 0.392 m, 최근접 0.524 m (목표 높이 차 < 2 m, 최근접 < 3 m).
     check_item(&c, "preview_vs_refined", true);
     let pr = c.report.item("preview_vs_refined").unwrap();
     assert!(
@@ -321,6 +345,8 @@ fn preview_ba_option_does_not_change_refined() {
 }
 
 /// 위치 평균 경로(`--position translation-averaging` 과 같은 설정), 트랙은 `tracks::build_tracks`.
+/// 실측(`PositionMethod::TranslationAveraging`, 초벌 BA 0, 다듬기 5): TA_MEASURED
+/// 상한은 실측에 여유를 둔 값이고, 위치 평균이 실패해 GPS 최소제곱으로 되돌아가면 실패한다.
 #[test]
 fn synthetic_single_region_translation_averaging() {
     let c = run_case_with(
@@ -332,7 +358,143 @@ fn synthetic_single_region_translation_averaging() {
     );
     print_case(&c);
     eprintln!(
-        "TA registered {} of {} center med {:.3} max {:.3}",
-        c.registered, c.images, c.center_med, c.center_max
+        "TA registered {} of {} center med {:.3} max {:.3} fallback {}",
+        c.registered,
+        c.images,
+        c.center_med,
+        c.center_max,
+        c.issues.iter().any(|i| i.contains("위치 평균 실패"))
     );
+    assert!(
+        !c.issues.iter().any(|i| i.contains("위치 평균 실패")),
+        "위치 평균이 GPS 최소제곱으로 되돌아감: {:?}",
+        c.issues
+    );
+    assert_eq!(c.regions, 1);
+    assert_eq!(c.registered, c.images, "등록 수");
+    assert_eq!(c.registered, 120);
+    assert!(c.center_med < 0.35, "중심 오차 중앙 {}", c.center_med);
+    assert!(c.center_max < 0.75, "중심 오차 최대 {}", c.center_max);
+    assert!(
+        c.report.items.iter().all(|i| i.pass),
+        "verify 전부 통과해야 함"
+    );
+    assert_eq!(c.report.items.len(), 7);
+    let pr = c.report.item("preview_vs_refined").unwrap();
+    assert!(
+        number_after(&pr.measured, "높이 차 중앙 최대 ") < 0.2,
+        "{}",
+        pr.measured
+    );
+    assert!(
+        number_after(&pr.measured, "최근접 중앙 최대 ") < 0.5,
+        "{}",
+        pr.measured
+    );
+}
+
+/// `--preview-refine-iters` 0 과 5(기본)의 verify 결과를 항목별로 고정한다(F-313).
+/// 위치 전용 다듬기는 BA 가 아니다(회전 고정, 카메라 중심만). 두 설정 수치는 README 의 '초벌 다듬기' 표.
+#[test]
+fn preview_refine_settings_verify_outcome() {
+    let a = run_case_full(
+        2,
+        15,
+        DenseMethod::Sweep,
+        PositionMethod::GpsLeastSquares,
+        0,
+        0,
+    );
+    let b = run_case_full(
+        2,
+        15,
+        DenseMethod::Sweep,
+        PositionMethod::GpsLeastSquares,
+        0,
+        5,
+    );
+    for (tag, c) in [("refine 0", &a), ("refine 5", &b)] {
+        eprintln!(
+            "REFINE {tag}: preview reproj {:.3} px refined {:.3} px verify {}/{}",
+            c.preview_px,
+            c.refined_px,
+            c.report.items.iter().filter(|i| i.pass).count(),
+            c.report.items.len()
+        );
+        for i in &c.report.items {
+            eprintln!("REFINE {tag}   {} pass={} {}", i.name, i.pass, i.measured);
+        }
+    }
+    for (c, px_lo, px_hi) in [(&a, 2.5, 3.5), (&b, 0.3, 0.6)] {
+        assert_eq!(c.registered, 120);
+        // 단구역은 두 설정 모두 7/7 통과한다.
+        assert!(
+            c.report.items.iter().all(|i| i.pass),
+            "verify 전부 통과해야 함"
+        );
+        assert_eq!(c.report.items.len(), 7);
+        assert!(
+            c.preview_px > px_lo && c.preview_px < px_hi,
+            "초벌 재투영 {} px",
+            c.preview_px
+        );
+        assert!((c.refined_px - 0.213).abs() < 0.03, "정밀 {}", c.refined_px);
+    }
+    // 정밀 쪽은 같고 초벌만 달라진다(위치 전용 다듬기는 정밀 시작점을 바꾸지 않는다).
+    assert!((a.center_med - b.center_med).abs() < 1e-3);
+    // 다듬기가 초벌 재투영을 3분의 1 이하로 줄이고 초벌-정밀 차이를 줄인다.
+    assert!(b.preview_px < a.preview_px / 2.5);
+    let ha = number_after(
+        &a.report.item("preview_vs_refined").unwrap().measured,
+        "높이 차 중앙 최대 ",
+    );
+    let hb = number_after(
+        &b.report.item("preview_vs_refined").unwrap().measured,
+        "높이 차 중앙 최대 ",
+    );
+    assert!(hb < ha, "높이 차 {ha} -> {hb}");
+}
+
+/// 구역 2개에서 `--preview-refine-iters 0`: 초벌 재투영이 크고 preview_vs_refined 가 SPEC 기준에 못 미친다.
+/// 알려진 미달을 측정값 그대로 단언한다(완화 아님). 다듬기 5회(기본)는 위 synthetic_two_region_end_to_end 가 통과를 고정한다.
+#[test]
+fn two_region_refine_off_verify_outcome() {
+    let c = run_case_full(
+        1,
+        15,
+        DenseMethod::Sweep,
+        PositionMethod::GpsLeastSquares,
+        0,
+        0,
+    );
+    print_case(&c);
+    eprintln!(
+        "REFINE0 two-region preview reproj {:.3} px refined {:.3} px",
+        c.preview_px, c.refined_px
+    );
+    assert_eq!(c.registered, 240);
+    for n in [
+        "registered",
+        "region_images",
+        "refined_reprojection",
+        "snapshots",
+        "refined_overlap",
+    ] {
+        check_item(&c, n, true);
+    }
+    // 실측: 초벌 재투영 3.140 px, preview_vs_refined 최근접 중앙 최대 3.916 m, 높이 차 4.656 m (목표 3 m, 2 m).
+    assert!(c.preview_px > 2.5, "초벌 재투영 {}", c.preview_px);
+    check_item(&c, "preview_vs_refined", false);
+    let pr = c.report.item("preview_vs_refined").unwrap();
+    assert!(
+        number_after(&pr.measured, "높이 차 중앙 최대 ") > 2.0,
+        "{}",
+        pr.measured
+    );
+    assert!(
+        number_after(&pr.measured, "최근접 중앙 최대 ") > 3.0,
+        "{}",
+        pr.measured
+    );
+    check_item(&c, "preview_align", true);
 }

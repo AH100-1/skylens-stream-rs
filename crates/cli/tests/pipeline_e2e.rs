@@ -243,8 +243,10 @@ fn expect_items(o: &Outcome, expected: &[(&str, &str)]) {
 }
 
 /// 단구역(README 첫 명령, stride 2 → 40위치 × 3대 = 120장). 4코어 부하 20 에서 run 약 2분.
-/// 실측: verify 7/7 종료 코드 0, 중심 오차 중앙 0.329/최대 2.912 m, 정밀 점 표면 거리 중앙 0.475/95% 1.465 m (점 11054개).
-/// 상한은 실측 x 1.2 (0.395, 3.494, 0.570, 1.758).
+/// 실측(초벌 다듬기 5회 기본, 반점 제거 뒤): verify 7/7 종료 코드 0, 중심 오차 중앙 0.256/최대 0.713 m,
+/// 정밀 점 표면 거리 중앙 0.392/95% 1.214 m (점 11444개). 작은 사진(긴 변 800 px 미만) 2배 확대 보충이 기본으로 켜진 뒤
+/// (main #67) 중심 오차는 줄고 표면 거리 분포는 넓어졌다(이전 0.336/0.932 m, 점 10302개).
+/// 상한은 실측 x 1.2 안팎: 중심 0.31/0.86, 표면 0.47/1.46.
 #[test]
 fn single_region_end_to_end() {
     let o = pipeline("single", "2", "15");
@@ -257,7 +259,7 @@ fn single_region_end_to_end() {
             ("region_images", "PASS"),
             ("refined_reprojection", "PASS"),
             ("preview_align", "PASS"),
-            // 통과: 최근접 중앙 1.416 m (< 3), 높이 차 중앙 1.553 m (< 2).
+            // 통과: 최근접 중앙 최대 0.450 m (< 3), 높이 차 중앙 최대 0.237 m (< 2). 초벌 재투영 0.420 px.
             ("preview_vs_refined", "PASS"),
             ("refined_overlap", "PASS"),
             ("snapshots", "PASS"),
@@ -269,12 +271,12 @@ fn single_region_end_to_end() {
     let h = number_after(&pr, "높이 차 중앙 최대 ");
     assert!(h < 2.0, "높이 차 상한: {pr}");
     assert!(number_after(&pr, "최근접 중앙 최대 ") < 3.0, "{pr}");
-    assert!(o.m.center_med < 0.40, "중심 오차 중앙 {}", o.m.center_med);
-    assert!(o.m.center_max < 3.5, "중심 오차 최대 {}", o.m.center_max);
-    assert!(o.m.surface_med < 0.57, "점 중앙 {}", o.m.surface_med);
-    assert!(o.m.surface_p95 < 1.76, "점 95% {}", o.m.surface_p95);
+    assert!(o.m.center_med < 0.31, "중심 오차 중앙 {}", o.m.center_med);
+    assert!(o.m.center_max < 0.86, "중심 오차 최대 {}", o.m.center_max);
+    assert!(o.m.surface_med < 0.47, "점 중앙 {}", o.m.surface_med);
+    assert!(o.m.surface_p95 < 1.46, "점 95% {}", o.m.surface_p95);
     assert!(
-        o.m.points >= 11054 * 4 / 5 && o.m.points <= 11054 * 6 / 5,
+        o.m.points >= 11444 * 4 / 5 && o.m.points <= 11444 * 6 / 5,
         "점 수 {}",
         o.m.points
     );
@@ -325,7 +327,7 @@ fn assert_two_region_spec(o: &Outcome) {
     );
 }
 
-/// 구역 2개 구역 간 스케일 차 회귀 상한(%). 실측 0.55% 의 약 3.6배. SPEC 판정값(`ALIGN_SCALE_TOL`, 10%)과는 별개다.
+/// 구역 2개 구역 간 스케일 차 회귀 상한(%). 실측 0.49% 의 약 4배. SPEC 판정값(`ALIGN_SCALE_TOL`, 10%)과는 별개다.
 const TWO_REGION_SCALE_REGRESSION_PCT: f64 = 2.0;
 
 fn assert_two_region_scale_regression(o: &Outcome) {
@@ -346,21 +348,24 @@ fn two_region_end_to_end_ba10() {
 }
 
 /// 구역 2개(README 둘째 명령, stride 1 → 80위치 × 3대 = 240장): refined_overlap 이 실제로 판정된다.
-/// 시험 전체 약 3 분(부하 낮을 때 179 초, 부하 22 에서는 run 만 332 초).
-/// 실측: verify 7/7 종료 코드 0. preview_align 은 구역 간 점쌍을 구역의 모든 이미지 관측으로 만들어 점쌍 최소 2914,
-/// 스케일 차 0.55%, 잔차 중앙 최대 0.176 m. 겹침 차 중앙 최대 0.152 m, 높이 차 중앙 최대 0.445 m, 최근접 중앙 최대 0.552 m.
+/// 시험 전체 약 3 분(run 약 150 초). 실측(초벌 다듬기 5회 기본, 반점 제거 뒤): verify 7/7 종료 코드 0, 중심 오차 중앙 0.185/최대 0.704 m,
+/// 정밀 점 표면 거리 중앙 0.147/95% 0.527 m (점 21033개). 상한은 실측 x 1.2 안팎.
+/// preview_vs_refined 통과(최근접 0.524 m < 3, 높이 차 0.392 m < 2). preview_align 통과: 구역 간 점쌍을 구역의
+/// 모든 이미지 관측으로 만들어 점쌍 최소 2911, 스케일 차 0.49%, 잔차 중앙 최대 0.186 m. 초벌 재투영 0.319 px.
 /// 판정은 SPEC 상수(`assert_two_region_spec`)로, 스케일 차는 따로 실측 기반 회귀 상한(`TWO_REGION_SCALE_REGRESSION_PCT`)을 건다.
 #[test]
 fn two_region_end_to_end() {
     let o = pipeline("two", "1", "15");
     assert_two_region_spec(&o);
     assert_two_region_scale_regression(&o);
-    assert!(o.m.center_med < 0.35, "중심 오차 중앙 {}", o.m.center_med);
-    assert!(o.m.center_max < 3.75, "중심 오차 최대 {}", o.m.center_max);
-    assert!(o.m.surface_med < 0.60, "점 중앙 {}", o.m.surface_med);
-    assert!(o.m.surface_p95 < 3.63, "점 95% {}", o.m.surface_p95);
+    assert!(o.m.center_med < 0.23, "중심 오차 중앙 {}", o.m.center_med);
+    assert!(o.m.center_max < 0.85, "중심 오차 최대 {}", o.m.center_max);
+    assert!(o.m.surface_med < 0.18, "점 중앙 {}", o.m.surface_med);
+    assert!(o.m.surface_p95 < 0.64, "점 95% {}", o.m.surface_p95);
+    // 현재 출력(반점 제거 뒤): 점 21033, 표면 거리 중앙 0.147 m, 95% 0.527 m.
+    // 95% 상한 0.64 m 는 현재 출력 0.527 m 의 약 1.21 배.
     assert!(
-        o.m.points >= 19855 * 4 / 5 && o.m.points <= 19855 * 6 / 5,
+        o.m.points >= 21033 * 4 / 5 && o.m.points <= 21033 * 6 / 5,
         "점 수 {}",
         o.m.points
     );
