@@ -932,6 +932,9 @@ pub struct PreviewOpts {
     /// 장착(rig) 상대 회전: 카메라 번호별 (카메라 0 기준) 상대 회전. 있으면 떨어진 성분 붙이기의 롤을
     /// 같은 위치의 주 모델 사진과의 장착 관계로 정한다. 없으면 바닥 법선으로 정한다.
     pub rig_rel: Option<[Option<Rotation3<f64>>; 3]>,
+    /// 카메라별 장착 상대 회전 추정을 믿을 수 있는지(`rig_trust`). 믿지 못하는 카메라가 낀 사진은
+    /// 떨어진 성분 붙이기의 장착 거부 검사에 쓰지 않는다.
+    pub rig_trusted: [bool; 3],
     /// 다듬기 Huber 문턱(도).
     pub refine_huber_deg: f64,
     /// 다듬기 바깥 관측 제거 각(도), 두 번째 바퀴부터.
@@ -957,6 +960,7 @@ impl Default for PreviewOpts {
             refine_iters: 0,
             detached_refine_iters: None,
             rig_rel: None,
+            rig_trusted: [false; 3],
             refine_huber_deg: 0.3,
             refine_drop_deg: 2.0,
             refine_anchor: 0.02,
@@ -1189,6 +1193,12 @@ const DETACHED_MIN_PHOTOS: usize = 5;
 const DETACHED_MIN_GPS_OK: usize = 3;
 /// 붙인 뒤 GPS 대응을 정상으로 치는 거리(m). 합성 GPS 잡음(축마다 1.5 m)의 3차원 중앙값이 약 2.5 m 라 넉넉히 잡는다.
 const DETACHED_GPS_OK_M: f64 = 5.0;
+/// 붙인 뒤 장착 관계로 정한 목표 회전과의 각거리 중앙값이 이 값(도)을 넘으면 붙이지 않는다.
+/// 시드 5 실측: 정상 성분 최대 2.47°(0.38°·2.47°), 거부 성분 10.05°. 문턱은 그 사이(정상 최대 +0.5° 이상 여유).
+const DETACHED_RIG_MAX_DEG: f64 = 3.0;
+/// 장착 상대 회전 추정을 믿는 데 필요한 카메라별 최소 표본 수, 표본이 평균에서 벗어난 각 중앙값의 상한(도).
+const DETACHED_RIG_MIN_SAMPLES: usize = 8;
+const DETACHED_RIG_SPREAD_DEG: f64 = 3.0;
 
 /// 점들의 바닥 평면 법선(위쪽). 평면을 맞추고 잔차 중앙값의 2배 밖 점을 버리며 세 번 되풀이한다.
 fn ground_normal(points: &[Vector3<f64>]) -> Option<Vector3<f64>> {
@@ -1237,6 +1247,7 @@ fn attach_detached(
     mut sub: Sparse,
     gps: &[Vector3<f64>],
     rig_targets: &[(usize, Rotation3<f64>)],
+    check_targets: &[(usize, Rotation3<f64>)],
 ) -> Option<(usize, f64)> {
     let ids: Vec<usize> = (0..sub.poses.len())
         .filter(|&i| sub.poses[i].is_some() && s.poses[i].is_none())
@@ -1365,6 +1376,23 @@ fn attach_detached(
     if res.len() < DETACHED_MIN_GPS_OK {
         return None;
     }
+    // 장착 관계 검사: 믿을 수 있는 목표(`check_targets`)가 있는 사진의 회전이 목표에서 `DETACHED_RIG_MAX_DEG` 넘게
+    // 벗어나면(롤이 틀린 성분) 붙이지 않는다. 목표가 하나도 없으면(장착 추정을 믿을 수 없거나 초벌 경로)
+    // 검사를 건너뛰고 GPS 판정만 따른다. 중앙값이 NaN 이면 비교가 항상 거짓이라 통과하므로 거부한다.
+    let mut rig_err: Vec<f64> = check_targets
+        .iter()
+        .filter_map(|(i, t)| sub.poses[*i].map(|p| p.rotation.rotation_to(t).angle().to_degrees()))
+        .collect();
+    if !rig_err.is_empty() {
+        rig_err.sort_by(f64::total_cmp);
+        let med = rig_err[rig_err.len() / 2];
+        if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+            eprintln!("diag rig check n {} med_deg {:.2}", rig_err.len(), med);
+        }
+        if med.is_nan() || med > DETACHED_RIG_MAX_DEG {
+            return None;
+        }
+    }
     for &i in &ids {
         s.poses[i] = sub.poses[i];
     }
@@ -1474,6 +1502,37 @@ fn rig_from_samples(samples: &[Vec<Rotation3<f64>>; 3]) -> [Option<Rotation3<f64
         if samples[c].len() >= 3 {
             out[c] = mean_rotation(&samples[c]);
         }
+    }
+    out
+}
+
+/// 카메라별 장착 상대 회전 추정을 믿을 수 있는지: 표본이 `DETACHED_RIG_MIN_SAMPLES` 개 이상이고, 표본이 평균에서
+/// 벗어난 각의 중앙값이 `DETACHED_RIG_SPREAD_DEG` 이하(구역 간·위치 간 표본이 서로 일치)여야 한다.
+/// 카메라 0 은 기준이라 항상 믿는다.
+fn rig_trust(samples: &[Vec<Rotation3<f64>>; 3]) -> [bool; 3] {
+    let mut out = [true, false, false];
+    for c in 1..3 {
+        let v = &samples[c];
+        if v.len() < DETACHED_RIG_MIN_SAMPLES {
+            continue;
+        }
+        let Some(m) = mean_rotation(v) else {
+            continue;
+        };
+        let mut d: Vec<f64> = v
+            .iter()
+            .map(|r| r.rotation_to(&m).angle().to_degrees())
+            .collect();
+        d.sort_by(f64::total_cmp);
+        let med = d[d.len() / 2];
+        if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+            eprintln!(
+                "diag rig trust cam {c} n {} spread_med_deg {:.2}",
+                v.len(),
+                med
+            );
+        }
+        out[c] = med <= DETACHED_RIG_SPREAD_DEG;
     }
     out
 }
@@ -1761,7 +1820,37 @@ fn merge_detached_components(
                 }
             }
         }
-        let res = attach_detached(s, full, gps, &rig_targets);
+        // 거부 검사 목표: 같은 위치의 다른 카메라 사진 모두(주 모델에 등록된 것)에서 낸 목표의 회전 평균.
+        // 이 사진의 카메라나 짝의 카메라 중 장착 추정을 믿을 수 없는 것이 있으면 그 사진은 검사에 쓰지 않는다.
+        let mut check_targets: Vec<(usize, Rotation3<f64>)> = Vec::new();
+        if let Some(rig) = &opts.rig_rel {
+            for &i in comp {
+                let Some(&(ci, pi)) = view_of.get(&i) else {
+                    continue;
+                };
+                let Some(rci) = rig.get(ci).copied().flatten() else {
+                    continue;
+                };
+                if !opts.rig_trusted[ci.min(2)] {
+                    continue;
+                }
+                let ts: Vec<Rotation3<f64>> = (0..n)
+                    .filter_map(|j| {
+                        let &(cj, pj) = view_of.get(&j)?;
+                        if pj != pi || cj == ci || !opts.rig_trusted[cj.min(2)] {
+                            return None;
+                        }
+                        let rcj = rig.get(cj).copied().flatten()?;
+                        let pose = s.poses[j].as_ref()?;
+                        Some(rci * rcj.inverse() * pose.rotation)
+                    })
+                    .collect();
+                if let Some(t) = mean_rotation(&ts) {
+                    check_targets.push((i, t));
+                }
+            }
+        }
+        let res = attach_detached(s, full, gps, &rig_targets, &check_targets);
         if diag {
             eprintln!(
                 "diag rig targets {} of {} rig {:?}",
@@ -3360,6 +3449,7 @@ pub fn run_pipeline_with(
                 pair_vote: cfg.pair_vote,
                 detached_refine_iters: Some(cfg.preview_refine_iters),
                 rig_rel: Some(rig),
+                rig_trusted: rig_trust(&rig_samples),
                 ..PreviewOpts::default()
             },
         )
@@ -5112,7 +5202,7 @@ mod detached_tests {
     #[test]
     fn detached_component_attaches_within_one_meter_and_two_degrees() {
         let (mut main, sub, gps) = setup(12);
-        let (ok, med) = attach_detached(&mut main, sub, &gps, &[]).expect("attached");
+        let (ok, med) = attach_detached(&mut main, sub, &gps, &[], &[]).expect("attached");
         assert!(ok >= 10 && med < 1.0, "{ok} {med}");
         for i in 10..22 {
             let p = main.poses[i].expect("pose");
@@ -5126,16 +5216,75 @@ mod detached_tests {
     #[test]
     fn too_few_photos_or_gps_inliers_are_not_attached() {
         let (mut main, sub, gps) = setup(4);
-        assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
+        assert!(attach_detached(&mut main, sub, &gps, &[], &[]).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
+        // 문턱 경계: 정확히 5장은 붙는다.
+        let (mut main, sub, gps) = setup(5);
+        assert!(attach_detached(&mut main, sub, &gps, &[], &[]).is_some());
+        assert!(main.poses[10..15].iter().all(|p| p.is_some()));
         // GPS 정상 대응 2 개뿐: 나머지는 50 m 어긋남.
         let (mut main, sub, mut gps) = setup(12);
         for g in gps.iter_mut().skip(12) {
             g.y += 50.0 + g.x;
         }
-        assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
+        assert!(attach_detached(&mut main, sub, &gps, &[], &[]).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
         assert_eq!(main.points.len(), 30);
+    }
+
+    #[test]
+    fn component_far_from_rig_targets_is_not_attached() {
+        // 목표가 2 개(롤을 따로 정하지 않는 수)이고 정답에서 벗어난 각(z 축 둘레)에 따라 받아들이거나 거부한다.
+        // 문턱 3° 둘레의 경계: 2°·2.6° 는 붙고 3.4°·4° 는 거부(문턱을 2° 나 5° 로 바꾸면 실패).
+        let targets = |deg: f64| -> Vec<(usize, Rotation3<f64>)> {
+            let off = Rotation3::from_axis_angle(&Vector3::z_axis(), deg.to_radians());
+            (10..12).map(|i| (i, off * truth_rot())).collect()
+        };
+        for (deg, attached) in [
+            (0.0, true),
+            (2.0, true),
+            (2.47, true),
+            (2.6, true),
+            (2.95, true),
+            (3.05, false),
+            (3.4, false),
+            (4.0, false),
+            (10.05, false),
+        ] {
+            let (mut main, sub, gps) = setup(12);
+            let r = attach_detached(&mut main, sub, &gps, &[], &targets(deg));
+            assert_eq!(r.is_some(), attached, "target off by {deg} deg");
+            assert_eq!(main.poses[10..].iter().all(|p| p.is_some()), attached);
+            assert_eq!(main.poses[10..].iter().all(|p| p.is_none()), !attached);
+        }
+        // 시드 5 실측의 정상 최대 2.47° 와 거부 최소 10.05° 사이에 문턱이 있고, 양쪽 모두에서 여유가 있다.
+        let (normal_max, reject_min) = (2.47, 10.05);
+        assert!(normal_max < DETACHED_RIG_MAX_DEG && DETACHED_RIG_MAX_DEG < reject_min);
+        assert!(DETACHED_RIG_MAX_DEG - normal_max >= 0.5);
+        // 목표 회전이 NaN 이면 중앙값도 NaN: 거부한다.
+        let nan = Rotation3::from_matrix_unchecked(nalgebra::Matrix3::repeat(f64::NAN));
+        let bad: Vec<(usize, Rotation3<f64>)> = (10..12).map(|i| (i, nan)).collect();
+        let (mut main, sub, gps) = setup(12);
+        assert!(attach_detached(&mut main, sub, &gps, &[], &bad).is_none());
+        assert!(main.poses[10..].iter().all(|p| p.is_none()));
+        // 목표가 비어 있으면(장착 추정을 믿을 수 없는 경우 포함) 거부 검사를 건너뛰고 GPS 판정만 따른다.
+        let (mut main, sub, gps) = setup(12);
+        assert!(attach_detached(&mut main, sub, &gps, &[], &[]).is_some());
+    }
+
+    #[test]
+    fn rig_estimate_is_trusted_only_with_enough_agreeing_samples() {
+        let rot = |deg: f64| Rotation3::from_axis_angle(&Vector3::z_axis(), deg.to_radians());
+        let agree: Vec<Rotation3<f64>> = (0..10).map(|k| rot(70.0 + 0.2 * k as f64)).collect();
+        // 구역마다 다른 값(72°/110° 쪽과 39°/88° 쪽이 반반): 표본이 평균에서 멀다.
+        let split: Vec<Rotation3<f64>> = (0..10)
+            .map(|k| if k % 2 == 0 { rot(72.5) } else { rot(38.7) })
+            .collect();
+        let samples = [Vec::new(), agree.clone(), split];
+        assert_eq!(rig_trust(&samples), [true, true, false]);
+        // 표본이 하한(8) 미만이면 일치해도 믿지 않는다.
+        let few = [Vec::new(), agree[..7].to_vec(), agree[..8].to_vec()];
+        assert_eq!(rig_trust(&few), [true, false, true]);
     }
 
     fn relief(x: f64, y: f64) -> f64 {
@@ -5193,7 +5342,7 @@ mod detached_tests {
             },
         );
         let gps: Vec<Vector3<f64>> = (0..total).map(center).collect();
-        attach_detached(&mut main, sub, &gps, &[]).expect("attached");
+        attach_detached(&mut main, sub, &gps, &[], &[]).expect("attached");
         let c = |i: usize| main.poses[i].unwrap().center().coords;
         let scale = (c(21) - c(10)).norm() / (center(21) - center(10)).norm();
         assert!((scale - 1.0).abs() < 0.02, "scale {scale}");

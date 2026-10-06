@@ -53,5 +53,6 @@ fn seed5_repeat_runs() {
     for r in 1..runs {
         assert_eq!(posesets[0], posesets[r], "run0 와 run{r} 의 poses 가 다름");
     }
-    eprintln!("ROOT {}", root.display());
+    // 성공하면 임시 폴더를 지운다(실패하면 위 단언에서 멈춰 남는다).
+    let _ = std::fs::remove_dir_all(&root);
 }
