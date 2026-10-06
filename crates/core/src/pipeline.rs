@@ -1189,6 +1189,8 @@ const DETACHED_MIN_PHOTOS: usize = 5;
 const DETACHED_MIN_GPS_OK: usize = 3;
 /// 붙인 뒤 GPS 대응을 정상으로 치는 거리(m). 합성 GPS 잡음(축마다 1.5 m)의 3차원 중앙값이 약 2.5 m 라 넉넉히 잡는다.
 const DETACHED_GPS_OK_M: f64 = 5.0;
+/// 붙인 뒤 장착 관계로 정한 목표 회전과의 각거리 중앙값이 이 값(도)을 넘으면 붙이지 않는다.
+const DETACHED_RIG_MAX_DEG: f64 = 3.0;
 
 /// 점들의 바닥 평면 법선(위쪽). 평면을 맞추고 잔차 중앙값의 2배 밖 점을 버리며 세 번 되풀이한다.
 fn ground_normal(points: &[Vector3<f64>]) -> Option<Vector3<f64>> {
@@ -1364,6 +1366,21 @@ fn attach_detached(
     res.sort_by(f64::total_cmp);
     if res.len() < DETACHED_MIN_GPS_OK {
         return None;
+    }
+    // 장착 관계 검사: 목표 자세가 있는 사진의 회전이 목표에서 3° 넘게 벗어나면(롤이 틀린 성분) 붙이지 않는다.
+    let mut rig_err: Vec<f64> = rig_targets
+        .iter()
+        .filter_map(|(i, t)| sub.poses[*i].map(|p| p.rotation.rotation_to(t).angle().to_degrees()))
+        .collect();
+    if !rig_err.is_empty() {
+        rig_err.sort_by(f64::total_cmp);
+        let med = rig_err[rig_err.len() / 2];
+        if std::env::var("SKYLENS_REGION_DIAG").is_ok() {
+            eprintln!("diag rig check n {} med_deg {:.2}", rig_err.len(), med);
+        }
+        if med > DETACHED_RIG_MAX_DEG {
+            return None;
+        }
     }
     for &i in &ids {
         s.poses[i] = sub.poses[i];
@@ -5128,6 +5145,10 @@ mod detached_tests {
         let (mut main, sub, gps) = setup(4);
         assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
+        // 문턱 경계: 정확히 5장은 붙는다.
+        let (mut main, sub, gps) = setup(5);
+        assert!(attach_detached(&mut main, sub, &gps, &[]).is_some());
+        assert!(main.poses[10..15].iter().all(|p| p.is_some()));
         // GPS 정상 대응 2 개뿐: 나머지는 50 m 어긋남.
         let (mut main, sub, mut gps) = setup(12);
         for g in gps.iter_mut().skip(12) {
@@ -5136,6 +5157,19 @@ mod detached_tests {
         assert!(attach_detached(&mut main, sub, &gps, &[]).is_none());
         assert!(main.poses[10..].iter().all(|p| p.is_none()));
         assert_eq!(main.points.len(), 30);
+    }
+
+    #[test]
+    fn component_far_from_rig_targets_is_not_attached() {
+        // 목표가 2 개(롤을 따로 정하지 않는 수)이고 정답에서 10° 벗어나 있으면 붙이지 않는다.
+        let off = Rotation3::from_axis_angle(&Vector3::z_axis(), 10f64.to_radians());
+        let bad: Vec<(usize, Rotation3<f64>)> = (10..12).map(|i| (i, off * truth_rot())).collect();
+        let (mut main, sub, gps) = setup(12);
+        assert!(attach_detached(&mut main, sub, &gps, &bad).is_none());
+        assert!(main.poses[10..].iter().all(|p| p.is_none()));
+        let good: Vec<(usize, Rotation3<f64>)> = (10..12).map(|i| (i, truth_rot())).collect();
+        let (mut main, sub, gps) = setup(12);
+        assert!(attach_detached(&mut main, sub, &gps, &good).is_some());
     }
 
     fn relief(x: f64, y: f64) -> f64 {
