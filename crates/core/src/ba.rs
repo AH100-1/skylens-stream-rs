@@ -20,7 +20,7 @@
 
 use crate::camera::Pose;
 use crate::distortion::DistortedIntrinsics;
-use crate::math::{Matrix3, Point3, Rotation3, SMatrix, Vector2, Vector3};
+use crate::math::{Matrix3, Point3, Rotation3, SMatrix, UnitQuaternion, Vector2, Vector3};
 use nalgebra::{DMatrix, DVector};
 
 /// 관측 하나: 카메라 번호, 점 번호, 픽셀.
@@ -150,6 +150,8 @@ pub struct BaOptions {
     pub function_tolerance: f64,
     /// 카메라 중심 위치 사전항. 기본 None(끔).
     pub position_prior: Option<PositionPrior>,
+    /// 장착 상대 회전 공유 정규화. 기본 None(끔). 기체마다 따로 흔들리는 편대에서는 켬이 끔보다 나빠질 수 있어 켜지 않는다.
+    pub rig_share: Option<RigShare>,
 }
 
 impl Default for BaOptions {
@@ -164,6 +166,7 @@ impl Default for BaOptions {
             initial_lambda: 1e-4,
             function_tolerance: 1e-10,
             position_prior: None,
+            rig_share: None,
         }
     }
 }
@@ -562,8 +565,9 @@ fn evaluate(
     obs: &[Observation],
     loss: Loss,
     prior: Option<&PositionPrior>,
+    rig: Option<&RigShare>,
 ) -> (f64, f64, usize) {
-    let mut cost = prior_cost(problem, prior);
+    let mut cost = prior_cost(problem, prior) + rig_cost(problem, rig);
     let mut sq = 0.0;
     let mut bad = 0;
     for o in obs {
@@ -640,6 +644,151 @@ fn add_prior(
     }
 }
 
+/// 장착 상대 회전 공유 정규화(약한 항). 같은 위치(station)의 카메라 묶음에서 기준
+/// 카메라(slot 0)에 대한 다른 카메라의 상대 회전 R_c R_ref^T 는 위치와 무관하게 같다.
+/// 슬롯별 장착 회전은 매 평가에서 현재 포즈로 강건 평균(구면 중앙값)을 구해 상수로 두고,
+/// 잔차는 각 위치의 실제 상대 회전과 평균의 차(축-각 3성분)에 `weight` 를 곱한 것이다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RigShare {
+    /// 카메라별 위치 번호. `usize::MAX` 는 해당 없음.
+    pub station: Vec<usize>,
+    /// 카메라별 슬롯 번호. 0 이 기준 카메라(위치마다 하나).
+    pub slot: Vec<usize>,
+    /// 가중치 = 1/σ (σ 는 라디안). 0 이하·비유한이면 항 없음.
+    pub weight: f64,
+    /// Huber 문턱(σ 단위, 기본 3.0).
+    pub huber_k: f64,
+}
+
+impl RigShare {
+    pub fn new(station: Vec<usize>, slot: Vec<usize>, sigma_deg: f64) -> Self {
+        Self {
+            station,
+            slot,
+            weight: 1.0 / sigma_deg.to_radians(),
+            huber_k: 3.0,
+        }
+    }
+
+    /// (카메라, 기준 카메라, 슬롯) 행.
+    fn rows(&self, n_cam: usize) -> Vec<(usize, usize, usize)> {
+        if !(self.weight.is_finite() && self.weight > 0.0) {
+            return Vec::new();
+        }
+        let n = n_cam.min(self.station.len()).min(self.slot.len());
+        let mut refs = std::collections::HashMap::new();
+        for c in 0..n {
+            if self.station[c] != usize::MAX && self.slot[c] == 0 {
+                refs.entry(self.station[c]).or_insert(c);
+            }
+        }
+        let mut rows = Vec::new();
+        for c in 0..n {
+            if self.station[c] == usize::MAX || self.slot[c] == 0 {
+                continue;
+            }
+            if let Some(&f) = refs.get(&self.station[c]) {
+                rows.push((c, f, self.slot[c]));
+            }
+        }
+        rows
+    }
+}
+
+fn rot_log(r: &Rotation3<f64>) -> Vector3<f64> {
+    UnitQuaternion::from_rotation_matrix(r).scaled_axis()
+}
+
+/// 슬롯별 강건 평균 장착 회전(구면 중앙값, Weiszfeld 반복).
+fn rig_means(problem: &BaProblem, rows: &[(usize, usize, usize)]) -> Vec<Option<Rotation3<f64>>> {
+    let n_slot = rows.iter().map(|r| r.2 + 1).max().unwrap_or(0);
+    let mut out = vec![None; n_slot];
+    for (slot, o) in out.iter_mut().enumerate() {
+        let rels: Vec<Rotation3<f64>> = rows
+            .iter()
+            .filter(|r| r.2 == slot)
+            .map(|&(c, f, _)| problem.poses[c].rotation * problem.poses[f].rotation.inverse())
+            .collect();
+        if rels.is_empty() {
+            continue;
+        }
+        let mut m = rels[0];
+        for _ in 0..30 {
+            let mut sum = Vector3::zeros();
+            let mut wsum = 0.0;
+            for r in &rels {
+                let e = rot_log(&(*r * m.inverse()));
+                let w = 1.0 / e.norm().max(1e-4);
+                sum += w * e;
+                wsum += w;
+            }
+            let d = sum / wsum;
+            m = Rotation3::new(d) * m;
+            if d.norm() < 1e-12 {
+                break;
+            }
+        }
+        *o = Some(m);
+    }
+    out
+}
+
+/// 행마다 (카메라, 기준, 상대 회전, 잔차 σ 단위). 평균이 없으면 건너뛴다.
+fn rig_residuals(
+    problem: &BaProblem,
+    rig: &RigShare,
+) -> Vec<(usize, usize, Rotation3<f64>, Vector3<f64>)> {
+    let rows = rig.rows(problem.poses.len());
+    let means = rig_means(problem, &rows);
+    rows.iter()
+        .filter_map(|&(c, f, slot)| {
+            let m = means[slot]?;
+            let rel = problem.poses[c].rotation * problem.poses[f].rotation.inverse();
+            Some((c, f, rel, rig.weight * rot_log(&(rel * m.inverse()))))
+        })
+        .collect()
+}
+
+fn rig_cost(problem: &BaProblem, rig: Option<&RigShare>) -> f64 {
+    let Some(rig) = rig else { return 0.0 };
+    let huber = Loss::Huber(rig.huber_k);
+    rig_residuals(problem, rig)
+        .iter()
+        .map(|r| 0.5 * huber.rho(r.3.norm_squared()))
+        .sum()
+}
+
+/// 장착 항을 정규방정식에 더한다. r ≈ r0 + w(ω_c − Rel ω_f).
+fn add_rig(
+    problem: &BaProblem,
+    lay: &Layout,
+    rig: &RigShare,
+    a: &mut DMatrix<f64>,
+    gc: &mut DVector<f64>,
+) {
+    let huber = Loss::Huber(rig.huber_k);
+    for (c, f, rel, r) in rig_residuals(problem, rig) {
+        let wt = huber.weight(r.norm_squared());
+        let mut cols: Vec<(usize, Vector3<f64>)> = Vec::new();
+        for k in 0..3 {
+            if let Some(i) = lay.cam_idx[c][k] {
+                let mut v = Vector3::zeros();
+                v[k] = rig.weight;
+                cols.push((i, v));
+            }
+            if let Some(i) = lay.cam_idx[f][k] {
+                cols.push((i, -rig.weight * rel.matrix().column(k).into_owned()));
+            }
+        }
+        for &(ia, ca) in &cols {
+            gc[ia] += wt * ca.dot(&r);
+            for &(ib, cb) in &cols {
+                a[(ia, ib)] += wt * ca.dot(&cb);
+            }
+        }
+    }
+}
+
 struct PointBlock {
     c: Matrix3<f64>,
     g: Vector3<f64>,
@@ -653,6 +802,7 @@ struct Linearization {
     points: Vec<(usize, PointBlock)>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn linearize(
     problem: &BaProblem,
     lay: &Layout,
@@ -661,11 +811,15 @@ fn linearize(
     obs: &[Observation],
     loss: Loss,
     prior: Option<&PositionPrior>,
+    rig: Option<&RigShare>,
 ) -> Linearization {
     let mut a = DMatrix::<f64>::zeros(lay.n, lay.n);
     let mut gc = DVector::<f64>::zeros(lay.n);
     if let Some(pr) = prior {
         add_prior(problem, lay, pr, &mut a, &mut gc);
+    }
+    if let Some(rg) = rig {
+        add_rig(problem, lay, rg, &mut a, &mut gc);
     }
     let mut points = Vec::with_capacity(tracks.len());
     for &p in tracks {
@@ -918,6 +1072,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
     }
     let lay = layout(problem, opts, &obs);
     let prior = opts.position_prior.as_ref();
+    let rig = opts.rig_share.as_ref();
     let rms = |sq: f64, behind: usize| {
         let n = obs.len() - behind;
         if n == 0 {
@@ -932,11 +1087,11 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
         Loss::Cauchy(d) => Some(Loss::Huber(d)),
         _ => None,
     };
-    let (initial_cost, sq0, behind0) = evaluate(problem, &obs, opts.loss, prior);
+    let (initial_cost, sq0, behind0) = evaluate(problem, &obs, opts.loss, prior, rig);
     let initial_rms = rms(sq0, behind0);
     let mut loss = staged.unwrap_or(opts.loss);
     let mut cost = if staged.is_some() {
-        evaluate(problem, &obs, loss, prior).0
+        evaluate(problem, &obs, loss, prior, rig).0
     } else {
         initial_cost
     };
@@ -966,7 +1121,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
             {
                 staged = None;
                 loss = opts.loss;
-                cost = evaluate(problem, &obs, loss, prior).0;
+                cost = evaluate(problem, &obs, loss, prior, rig).0;
                 lambda = opts.initial_lambda;
                 stop = BaStop::MaxIterations;
                 if iterations < opts.max_iterations {
@@ -976,8 +1131,8 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
             break;
         }
         iterations += 1;
-        let lin = linearize(problem, &lay, &tracks, &by_point, &obs, loss, prior);
-        let (_, _, bad0) = evaluate(problem, &obs, loss, prior);
+        let lin = linearize(problem, &lay, &tracks, &by_point, &obs, loss, prior, rig);
+        let (_, _, bad0) = evaluate(problem, &obs, loss, prior, rig);
         let mut accepted = false;
         for _ in 0..12 {
             match solve(&lin, lambda) {
@@ -986,7 +1141,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
                     if let Some(rn) = &lay.rot_norm {
                         rn.normalize(&mut cand);
                     }
-                    let (c_new, sq_new, bad) = evaluate(&cand, &obs, loss, prior);
+                    let (c_new, sq_new, bad) = evaluate(&cand, &obs, loss, prior, rig);
                     if bad <= bad0 && c_new < cost {
                         let rel = (cost - c_new) / cost.max(1e-300);
                         *problem = cand;
@@ -1019,7 +1174,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
         initial_rms,
         final_rms: rms(final_sq, final_behind),
         initial_cost,
-        final_cost: evaluate(problem, &obs, opts.loss, prior).0,
+        final_cost: evaluate(problem, &obs, opts.loss, prior, rig).0,
         converged: stop == BaStop::Converged,
         stop,
         num_observations_rejected: rejected,
@@ -2211,6 +2366,7 @@ mod tests {
             &p.observations,
             opts.loss,
             None,
+            None,
         );
         let lambda = 1e-3;
         let (s, rhs, _) = schur(&lin, lambda);
@@ -2279,6 +2435,7 @@ mod tests {
             &p.observations,
             opts.loss,
             None,
+            None,
         );
         let t_lin = t.elapsed().as_secs_f64();
         let t = Instant::now();
@@ -2288,7 +2445,7 @@ mod tests {
         let ok = s.cholesky().map(|c| c.solve(&rhs)).is_some();
         let t_chol = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let (cost, _, _) = evaluate(&p, &p.observations, opts.loss, None);
+        let (cost, _, _) = evaluate(&p, &p.observations, opts.loss, None, None);
         let t_eval = t.elapsed().as_secs_f64();
         let t = Instant::now();
         let rep = bundle_adjust(
