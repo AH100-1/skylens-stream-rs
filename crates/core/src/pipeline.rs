@@ -1839,6 +1839,37 @@ fn tilt_deg(s: &Similarity) -> f64 {
         .to_degrees()
 }
 
+/// 재정렬 기준 구역 선택. `SKYLENS_REALIGN_REF=1` 이면 기준을 최신 정밀 모델이 아니라 자기 초벌→정밀 정렬의
+/// 연직 기울기(GPS 좌표계인 초벌 대비)가 가장 작은 구역으로 고정하고, 기울어진 짧은 구역을 그 좌표계로 옮긴다.
+/// 기본은 꺼짐(최신 정밀 모델 기준).
+fn realign_ref_enabled() -> bool {
+    std::env::var("SKYLENS_REALIGN_REF").as_deref() == Ok("1")
+}
+
+/// 기준 후보: 정밀과 자기 정렬이 있는 구역 중 기울기가 가장 작은 구역. 현재 기준보다 1도 넘게 작아야 바꾼다.
+fn pick_ref_zone(recs: &[RegionRec], current: Option<usize>, newest: usize) -> usize {
+    let tilt = |i: usize| {
+        recs[i]
+            .own
+            .as_ref()
+            .and_then(|o| o.0.as_ref())
+            .filter(|_| recs[i].refined.is_some())
+            .map(tilt_deg)
+    };
+    let mut best = (newest, tilt(newest).unwrap_or(f64::INFINITY));
+    for i in 0..recs.len() {
+        if let Some(t) = tilt(i) {
+            if t < best.1 {
+                best = (i, t);
+            }
+        }
+    }
+    match current.and_then(|c| tilt(c).map(|t| (c, t))) {
+        Some((c, t)) if t <= best.1 + 1.0 => c,
+        _ => best.0,
+    }
+}
+
 fn tilt_ok(label: &str, s: &Similarity) -> bool {
     let (t, lim) = (tilt_deg(s), align_max_tilt_deg());
     let ok = lim <= 0.0 || t <= lim;
@@ -2246,7 +2277,16 @@ pub fn run_pipeline_with(
         }
         rec.own = Some((sim, ar));
         rec.refined = Some((tb, m.cloud));
-        *latest_ref = Some(k);
+        let refmode = realign_ref_enabled();
+        let target = if refmode {
+            pick_ref_zone(recs, *latest_ref, k)
+        } else {
+            k
+        };
+        if refmode && std::env::var_os("SKYLENS_DIAG_PREVIEW").is_some() {
+            eprintln!("DIAGREF new refined {k} reference zone {target}");
+        }
+        *latest_ref = Some(target);
         live.snapshot(t_now(), "refined_replace", r.index, &live_state(recs))?;
         // 다음 구역의 정밀 작업이 이 모델을 기다리고 있으면 기준을 보낸다.
         if k + 1 < recs.len() {
@@ -2272,19 +2312,19 @@ pub fn run_pipeline_with(
         let n_realign0 = realigns.len();
         // 이미 내보낸, 아직 정밀이 없는 초벌 구역을 새 정밀 모델 좌표로 다시 맞춘다.
         for j in 0..recs.len() {
-            if j == k || recs[j].refined.is_some() {
+            if j == target || recs[j].refined.is_some() {
                 continue;
             }
-            let tbk = &recs[k].refined.as_ref().unwrap().0;
+            let tbk = &recs[target].refined.as_ref().unwrap().0;
             let ca = crate::timing::timed("align_ghost", || {
-                region_align(&recs[j].ta, tbk, &recs[j].region, &recs[k].region)
+                region_align(&recs[j].ta, tbk, &recs[j].region, &recs[target].region)
             });
             if let Some((s, n, med)) = ca {
-                diag_sim("realign_coarse", j, k, &s, n);
+                diag_sim("realign_coarse", j, target, &s, n);
                 realigns.push(ReAlign {
                     secs: t_now(),
                     region: j,
-                    target: k,
+                    target,
                     pairs: n,
                     median_m: med,
                     scale: s.s,
@@ -2296,12 +2336,12 @@ pub fn run_pipeline_with(
                     &crate::stream::apply_cloud(&s, &recs[j].coarse),
                 )?;
                 recs[j].sim = Some(s);
-                recs[j].target = Some(k);
+                recs[j].target = Some(target);
                 events.push(format!(
                     "{:.1}s realign coarse {} to refined {} pairs {n} median {med:.3} m",
                     t_now(),
                     jr.index,
-                    recs[k].region.index
+                    recs[target].region.index
                 ));
             }
         }
@@ -2313,16 +2353,16 @@ pub fn run_pipeline_with(
                 .map(|x| x.refined.as_ref().map(|(t, _)| (x.region, t.as_slice())))
                 .collect();
             crate::timing::timed("align_ghost", || {
-                crate::progressive::chain_realign_with(&items, k, region_align)
+                crate::progressive::chain_realign_with(&items, target, region_align)
             })
         };
         for st in steps {
             let (j, acc) = (st.region, st.total);
-            diag_sim("realign_refined", j, k, &acc, st.pairs);
+            diag_sim("realign_refined", j, target, &acc, st.pairs);
             realigns.push(ReAlign {
                 secs: t_now(),
                 region: j,
-                target: k,
+                target,
                 pairs: st.pairs,
                 median_m: st.median_m,
                 scale: acc.s,
@@ -2334,12 +2374,42 @@ pub fn run_pipeline_with(
                 "{:.1}s realign refined {} to refined {} via {} pairs {} median {:.3} m",
                 t_now(),
                 jr.index,
-                recs[k].region.index,
+                recs[target].region.index,
                 recs[st.via].region.index,
                 st.pairs,
                 st.median_m
             ));
             recs[j].rsim = Some(acc);
+            if refmode {
+                // 정밀 구역의 초벌도 같은 변환으로 옮겨 쌍이 어긋나지 않게 한다(자기 정렬 뒤 재정렬).
+                if let Some(Some(own)) = recs[j].own.as_ref().map(|o| o.0) {
+                    let comb = acc.compose(&own);
+                    write_decimated(
+                        out,
+                        &preview_name(&jr),
+                        &crate::stream::apply_cloud(&comb, &recs[j].coarse),
+                    )?;
+                    recs[j].sim = Some(comb);
+                }
+            }
+        }
+        if refmode && recs[target].rsim.is_some() {
+            // 기준이 바뀌어 예전에 옮겨 둔 구역이 기준이 됐다: 자기 좌표로 되돌린다.
+            let tr = recs[target].region;
+            write_decimated(
+                out,
+                &refined_name(&tr),
+                &recs[target].refined.as_ref().unwrap().1,
+            )?;
+            recs[target].rsim = None;
+            if let Some(Some(own)) = recs[target].own.as_ref().map(|o| o.0) {
+                write_decimated(
+                    out,
+                    &preview_name(&tr),
+                    &crate::stream::apply_cloud(&own, &recs[target].coarse),
+                )?;
+                recs[target].sim = Some(own);
+            }
         }
         if realigns.len() > n_realign0 {
             live.snapshot(t_now(), "realign", r.index, &live_state(recs))?;
@@ -2845,9 +2915,16 @@ pub fn run_pipeline_with(
     }
 
     let kept: Vec<Region> = recs.iter().map(|r| r.region).collect();
+    let refmode = realign_ref_enabled();
     let sims: Vec<Option<Similarity>> = recs
         .iter()
-        .map(|r| r.own.as_ref().and_then(|o| o.0))
+        .map(|r| {
+            let own = r.own.as_ref().and_then(|o| o.0);
+            match (refmode, &r.rsim, own) {
+                (true, Some(rs), Some(o)) => Some(rs.compose(&o)),
+                _ => own,
+            }
+        })
         .collect();
     let records: Vec<AlignRecord> = recs
         .iter()
