@@ -24,7 +24,9 @@ use crate::fusion::{fuse, FusionConfig, FusionView};
 use crate::matching::{ratio_match, scheduled_pairs, PairSchedule, RansacConfig};
 use crate::math::{Matrix3, Point3, Rotation3, Vector2, Vector3};
 use crate::ply::{PointCloud, PointRecord};
-use crate::rotation_averaging::{average_rotations, AveragingConfig, RelativeRotation};
+use crate::rotation_averaging::{
+    average_rotations, group_residual_stats, AveragingConfig, RelativeRotation,
+};
 use crate::stream::{
     align_region, apply_alignments, point_pairs, split_regions, write_outputs, AlignRecord, Region,
     Track,
@@ -1163,6 +1165,58 @@ fn rot_cfg() -> AveragingConfig {
     }
 }
 
+/// 종류 덩어리 전체가 돌아간 붕괴 검출 문턱: 같은 종류 간선 잔차 중앙이 이 값 이하이고(rad)
+const COLLAPSE_SAME_MAX_RAD: f64 = 3.0 * std::f64::consts::PI / 180.0;
+/// 다른 종류와의 간선 잔차 중앙이 이 값 이상이면(rad) 그 종류 덩어리가 통째로 돌아간 것으로 본다.
+const COLLAPSE_CROSS_MIN_RAD: f64 = 20.0 * std::f64::consts::PI / 180.0;
+/// 종류당 최소 간선 수(같은 종류·다른 종류 각각).
+const COLLAPSE_MIN_EDGES: usize = 20;
+
+/// 회전 평균 직후 카메라 종류별 간선 잔차로 종류 덩어리 붕괴를 검출한다. 종류별 문턱 재평균을 쓸지 정한다.
+/// 요약은 항상 표준 오류로 낸다. `SKYLENS_ROT_DETECT=0` 이면 끈다.
+fn class_collapse_detected(
+    n: usize,
+    pm: &[PairMatch],
+    edges: &[RelativeRotation],
+    rots: &[Option<Rotation3<f64>>],
+) -> bool {
+    if std::env::var("SKYLENS_ROT_DETECT").as_deref() == Ok("0") {
+        return false;
+    }
+    let mut group = vec![0usize; n];
+    for p in pm {
+        group[p.i] = p.views.0 .0;
+        group[p.j] = p.views.1 .0;
+    }
+    let mut hit = false;
+    let mut line = String::new();
+    for g in group_residual_stats(edges, rots, &group) {
+        let bad = g.same_count >= COLLAPSE_MIN_EDGES
+            && g.cross_count >= COLLAPSE_MIN_EDGES
+            && g.same_median_rad <= COLLAPSE_SAME_MAX_RAD
+            && g.cross_median_rad >= COLLAPSE_CROSS_MIN_RAD;
+        hit |= bad;
+        line += &format!(
+            " [종류 {}: 같은 {} 중앙 {:.2}°, 교차 {} 중앙 {:.2}°{}]",
+            g.group,
+            g.same_count,
+            g.same_median_rad.to_degrees(),
+            g.cross_count,
+            g.cross_median_rad.to_degrees(),
+            if bad { " 붕괴" } else { "" }
+        );
+    }
+    eprintln!(
+        "rotavg-detect n={n}:{line} -> {}",
+        if hit {
+            "종류별 문턱 재평균"
+        } else {
+            "발동 안 함"
+        }
+    );
+    hit
+}
+
 /// 회전 평균 + 상대 회전과 어긋나는 간선 제거 뒤 재평균. 반환: 회전, 간선 유지 표시.
 fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<RotsAndKeep, String> {
     let mk = |keep: &[bool]| -> Vec<RelativeRotation> {
@@ -1181,8 +1235,15 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
     if opts.pair_vote {
         vote_pairs(n, pm, &mut keep);
     }
-    let ra = average_rotations(n, &mk(&keep), &rot_cfg())
-        .ok_or("회전 평균 실패: 쓸 수 있는 간선 없음")?;
+    let mut cfg = rot_cfg();
+    let mut ra =
+        average_rotations(n, &mk(&keep), &cfg).ok_or("회전 평균 실패: 쓸 수 있는 간선 없음")?;
+    if !cfg.class_thresholds && class_collapse_detected(n, pm, &mk(&keep), &ra.rotations) {
+        cfg.class_thresholds = true;
+        if let Some(r2) = average_rotations(n, &mk(&keep), &cfg) {
+            ra = r2;
+        }
+    }
     let mut rots = ra.rotations;
     dump_rotavg(n, pm, &keep, &rots);
     if let Some(deg) = opts.prune_deg {
@@ -1196,7 +1257,7 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
                         _ => false,
                     };
             }
-            if let Some(r2) = average_rotations(n, &mk(&keep), &rot_cfg()) {
+            if let Some(r2) = average_rotations(n, &mk(&keep), &cfg) {
                 rots = r2.rotations;
             }
         }

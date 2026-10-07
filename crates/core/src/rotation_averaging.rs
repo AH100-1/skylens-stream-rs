@@ -160,6 +160,64 @@ fn adaptive_threshold(residuals: &[f64], cfg: &AveragingConfig) -> (f64, bool) {
     (raw.min(cap), raw > cap)
 }
 
+/// 카메라 종류(묶음) 하나의 간선 잔차 요약.
+#[derive(Clone, Debug)]
+pub struct GroupResidual {
+    pub group: usize,
+    /// 양 끝이 모두 이 종류인 간선 수와 잔차 중앙(rad, 간선이 없으면 NaN).
+    pub same_count: usize,
+    pub same_median_rad: f64,
+    /// 한 끝만 이 종류인 간선 수와 잔차 중앙(rad, 간선이 없으면 NaN).
+    pub cross_count: usize,
+    pub cross_median_rad: f64,
+}
+
+/// 회전 평균 결과 `rots` 에 대한 간선 잔차 ∠(R_j R_iᵀ R_ijᵀ) 를 카메라 종류 `group[정점]` 별로 요약한다.
+/// 같은 종류끼리 잇는 간선은 작은데 다른 종류와 잇는 간선만 큰 종류는 종류 덩어리 전체가 돌아간 것이다.
+pub fn group_residual_stats(
+    edges: &[RelativeRotation],
+    rots: &[Option<Rotation3<f64>>],
+    group: &[usize],
+) -> Vec<GroupResidual> {
+    let mut ids: Vec<usize> = group.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let median = |mut v: Vec<f64>| -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    ids.into_iter()
+        .map(|g| {
+            let (mut same, mut cross) = (Vec::new(), Vec::new());
+            for e in edges {
+                let (Some(Some(a)), Some(Some(b))) = (rots.get(e.i), rots.get(e.j)) else {
+                    continue;
+                };
+                let (gi, gj) = (group[e.i] == g, group[e.j] == g);
+                if !gi && !gj {
+                    continue;
+                }
+                let r = (b * a.inverse() * e.rotation.inverse()).angle();
+                if gi && gj {
+                    same.push(r);
+                } else {
+                    cross.push(r);
+                }
+            }
+            GroupResidual {
+                group: g,
+                same_count: same.len(),
+                same_median_rad: median(same.clone()),
+                cross_count: cross.len(),
+                cross_median_rad: median(cross),
+            }
+        })
+        .collect()
+}
+
 /// 3×3 행렬을 프로베니우스 거리로 가장 가까운 회전에 사영한다.
 pub fn project_to_rotation(m: &Matrix3<f64>) -> Option<Rotation3<f64>> {
     if !m.iter().all(|v| v.is_finite()) || m.norm() == 0.0 {
