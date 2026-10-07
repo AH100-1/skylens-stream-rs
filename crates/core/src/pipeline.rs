@@ -482,6 +482,20 @@ fn ransac_stats_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("SKYLENS_RANSAC_STATS").is_some())
 }
 
+/// 환경 변수 `SKYLENS_CROSS_MIN_MATCHES`(양의 정수)가 있으면 다른 카메라 사이 짝의 최소 대응 수 하한으로 쓴다.
+/// 없거나 20 이상이면 기존 하한 20. 같은 카메라 짝은 항상 20.
+fn cross_min_matches() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SKYLENS_CROSS_MIN_MATCHES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map_or(PAIR_MIN_MATCHES, |v| v.clamp(8, PAIR_MIN_MATCHES))
+    })
+}
+
+const PAIR_MIN_MATCHES: usize = 20;
+
 fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> Vec<PairMatch> {
     let pairs = scheduled_pairs(views, &PairSchedule::default());
     pairs
@@ -503,13 +517,19 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                     m.len()
                 );
             }
-            if m.len() < 20 {
+            let min_m = if views[i].0 != views[j].0 {
+                cross_min_matches()
+            } else {
+                PAIR_MIN_MATCHES
+            };
+            if m.len() < min_m {
                 return None;
             }
             let n1: Vec<_> = m.iter().map(|&(a, _)| norm(k, &fa[a])).collect();
             let n2: Vec<_> = m.iter().map(|&(_, b)| norm(k, &fb[b])).collect();
             let cfg = RansacConfig {
                 max_iters: 500,
+                min_inliers: RansacConfig::default().min_inliers.min(min_m),
                 ..RansacConfig::default()
             };
             let t_ransac = Instant::now();
@@ -539,7 +559,7 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                     .collect()
             };
             let (s1, s2) = (sel(&n1), sel(&n2));
-            if s1.len() < 20 {
+            if s1.len() < min_m {
                 return None;
             }
             let rp = recover_pose(&e, &s1, &s2)?;
