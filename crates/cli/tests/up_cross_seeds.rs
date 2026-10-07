@@ -79,6 +79,34 @@ fn region_maxes(report: &str) -> Vec<Option<f64>> {
         .collect()
 }
 
+/// 실패 문구: 문턱 초과 구역에 미측정 구역 안내를 덧붙인다.
+fn fail_message(bad: &[String], unmeasured: &[String]) -> String {
+    let mut m = format!("문턱 {UP_CROSS_FAIL_DEG}° 초과(시드 3 구역 0 제외): {bad:?}");
+    if !unmeasured.is_empty() {
+        m.push_str(&format!("; 미측정(검사 안 됨): {unmeasured:?}"));
+    }
+    m
+}
+
+#[test]
+fn fail_message_keeps_unmeasured_regions() {
+    let m = fail_message(
+        &["seed 5 구역 1: 10.500°".into()],
+        &["seed 5 구역 0".into()],
+    );
+    assert!(
+        m.contains("10.500°") && m.contains("미측정") && m.contains("구역 0"),
+        "{m}"
+    );
+    assert!(!fail_message(&[], &[]).contains("미측정"));
+}
+
+#[test]
+fn region_maxes_marks_all_null_region_unmeasured() {
+    let r = r#"{"regions":[{"diff_deg":[null, null]},{"diff_deg":[0.5, -1.25, null]}]}"#;
+    assert_eq!(region_maxes(r), vec![None, Some(1.25)]);
+}
+
 fn seeds() -> Vec<u64> {
     std::env::var("UPX_SEEDS")
         .unwrap_or_else(|_| "4,5".into())
@@ -91,6 +119,7 @@ fn seeds() -> Vec<u64> {
 #[ignore = "시드당 2~3분"]
 fn up_cross_default_path_seeds() {
     let mut bad = Vec::new();
+    let mut unmeasured = Vec::new();
     for seed in seeds() {
         let t = TempDir::new(&format!("s{seed}"));
         let (input, output) = (t.0.join("in"), t.0.join("out"));
@@ -127,6 +156,7 @@ fn up_cross_default_path_seeds() {
         for (r, m) in maxes.iter().enumerate() {
             let Some(m) = m else {
                 eprintln!("seed {seed} 구역 {r}: up_cross 미측정(diff_deg 전부 null)");
+                unmeasured.push(format!("seed {seed} 구역 {r}"));
                 continue;
             };
             if (seed, r) != KNOWN_FAIL && *m > UP_CROSS_FAIL_DEG {
@@ -134,8 +164,5 @@ fn up_cross_default_path_seeds() {
             }
         }
     }
-    assert!(
-        bad.is_empty(),
-        "문턱 {UP_CROSS_FAIL_DEG}° 초과(시드 3 구역 0 제외): {bad:?}"
-    );
+    assert!(bad.is_empty(), "{}", fail_message(&bad, &unmeasured));
 }

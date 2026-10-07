@@ -8,6 +8,36 @@ use std::process::Command;
 
 use skylens_core::synth::{Scene, SceneConfig};
 
+/// verify 표 `| registered | 판정 | 초벌 P/T, 정밀 R/T | ... |` 줄에서 초벌 등록 수 P 를 읽는다.
+/// 줄이 없거나 형식이 다르면 None (호출하는 쪽이 실패시킨다).
+fn parse_registered(vout: &str) -> Option<usize> {
+    let line = vout.lines().find(|l| l.starts_with("| registered |"))?;
+    line.split('|')
+        .nth(3)?
+        .split('/')
+        .next()?
+        .split_whitespace()
+        .last()?
+        .parse()
+        .ok()
+}
+
+#[test]
+fn parse_registered_reads_row_or_none() {
+    let t = "| 항목 | 판정 | 측정 | 기준 |\n| registered | PASS | 초벌 240/240, 정밀 240/240 (x) | c |\n";
+    assert_eq!(parse_registered(t), Some(240));
+    let t = "| registered | FAIL | 초벌 54/240, 정밀 54/240 | c |";
+    assert_eq!(parse_registered(t), Some(54));
+    // 줄이 없거나 형식이 바뀌면 None.
+    assert_eq!(parse_registered("| region_images | PASS | 1 | c |"), None);
+    assert_eq!(parse_registered(""), None);
+    assert_eq!(
+        parse_registered("| registered | FAIL | 오류: x | c |"),
+        None
+    );
+    assert_eq!(parse_registered("registered PASS 초벌 3/3"), None);
+}
+
 #[test]
 #[ignore = "시드당 약 8분"]
 fn seed_registration_diag() {
@@ -15,10 +45,8 @@ fn seed_registration_diag() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
-    let min: usize = std::env::var("REG_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // REG_MIN 이 없으면 최소한 등록 1장 이상이어야 한다(기본값 0 은 항상 참이라 쓰지 않는다).
+    let min: Option<usize> = std::env::var("REG_MIN").ok().and_then(|s| s.parse().ok());
     let root: PathBuf =
         std::env::temp_dir().join(format!("skylens_regdiag_{seed}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -57,14 +85,14 @@ fn seed_registration_diag() {
         .find(|l| l.starts_with("| registered |"))
         .unwrap_or("");
     eprintln!("seed {seed} {reg_line}");
-    let n: usize = reg_line
-        .split('|')
-        .nth(3)
-        .and_then(|c| c.split('/').next())
-        .and_then(|c| c.split_whitespace().last())
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(0);
-    assert!(n >= min, "seed {seed} 등록 {n} < {min}");
+    let n = parse_registered(&vout).unwrap_or_else(|| {
+        panic!("seed {seed}: verify 출력에서 `| registered |` 줄의 등록 수를 읽지 못함:\n{vout}")
+    });
+    assert!(
+        n >= min.unwrap_or(1),
+        "seed {seed} 등록 {n} < {}",
+        min.unwrap_or(1)
+    );
     if std::env::var_os("KEEP_OUT").is_none() {
         let _ = std::fs::remove_dir_all(&root);
     }

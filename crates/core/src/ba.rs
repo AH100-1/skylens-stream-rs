@@ -20,7 +20,7 @@
 
 use crate::camera::Pose;
 use crate::distortion::DistortedIntrinsics;
-use crate::math::{Matrix3, Point3, Rotation3, SMatrix, Vector2, Vector3};
+use crate::math::{Matrix3, Point3, Rotation3, SMatrix, UnitQuaternion, Vector2, Vector3};
 use nalgebra::{DMatrix, DVector};
 
 /// 관측 하나: 카메라 번호, 점 번호, 픽셀.
@@ -150,6 +150,8 @@ pub struct BaOptions {
     pub function_tolerance: f64,
     /// 카메라 중심 위치 사전항. 기본 None(끔).
     pub position_prior: Option<PositionPrior>,
+    /// 장착 상대 회전 공유 정규화. 기본 None(끔). 기체마다 따로 흔들리는 편대에서는 켬이 끔보다 나빠질 수 있어 켜지 않는다.
+    pub rig_share: Option<RigShare>,
 }
 
 impl Default for BaOptions {
@@ -164,6 +166,7 @@ impl Default for BaOptions {
             initial_lambda: 1e-4,
             function_tolerance: 1e-10,
             position_prior: None,
+            rig_share: None,
         }
     }
 }
@@ -208,20 +211,27 @@ pub struct BaReport {
     /// 시작·끝 상태에서 카메라 뒤(z ≤ 0)라 RMS 에서 뺀 관측 수.
     pub initial_observations_behind: usize,
     pub final_observations_behind: usize,
+    /// 사전 위치가 거의 한 직선이라(둘째 고유값 < σ²) 그 축 회전 1자유도를 고정했으면 참.
+    pub prior_degenerate: bool,
 }
 
-/// 결정적 트랙 선택: 관측 2개 이상인 점만, 관측 수 내림차순, 같으면 점 번호 오름차순.
-/// 선택된 점 번호(오름차순). 범위 밖 점 번호 관측은 센하지 않는다.
+/// 결정적 트랙 선택: 서로 다른 카메라 2대 이상이 본 점만, 카메라 수 내림차순, 같으면 점 번호
+/// 오름차순. 선택된 점 번호(오름차순). 범위 밖 점 번호 관측은 세지 않는다.
 pub fn select_tracks(
     num_points: usize,
     observations: &[Observation],
     max_tracks: usize,
 ) -> Vec<usize> {
+    let mut pairs: Vec<(usize, usize)> = observations
+        .iter()
+        .filter(|o| o.point < num_points)
+        .map(|o| (o.point, o.camera))
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
     let mut count = vec![0usize; num_points];
-    for o in observations {
-        if let Some(c) = count.get_mut(o.point) {
-            *c += 1;
-        }
+    for (p, _) in pairs {
+        count[p] += 1;
     }
     let mut ids: Vec<usize> = (0..num_points).filter(|&p| count[p] >= 2).collect();
     if ids.len() > max_tracks {
@@ -286,17 +296,155 @@ pub fn residual_jacobian(
 struct Layout {
     /// 카메라별 포즈 6성분의 축소 계통 번호(고정이면 None).
     cam_idx: Vec<[Option<usize>; 6]>,
+    prior_degenerate: bool,
+    rot_norm: Option<RotNorm>,
     /// 그룹별 (내부 파라미터 번호, 축소 계통 번호).
     intr_idx: Vec<Vec<(usize, usize)>>,
     n: usize,
 }
 
-/// 고정 카메라 목록(범위 밖 제거, 비면 첫 카메라)과 축척 고정 (카메라, 평행이동 성분).
-fn gauge(problem: &BaProblem, opts: &BaOptions) -> (Vec<usize>, Option<(usize, usize)>) {
+/// 사전 위치 직선 둘레 회전 게이지의 정규화: 카메라 `cam` 의 `axis` 번째 좌표축이 직선에
+/// 수직인 평면에서 이루는 각을 처음 값으로 되돌린다(점 `a`, 방향 `u`, 수직 기저 `e1`, `e2`).
+#[derive(Clone, Copy, Debug)]
+struct RotNorm {
+    a: Point3<f64>,
+    u: Vector3<f64>,
+    e1: Vector3<f64>,
+    e2: Vector3<f64>,
+    cam: usize,
+    axis: usize,
+    phi_ref: f64,
+}
+
+impl RotNorm {
+    fn angle(&self, pose: &Pose) -> f64 {
+        let w = pose.rotation.matrix().row(self.axis).transpose();
+        (w.dot(&self.e2)).atan2(w.dot(&self.e1))
+    }
+
+    /// 문제 전체를 직선 둘레로 돌려 기준 각을 회복한다(사전항 비용은 직선 둘레 회전에 불변).
+    fn normalize(&self, p: &mut BaProblem) {
+        let theta = self.phi_ref - self.angle(&p.poses[self.cam]);
+        if theta == 0.0 || !theta.is_finite() {
+            return;
+        }
+        let rg = Rotation3::from_axis_angle(&nalgebra::Unit::new_normalize(self.u), theta);
+        for q in &mut p.poses {
+            let c = self.a + rg * (q.center() - self.a);
+            *q = Pose::from_center(q.rotation * rg.inverse(), &c);
+        }
+        for x in &mut p.points {
+            *x = self.a + rg * (*x - self.a);
+        }
+    }
+}
+
+struct Gauge {
+    rot_norm: Option<RotNorm>,
+    fixed: Vec<usize>,
+    /// 축척 고정 (카메라, 평행이동 성분).
+    scale_fix: Option<(usize, usize)>,
+    /// 사전 위치가 한 직선일 때 고정하는 (카메라, 회전 성분).
+    rot_fix: Option<(usize, usize)>,
+    prior_degenerate: bool,
+}
+
+/// 사전 위치(유효한 것)의 공분산 둘째 고유값이 σ² 보다 작으면 주축(직선 방향)을 돌려준다.
+fn degenerate_prior_axis(pr: &PositionPrior) -> Option<(Point3<f64>, Vector3<f64>)> {
+    let pts: Vec<(Point3<f64>, f64)> = (0..pr.positions.len())
+        .filter_map(|c| pr.target(c).map(|g| (g, pr.sigma_of(c))))
+        .collect();
+    if pts.len() < 3 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let mean = pts.iter().fold(Vector3::zeros(), |a, (g, _)| a + g.coords) / n;
+    let mut cov = Matrix3::zeros();
+    for (g, _) in &pts {
+        let d = g.coords - mean;
+        cov += d * d.transpose();
+    }
+    cov /= n;
+    let var = pts.iter().map(|(_, s)| s * s).sum::<f64>() / n;
+    let eig = cov.symmetric_eigen();
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&a, &b| eig.eigenvalues[b].total_cmp(&eig.eigenvalues[a]));
+    let second = eig.eigenvalues[order[1]];
+    if second.is_finite() && second < var {
+        Some((
+            Point3::from(mean),
+            eig.eigenvectors.column(order[0]).into_owned(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// 고정 카메라 목록(범위 밖 제거, 비면 첫 카메라)과 축척·축 회전 고정. 선택된 트랙의
+/// 관측 `obs` 를 가진 카메라만 후보로 삼는다.
+fn gauge(problem: &BaProblem, opts: &BaOptions, obs: &[Observation]) -> Gauge {
     let n_cam = problem.poses.len();
+    let mut has_obs = vec![false; n_cam];
+    for o in obs {
+        has_obs[o.camera] = true;
+    }
     if let Some(pr) = &opts.position_prior {
         if pr.free_gauge {
-            return (Vec::new(), None);
+            let mut g = Gauge {
+                fixed: Vec::new(),
+                rot_norm: None,
+                scale_fix: None,
+                rot_fix: None,
+                prior_degenerate: false,
+            };
+            if let Some((a, u)) = degenerate_prior_axis(pr) {
+                g.prior_degenerate = true;
+                // 세계 축 u 둘레 회전의 카메라 k 좌표계 방향은 R_k u (왼쪽 섭동 ω 와 부호만 다름).
+                let mut best: Option<(usize, usize, f64)> = None;
+                for k in (0..n_cam).filter(|&k| has_obs[k]) {
+                    let w = problem.poses[k].rotation * u;
+                    for i in 0..3 {
+                        let v = w[i].abs();
+                        if v.is_finite() && v > 1e-9 && best.is_none_or(|b| v > b.2) {
+                            best = Some((k, i, v));
+                        }
+                    }
+                }
+                g.rot_fix = best.map(|b| (b.0, b.1));
+                // 정규화 기준: 직선에 수직 성분이 가장 큰 (카메라, 좌표축).
+                let e1 = if u.x.abs() < 0.9 {
+                    Vector3::x().cross(&u)
+                } else {
+                    Vector3::y().cross(&u)
+                }
+                .normalize();
+                let e2 = u.cross(&e1);
+                let mut nb: Option<(usize, usize, f64)> = None;
+                for k in (0..n_cam).filter(|&k| has_obs[k]) {
+                    let m = problem.poses[k].rotation.into_inner();
+                    for i in 0..3 {
+                        let w = m.row(i).transpose();
+                        let v = w.dot(&e1).hypot(w.dot(&e2));
+                        if nb.is_none_or(|b| v > b.2) {
+                            nb = Some((k, i, v));
+                        }
+                    }
+                }
+                if let Some((cam, axis, _)) = nb.filter(|b| b.2 > 1e-6) {
+                    let mut rn = RotNorm {
+                        a,
+                        u,
+                        e1,
+                        e2,
+                        cam,
+                        axis,
+                        phi_ref: 0.0,
+                    };
+                    rn.phi_ref = rn.angle(&problem.poses[cam]);
+                    g.rot_norm = Some(rn);
+                }
+            }
+            return g;
         }
     }
     let mut fixed: Vec<usize> = opts
@@ -310,31 +458,64 @@ fn gauge(problem: &BaProblem, opts: &BaOptions) -> (Vec<usize>, Option<(usize, u
     if fixed.is_empty() && n_cam > 0 {
         fixed.push(0);
     }
-    if fixed.len() != 1 || opts.position_prior.is_some() {
-        return (fixed, None);
+    let mut g = Gauge {
+        fixed,
+        rot_norm: None,
+        scale_fix: None,
+        rot_fix: None,
+        prior_degenerate: false,
+    };
+    if g.fixed.len() != 1 || opts.position_prior.is_some() {
+        return g;
     }
-    // 고정 카메라 C_0 를 중심으로 한 축척 s 에서 t_k = −R_k(C_0 + s(C_k − C_0)) 이므로
-    // ∂t_k/∂s = −R_k(C_k − C_0). 이 기울기 성분이 가장 큰 (k, i) 를 고정한다.
-    let c0 = problem.poses[fixed[0]].center();
-    let mut best: Option<(usize, usize, f64)> = None;
-    for k in 0..n_cam {
-        if k == fixed[0] {
-            continue;
-        }
-        let pose = &problem.poses[k];
-        let d = pose.rotation * (pose.center() - c0);
-        for i in 0..3 {
-            let v = d[i].abs();
-            if v.is_finite() && v > 1e-9 && best.is_none_or(|b| v > b.2) {
-                best = Some((k, i, v));
+    let f0 = g.fixed[0];
+    // 고정 카메라와 트랙을 공유하는 카메라를 우선한다.
+    let mut by_point: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+    for o in obs {
+        by_point.entry(o.point).or_default().push(o.camera);
+    }
+    let mut shares = vec![false; n_cam];
+    for cams in by_point.values() {
+        if cams.contains(&f0) {
+            for &c in cams {
+                shares[c] = true;
             }
         }
     }
-    (fixed, best.map(|b| (b.0, b.1)))
+    // 고정 카메라 C_0 를 중심으로 한 축척 s 에서 t_k = −R_k(C_0 + s(C_k − C_0)) 이므로
+    // ∂t_k/∂s = −R_k(C_k − C_0). 이 기울기 성분이 가장 큰 (k, i) 를 고정한다.
+    let c0 = problem.poses[f0].center();
+    for require_share in [true, false] {
+        let mut best: Option<(usize, usize, f64)> = None;
+        for k in 0..n_cam {
+            if k == f0 || !has_obs[k] || (require_share && !shares[k]) {
+                continue;
+            }
+            let pose = &problem.poses[k];
+            let d = pose.rotation * (pose.center() - c0);
+            for i in 0..3 {
+                let v = d[i].abs();
+                if v.is_finite() && v > 1e-9 && best.is_none_or(|b| v > b.2) {
+                    best = Some((k, i, v));
+                }
+            }
+        }
+        if let Some(b) = best {
+            g.scale_fix = Some((b.0, b.1));
+            break;
+        }
+    }
+    g
 }
 
-fn layout(problem: &BaProblem, opts: &BaOptions) -> Layout {
-    let (fixed, scale_fix) = gauge(problem, opts);
+fn layout(problem: &BaProblem, opts: &BaOptions, obs: &[Observation]) -> Layout {
+    let Gauge {
+        fixed,
+        scale_fix,
+        rot_fix,
+        prior_degenerate,
+        rot_norm,
+    } = gauge(problem, opts, obs);
     let mut n = 0;
     let mut cam_idx = Vec::with_capacity(problem.poses.len());
     for c in 0..problem.poses.len() {
@@ -342,6 +523,9 @@ fn layout(problem: &BaProblem, opts: &BaOptions) -> Layout {
         if !fixed.contains(&c) {
             for (k, slot) in idx.iter_mut().enumerate() {
                 if k >= 3 && scale_fix == Some((c, k - 3)) {
+                    continue;
+                }
+                if k < 3 && rot_fix == Some((c, k)) {
                     continue;
                 }
                 *slot = Some(n);
@@ -368,6 +552,8 @@ fn layout(problem: &BaProblem, opts: &BaOptions) -> Layout {
     }
     Layout {
         cam_idx,
+        prior_degenerate,
+        rot_norm,
         intr_idx,
         n,
     }
@@ -379,8 +565,9 @@ fn evaluate(
     obs: &[Observation],
     loss: Loss,
     prior: Option<&PositionPrior>,
+    rig: Option<&RigShare>,
 ) -> (f64, f64, usize) {
-    let mut cost = prior_cost(problem, prior);
+    let mut cost = prior_cost(problem, prior) + rig_cost(problem, rig);
     let mut sq = 0.0;
     let mut bad = 0;
     for o in obs {
@@ -457,6 +644,151 @@ fn add_prior(
     }
 }
 
+/// 장착 상대 회전 공유 정규화(약한 항). 같은 위치(station)의 카메라 묶음에서 기준
+/// 카메라(slot 0)에 대한 다른 카메라의 상대 회전 R_c R_ref^T 는 위치와 무관하게 같다.
+/// 슬롯별 장착 회전은 매 평가에서 현재 포즈로 강건 평균(구면 중앙값)을 구해 상수로 두고,
+/// 잔차는 각 위치의 실제 상대 회전과 평균의 차(축-각 3성분)에 `weight` 를 곱한 것이다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RigShare {
+    /// 카메라별 위치 번호. `usize::MAX` 는 해당 없음.
+    pub station: Vec<usize>,
+    /// 카메라별 슬롯 번호. 0 이 기준 카메라(위치마다 하나).
+    pub slot: Vec<usize>,
+    /// 가중치 = 1/σ (σ 는 라디안). 0 이하·비유한이면 항 없음.
+    pub weight: f64,
+    /// Huber 문턱(σ 단위, 기본 3.0).
+    pub huber_k: f64,
+}
+
+impl RigShare {
+    pub fn new(station: Vec<usize>, slot: Vec<usize>, sigma_deg: f64) -> Self {
+        Self {
+            station,
+            slot,
+            weight: 1.0 / sigma_deg.to_radians(),
+            huber_k: 3.0,
+        }
+    }
+
+    /// (카메라, 기준 카메라, 슬롯) 행.
+    fn rows(&self, n_cam: usize) -> Vec<(usize, usize, usize)> {
+        if !(self.weight.is_finite() && self.weight > 0.0) {
+            return Vec::new();
+        }
+        let n = n_cam.min(self.station.len()).min(self.slot.len());
+        let mut refs = std::collections::HashMap::new();
+        for c in 0..n {
+            if self.station[c] != usize::MAX && self.slot[c] == 0 {
+                refs.entry(self.station[c]).or_insert(c);
+            }
+        }
+        let mut rows = Vec::new();
+        for c in 0..n {
+            if self.station[c] == usize::MAX || self.slot[c] == 0 {
+                continue;
+            }
+            if let Some(&f) = refs.get(&self.station[c]) {
+                rows.push((c, f, self.slot[c]));
+            }
+        }
+        rows
+    }
+}
+
+fn rot_log(r: &Rotation3<f64>) -> Vector3<f64> {
+    UnitQuaternion::from_rotation_matrix(r).scaled_axis()
+}
+
+/// 슬롯별 강건 평균 장착 회전(구면 중앙값, Weiszfeld 반복).
+fn rig_means(problem: &BaProblem, rows: &[(usize, usize, usize)]) -> Vec<Option<Rotation3<f64>>> {
+    let n_slot = rows.iter().map(|r| r.2 + 1).max().unwrap_or(0);
+    let mut out = vec![None; n_slot];
+    for (slot, o) in out.iter_mut().enumerate() {
+        let rels: Vec<Rotation3<f64>> = rows
+            .iter()
+            .filter(|r| r.2 == slot)
+            .map(|&(c, f, _)| problem.poses[c].rotation * problem.poses[f].rotation.inverse())
+            .collect();
+        if rels.is_empty() {
+            continue;
+        }
+        let mut m = rels[0];
+        for _ in 0..30 {
+            let mut sum = Vector3::zeros();
+            let mut wsum = 0.0;
+            for r in &rels {
+                let e = rot_log(&(*r * m.inverse()));
+                let w = 1.0 / e.norm().max(1e-4);
+                sum += w * e;
+                wsum += w;
+            }
+            let d = sum / wsum;
+            m = Rotation3::new(d) * m;
+            if d.norm() < 1e-12 {
+                break;
+            }
+        }
+        *o = Some(m);
+    }
+    out
+}
+
+/// 행마다 (카메라, 기준, 상대 회전, 잔차 σ 단위). 평균이 없으면 건너뛴다.
+fn rig_residuals(
+    problem: &BaProblem,
+    rig: &RigShare,
+) -> Vec<(usize, usize, Rotation3<f64>, Vector3<f64>)> {
+    let rows = rig.rows(problem.poses.len());
+    let means = rig_means(problem, &rows);
+    rows.iter()
+        .filter_map(|&(c, f, slot)| {
+            let m = means[slot]?;
+            let rel = problem.poses[c].rotation * problem.poses[f].rotation.inverse();
+            Some((c, f, rel, rig.weight * rot_log(&(rel * m.inverse()))))
+        })
+        .collect()
+}
+
+fn rig_cost(problem: &BaProblem, rig: Option<&RigShare>) -> f64 {
+    let Some(rig) = rig else { return 0.0 };
+    let huber = Loss::Huber(rig.huber_k);
+    rig_residuals(problem, rig)
+        .iter()
+        .map(|r| 0.5 * huber.rho(r.3.norm_squared()))
+        .sum()
+}
+
+/// 장착 항을 정규방정식에 더한다. r ≈ r0 + w(ω_c − Rel ω_f).
+fn add_rig(
+    problem: &BaProblem,
+    lay: &Layout,
+    rig: &RigShare,
+    a: &mut DMatrix<f64>,
+    gc: &mut DVector<f64>,
+) {
+    let huber = Loss::Huber(rig.huber_k);
+    for (c, f, rel, r) in rig_residuals(problem, rig) {
+        let wt = huber.weight(r.norm_squared());
+        let mut cols: Vec<(usize, Vector3<f64>)> = Vec::new();
+        for k in 0..3 {
+            if let Some(i) = lay.cam_idx[c][k] {
+                let mut v = Vector3::zeros();
+                v[k] = rig.weight;
+                cols.push((i, v));
+            }
+            if let Some(i) = lay.cam_idx[f][k] {
+                cols.push((i, -rig.weight * rel.matrix().column(k).into_owned()));
+            }
+        }
+        for &(ia, ca) in &cols {
+            gc[ia] += wt * ca.dot(&r);
+            for &(ib, cb) in &cols {
+                a[(ia, ib)] += wt * ca.dot(&cb);
+            }
+        }
+    }
+}
+
 struct PointBlock {
     c: Matrix3<f64>,
     g: Vector3<f64>,
@@ -470,6 +802,7 @@ struct Linearization {
     points: Vec<(usize, PointBlock)>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn linearize(
     problem: &BaProblem,
     lay: &Layout,
@@ -478,11 +811,15 @@ fn linearize(
     obs: &[Observation],
     loss: Loss,
     prior: Option<&PositionPrior>,
+    rig: Option<&RigShare>,
 ) -> Linearization {
     let mut a = DMatrix::<f64>::zeros(lay.n, lay.n);
     let mut gc = DVector::<f64>::zeros(lay.n);
     if let Some(pr) = prior {
         add_prior(problem, lay, pr, &mut a, &mut gc);
+    }
+    if let Some(rg) = rig {
+        add_rig(problem, lay, rg, &mut a, &mut gc);
     }
     let mut points = Vec::with_capacity(tracks.len());
     for &p in tracks {
@@ -707,6 +1044,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
             cholesky_failures: 0,
             initial_observations_behind: 0,
             final_observations_behind: 0,
+            prior_degenerate: false,
         };
     }
     let valid: Vec<Observation> = problem
@@ -714,6 +1052,12 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
         .iter()
         .filter(|o| observation_is_valid(problem, o))
         .copied()
+        .collect();
+    // 같은 (카메라, 점) 중복 관측은 첫 것만 남긴다.
+    let mut seen = std::collections::HashSet::new();
+    let valid: Vec<Observation> = valid
+        .into_iter()
+        .filter(|o| seen.insert((o.camera, o.point)))
         .collect();
     let rejected = problem.observations.len() - valid.len();
     let tracks = select_tracks(problem.points.len(), &valid, opts.max_tracks);
@@ -726,20 +1070,28 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
     for (i, o) in obs.iter().enumerate() {
         by_point[o.point].push(i);
     }
-    let lay = layout(problem, opts);
+    let lay = layout(problem, opts, &obs);
     let prior = opts.position_prior.as_ref();
-    let rms = |sq: f64, behind: usize| (sq / (obs.len() - behind).max(1) as f64).sqrt();
+    let rig = opts.rig_share.as_ref();
+    let rms = |sq: f64, behind: usize| {
+        let n = obs.len() - behind;
+        if n == 0 {
+            f64::NAN
+        } else {
+            (sq / n as f64).sqrt()
+        }
+    };
     // Cauchy 는 비볼록이라 먼 초기값에서 일부 점이 이상치 쪽 해에 걸린다. 같은 척도의
     // Huber 로 먼저 수렴시킨 뒤 Cauchy 로 바꾼다(단계 방식).
     let mut staged = match opts.loss {
         Loss::Cauchy(d) => Some(Loss::Huber(d)),
         _ => None,
     };
-    let (initial_cost, sq0, behind0) = evaluate(problem, &obs, opts.loss, prior);
+    let (initial_cost, sq0, behind0) = evaluate(problem, &obs, opts.loss, prior, rig);
     let initial_rms = rms(sq0, behind0);
     let mut loss = staged.unwrap_or(opts.loss);
     let mut cost = if staged.is_some() {
-        evaluate(problem, &obs, loss, prior).0
+        evaluate(problem, &obs, loss, prior, rig).0
     } else {
         initial_cost
     };
@@ -769,7 +1121,7 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
             {
                 staged = None;
                 loss = opts.loss;
-                cost = evaluate(problem, &obs, loss, prior).0;
+                cost = evaluate(problem, &obs, loss, prior, rig).0;
                 lambda = opts.initial_lambda;
                 stop = BaStop::MaxIterations;
                 if iterations < opts.max_iterations {
@@ -779,14 +1131,17 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
             break;
         }
         iterations += 1;
-        let lin = linearize(problem, &lay, &tracks, &by_point, &obs, loss, prior);
-        let (_, _, bad0) = evaluate(problem, &obs, loss, prior);
+        let lin = linearize(problem, &lay, &tracks, &by_point, &obs, loss, prior, rig);
+        let (_, _, bad0) = evaluate(problem, &obs, loss, prior, rig);
         let mut accepted = false;
         for _ in 0..12 {
             match solve(&lin, lambda) {
                 Some((dc, dp)) => {
-                    let cand = apply(problem, &lay, &lin, &dc, &dp);
-                    let (c_new, sq_new, bad) = evaluate(&cand, &obs, loss, prior);
+                    let mut cand = apply(problem, &lay, &lin, &dc, &dp);
+                    if let Some(rn) = &lay.rot_norm {
+                        rn.normalize(&mut cand);
+                    }
+                    let (c_new, sq_new, bad) = evaluate(&cand, &obs, loss, prior, rig);
                     if bad <= bad0 && c_new < cost {
                         let rel = (cost - c_new) / cost.max(1e-300);
                         *problem = cand;
@@ -819,13 +1174,14 @@ pub fn bundle_adjust(problem: &mut BaProblem, opts: &BaOptions) -> BaReport {
         initial_rms,
         final_rms: rms(final_sq, final_behind),
         initial_cost,
-        final_cost: evaluate(problem, &obs, opts.loss, prior).0,
+        final_cost: evaluate(problem, &obs, opts.loss, prior, rig).0,
         converged: stop == BaStop::Converged,
         stop,
         num_observations_rejected: rejected,
         cholesky_failures,
         initial_observations_behind: behind0,
         final_observations_behind: final_behind,
+        prior_degenerate: lay.prior_degenerate,
     }
 }
 
@@ -1381,6 +1737,209 @@ mod tests {
         assert_eq!(rep2.final_cost, rep.final_cost);
     }
 
+    fn run_sq(
+        base: &BaProblem,
+        lambda: f64,
+        prior: Option<PositionPrior>,
+        tol: f64,
+    ) -> (BaProblem, BaReport) {
+        let mut p = base.clone();
+        let rep = bundle_adjust(
+            &mut p,
+            &BaOptions {
+                loss: Loss::Squared,
+                max_iterations: 200,
+                initial_lambda: lambda,
+                function_tolerance: tol,
+                position_prior: prior,
+                ..Default::default()
+            },
+        );
+        (p, rep)
+    }
+
+    /// F-162: 투영된 관측이 0개이면 RMS 는 NaN 이고 정밀·수렴으로 보고하지 않는다.
+    #[test]
+    fn zero_projected_observations_report_nan_rms() {
+        let mut nan_px = noisy_perturbed(16);
+        for o in &mut nan_px.observations {
+            o.pixel.x = f64::NAN;
+        }
+        let mut behind = noisy_perturbed(16);
+        for x in &mut behind.points {
+            *x = Point3::new(0.0, 0.0, 1000.0);
+        }
+        let mut cases = vec![nan_px, behind];
+        cases.push(noisy_perturbed(16));
+        for (i, mut p) in cases.into_iter().enumerate() {
+            let max_tracks = if i == 2 { 0 } else { 100_000 };
+            let rep = bundle_adjust(
+                &mut p,
+                &BaOptions {
+                    max_tracks,
+                    ..short_opts()
+                },
+            );
+            eprintln!(
+                "case {i}: {:?} rms {} {}",
+                rep.stop, rep.initial_rms, rep.final_rms
+            );
+            if i == 1 {
+                assert!(rep.num_observations_used > 0);
+                assert_eq!(rep.initial_observations_behind, rep.num_observations_used);
+            }
+            assert!(
+                rep.initial_rms.is_nan() && rep.final_rms.is_nan(),
+                "case {i}"
+            );
+            assert!(!rep.refined && !rep.converged, "case {i}");
+        }
+    }
+
+    /// F-164: 축척 고정 카메라는 선택된 트랙 관측이 있다. 고정 성분 카메라의 관측을 지워도
+    /// 해가 감쇠 초기값과 무관하다.
+    #[test]
+    fn scale_gauge_camera_has_observations() {
+        let mut p = noisy_perturbed(11);
+        let opts = BaOptions::default();
+        let c = gauge(&p, &opts, &p.observations).scale_fix.unwrap().0;
+        p.observations.retain(|o| o.camera != c);
+        let g = gauge(&p, &opts, &p.observations);
+        let (k, _) = g.scale_fix.unwrap();
+        assert_ne!(k, c);
+        assert!(p.observations.iter().any(|o| o.camera == k));
+        let (p0, r0) = run_sq(&p, 1e-12, None, 0.0);
+        let (p1, r1) = run_sq(&p, 1e-4, None, 0.0);
+        let d = |q: &BaProblem| (q.poses[1].center() - q.poses[0].center()).norm();
+        let rel = ((d(&p0) - d(&p1)) / d(&p1)).abs();
+        eprintln!(
+            "rel {rel:e} chol {} {}",
+            r0.cholesky_failures, r1.cholesky_failures
+        );
+        assert!(rel < 1e-9, "{rel}");
+        assert_eq!(r0.cholesky_failures, 0);
+        assert_eq!(r1.cholesky_failures, 0);
+    }
+
+    /// F-165: 한 카메라만 본 점은 트랙이 아니다. 중복 관측은 하나만 남기고 센다.
+    #[test]
+    fn single_camera_points_and_duplicates() {
+        let p = noisy_perturbed(15);
+        let mut single = p.clone();
+        single.observations.retain(|o| o.camera == 0);
+        let before = single.points.clone();
+        let rep = bundle_adjust(&mut single, &short_opts());
+        assert_eq!(rep.num_tracks_used, 0);
+        assert_eq!(rep.stop, BaStop::EvaluationOnly);
+        assert!(!rep.refined);
+        assert_eq!(single.points, before);
+        // 같은 카메라가 두 번 본 점도 트랙이 아니다.
+        let o = p.observations[0];
+        assert!(select_tracks(p.points.len(), &[o, o], 10).is_empty());
+
+        let opts = BaOptions {
+            loss: Loss::Squared,
+            max_iterations: 50,
+            ..Default::default()
+        };
+        let mut clean = p.clone();
+        let rc = bundle_adjust(&mut clean, &opts);
+        let mut dup = p.clone();
+        let mut extra = dup.observations[3];
+        extra.pixel += Vector2::new(5.0, -4.0);
+        dup.observations.push(extra);
+        let rd = bundle_adjust(&mut dup, &opts);
+        assert_eq!(rd.num_observations_rejected, 1);
+        assert_eq!(rd.num_observations_used, rc.num_observations_used);
+        assert!(
+            ((rd.final_rms - rc.final_rms) / rc.final_rms).abs() < 0.01,
+            "{} {}",
+            rd.final_rms,
+            rc.final_rms
+        );
+    }
+
+    /// F-259: 사전 위치가 한 직선이면 축 회전 1자유도를 고정해 해가 감쇠와 무관하다.
+    #[test]
+    fn collinear_prior_fixes_axis_rotation() {
+        // 카메라 중심을 직선 (x, 0, 20) 위에 둔 장면(관측은 새 포즈로 다시 투영).
+        let (mut gt, mut rng) = scene(11, 10, 400);
+        for q in &mut gt.poses {
+            let c = q.center();
+            *q = Pose::from_center(q.rotation, &Point3::new(c.x, 0.0, 20.0));
+        }
+        for o in &mut gt.observations {
+            let xc = gt.poses[o.camera].transform(&gt.points[o.point]);
+            o.pixel = gt.groups[gt.camera_group[o.camera]].project_camera(&xc);
+        }
+        let mut base = gt;
+        add_noise(&mut base, &mut rng, 0.5);
+        perturb(&mut base, &mut rng);
+        let line = |p: &BaProblem| {
+            PositionPrior::new(
+                p.poses
+                    .iter()
+                    .map(|q| Some(Point3::new(q.center().x, 0.0, 20.0)))
+                    .collect(),
+            )
+        };
+        let (p0, r0) = run_sq(&base, 1e-12, Some(line(&base)), 1e-12);
+        let (p1, r1) = run_sq(&base, 1e-4, Some(line(&base)), 1e-12);
+        let dmax = p0
+            .poses
+            .iter()
+            .zip(&p1.poses)
+            .map(|(a, b)| (a.center() - b.center()).norm())
+            .fold(0.0, f64::max);
+        let rot = p0
+            .poses
+            .iter()
+            .zip(&p1.poses)
+            .map(|(a, b)| (a.rotation.inverse() * b.rotation).angle())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "dmax {dmax:e} rot {rot:e} {:?} {:?} cost {:e} {:e} it {} {} deg {} {}",
+            r0.stop,
+            r1.stop,
+            r0.final_cost,
+            r1.final_cost,
+            r0.iterations,
+            r1.iterations,
+            r0.prior_degenerate,
+            r1.prior_degenerate
+        );
+        assert!(r0.prior_degenerate && r1.prior_degenerate);
+        assert!(dmax < 1e-6, "{dmax}");
+        assert!(r0.converged && r1.converged, "{:?} {:?}", r0.stop, r1.stop);
+        // 회전 해도 감쇠와 무관하다(각도 계산의 수치 바닥은 약 3e-8).
+        assert!(rot < 1e-6, "{rot}");
+        // 정상 사전항은 조건 표시가 없다.
+        let (gp, _gt, gps) = bowed_formation(11);
+        let mut q = gp.clone();
+        let rep = bundle_adjust(
+            &mut q,
+            &BaOptions {
+                position_prior: Some(PositionPrior::new(gps)),
+                ..BaOptions::default()
+            },
+        );
+        assert!(!rep.prior_degenerate);
+    }
+
+    /// 정상 장면의 RMS 는 변하지 않는다(시드 11~13).
+    #[test]
+    fn normal_scene_rms_is_stable() {
+        for (seed, want) in [(11u64, 0.6234), (12, 0.6250), (13, 0.6186)] {
+            let (_, rep) = run_sq(&noisy_perturbed(seed), 1e-4, None, 0.0);
+            eprintln!("seed {seed} rms {:.4}", rep.final_rms);
+            assert!(
+                (rep.final_rms - want).abs() < 6e-4,
+                "{seed} {}",
+                rep.final_rms
+            );
+        }
+    }
+
     fn short_opts() -> BaOptions {
         BaOptions {
             loss: Loss::Squared,
@@ -1798,7 +2357,7 @@ mod tests {
         for (i, o) in p.observations.iter().enumerate() {
             by_point[o.point].push(i);
         }
-        let lay = layout(&p, &opts);
+        let lay = layout(&p, &opts, &p.observations);
         let lin = linearize(
             &p,
             &lay,
@@ -1806,6 +2365,7 @@ mod tests {
             &by_point,
             &p.observations,
             opts.loss,
+            None,
             None,
         );
         let lambda = 1e-3;
@@ -1865,7 +2425,7 @@ mod tests {
         for (i, o) in p.observations.iter().enumerate() {
             by_point[o.point].push(i);
         }
-        let lay = layout(&p, &opts);
+        let lay = layout(&p, &opts, &p.observations);
         let t = Instant::now();
         let lin = linearize(
             &p,
@@ -1874,6 +2434,7 @@ mod tests {
             &by_point,
             &p.observations,
             opts.loss,
+            None,
             None,
         );
         let t_lin = t.elapsed().as_secs_f64();
@@ -1884,7 +2445,7 @@ mod tests {
         let ok = s.cholesky().map(|c| c.solve(&rhs)).is_some();
         let t_chol = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let (cost, _, _) = evaluate(&p, &p.observations, opts.loss, None);
+        let (cost, _, _) = evaluate(&p, &p.observations, opts.loss, None, None);
         let t_eval = t.elapsed().as_secs_f64();
         let t = Instant::now();
         let rep = bundle_adjust(

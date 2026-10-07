@@ -39,8 +39,8 @@ struct Fixture {
 impl Default for Fixture {
     fn default() -> Self {
         Fixture {
-            reg_preview: 240,
-            reg_refined: 240,
+            reg_preview: 78,
+            reg_refined: 78,
             region_images: [42, 48],
             reproj_refined: 0.7,
             align_pairs: [1000, 2000],
@@ -94,7 +94,7 @@ fn build(dir: &Path, f: &Fixture) {
     std::fs::write(
         dir.join("report.json"),
         format!(
-            r#"{{"registered":{{"total":240,"preview":{},"refined":{}}},
+            r#"{{"registered":{{"total":78,"preview":{},"refined":{}}},
 "reprojection_px":{{"preview":4.5,"refined":{}}},
 "regions":[{{"region":0,"positions":14,"images":{}}},{{"region":1,"positions":16,"images":{}}}]}}"#,
             f.reg_preview, f.reg_refined, f.reproj_refined, f.region_images[0], f.region_images[1]
@@ -193,7 +193,7 @@ fn run_with(tag: &str, f: &Fixture, edit: impl FnOnce(&Path)) -> (i32, String) {
     )
 }
 
-const ITEMS: [&str; 7] = [
+const ITEMS: [&str; 8] = [
     "registered",
     "region_images",
     "refined_reprojection",
@@ -201,6 +201,7 @@ const ITEMS: [&str; 7] = [
     "preview_vs_refined",
     "refined_overlap",
     "snapshots",
+    "up_cross",
 ];
 
 fn status(out: &str, item: &str) -> &'static str {
@@ -232,8 +233,8 @@ fn passing_output_exits_zero() {
     for it in ITEMS {
         assert_eq!(status(&out, it), "PASS", "{it}\n{out}");
     }
-    assert!(out.contains("결과: 7/7 통과"), "{out}");
-    assert!(out.contains("초벌 240/240, 정밀 240/240"), "{out}");
+    assert!(out.contains("결과: 8/8 통과"), "{out}");
+    assert!(out.contains("초벌 78/78, 정밀 78/78"), "{out}");
     assert!(out.contains("정밀 0.700 px"), "{out}");
     assert!(out.contains("점쌍 최소 1000"), "{out}");
     assert!(out.contains("구역 간 스케일 차 10.00%"), "{out}");
@@ -248,12 +249,12 @@ fn passing_output_exits_zero() {
 #[test]
 fn registered_239_fails() {
     let f = Fixture {
-        reg_preview: 239,
+        reg_preview: 77,
         ..Default::default()
     };
     expect_only_fail("reg_p", &f, "registered");
     let f = Fixture {
-        reg_refined: 239,
+        reg_refined: 77,
         ..Default::default()
     };
     expect_only_fail("reg_r", &f, "registered");
@@ -395,7 +396,7 @@ fn missing_folder_fails_every_item() {
     for it in ITEMS {
         assert_eq!(status(&s, it), "FAIL", "{it}\n{s}");
     }
-    assert!(s.contains("결과: 0/7 통과"), "{s}");
+    assert!(s.contains("결과: 0/8 통과"), "{s}");
 }
 
 /// F-088·F-118: final 은 정밀 전부라 마지막 step(초벌 포함)보다 작을 수 있다. 같은 수 정체도 허용.
@@ -546,7 +547,8 @@ fn spec_outputs_only_decides_from_files() {
     {
         assert_eq!(status(&out, it), "PASS", "{it}\n{out}");
     }
-    assert!(out.contains("결과: 5/7 통과"), "{out}");
+    assert!(out.contains("건너뜀 (report.json 없음)"), "{out}");
+    assert!(out.contains("결과: 6/8 통과"), "{out}");
     assert!(out.contains("판정 불가: 2개"), "{out}");
     assert!(out.contains("0..26 빈틈 없음"), "{out}");
     assert!(out.contains("SPAN 12, OVL 2"), "{out}");
@@ -769,4 +771,39 @@ fn deeply_nested_manifest_fails_without_crash() {
     assert!(out.contains("중첩 깊이 64 초과"), "{out}");
     assert!(bytes < 1 << 20, "출력 {bytes} B");
     assert!(secs < 1.0, "verify {secs:.2} s");
+}
+
+/// 여덟째 항목: report.json 의 up_cross_check 로 통과/경고/실패, 항목이 없으면 건너뜀(통과).
+#[test]
+fn up_cross_item_in_cli() {
+    let uc = |d0: &str| {
+        format!(
+            r#","up_cross_check":{{"threshold_deg":0.3,"max_diff_deg":0,"exceeds":false,"regions":[{{"region":0,"cameras":["F","R","L"],"diff_deg":[{d0}]}}]}}}}"#
+        )
+    };
+    let with = |tag: &str, d0: Option<&str>| {
+        run_with(tag, &Fixture::default(), |d| {
+            let p = d.join("report.json");
+            let s = std::fs::read_to_string(&p).unwrap();
+            let s = s.trim_end().strip_suffix('}').unwrap().to_string();
+            let s = match d0 {
+                Some(v) => s + &uc(v),
+                None => s + "}",
+            };
+            std::fs::write(p, s).unwrap();
+        })
+    };
+    let (code, out) = with("upx_ok", Some("0.02, 0.03, 0.01"));
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("결과: 8/8 통과"), "{out}");
+    let (code, out) = with("upx_warn", Some("1.386, 0.2"));
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("경고"), "{out}");
+    let (code, out) = with("upx_fail", Some("69.509, 47.0"));
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(status(&out, "up_cross"), "FAIL", "{out}");
+    assert!(out.contains("결과: 7/8 통과"), "{out}");
+    let (code, out) = with("upx_skip", None);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("건너뜀"), "{out}");
 }
