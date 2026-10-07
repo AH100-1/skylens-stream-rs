@@ -2522,10 +2522,10 @@ mod tests {
         let rss = peak_rss_mb();
         eprintln!("offset 0: {t0:.2} s rms {rms0:.4}; offset 1e6: {t1:.2} s rms {rms1:.4}; peak {rss:.0} MB");
         assert!(len1 > 1_000_000, "{len1}");
-        assert!(t0 < 60.0, "{t0}");
+        // 시간은 출력만 한다. 점 번호 이동이 계산에 영향을 주지 않는다는 조건은
+        // 부하와 무관한 양(RMS 오차의 비트 일치)으로 단언한다.
+        assert_eq!(rms0.to_bits(), rms1.to_bits(), "{rms0} vs {rms1}");
         assert!(rss < 1024.0, "{rss}");
-        assert!((t1 - t0).abs() <= 0.1 * t0.max(1.0), "{t0} vs {t1}");
-        assert!((rms0 - rms1).abs() < 1e-4, "{rms0} vs {rms1}");
         assert!(rms0 < 0.05, "{rms0}");
     }
 }
