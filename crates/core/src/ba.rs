@@ -150,7 +150,7 @@ pub struct BaOptions {
     pub function_tolerance: f64,
     /// 카메라 중심 위치 사전항. 기본 None(끔).
     pub position_prior: Option<PositionPrior>,
-    /// 장착 상대 회전 공유 정규화. 기본 None(끔).
+    /// 장착 상대 회전 공유 정규화. 기본 None(끔). 기체마다 따로 흔들리는 편대에서는 켬이 끔보다 나빠질 수 있어 켜지 않는다.
     pub rig_share: Option<RigShare>,
 }
 
