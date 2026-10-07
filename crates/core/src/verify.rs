@@ -39,6 +39,7 @@
 //! 너머는 찾지 않고 상한값으로 둔다(표기 "> 상한").
 //! |좌표| > `COORD_LIMIT_M` 인 점은 계산에서 뺀다.
 
+use crate::align::UP_CROSS_WARN_DEG;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -68,8 +69,6 @@ pub const COORD_LIMIT_M: f64 = 1e7;
 /// 근거: 정상 실행 시드 1/2/3 구역별 최대 1.449° 이하, 한 기체 짐벌 구름 1~2° 장면 1.1~1.3°,
 /// 회전이 틀린 묶음은 47° 이상(시드 3 구역 0: 최대 69.5°). 정상 최대의 약 7배, 고장의 1/4 이하.
 pub const UP_CROSS_FAIL_DEG: f64 = 10.0;
-/// 이 값을 넘고 `UP_CROSS_FAIL_DEG` 이하면 경고(통과). `skylens run` 의 문턱과 같다.
-pub const UP_CROSS_WARN_DEG: f64 = 0.3;
 const EPS: f64 = 1e-9;
 
 // ---------------------------------------------------------------- 결과
@@ -240,6 +239,8 @@ fn check_up_cross(r: &Json) -> Result<(bool, String), String> {
         .and_then(Json::as_array)
         .ok_or("up_cross_check.regions 없음")?;
     let mut per: Vec<(String, f64)> = Vec::new();
+    // diff_deg 가 전부 null 인 구역(등록 부족으로 카메라 묶음이 모자란 구역).
+    let mut unmeasured: Vec<String> = Vec::new();
     for (i, g) in regs.iter().enumerate() {
         let k = g
             .get("region")
@@ -260,12 +261,24 @@ fn check_up_cross(r: &Json) -> Result<(bool, String), String> {
                 return Err(format!("구역 {k} diff_deg 가 숫자 또는 null 이 아님"));
             }
         }
-        if let Some(m) = mx {
-            per.push((k, m));
+        match mx {
+            Some(m) => per.push((k, m)),
+            None => unmeasured.push(k),
         }
     }
     if per.is_empty() {
-        return Ok((true, "측정값 없음 (검사할 수 있는 구역 없음)".into()));
+        // 검사한 구역이 하나도 없다: 문턱을 검증하지 못했으므로 '건너뜀' 통과가 아니라 경고로 표시한다.
+        return Ok((
+            true,
+            format!(
+                "경고: 측정값 없음 (구역 {} 전부 diff_deg null, 등록 부족으로 검사 못 함)",
+                if unmeasured.is_empty() {
+                    "없음".to_string()
+                } else {
+                    unmeasured.join(",")
+                }
+            ),
+        ));
     }
     let list = per
         .iter()
@@ -287,11 +300,17 @@ fn check_up_cross(r: &Json) -> Result<(bool, String), String> {
         ));
     }
     let warn = per.iter().any(|(_, m)| *m > UP_CROSS_WARN_DEG);
-    let tag = if warn {
+    let mut tag = if warn {
         format!("경고: {UP_CROSS_WARN_DEG}° 초과, ")
     } else {
         String::new()
     };
+    if !unmeasured.is_empty() {
+        tag = format!(
+            "경고: 구역 {} 미측정 (diff_deg 전부 null), {tag}",
+            unmeasured.join(",")
+        );
+    }
     Ok((true, format!("{tag}구역별 최대 {list}")))
 }
 
@@ -1332,7 +1351,21 @@ mod tests {
         assert!(ok && m.starts_with("건너뜀"), "{m}");
         // 값이 모두 null → 통과, 측정값 없음.
         let (ok, m) = up_cross(&up_cross_report("null", "")).unwrap();
-        assert!(ok && m.contains("측정값 없음"), "{m}");
+        assert!(
+            ok && m.starts_with("경고: 측정값 없음") && m.contains("구역 0,1"),
+            "{m}"
+        );
+        // 일부 구역만 null → 측정된 구역은 판정하고 미측정 구역을 경고로 알린다.
+        let (ok, m) = up_cross(&up_cross_report("null, null", "0.02")).unwrap();
+        assert!(
+            ok && m.starts_with("경고: 구역 0 미측정") && m.contains("1:0.020°"),
+            "{m}"
+        );
+        let (ok, m) = up_cross(&up_cross_report("null", "10.5")).unwrap();
+        assert!(!ok && m.contains("구역 1 "), "{m}");
+        // 구역 목록이 비어도(regions: []) 건너뜀이 아니라 경고.
+        let (ok, m) = up_cross(r#"{"up_cross_check":{"regions":[]}}"#).unwrap();
+        assert!(ok && m.starts_with("경고: 측정값 없음"), "{m}");
         // 형식 오류는 오류.
         assert!(up_cross(r#"{"up_cross_check":{}}"#).is_err());
         assert!(up_cross(&up_cross_report("\"x\"", "0.1")).is_err());

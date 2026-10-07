@@ -1381,6 +1381,17 @@ fn sparse_init_with(
         poses[i] = Some(Pose::from_center(r, &Point3::from(c)));
     }
     stages.placed = poses.clone();
+    if std::env::var_os("SKYLENS_REG_DEBUG").is_some() {
+        let no_rot: Vec<usize> = (0..n).filter(|&i| rots[i].is_none()).collect();
+        let no_pos: Vec<usize> = (0..n)
+            .filter(|&i| rots[i].is_some() && poses[i].is_none())
+            .collect();
+        eprintln!(
+            "reg_debug sparse_init pairs {} pruned {} kabsch_pairs {n_kabsch} rot_none {no_rot:?} pos_none {no_pos:?}",
+            pm.len(),
+            stages.pruned.0
+        );
+    }
     if opts.snap {
         snap_poses_to_gps(&mut poses, gps, opts.vfix);
     }
@@ -2514,6 +2525,26 @@ pub fn run_pipeline_with(
                 "registration table region {}: cam0 {} missing {:?}; cam1 {} missing {:?}; cam2 {} missing {:?}",
                 r.index, tab[0].0, tab[0].1, tab[1].0, tab[1].1, tab[2].0, tab[2].1
             ));
+        }
+        if std::env::var_os("SKYLENS_REG_DEBUG").is_some() {
+            let min_inl = PreviewOpts::default().min_inl;
+            for a in n_help..gids.len() {
+                if init.poses[a].is_some() {
+                    continue;
+                }
+                let mine: Vec<&PairMatch> = pm.iter().filter(|p| p.i == a || p.j == a).collect();
+                let good = mine.iter().filter(|p| p.inl.len() >= min_inl).count();
+                let best = mine.iter().map(|p| p.inl.len()).max().unwrap_or(0);
+                eprintln!(
+                    "reg_debug region {} unregistered local {a} gid {} cam {} position {} pairs {} pairs_inl>={min_inl} {good} max_inl {best} features {}",
+                    r.index,
+                    gids[a],
+                    gids[a] % 3,
+                    gids[a] / 3,
+                    mine.len(),
+                    imgs[a].feats.len()
+                );
+            }
         }
         let slot = recs.len();
         // 초벌 점군: 곧바로 만들어 최신 정밀 좌표계로 정렬해 내보낸다.
