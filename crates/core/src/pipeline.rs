@@ -1314,6 +1314,7 @@ fn sparse_init_with(
     let mut g = vt.transpose() * Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, d)) * u.transpose();
     // 편대가 거의 한 직선으로 날면 Kabsch 는 직선 둘레 회전을 못 정한다: 비행 축 둘레 회전을
     // 광축 높이 분산이 최소인 각(닫힌 식)으로 고른다.
+    let g_kabsch = g;
     let valid: Vec<Rotation3<f64>> = rots.iter().flatten().copied().collect();
     let mut axis = Vector3::zeros();
     let mut first: Option<Vector3<f64>> = None;
@@ -1347,6 +1348,7 @@ fn sparse_init_with(
             g = *Rotation3::from_axis_angle(&axis, theta).matrix() * g;
         }
     }
+    diag_rot(pm, &keep_edge, &rots, &g_kabsch, &g);
     if std::env::var_os("SKYLENS_DIAG_PREVIEW").is_some() {
         let rp: Vec<Option<Pose>> = rots
             .iter()
@@ -2176,6 +2178,73 @@ fn diag_set_ctx(region: usize, gids: &[usize]) {
     } else if std::env::var_os("SKYLENS_DIAG_PREVIEW").is_some() {
         DIAG_CTX.with(|c| *c.borrow_mut() = Some((region, gids.to_vec())));
     }
+}
+
+/// 진단(`SKYLENS_DIAG_ROT`): 회전 평균 간선 구조·잔차, 게이지 전 회전(`DIAGROTR`), 게이지(Kabsch 직후·롤 선택 뒤)를 낸다.
+fn diag_rot(
+    pm: &[PairMatch],
+    keep: &[bool],
+    rots: &[Option<Rotation3<f64>>],
+    g_kabsch: &Matrix3<f64>,
+    g_final: &Matrix3<f64>,
+) {
+    if std::env::var_os("SKYLENS_DIAG_ROT").is_none() {
+        return;
+    }
+    DIAG_CTX.with(|c| {
+        let c = c.borrow();
+        let Some((region, gids)) = c.as_ref() else {
+            return;
+        };
+        // (카메라 쌍) → (전체, 유지, 유지 간선 잔차 도 목록)
+        let mut by: BTreeMap<(usize, usize), (usize, usize, Vec<f64>)> = BTreeMap::new();
+        for (p, &k) in pm.iter().zip(keep) {
+            let key = (p.views.0 .0.min(p.views.1 .0), p.views.0 .0.max(p.views.1 .0));
+            let e = by.entry(key).or_default();
+            e.0 += 1;
+            if k {
+                e.1 += 1;
+                if let (Some(a), Some(b)) = (rots[p.i], rots[p.j]) {
+                    e.2.push((b * a.inverse() * p.rot.inverse()).angle().to_degrees());
+                }
+            }
+        }
+        let mut all: Vec<f64> = Vec::new();
+        for ((c0, c1), (n, kept, mut r)) in by {
+            all.extend(&r);
+            r.sort_by(f64::total_cmp);
+            let q = |f: f64| r.get(((r.len() as f64 - 1.0) * f) as usize).copied().unwrap_or(f64::NAN);
+            let mean = r.iter().sum::<f64>() / r.len().max(1) as f64;
+            eprintln!(
+                "DIAGROT edges region {region} cams {c0}-{c1} total {n} kept {kept} res_deg mean {mean:.3} med {:.3} p90 {:.3} max {:.3}",
+                q(0.5), q(0.9), q(1.0)
+            );
+        }
+        all.sort_by(f64::total_cmp);
+        let q = |f: f64| all.get(((all.len() as f64 - 1.0) * f) as usize).copied().unwrap_or(f64::NAN);
+        eprintln!(
+            "DIAGROT edges region {region} ALL kept {} verts {} res_deg med {:.3} p90 {:.3} max {:.3}",
+            all.len(),
+            rots.iter().flatten().count(),
+            q(0.5),
+            q(0.9),
+            q(1.0)
+        );
+        let fmt = |m: &Matrix3<f64>| {
+            m.transpose()
+                .iter()
+                .map(|v| format!("{v:.7}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        eprintln!("DIAGROTG kabsch {region} {}", fmt(g_kabsch));
+        eprintln!("DIAGROTG final {region} {}", fmt(g_final));
+        for (i, r) in rots.iter().enumerate() {
+            if let (Some(r), Some(g)) = (r, gids.get(i)) {
+                eprintln!("DIAGROTR {region} {g} {}", fmt(r.matrix()));
+            }
+        }
+    });
 }
 
 /// 진단: 단계별 포즈(세계→카메라 회전 9개, 중심 3개)를 표준 오류로 낸다. 시험이 정답 회전과 비교해 연직 기울기를 구한다.
