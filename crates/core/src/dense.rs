@@ -34,6 +34,8 @@ pub struct DenseConfig {
     pub depth_rel: f64,
     /// 이웃 시점 점수 설정(기본: 각 제한 없음).
     pub neighbor: view_selection::NeighborConfig,
+    /// 융합 법선 일치 각 상한(도, 기본 25). 융합 설정 기본(30)보다 좁게 둔 밀집 경로 값이다.
+    pub normal_deg: f64,
 }
 
 impl Default for DenseConfig {
@@ -45,10 +47,13 @@ impl Default for DenseConfig {
             reproj_px: 1.0,
             depth_rel: 0.01,
             neighbor: view_selection::NeighborConfig::default(),
+            normal_deg: DEFAULT_NORMAL_DEG,
         }
     }
 }
 
+/// 밀집 융합 법선 일치 각 기본값(도).
+pub const DEFAULT_NORMAL_DEG: f64 = 25.0;
 /// 평면 스윕 깊이 가설 수.
 pub const SWEEP_HYPOTHESES: usize = 64;
 /// 비용 집계에 쓰는 이웃 수.
@@ -577,12 +582,24 @@ pub fn patchmatch_depth(
     let rv = to_view(r);
     let nv: Vec<pm::View> = nbrs.iter().map(|n| to_view(n)).collect();
     let m = pm::estimate(&rv, &nv, range, &pm::Config::default());
-    DepthMap {
+    let mut map = DepthMap {
         w: m.w,
         h: m.h,
         depth: m.depth,
         normal: m.normal,
         cost: m.cost,
+    };
+    mark_invalid_cost(&mut map);
+    map
+}
+
+/// 깊이가 없는(유한한 양수가 아닌) 화소의 비용을 무효 값 [`f32::INFINITY`] 하나로 통일한다.
+/// 스윕·반점 제거는 이미 이 값을 쓰고, 패치매치는 상한값(2.0)을 쓰므로 한 지도에 섞이지 않게 맞춘다.
+pub fn mark_invalid_cost(map: &mut DepthMap) {
+    for (c, d) in map.cost.iter_mut().zip(&map.depth) {
+        if !(d.is_finite() && *d > 0.0) {
+            *c = f32::INFINITY;
+        }
     }
 }
 
@@ -600,6 +617,7 @@ pub fn region_cloud_patchmatch(
         &SweepConfig::default(),
         cfg.neighbors.max(1),
     )
+    .0
 }
 
 /// [`region_cloud`] 와 같고, 사진별 깊이 추정기와 그 설정을 고를 수 있다.
@@ -610,7 +628,7 @@ pub fn region_cloud_with(
     estimate: DepthEstimator,
     sweep: &SweepConfig,
 ) -> PointCloud {
-    region_cloud_impl(views, sparse_points, cfg, estimate, sweep, SWEEP_NEIGHBORS)
+    region_cloud_impl(views, sparse_points, cfg, estimate, sweep, SWEEP_NEIGHBORS).0
 }
 
 /// 사진별 깊이 단계의 결과: 보정된 사진, 이웃 목록, 깊이 맵.
@@ -698,13 +716,27 @@ fn depth_stage(
     })
 }
 
+/// 반점 제거에 넘긴 지도의 배열 길이가 `w * h` 와 맞지 않는다(곱이 넘치는 경우 포함).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BadMapLen {
+    pub w: usize,
+    pub h: usize,
+    pub len: usize,
+}
+
 /// 반점 제거: 4-연결 성분(이웃 상대 깊이차 < `rel`)의 화소 수가 `min_px` 미만이면
 /// 그 성분의 깊이·법선을 비우고 비용은 무효 값(`f32::INFINITY`)으로 둔다. 지워진 화소 수를
-/// 돌려준다. 지도 길이가 w·h 와 맞지 않으면 아무것도 건드리지 않고 0 을 돌려준다.
-pub fn remove_speckles(map: &mut DepthMap, rel: f32, min_px: usize) -> usize {
+/// 돌려준다. 상대 깊이차는 `|d1 - d2| / min(d1, d2)` 로 두 화소에 대해 대칭이라 훑는 순서와
+/// 무관하다. 지도 길이가 `w * h` 와 맞지 않으면 아무것도 건드리지 않고 `Err` 를 돌려준다
+/// ("지운 것 없음" 인 `Ok(0)` 과 구분된다).
+pub fn remove_speckles(map: &mut DepthMap, rel: f32, min_px: usize) -> Result<usize, BadMapLen> {
     let (w, h) = (map.w, map.h);
-    if map.depth.len() != w * h {
-        return 0;
+    if w.checked_mul(h) != Some(map.depth.len()) {
+        return Err(BadMapLen {
+            w,
+            h,
+            len: map.depth.len(),
+        });
     }
     let ok = |d: f32| d.is_finite() && d > 0.0;
     let mut seen = vec![false; w * h];
@@ -724,7 +756,7 @@ pub fn remove_speckles(map: &mut DepthMap, rel: f32, min_px: usize) -> usize {
             let d0 = map.depth[i];
             let mut push = |j: usize| {
                 let dj = map.depth[j];
-                if !seen[j] && ok(dj) && ((dj - d0) / d0).abs() < rel {
+                if !seen[j] && ok(dj) && (dj - d0).abs() < rel * d0.min(dj) {
                     seen[j] = true;
                     stack.push(j);
                 }
@@ -755,37 +787,91 @@ pub fn remove_speckles(map: &mut DepthMap, rel: f32, min_px: usize) -> usize {
             }
         }
     }
-    removed
+    Ok(removed)
 }
 
 /// 융합 전 깊이 지도 걸러내기 기본값: 반점 제거(상대 깊이차 0.007, 100 화소 미만).
 /// 100 화소는 480×270 에서 잰 값이고 문턱은 지도 면적에 비례한다. 작은 지도에서는 줄이되
 /// 하한 4 화소를 둔다(80×45 에서 100 화소면 지도의 3% 가 한 조각이라 참 표면까지 지워진다).
-/// 큰 지도에서는 상한 없이 키운다(960×540 에서 400 화소가 100 화소보다 중앙·95% 가 모두 낫다).
-const SPECKLE_REL: f32 = 0.007;
-const SPECKLE_MIN_PX: usize = 100;
-const SPECKLE_MIN_PX_FLOOR: usize = 4;
+/// 큰 지도에서는 상한 400 화소로 막는다. 400 은 960×540 에서 잰 값(100 화소보다 중앙·95% 가
+/// 모두 낫다)이고, 상한이 없으면 1920×1080 에서 1600 화소가 되어 폭 수십 화소의 기둥·지붕
+/// 모서리 같은 가는 참 표면 조각이 지워진다.
+pub const SPECKLE_REL: f32 = 0.007;
+pub const SPECKLE_MIN_PX: usize = 100;
+pub const SPECKLE_MIN_PX_FLOOR: usize = 4;
+pub const SPECKLE_MIN_PX_CAP: usize = 400;
 const SPECKLE_REF_AREA: usize = 480 * 270;
 
-fn speckle_min_px(w: usize, h: usize) -> usize {
-    (SPECKLE_MIN_PX * w * h / SPECKLE_REF_AREA).max(SPECKLE_MIN_PX_FLOOR)
+/// 지도 크기에 맞춘 반점 크기 문턱(화소 수). 면적 비례, 하한 4, 상한 400.
+pub fn speckle_min_px(w: usize, h: usize) -> usize {
+    let area = w.saturating_mul(h);
+    (SPECKLE_MIN_PX.saturating_mul(area) / SPECKLE_REF_AREA)
+        .clamp(SPECKLE_MIN_PX_FLOOR, SPECKLE_MIN_PX_CAP)
 }
 
-/// 깊이 지도마다 반점 제거를 적용한다. (지워진 화소 수, 걸러내기 전 유효 화소 수).
-fn filter_depth_maps(maps: &mut [DepthMap]) -> (usize, usize) {
+/// 깊이 지도 걸러내기 통계.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpeckleStats {
+    /// 지워진 화소 수.
+    pub removed: usize,
+    /// 걸러내기 전 유효 화소 수(길이가 틀린 지도는 뺀다).
+    pub valid: usize,
+    /// 배열 길이가 틀려 건너뛴 지도 수.
+    pub bad_maps: usize,
+}
+
+impl SpeckleStats {
+    /// 지워진 비율(유효 화소가 없으면 0).
+    pub fn share(&self) -> f64 {
+        self.removed as f64 / self.valid.max(1) as f64
+    }
+}
+
+/// 깊이 지도마다 반점 제거를 적용한다. 길이가 틀린 지도는 건드리지 않고 `bad_maps` 로 센다.
+fn filter_depth_maps(maps: &mut [DepthMap]) -> SpeckleStats {
+    let one = |m: &mut DepthMap| {
+        let min_px = speckle_min_px(m.w, m.h);
+        match remove_speckles(m, SPECKLE_REL, min_px) {
+            Ok(removed) => {
+                let valid = removed
+                    + m.depth
+                        .iter()
+                        .filter(|d| d.is_finite() && **d > 0.0)
+                        .count();
+                SpeckleStats {
+                    removed,
+                    valid,
+                    bad_maps: 0,
+                }
+            }
+            Err(_) => SpeckleStats {
+                bad_maps: 1,
+                ..SpeckleStats::default()
+            },
+        }
+    };
     maps.par_iter_mut()
-        .map(|m| {
-            let valid = m
-                .depth
-                .iter()
-                .filter(|d| d.is_finite() && **d > 0.0)
-                .count();
-            let min_px = speckle_min_px(m.w, m.h);
-            (remove_speckles(m, SPECKLE_REL, min_px), valid)
+        .map(one)
+        .reduce(SpeckleStats::default, |a, b| SpeckleStats {
+            removed: a.removed + b.removed,
+            valid: a.valid + b.valid,
+            bad_maps: a.bad_maps + b.bad_maps,
         })
-        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
 }
 
+/// 구역 하나의 밀집 융합 보고: 반점 제거 통계와 융합 오류.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DenseReport {
+    pub speckle: SpeckleStats,
+    /// 융합 법선 각(도): 점이 성길 때 반점 제거와 법선 검사 중 원인을 가르는 데 쓴다.
+    pub normal_deg: f64,
+    /// 반점 제거 문턱으로 쓴 화소 수(첫 지도 기준, 지도가 없으면 0).
+    pub min_px: usize,
+    /// 오류·경고 문장.
+    pub issues: Vec<String>,
+}
+
+#[cfg(test)]
 fn fuse_stage(st: &DepthStage, cfg: &DenseConfig) -> PointCloud {
     fuse_stage_with(st, &fusion_config(cfg))
 }
@@ -795,12 +881,20 @@ fn fusion_config(cfg: &DenseConfig) -> FusionConfig {
         reproj_px: cfg.reproj_px,
         depth_rel: cfg.depth_rel,
         min_views: cfg.min_views.max(1),
-        normal_deg: 25.0,
+        normal_deg: cfg.normal_deg,
         ..FusionConfig::default()
     }
 }
 
+#[cfg(test)]
 fn fuse_stage_with(st: &DepthStage, fcfg: &FusionConfig) -> PointCloud {
+    fuse_stage_checked(st, fcfg).unwrap_or_default()
+}
+
+fn fuse_stage_checked(
+    st: &DepthStage,
+    fcfg: &FusionConfig,
+) -> Result<PointCloud, fusion::FusionError> {
     let fviews: Vec<FusionView> = st
         .preps
         .iter()
@@ -812,7 +906,7 @@ fn fuse_stage_with(st: &DepthStage, fcfg: &FusionConfig) -> PointCloud {
             group: None,
         })
         .collect();
-    fusion::try_fuse(&fviews, &st.maps, *fcfg).unwrap_or_default()
+    fusion::try_fuse(&fviews, &st.maps, *fcfg)
 }
 
 fn region_cloud_impl(
@@ -822,18 +916,46 @@ fn region_cloud_impl(
     estimate: DepthEstimator,
     sweep: &SweepConfig,
     take_nbrs: usize,
-) -> PointCloud {
+) -> (PointCloud, DenseReport) {
+    let mut report = DenseReport {
+        normal_deg: cfg.normal_deg,
+        ..DenseReport::default()
+    };
     let t_depth = std::time::Instant::now();
     let Some(st) = depth_stage(views, sparse_points, cfg, estimate, sweep, take_nbrs) else {
-        return PointCloud::default();
+        return (PointCloud::default(), report);
     };
     let mut st = st;
-    let _ = filter_depth_maps(&mut st.maps);
+    report.min_px = st.maps.first().map_or(0, |m| speckle_min_px(m.w, m.h));
+    report.speckle = filter_depth_maps(&mut st.maps);
+    if report.speckle.bad_maps > 0 {
+        report.issues.push(format!(
+            "깊이 지도 {}장의 배열 길이가 w·h 와 달라 반점 제거를 건너뜀",
+            report.speckle.bad_maps
+        ));
+    }
     crate::timing::add("dense_depth", t_depth.elapsed().as_secs_f64());
     let t_fuse = std::time::Instant::now();
-    let cloud = fuse_stage(&st, cfg);
+    let cloud = match fuse_stage_checked(&st, &fusion_config(cfg)) {
+        Ok(c) => c,
+        Err(e) => {
+            report.issues.push(format!("융합 실패: {e:?}"));
+            PointCloud::default()
+        }
+    };
     crate::timing::add("fusion", t_fuse.elapsed().as_secs_f64());
-    cloud
+    (cloud, report)
+}
+
+/// [`region_cloud_with`] 와 같고, 구역별 반점 제거 비율·법선 각·융합 오류를 함께 돌려준다.
+pub fn region_cloud_report(
+    views: &[DenseView],
+    sparse_points: &[[f64; 3]],
+    cfg: &DenseConfig,
+    estimate: DepthEstimator,
+    sweep: &SweepConfig,
+) -> (PointCloud, DenseReport) {
+    region_cloud_impl(views, sparse_points, cfg, estimate, sweep, SWEEP_NEIGHBORS)
 }
 
 #[cfg(test)]
@@ -1126,7 +1248,7 @@ mod tests {
             let secs = t.elapsed().as_secs_f64();
             // 기본 흐름과 같게 반점 제거를 거친 뒤 융합한다(깊이 오차 줄은 제거 전 지도).
             let mut filtered = copy_stage(&st);
-            let (removed, valid) = filter_depth_maps(&mut filtered.maps);
+            let SpeckleStats { removed, valid, .. } = filter_depth_maps(&mut filtered.maps);
             let cloud = fuse_stage(&filtered, &cfg);
             let (med, p95, over1) = dist_stats(&s, &cloud);
             let line = if ps == 0.0 {
@@ -1220,7 +1342,8 @@ mod tests {
         for (name, speckle, fc) in variants {
             let mut st2 = copy_stage(&st);
             let (removed, valid) = if speckle {
-                filter_depth_maps(&mut st2.maps)
+                let st = filter_depth_maps(&mut st2.maps);
+                (st.removed, st.valid)
             } else {
                 (0, 0)
             };
@@ -1253,6 +1376,71 @@ mod tests {
         assert_eq!(speckle_min_px(240, 135), 25);
         assert_eq!(speckle_min_px(80, 45), SPECKLE_MIN_PX_FLOOR);
         assert_eq!(speckle_min_px(8, 8), SPECKLE_MIN_PX_FLOOR);
+        // 상한 400: 960×540 이상은 모두 400. 곱이 넘치는 크기도 죽지 않는다.
+        assert_eq!(speckle_min_px(1280, 720), 400);
+        assert_eq!(speckle_min_px(1920, 1080), 400);
+        assert_eq!(speckle_min_px(3840, 2160), 400);
+        assert_eq!(speckle_min_px(usize::MAX, usize::MAX), 400);
+    }
+
+    /// 상한 도입 전 식(하한만 있음).
+    fn old_min_px(w: usize, h: usize) -> usize {
+        (100 * w * h / (480 * 270)).max(4)
+    }
+
+    #[test]
+    fn cap_changes_only_maps_above_960_wide() {
+        // 960×540 이하는 상한 도입 전과 같고, 그 위만 바뀐다.
+        for (w, h) in [(80, 45), (192, 108), (480, 270), (640, 360), (960, 540)] {
+            assert_eq!(speckle_min_px(w, h), old_min_px(w, h), "{w}x{h}");
+        }
+        let rows: Vec<(usize, usize, usize)> = [1280usize, 1920, 3840]
+            .iter()
+            .map(|&w| (w, old_min_px(w, w * 9 / 16), speckle_min_px(w, w * 9 / 16)))
+            .collect();
+        eprintln!("CAP width, old min_px, new min_px: {rows:?}");
+        assert_eq!(
+            rows,
+            vec![(1280, 711, 400), (1920, 1600, 400), (3840, 6400, 400)]
+        );
+    }
+
+    #[test]
+    fn thin_true_structure_survives_at_1920() {
+        // 1920×1080 지도: 큰 벽(300×300), 가는 기둥(8×120 = 960 화소, 벽과 깊이가 크게 달라 별도 성분),
+        // 진짜 반점 3x3 두 개(9 화소 ×2). 상한이 없으면 문턱이 1600 이라 기둥(960)이 지워진다.
+        let (w, h) = (1920usize, 1080usize);
+        assert!(old_min_px(w, h) > 960, "상한 전 문턱 {}", old_min_px(w, h));
+        let mut m = blank(w, h);
+        fill(&mut m, 100..400, 100..400, 30.0);
+        fill(&mut m, 600..608, 200..320, 12.0);
+        fill(&mut m, 1000..1003, 500..503, 20.0);
+        fill(&mut m, 1500..1503, 900..903, 25.0);
+        let st = filter_depth_maps(std::slice::from_mut(&mut m));
+        assert_eq!(st.bad_maps, 0);
+        assert_eq!(st.valid, 300 * 300 + 960 + 9 + 9);
+        assert_eq!(st.removed, 18, "반점 18 화소만 지워진다");
+        assert_eq!(m.depth[200 * w + 603], 12.0, "기둥 보존");
+        assert_eq!(m.depth[501 * w + 1001], 0.0);
+        // 기둥보다 작은 조각(399 화소)은 여전히 지워진다.
+        let mut m2 = blank(w, h);
+        fill(&mut m2, 600..621, 200..219, 12.0); // 21×19 = 399
+        assert_eq!(
+            filter_depth_maps(std::slice::from_mut(&mut m2)).removed,
+            399
+        );
+    }
+
+    #[test]
+    fn invalid_cost_has_one_marker() {
+        let mut m = blank(4, 1);
+        m.depth = vec![5.0, 0.0, f32::NAN, 7.0];
+        m.cost = vec![0.2, 2.0, 2.0, 0.3];
+        mark_invalid_cost(&mut m);
+        assert_eq!(m.cost[0], 0.2);
+        assert_eq!(m.cost[1], f32::INFINITY);
+        assert_eq!(m.cost[2], f32::INFINITY);
+        assert_eq!(m.cost[3], 0.3);
     }
 
     /// 반점 제거로 지워진 비율과 960 폭 장당 시간(무시 측정).
@@ -1273,9 +1461,9 @@ mod tests {
             let mut fixed = st.maps.clone();
             let fixed_removed: usize = fixed
                 .iter_mut()
-                .map(|m| remove_speckles(m, SPECKLE_REL, SPECKLE_MIN_PX))
+                .map(|m| rs(m, SPECKLE_REL, SPECKLE_MIN_PX))
                 .sum();
-            let (removed, valid) = filter_depth_maps(&mut st.maps);
+            let SpeckleStats { removed, valid, .. } = filter_depth_maps(&mut st.maps);
             let share = removed as f64 / valid.max(1) as f64;
             let fixed_share = fixed_removed as f64 / valid.max(1) as f64;
             eprintln!(
@@ -1288,7 +1476,13 @@ mod tests {
                 std::thread::available_parallelism().map_or(0, |n| n.get()),
                 load.trim()
             );
-            assert!(share <= fixed_share, "너비 {w}: {share} > {fixed_share}");
+            // 문턱이 100 보다 작으면(작은 지도) 고정 100 보다 적게, 크면(큰 지도) 많게 지운다.
+            let min_px = speckle_min_px(w as usize, h as usize);
+            if min_px >= SPECKLE_MIN_PX {
+                assert!(share >= fixed_share, "너비 {w}: {share} < {fixed_share}");
+            } else {
+                assert!(share <= fixed_share, "너비 {w}: {share} > {fixed_share}");
+            }
         }
     }
 
@@ -1348,7 +1542,7 @@ mod tests {
                 if minpx > 0 {
                     for (i, m) in maps.iter_mut().enumerate() {
                         let before = m.depth.clone();
-                        removed += remove_speckles(m, rel, minpx);
+                        removed += rs(m, rel, minpx);
                         let mut v = s.views[st.src[i]].clone();
                         v.camera = st.preps[i].camera;
                         let (_, gt) = s.render(&v);
@@ -1416,7 +1610,7 @@ mod tests {
         for x in 20..25 {
             m.depth[x] = 20.0;
         }
-        let removed = remove_speckles(&mut m, 0.007, 100);
+        let removed = rs(&mut m, 0.007, 100);
         assert_eq!(removed, 14);
         assert_eq!(m.depth[0], 10.0);
         assert_eq!(m.depth[31 * w + 31], 0.0);
@@ -1451,7 +1645,7 @@ mod tests {
         let mut m = blank(40, 40);
         fill(&mut m, 0..12, 0..12, 10.0);
         fill(&mut m, 12..21, 12..21, 10.0);
-        let removed = remove_speckles(&mut m, 0.007, 100);
+        let removed = rs(&mut m, 0.007, 100);
         assert_eq!(removed, 81);
         assert_eq!(m.depth[11 * 40 + 11], 10.0);
         assert_eq!(m.depth[12 * 40 + 12], 0.0);
@@ -1468,7 +1662,7 @@ mod tests {
             }
         }
         let before = m.depth.clone();
-        assert_eq!(remove_speckles(&mut m, 0.007, 100), 0);
+        assert_eq!(rs(&mut m, 0.007, 100), 0);
         assert_eq!(m.depth, before);
     }
 
@@ -1478,7 +1672,7 @@ mod tests {
         let mut m = blank(40, 40);
         fill(&mut m, 0..20, 0..20, 10.0);
         fill(&mut m, 20..25, 0..5, 10.08);
-        assert_eq!(remove_speckles(&mut m, 0.007, 100), 25);
+        assert_eq!(rs(&mut m, 0.007, 100), 25);
         assert_eq!(m.depth[0], 10.0);
         assert_eq!(m.depth[22], 0.0);
     }
@@ -1489,9 +1683,157 @@ mod tests {
         let mut m = blank(40, 40);
         fill(&mut m, 0..20, 0..20, 8.0);
         fill(&mut m, 20..25, 0..5, 10.0);
-        assert_eq!(remove_speckles(&mut m, 0.25, 100), 25);
+        assert_eq!(rs(&mut m, 0.25, 100), 25);
         assert_eq!(m.depth[0], 8.0);
         assert_eq!(m.depth[22], 0.0);
+    }
+
+    #[test]
+    fn relative_gap_is_symmetric_in_every_layout() {
+        // 깊이 8 과 10 조각의 상대차는 분모를 min 으로 잡아 어느 쪽을 먼저 훑든 2/8 = 0.25.
+        // (rel, 지운 화소 수): 0.25 는 동치라 분리, 0.22 는 분리, 0.26 은 합쳐짐.
+        for (rel, expect) in [(0.25f32, 25usize), (0.22, 25), (0.26, 0)] {
+            // 배치 1: 큰 쪽 8 이 왼쪽(먼저 훑음). 배치 2: 큰 쪽 10 이 왼쪽.
+            // 배치 3: 작은 8 조각이 왼쪽(먼저 훑음). 배치 4: 작은 10 조각이 왼쪽.
+            for (big_l, small_l, big_d, small_d) in [
+                (0..20, 20..25, 8.0, 10.0),
+                (0..20, 20..25, 10.0, 8.0),
+                (5..25, 0..5, 10.0, 8.0),
+                (5..25, 0..5, 8.0, 10.0),
+            ] {
+                let mut m = blank(40, 40);
+                fill(&mut m, big_l.clone(), 0..20, big_d);
+                fill(&mut m, small_l.clone(), 0..5, small_d);
+                // 한 조각 25 화소만 문턱 아래, 큰 조각 400 은 항상 남는다.
+                let r = rs(&mut m, rel, 100);
+                let expect = if expect == 25 { 25 } else { 0 };
+                assert_eq!(r, expect, "rel {rel} big {big_d} small {small_d}");
+            }
+        }
+    }
+
+    #[test]
+    fn overflowing_map_size_is_an_error_not_a_panic() {
+        let mut m = DepthMap {
+            w: usize::MAX,
+            h: 2,
+            depth: vec![],
+            normal: vec![],
+            cost: vec![],
+        };
+        assert_eq!(
+            remove_speckles(&mut m, 0.007, 100),
+            Err(BadMapLen {
+                w: usize::MAX,
+                h: 2,
+                len: 0
+            })
+        );
+    }
+
+    #[test]
+    fn bad_maps_are_counted_apart_from_nothing_removed() {
+        let mut ok = blank(40, 40);
+        fill(&mut ok, 0..3, 0..1, 10.0); // 3 화소 < 하한 4
+        let mut bad = blank(4, 4);
+        bad.depth.truncate(8);
+        let mut maps = vec![ok, bad, blank(8, 8)];
+        let st = filter_depth_maps(&mut maps);
+        assert_eq!(
+            st,
+            SpeckleStats {
+                removed: 3,
+                valid: 3,
+                bad_maps: 1
+            }
+        );
+        assert_eq!(st.share(), 1.0);
+        // 지운 것이 없는 정상 지도는 Ok(0), 잘못된 지도와 다르다.
+        let mut none = blank(8, 8);
+        assert_eq!(remove_speckles(&mut none, 0.007, 100), Ok(0));
+    }
+
+    fn short_map_estimator(
+        r: &DepthView,
+        _: &[&DepthView],
+        _: (f64, f64),
+        _: &SweepConfig,
+    ) -> DepthMap {
+        let k = r.camera.intrinsics;
+        let mut m = empty_map(k.width as usize, k.height as usize);
+        m.depth.truncate(3);
+        m
+    }
+
+    #[test]
+    fn short_maps_are_reported_for_the_region() {
+        let (_, views, sparse) = scene_views(4, 96, 54);
+        let cfg = DenseConfig {
+            max_width: 96,
+            ..DenseConfig::default()
+        };
+        let (cloud, rep) = region_cloud_report(
+            &views,
+            &sparse,
+            &cfg,
+            short_map_estimator,
+            &SweepConfig::default(),
+        );
+        assert!(cloud.is_empty());
+        assert_eq!(rep.speckle.bad_maps, views.len());
+        assert_eq!(rep.speckle.removed, 0);
+        assert!(
+            rep.issues.iter().any(|i| i.contains("배열 길이")),
+            "{:?}",
+            rep.issues
+        );
+        assert!(
+            rep.issues.iter().any(|i| i.contains("융합 실패")),
+            "{:?}",
+            rep.issues
+        );
+    }
+
+    #[test]
+    fn normal_angle_is_a_config_field_and_changes_fusion() {
+        assert_eq!(DenseConfig::default().normal_deg, 25.0);
+        assert_eq!(fusion_config(&DenseConfig::default()).normal_deg, 25.0);
+        let (_, views, sparse) = scene_views(4, 96, 54);
+        let run = |deg: f64| {
+            let cfg = DenseConfig {
+                max_width: 96,
+                normal_deg: deg,
+                ..DenseConfig::default()
+            };
+            let (c, rep) =
+                region_cloud_report(&views, &sparse, &cfg, sweep_depth, &SweepConfig::default());
+            assert_eq!(rep.normal_deg, deg);
+            assert_eq!(rep.min_px, speckle_min_px(96, 54));
+            assert!(rep.speckle.valid > 0 && rep.speckle.share() < 1.0);
+            eprintln!(
+                "NORMAL {deg}: points {} speckle share {:.4}",
+                c.len(),
+                rep.speckle.share()
+            );
+            c.len()
+        };
+        let (n25, n1) = (run(25.0), run(1.0));
+        let n_default = region_cloud(
+            &views,
+            &sparse,
+            &DenseConfig {
+                max_width: 96,
+                ..DenseConfig::default()
+            },
+        )
+        .len();
+        assert_eq!(n25, n_default, "기본값 그대로");
+        assert!(n1 < n25, "법선 각 1도는 점이 줄어야 한다: {n1} vs {n25}");
+    }
+
+    /// 길이가 맞는 지도에서 지운 화소 수.
+    fn rs(m: &mut DepthMap, rel: f32, min_px: usize) -> usize {
+        remove_speckles(m, rel, min_px).expect("지도 길이 정상")
     }
 
     #[test]
@@ -1503,7 +1845,11 @@ mod tests {
             normal: vec![[0.0, 0.0, 1.0]; 8],
             cost: vec![0.1; 8],
         };
-        assert_eq!(remove_speckles(&mut m, 0.007, 100), 0);
+        // 길이 불일치는 "지운 것 없음"(Ok(0)) 과 다른 값(Err)이다.
+        assert_eq!(
+            remove_speckles(&mut m, 0.007, 100),
+            Err(BadMapLen { w: 4, h: 4, len: 8 })
+        );
         assert_eq!(m.depth, vec![5.0; 8]);
         assert_eq!(m.cost, vec![0.1; 8]);
     }
