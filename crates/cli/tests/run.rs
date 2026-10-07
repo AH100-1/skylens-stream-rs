@@ -200,3 +200,59 @@ fn run_accepts_per_drone_gps() {
     );
     assert!(s.contains("positions 3\n"), "{s}");
 }
+
+#[test]
+fn run_reports_frame_missing_from_all_cameras() {
+    let t = TempDir::new("allgone");
+    let input = t.0.join("in");
+    make_dataset(&input, 40);
+    for cam in ["camF", "camR", "camL"] {
+        std::fs::remove_file(input.join(format!("images/{cam}/{cam}_0006.jpg"))).unwrap();
+    }
+    let o = t.0.join("o");
+    let out = run(&[input.to_str().unwrap(), o.to_str().unwrap()]);
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{s}");
+    assert!(s.contains("positions 13\n"), "{s}");
+    assert!(
+        s.contains("skipped 1 (frames 6)\nskip frame 6 missing camF,camR,camL\n"),
+        "{s}"
+    );
+}
+
+#[test]
+fn run_summarizes_huge_gap_as_range() {
+    // 프레임 0 과 5000000 만 있고 허용 10^7: 출력은 구간 요약 한 줄이고 짧다.
+    let t = TempDir::new("biggap");
+    let input = t.0.join("in");
+    let mut gps = String::new();
+    for cam in ["camF", "camR", "camL"] {
+        let d = input.join("images").join(cam);
+        std::fs::create_dir_all(&d).unwrap();
+        for f in [0u32, 5_000_000] {
+            std::fs::write(d.join(format!("{cam}_{f:04}.jpg")), b"x").unwrap();
+            gps += &format!("{cam}_{f:04}.jpg 37.5 127.0 30.0\n");
+        }
+    }
+    std::fs::write(input.join("gps.txt"), gps).unwrap();
+    let o = t.0.join("o");
+    let t0 = std::time::Instant::now();
+    let out = run(&[
+        input.to_str().unwrap(),
+        o.to_str().unwrap(),
+        "--stride",
+        "1",
+        "--max-skip-run",
+        "10000000",
+    ]);
+    let dt = t0.elapsed().as_secs_f64();
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{s}");
+    assert!(dt < 5.0, "{dt} s");
+    assert!(s.len() < 1024, "{} bytes", s.len());
+    assert!(
+        s.contains("skipped 4999999 (frames 1..=4999999 step 1)\n")
+            && s.contains("skip frames 1..=4999999 step 1 missing camF,camR,camL\n"),
+        "{s}"
+    );
+}
