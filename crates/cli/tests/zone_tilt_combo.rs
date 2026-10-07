@@ -80,7 +80,7 @@ struct Metrics {
     surface_p95: f64,
 }
 
-fn measure(input: &Path, output: &Path) -> Metrics {
+fn measure(input: &Path, output: &Path, seed: u64) -> Metrics {
     let shift = truth_to_output_shift(input);
     // 정답 카메라 중심 C = -Rᵀ t (이름 뒤 내부 파라미터 6개, 그다음 R 행 우선 9개, t 3개).
     let mut truth = std::collections::HashMap::new();
@@ -117,6 +117,7 @@ fn measure(input: &Path, output: &Path) -> Metrics {
     let scene = Scene::new(SceneConfig {
         width: 320,
         height: 180,
+        seed,
         ..SceneConfig::default()
     });
     let mut d = Vec::new();
@@ -150,10 +151,19 @@ fn measure(input: &Path, output: &Path) -> Metrics {
 #[test]
 #[ignore]
 fn zone_tilt_combo_seed1() {
-    let t = TempDir::new("zone_tilt_combo");
+    // 장면 시드는 `SKYLENS_TEST_SEED`(기본 1). 시드 1 만 기준을 단언한다.
+    let seed: u64 = std::env::var("SKYLENS_TEST_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let t = TempDir::new(&format!("zone_tilt_combo{seed}"));
     let (input, output) = (t.0.join("in"), t.0.join("out"));
     let (i, o) = (input.to_str().unwrap(), output.to_str().unwrap());
-    assert_eq!(cli(&["synth", i]).0, 0);
+    let scene = Scene::new(SceneConfig {
+        seed,
+        ..SceneConfig::default()
+    });
+    scene.write_dataset(&input).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_skylens-stream"))
         .args(["run", i, o])
         .env("SKYLENS_DIAG_PREVIEW", "1")
@@ -167,11 +177,14 @@ fn zone_tilt_combo_seed1() {
     }
     let (_, vout, _) = cli(&["verify", o]);
     eprintln!("{vout}");
-    let m = measure(&input, &output);
+    let m = measure(&input, &output, seed);
     eprintln!(
         "RESULT registered {} center med {:.4} max {:.4} points {} surface med {:.4} p95 {:.4}",
         m.registered, m.center_med, m.center_max, m.points, m.surface_med, m.surface_p95
     );
+    if seed != 1 {
+        return;
+    }
     assert!(vout.contains("결과: 8/8 통과"), "verify 8/8 이어야 한다");
     assert_eq!(m.registered, 81);
     assert!(
