@@ -1,4 +1,4 @@
-//! 출력 폴더 검증 (SPEC §2 출력 구조, §4 검증 기준 일곱 항목).
+//! 출력 폴더 검증 (SPEC §2 출력 구조, §4 검증 기준 일곱 항목 + 여덟째 `up_cross`).
 //!
 //! 읽는 파일:
 //! - `report.json` (출력 폴더 바로 아래, 선택): 포즈 단계 기록. SPEC §2 출력 목록에 없는 파일이다.
@@ -64,6 +64,12 @@ pub const NN_CAP_M: f64 = 2.0 * NN_MEDIAN_MAX_M;
 pub const MAX_QUERIES: usize = 200_000;
 /// 이 값보다 큰 |좌표|(m)의 점은 계산에서 뺀다 (지역 직교 좌표에서 나올 수 없는 값).
 pub const COORD_LIMIT_M: f64 = 1e7;
+/// 카메라 묶음 위 방향 일치: 구역별 최대 어긋남(도)이 이 값을 넘으면 FAIL.
+/// 근거: 정상 실행 시드 1/2/3 구역별 최대 1.449° 이하, 한 기체 짐벌 구름 1~2° 장면 1.1~1.3°,
+/// 회전이 틀린 묶음은 47° 이상(시드 3 구역 0: 최대 69.5°). 정상 최대의 약 7배, 고장의 1/4 이하.
+pub const UP_CROSS_FAIL_DEG: f64 = 10.0;
+/// 이 값을 넘고 `UP_CROSS_FAIL_DEG` 이하면 경고(통과). `skylens run` 의 문턱과 같다.
+pub const UP_CROSS_WARN_DEG: f64 = 0.3;
 const EPS: f64 = 1e-9;
 
 // ---------------------------------------------------------------- 결과
@@ -159,6 +165,7 @@ pub const ITEM_ALIGN: &str = "preview_align";
 pub const ITEM_PREVIEW_REFINED: &str = "preview_vs_refined";
 pub const ITEM_OVERLAP: &str = "refined_overlap";
 pub const ITEM_SNAPSHOTS: &str = "snapshots";
+pub const ITEM_UP_CROSS: &str = "up_cross";
 
 fn item(name: &'static str, criterion: &'static str, r: Result<(bool, String), String>) -> Item {
     match r {
@@ -202,6 +209,90 @@ fn report_item(
             r.as_ref().map_err(Clone::clone).and_then(check),
         ),
     }
+}
+
+/// 여덟째 항목. report.json 이 없거나 `up_cross_check` 가 없으면 '건너뜀'(통과로 셈).
+fn up_cross_item(report: &ReportJson) -> Item {
+    const CRIT: &str = "구역별 카메라 묶음 위 방향 최대 어긋남 ≤ 10° (0.3° 초과는 경고, report.json 에 없으면 건너뜀)";
+    match report {
+        ReportJson::Absent => Item {
+            name: ITEM_UP_CROSS,
+            pass: true,
+            decided: true,
+            measured: "건너뜀 (report.json 없음)".into(),
+            criterion: CRIT,
+        },
+        ReportJson::Read(r) => item(
+            ITEM_UP_CROSS,
+            CRIT,
+            r.as_ref().map_err(Clone::clone).and_then(check_up_cross),
+        ),
+    }
+}
+
+/// 구역별 최대 어긋남을 `(구역 번호, 최대 도)` 로 모은다. 값이 모두 null 인 구역은 뺀다.
+fn check_up_cross(r: &Json) -> Result<(bool, String), String> {
+    let Some(u) = r.get("up_cross_check") else {
+        return Ok((true, "건너뜀 (report.json 에 up_cross_check 없음)".into()));
+    };
+    let regs = u
+        .get("regions")
+        .and_then(Json::as_array)
+        .ok_or("up_cross_check.regions 없음")?;
+    let mut per: Vec<(String, f64)> = Vec::new();
+    for (i, g) in regs.iter().enumerate() {
+        let k = g
+            .get("region")
+            .and_then(as_index)
+            .map_or(i.to_string(), |k| k.to_string());
+        let d = g
+            .get("diff_deg")
+            .and_then(Json::as_array)
+            .ok_or("up_cross_check.regions[].diff_deg 없음")?;
+        let mut mx: Option<f64> = None;
+        for v in d {
+            if let Some(x) = v.as_f64() {
+                if !x.is_finite() || x < 0.0 {
+                    return Err(format!("구역 {k} diff_deg 값 {x} 이 올바르지 않음"));
+                }
+                mx = Some(mx.map_or(x, |m| m.max(x)));
+            } else if *v != Json::Null {
+                return Err(format!("구역 {k} diff_deg 가 숫자 또는 null 이 아님"));
+            }
+        }
+        if let Some(m) = mx {
+            per.push((k, m));
+        }
+    }
+    if per.is_empty() {
+        return Ok((true, "측정값 없음 (검사할 수 있는 구역 없음)".into()));
+    }
+    let list = per
+        .iter()
+        .map(|(k, m)| format!("{k}:{m:.3}°"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let failed: Vec<&str> = per
+        .iter()
+        .filter(|(_, m)| *m > UP_CROSS_FAIL_DEG)
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !failed.is_empty() {
+        return Ok((
+            false,
+            format!(
+                "구역 {} 최대 어긋남 > {UP_CROSS_FAIL_DEG}° (구역별 최대 {list})",
+                failed.join(",")
+            ),
+        ));
+    }
+    let warn = per.iter().any(|(_, m)| *m > UP_CROSS_WARN_DEG);
+    let tag = if warn {
+        format!("경고: {UP_CROSS_WARN_DEG}° 초과, ")
+    } else {
+        String::new()
+    };
+    Ok((true, format!("{tag}구역별 최대 {list}")))
 }
 
 /// `report.json` 읽기 결과: 출력 폴더는 있는데 파일만 없으면 `Absent`.
@@ -309,6 +400,7 @@ pub fn verify_dir(dir: &Path) -> Report {
                 )
             }),
         ),
+        up_cross_item(&report_src),
     ];
     Report { items }
 }
@@ -1202,6 +1294,54 @@ mod tests {
         );
         assert!(parse_json("{\"a\":1,}").is_err());
         assert!(parse_json("[1 2]").is_err());
+    }
+
+    fn up_cross(json: &str) -> Result<(bool, String), String> {
+        check_up_cross(&parse_json(json).unwrap())
+    }
+
+    fn up_cross_report(d0: &str, d1: &str) -> String {
+        format!(
+            r#"{{"up_cross_check":{{"threshold_deg":0.3,"regions":[
+{{"region":0,"cameras":["F","R","L"],"diff_deg":[{d0}]}},
+{{"region":1,"cameras":["F","R","L"],"diff_deg":[{d1}]}}]}}}}"#
+        )
+    }
+
+    /// 손으로 만든 report: 정상(≤0.3°) 통과, 0.3~10° 경고(통과), 10° 초과 FAIL, 항목 없음 건너뜀(통과).
+    #[test]
+    fn up_cross_pass_warn_fail_skip() {
+        let (ok, m) = up_cross(&up_cross_report("0.02, 0.03, 0.01", "0.25, null, 0.1")).unwrap();
+        assert!(ok && !m.contains("경고"), "{m}");
+        assert!(m.contains("0:0.030°") && m.contains("1:0.250°"), "{m}");
+        // 시드 2 구역 2 실측 1.386° → 경고, 통과.
+        let (ok, m) = up_cross(&up_cross_report("0.02, 0.03", "1.386, 0.5, 0.2")).unwrap();
+        assert!(ok && m.contains("경고"), "{m}");
+        // 경계: 정확히 10° 는 통과, 10.001° 는 FAIL.
+        assert!(up_cross(&up_cross_report("10.0", "0.1")).unwrap().0);
+        // 시드 3 구역 0 실측 69.509° → FAIL, 구역 번호 표시.
+        let (ok, m) = up_cross(&up_cross_report("69.509, 47.0, 70.0", "0.25")).unwrap();
+        assert!(
+            !ok && m.contains("구역 0 ") && m.contains("0:70.000°"),
+            "{m}"
+        );
+        let (ok, m) = up_cross(&up_cross_report("0.1", "10.001")).unwrap();
+        assert!(!ok && m.contains("구역 1 "), "{m}");
+        // 항목 없음 → 건너뜀(통과).
+        let (ok, m) = up_cross(r#"{"registered":{"total":1}}"#).unwrap();
+        assert!(ok && m.starts_with("건너뜀"), "{m}");
+        // 값이 모두 null → 통과, 측정값 없음.
+        let (ok, m) = up_cross(&up_cross_report("null", "")).unwrap();
+        assert!(ok && m.contains("측정값 없음"), "{m}");
+        // 형식 오류는 오류.
+        assert!(up_cross(r#"{"up_cross_check":{}}"#).is_err());
+        assert!(up_cross(&up_cross_report("\"x\"", "0.1")).is_err());
+    }
+
+    #[test]
+    fn up_cross_item_absent_report_is_skipped_pass() {
+        let it = up_cross_item(&ReportJson::Absent);
+        assert!(it.pass && it.decided && it.measured.starts_with("건너뜀"));
     }
 
     #[test]
