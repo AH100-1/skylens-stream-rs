@@ -1823,12 +1823,12 @@ fn shared_pairs(a: &[Track], b: &[Track], window: (usize, usize)) -> SharedPairs
 
 /// 정렬 닮음 변환이 연직을 이보다 더 기울이면 정렬 대상(정밀 모델)이 틀어진 것으로 보고 쓰지 않는다(도).
 /// 구역 정렬에서 정상인 연직 기울기는 4° 안쪽이고, 짧은 마지막 구역의 틀어진 정밀 모델(10~13°)이
-/// 이미 맞는 초벌·다른 구역 정밀 점군까지 같이 기울이는 것을 막는다. `SKYLENS_ALIGN_MAX_TILT` 로 바꾼다(0 이하면 끔).
+/// 이미 맞는 초벌·다른 구역 정밀 점군까지 같이 기울이는 것을 막는다. `SKYLENS_ALIGN_MAX_TILT`(도)로 켠다. 기본은 꺼짐(0): 켜면 구역 2 의 초벌·정밀 쌍이 어긋나 verify 가 악화된다.
 fn align_max_tilt_deg() -> f64 {
     std::env::var("SKYLENS_ALIGN_MAX_TILT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(6.0)
+        .unwrap_or(0.0)
 }
 
 fn tilt_deg(s: &Similarity) -> f64 {
