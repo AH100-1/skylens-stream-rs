@@ -871,6 +871,7 @@ pub struct DenseReport {
     pub issues: Vec<String>,
 }
 
+#[cfg(test)]
 fn fuse_stage(st: &DepthStage, cfg: &DenseConfig) -> PointCloud {
     fuse_stage_with(st, &fusion_config(cfg))
 }
@@ -885,6 +886,7 @@ fn fusion_config(cfg: &DenseConfig) -> FusionConfig {
     }
 }
 
+#[cfg(test)]
 fn fuse_stage_with(st: &DepthStage, fcfg: &FusionConfig) -> PointCloud {
     fuse_stage_checked(st, fcfg).unwrap_or_default()
 }
