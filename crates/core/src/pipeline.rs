@@ -1152,10 +1152,22 @@ fn dump_rotavg(n: usize, pm: &[PairMatch], keep: &[bool], rots: &[Option<Rotatio
     let _ = std::fs::write(dir.join(format!("rotavg_{c:03}_{n}.txt")), txt);
 }
 
-/// 회전 평균 설정. 환경 변수 `SKYLENS_ROT_BRIDGE` 가 1 이면 덩어리 잇기를 켠다(기본 끔).
-fn rot_cfg() -> AveragingConfig {
+/// 회전 평균 설정. 환경 변수 `SKYLENS_ROT_BRIDGE` 가 1 이면 덩어리 잇기를, `SKYLENS_ROT_CROSS_THRESH` 가 1 이면
+/// 카메라 묶음 사이 간선의 이상치 문턱 따로 정하기를 켠다(둘 다 기본 끔).
+fn rot_cfg(n: usize, pm: &[PairMatch]) -> AveragingConfig {
+    let cross = std::env::var("SKYLENS_ROT_CROSS_THRESH").as_deref() == Ok("1");
+    let mut vertex_groups = Vec::new();
+    if cross {
+        vertex_groups = vec![0usize; n];
+        for p in pm {
+            vertex_groups[p.i] = p.views.0 .0;
+            vertex_groups[p.j] = p.views.1 .0;
+        }
+    }
     AveragingConfig {
         bridge_components: std::env::var("SKYLENS_ROT_BRIDGE").as_deref() == Ok("1"),
+        cross_thresh: cross,
+        vertex_groups,
         ..AveragingConfig::default()
     }
 }
@@ -1178,7 +1190,7 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
     if opts.pair_vote {
         vote_pairs(n, pm, &mut keep);
     }
-    let ra = average_rotations(n, &mk(&keep), &rot_cfg())
+    let ra = average_rotations(n, &mk(&keep), &rot_cfg(n, pm))
         .ok_or("회전 평균 실패: 쓸 수 있는 간선 없음")?;
     let mut rots = ra.rotations;
     dump_rotavg(n, pm, &keep, &rots);
@@ -1193,7 +1205,7 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
                         _ => false,
                     };
             }
-            if let Some(r2) = average_rotations(n, &mk(&keep), &rot_cfg()) {
+            if let Some(r2) = average_rotations(n, &mk(&keep), &rot_cfg(n, pm)) {
                 rots = r2.rotations;
             }
         }

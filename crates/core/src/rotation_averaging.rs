@@ -68,6 +68,15 @@ pub struct AveragingConfig {
     pub bridge_components: bool,
     /// 덩어리 잇기에서 같은 무리로 보는 각(rad).
     pub bridge_agree_rad: f64,
+    /// 참이면 이상치 문턱을 간선 종류별로 따로 정한다: 양 끝 정점의 묶음(`vertex_groups`)이 같은 간선은
+    /// 기존 문턱, 다른 간선(묶음 사이)은 묶음 사이 간선 잔차의 중앙값으로 정하되 하한이 `cross_floor_rad`.
+    pub cross_thresh: bool,
+    /// 묶음 사이 간선 문턱의 하한(rad). 묶음 내부 하한(`outlier_threshold_rad`)보다 크게 둔다.
+    pub cross_floor_rad: f64,
+    /// 정점별 묶음 번호(카메라 묶음). 길이가 정점 수와 다르면 `cross_thresh` 는 무시된다.
+    pub vertex_groups: Vec<usize>,
+    /// 묶음 쌍 사이에 유지된 간선이 이 수 이하이면 결과의 `sparse_group_links` 에 남긴다.
+    pub min_cross_links: usize,
 }
 
 impl Default for AveragingConfig {
@@ -86,6 +95,10 @@ impl Default for AveragingConfig {
             active_set_rounds: 8,
             bridge_components: false,
             bridge_agree_rad: 8f64.to_radians(),
+            cross_thresh: false,
+            cross_floor_rad: 5f64.to_radians(),
+            vertex_groups: Vec::new(),
+            min_cross_links: 2,
         }
     }
 }
@@ -110,12 +123,19 @@ pub struct AveragingResult {
     pub outlier_threshold_rad: f64,
     /// 거짓이면 이상치가 너무 많아 잡음 추정이 무너졌다(문턱이 상한에 걸림 또는 정상 비율 부족).
     pub reliable: bool,
+    /// 묶음 사이 문턱을 따로 썼을 때의 그 문턱(rad). 쓰지 않았으면 None.
+    pub cross_threshold_rad: Option<f64>,
+    /// 경고: 입력에 간선이 있었으나 유지된 간선이 `min_cross_links` 이하인 묶음 쌍 (묶음 a, 묶음 b, 유지 수), a < b.
+    pub sparse_group_links: Vec<(usize, usize, usize)>,
 }
 
 /// 잔차 각(rad) 목록에서 이상치 문턱을 정한다: clamp(k·중앙값/1.5382, 하한, 상한).
 /// 둘째 값은 상한에 걸렸는지.
 fn adaptive_threshold(residuals: &[f64], cfg: &AveragingConfig) -> (f64, bool) {
-    let floor = cfg.outlier_threshold_rad;
+    adaptive_threshold_floor(residuals, cfg, cfg.outlier_threshold_rad)
+}
+
+fn adaptive_threshold_floor(residuals: &[f64], cfg: &AveragingConfig, floor: f64) -> (f64, bool) {
     let mut r: Vec<f64> = residuals
         .iter()
         .copied()
@@ -721,11 +741,46 @@ pub fn average_rotations(
         .iter()
         .map(|&k| edge_residual(&edges[k], &rot))
         .collect();
-    let (thr, capped) = adaptive_threshold(&robust_res, cfg);
+    let cross_on = cfg.cross_thresh && cfg.vertex_groups.len() == n;
+    let is_cross =
+        |k: usize| cross_on && cfg.vertex_groups[edges[k].i] != cfg.vertex_groups[edges[k].j];
+    let intra_res: Vec<f64> = comp_ids
+        .iter()
+        .zip(&robust_res)
+        .filter(|(&k, _)| !is_cross(k))
+        .map(|(_, &r)| r)
+        .collect();
+    let cross_res: Vec<f64> = comp_ids
+        .iter()
+        .zip(&robust_res)
+        .filter(|(&k, _)| is_cross(k))
+        .map(|(_, &r)| r)
+        .collect();
+    let (thr, mut capped) = if cross_on && !intra_res.is_empty() {
+        adaptive_threshold(&intra_res, cfg)
+    } else {
+        adaptive_threshold(&robust_res, cfg)
+    };
+    let cross_thr = if cross_on && !cross_res.is_empty() {
+        let floor = cfg.cross_floor_rad.max(cfg.outlier_threshold_rad);
+        let (t, c) = adaptive_threshold_floor(&cross_res, cfg, floor);
+        capped |= c;
+        Some(t)
+    } else {
+        None
+    };
+    // 간선별 문턱: 묶음 사이 간선은 따로 정한 문턱(없으면 공통 문턱).
+    let thr_of = |k: usize| {
+        if is_cross(k) {
+            cross_thr.unwrap_or(thr)
+        } else {
+            thr
+        }
+    };
     let mut active: Vec<usize> = comp_ids
         .iter()
         .zip(&robust_res)
-        .filter(|(_, &r)| r < thr)
+        .filter(|(&k, &r)| r < thr_of(k))
         .map(|(&k, _)| k)
         .collect();
     // 최소제곱 뒤 잔차로 정상 집합을 다시 정하고, 바뀌었으면 다시 푼다(두 번 연속 같을 때까지, 최대
@@ -747,7 +802,7 @@ pub fn average_rotations(
         active = comp_ids
             .iter()
             .copied()
-            .filter(|&k| edge_residual(&edges[k], &rot) < thr || bridges.contains(&k))
+            .filter(|&k| edge_residual(&edges[k], &rot) < thr_of(k) || bridges.contains(&k))
             .collect();
     }
     let rounds = cfg.active_set_rounds.max(1);
@@ -767,7 +822,7 @@ pub fn average_rotations(
         let next: Vec<usize> = comp_ids
             .iter()
             .copied()
-            .filter(|&k| edge_residual(&edges[k], &rot) < thr || bridges.contains(&k))
+            .filter(|&k| edge_residual(&edges[k], &rot) < thr_of(k) || bridges.contains(&k))
             .collect();
         if next == active {
             converged = true;
@@ -793,6 +848,28 @@ pub fn average_rotations(
     for &k in &active {
         inliers[k] = true;
     }
+    let mut sparse_group_links = Vec::new();
+    if cross_on {
+        let mut cnt: std::collections::BTreeMap<(usize, usize), usize> = Default::default();
+        for &k in &comp_ids {
+            if is_cross(k) {
+                let (a, b) = (cfg.vertex_groups[edges[k].i], cfg.vertex_groups[edges[k].j]);
+                *cnt.entry((a.min(b), a.max(b))).or_default() += 0;
+            }
+        }
+        for &k in &active {
+            if is_cross(k) {
+                let (a, b) = (cfg.vertex_groups[edges[k].i], cfg.vertex_groups[edges[k].j]);
+                *cnt.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        for ((a, b), c) in cnt {
+            if c <= cfg.min_cross_links {
+                eprintln!("회전 평균 경고: 묶음 {a}-{b} 사이 유지 간선 {c} 개");
+                sparse_group_links.push((a, b, c));
+            }
+        }
+    }
     let ratio = active.len() as f64 / comp_ids.len().max(1) as f64;
     let rotations = (0..n).map(|v| reached[v].then_some(rot[v])).collect();
     Some(AveragingResult {
@@ -804,6 +881,8 @@ pub fn average_rotations(
         active_set_converged: converged,
         outlier_threshold_rad: thr,
         reliable: !capped && ratio >= cfg.min_inlier_ratio,
+        cross_threshold_rad: cross_thr,
+        sparse_group_links,
     })
 }
 
