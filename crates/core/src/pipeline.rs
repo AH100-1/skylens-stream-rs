@@ -1152,10 +1152,10 @@ fn dump_rotavg(n: usize, pm: &[PairMatch], keep: &[bool], rots: &[Option<Rotatio
     let _ = std::fs::write(dir.join(format!("rotavg_{c:03}_{n}.txt")), txt);
 }
 
-/// 회전 평균 설정. 환경 변수 `SKYLENS_ROT_BRIDGE` 가 0 이면 덩어리 잇기를 끈다(비교용), 그 밖에는 켠다.
+/// 회전 평균 설정. 환경 변수 `SKYLENS_ROT_BRIDGE` 가 1 이면 덩어리 잇기를 켠다(기본 끔).
 fn rot_cfg() -> AveragingConfig {
     AveragingConfig {
-        bridge_components: std::env::var("SKYLENS_ROT_BRIDGE").as_deref() != Ok("0"),
+        bridge_components: std::env::var("SKYLENS_ROT_BRIDGE").as_deref() == Ok("1"),
         ..AveragingConfig::default()
     }
 }

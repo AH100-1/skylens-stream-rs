@@ -558,12 +558,17 @@ fn bridge_components(
     rot: &mut [Rotation3<f64>],
     edges: &[RelativeRotation],
     comp_ids: &[usize],
-    active: &[usize],
     nodes: &[usize],
     root: usize,
     agree: f64,
 ) -> Vec<usize> {
     let n = rot.len();
+    // 덩어리: 삼각형(공통 이웃 정점) 지지가 둘 이상인 간선으로 이은 연결 성분. 덩어리 사이 간선은 보통 삼각형이 없다.
+    let mut nbr: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); n];
+    for &k in comp_ids {
+        nbr[edges[k].i].insert(edges[k].j);
+        nbr[edges[k].j].insert(edges[k].i);
+    }
     let mut parent: Vec<usize> = (0..n).collect();
     fn find(p: &mut [usize], mut x: usize) -> usize {
         while p[x] != x {
@@ -572,16 +577,24 @@ fn bridge_components(
         }
         x
     }
-    for &k in active {
-        let (a, b) = (find(&mut parent, edges[k].i), find(&mut parent, edges[k].j));
-        parent[a] = b;
+    for &k in comp_ids {
+        let (i, j) = (edges[k].i, edges[k].j);
+        if nbr[i].intersection(&nbr[j]).count() >= 2 {
+            let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+            parent[a] = b;
+        }
     }
     let label: Vec<usize> = (0..n).map(|v| find(&mut parent, v)).collect();
     let mut merged: Vec<bool> = vec![false; n]; // 덩어리 표지 기준
     merged[label[root]] = true;
     let mut done: Vec<bool> = vec![false; n]; // 정점별: 이은 덩어리 소속
+    let mut size = vec![0usize; n];
     for &v in nodes {
-        done[v] = merged[label[v]];
+        size[label[v]] += 1;
+    }
+    for &v in nodes {
+        // 작은 덩어리(정점 5 개 미만)는 옮기지 않고 이은 쪽으로 친다.
+        done[v] = merged[label[v]] || size[label[v]] < 5;
     }
     let mut bridges = Vec::new();
     loop {
@@ -723,7 +736,6 @@ pub fn average_rotations(
             &mut rot,
             edges,
             &comp_ids,
-            &active,
             &comp,
             root,
             cfg.bridge_agree_rad,
@@ -731,12 +743,13 @@ pub fn average_rotations(
     } else {
         Vec::new()
     };
-    for &k in &bridges {
-        if !active.contains(&k) {
-            active.push(k);
-        }
+    if !bridges.is_empty() {
+        active = comp_ids
+            .iter()
+            .copied()
+            .filter(|&k| edge_residual(&edges[k], &rot) < thr || bridges.contains(&k))
+            .collect();
     }
-    active.sort_unstable();
     let rounds = cfg.active_set_rounds.max(1);
     let mut seen: Vec<Vec<usize>> = Vec::new();
     let mut reselections = 0;
