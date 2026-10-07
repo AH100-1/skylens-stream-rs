@@ -1821,8 +1821,44 @@ fn shared_pairs(a: &[Track], b: &[Track], window: (usize, usize)) -> SharedPairs
     (s, d, im)
 }
 
+/// 정렬 닮음 변환이 연직을 이보다 더 기울이면 정렬 대상(정밀 모델)이 틀어진 것으로 보고 쓰지 않는다(도).
+/// 구역 정렬에서 정상인 연직 기울기는 4° 안쪽이고, 짧은 마지막 구역의 틀어진 정밀 모델(10~13°)이
+/// 이미 맞는 초벌·다른 구역 정밀 점군까지 같이 기울이는 것을 막는다. `SKYLENS_ALIGN_MAX_TILT` 로 바꾼다(0 이하면 끔).
+fn align_max_tilt_deg() -> f64 {
+    std::env::var("SKYLENS_ALIGN_MAX_TILT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6.0)
+}
+
+fn tilt_deg(s: &Similarity) -> f64 {
+    (s.r * nalgebra::Vector3::z())
+        .z
+        .clamp(-1.0, 1.0)
+        .acos()
+        .to_degrees()
+}
+
+fn tilt_ok(label: &str, s: &Similarity) -> bool {
+    let (t, lim) = (tilt_deg(s), align_max_tilt_deg());
+    let ok = lim <= 0.0 || t <= lim;
+    if !ok && std::env::var_os("SKYLENS_DIAG_PREVIEW").is_some() {
+        eprintln!("DIAGSIM reject {label} tilt_deg {t:.3} > {lim}");
+    }
+    ok
+}
+
 /// 구역 정렬(초벌→정밀, 정밀→정밀 공통): 변환, 점쌍 수, 잔차 중앙값(m).
 fn region_align(
+    a: &[Track],
+    b: &[Track],
+    ra: &Region,
+    rb: &Region,
+) -> Option<(Similarity, usize, f64)> {
+    region_align_raw(a, b, ra, rb).filter(|r| tilt_ok("region", &r.0))
+}
+
+fn region_align_raw(
     a: &[Track],
     b: &[Track],
     ra: &Region,
@@ -1874,6 +1910,7 @@ fn own_align(
             pairs = point_pairs(ta, tb, pos, (r.lo, r.hi));
             (sim, ar) = align_region(r, &pairs);
         }
+        let sim = sim.filter(|s| tilt_ok("own", s));
         return (sim, ar);
     }
     let win = if mode == 2 {
@@ -2046,6 +2083,28 @@ fn write_decimated(out: &Path, name: &str, cloud: &PointCloud) -> Result<(), Str
     })
 }
 
+/// 진단: `SKYLENS_DIAG_PREVIEW` 가 켜져 있으면 초벌→정밀 정렬 닮음 변환(축척·연직 기울기·이동 z)을 표준 오류로 낸다.
+fn diag_sim(label: &str, region: usize, target: usize, s: &Similarity, pairs: usize) {
+    if std::env::var_os("SKYLENS_DIAG_PREVIEW").is_none() {
+        return;
+    }
+    let up = s.r * nalgebra::Vector3::z();
+    let tilt = up.z.clamp(-1.0, 1.0).acos().to_degrees();
+    eprintln!(
+        "DIAGSIM {label} region {region} -> {target} pairs {pairs} scale {:.4} tilt_deg {:.3} up_xy ({:.4},{:.4}) t ({:.2},{:.2},{:.2})",
+        s.s, tilt, up.x, up.y, s.t.x, s.t.y, s.t.z
+    );
+}
+
+/// 진단: 같은 환경 변수가 켜져 있으면 정렬 전 초벌 점군을 `raw/` 에 낸다.
+fn diag_dump_raw(out: &Path, r: &Region, cloud: &PointCloud) -> Result<(), String> {
+    if std::env::var_os("SKYLENS_DIAG_PREVIEW").is_none() {
+        return Ok(());
+    }
+    let _ = std::fs::create_dir_all(out.join("raw"));
+    write_decimated(out, &format!("raw/raw_{:02}_pre.ply", r.index), cloud)
+}
+
 /// 구역 앞쪽 보조 F 사진 범위: 위치 [lo-HELPER_SPAN, lo-HELPER_MIN].
 /// 짝 규칙상 R(p)·L(p) 는 F(p-40..=p-12) 와 겹치므로 구역 첫 12 위치의 R·L 은 구역 바로 앞 F 까지 필요하다.
 const HELPER_SPAN: usize = 40;
@@ -2168,6 +2227,7 @@ pub fn run_pipeline_with(
             own_align(&rec.ta, &tb, &r, ds.config.ovl, n_pos)
         });
         if let Some(s) = &sim {
+            diag_sim("own", k, k, s, ar.pairs);
             realigns.push(ReAlign {
                 secs: t_now(),
                 region: k,
@@ -2220,6 +2280,7 @@ pub fn run_pipeline_with(
                 region_align(&recs[j].ta, tbk, &recs[j].region, &recs[k].region)
             });
             if let Some((s, n, med)) = ca {
+                diag_sim("realign_coarse", j, k, &s, n);
                 realigns.push(ReAlign {
                     secs: t_now(),
                     region: j,
@@ -2257,6 +2318,7 @@ pub fn run_pipeline_with(
         };
         for st in steps {
             let (j, acc) = (st.region, st.total);
+            diag_sim("realign_refined", j, k, &acc, st.pairs);
             realigns.push(ReAlign {
                 secs: t_now(),
                 region: j,
@@ -2538,6 +2600,7 @@ pub fn run_pipeline_with(
             let ca =
                 crate::timing::timed("align_ghost", || region_align(&ta, tbm, r, &recs[m].region));
             if let Some((s, n, med)) = ca {
+                diag_sim("coarse_new", slot, m, &s, n);
                 realigns.push(ReAlign {
                     secs: t_now(),
                     region: slot,
@@ -2557,6 +2620,7 @@ pub fn run_pipeline_with(
             }
         }
         // 기준 모델이 없거나 겹침이 모자라면 GPS 좌표 그대로(초기 좌표계는 이미 GPS)로 내보낸다.
+        diag_dump_raw(out, r, &coarse)?;
         let shown = sim.unwrap_or_else(Similarity::identity);
         write_decimated(
             out,
