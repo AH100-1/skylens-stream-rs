@@ -1,4 +1,4 @@
-//! 기본 경로: 인자 없는 `synth` → `run` → `verify` 를 프로세스로 돌려 7/7·종료 0 과 정답 대비 오차를 숫자로 고정한다(F-343).
+//! 기본 경로: 인자 없는 `synth` → `run` → `verify` 를 프로세스로 돌려 8/8·종료 0 과 정답 대비 오차를 숫자로 고정한다(F-343).
 //! 기본 구역 크기(span 12)라 구역이 여러 개이고, 구역을 복원할 때 구역 밖 앞·뒤 보조 사진(`HelperConfig`)이
 //! 다른 카메라 짝을 이어 준다. 정답 비교 방식은 `pipeline_e2e` 와 같다(원점 차만큼 옮겨 비교, 회전은 재지 않음).
 
@@ -193,7 +193,7 @@ fn default_args_synth_run_verify() {
     assert!(chunks >= 2, "기본 경로가 구역 하나로 합쳐짐: {chunks}");
     let (vcode, vout, _) = cli(&["verify", o]);
     assert_eq!(vcode, 0, "{vout}");
-    assert!(vout.contains("결과: 7/7 통과"), "{vout}");
+    assert!(vout.contains("결과: 8/8 통과"), "{vout}");
     let (st, reg) = item(&vout, "registered");
     assert_eq!(st, "PASS", "{vout}");
     assert!(
