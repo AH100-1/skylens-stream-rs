@@ -63,6 +63,26 @@ pub struct AveragingConfig {
     pub global_iterations: usize,
     /// 최소제곱·정상 집합 재선정을 되풀이하는 최대 횟수(1 이상으로 다룬다).
     pub active_set_rounds: usize,
+    /// 참이면 정상 간선만으로는 끊어지는 덩어리(이상치 문턱이 좁아 덩어리 사이 간선이 모두 빠진 경우)를
+    /// 빠진 간선들이 가리키는 상대 회전의 합의 무리로 다시 잇는다.
+    pub bridge_components: bool,
+    /// 덩어리 잇기에서 같은 무리로 보는 각(rad).
+    pub bridge_agree_rad: f64,
+    /// 참이면 이상치 문턱을 간선 종류별로 둔다: 삼각형 지지 덩어리 사이 간선은 덩어리 상대 회전을
+    /// 가중 L1 중앙점 + 강건(Geman–McClure) 반복으로 정한 뒤, 자기 잔차 분포의 문턱
+    /// clamp(`outlier_sigma_factor`·σ̂, `class_floor_rad`, `outlier_cap_rad`)로 가른다.
+    pub class_thresholds: bool,
+    /// 덩어리 사이 간선 문턱의 하한(rad).
+    pub class_floor_rad: f64,
+    /// 참이면 마지막 단계의 정상 집합 되풀이 대신 Geman–McClure 가중 반복(IRLS)으로 하드 문턱 없이 푼다.
+    /// 덩어리 정렬은 `class_thresholds` 와 같은 L1 중앙점 초기화를 쓴다.
+    pub gm_irls: bool,
+    /// Geman–McClure 반복 횟수.
+    pub gm_iterations: usize,
+    /// Geman–McClure 축척 σ(rad), 가중치 ∝ 1/(1+(e/σ)²)².
+    pub gm_sigma_rad: f64,
+    /// `gm_irls` 에서 풀이 뒤 간선을 거르는 고정 각(rad). 잔차 분포에서 문턱을 뽑지 않는다.
+    pub gm_filter_rad: f64,
 }
 
 impl Default for AveragingConfig {
@@ -79,6 +99,14 @@ impl Default for AveragingConfig {
             init_starts: 8,
             global_iterations: 5,
             active_set_rounds: 8,
+            bridge_components: false,
+            bridge_agree_rad: 8f64.to_radians(),
+            class_thresholds: false,
+            class_floor_rad: 5f64.to_radians(),
+            gm_irls: false,
+            gm_iterations: 12,
+            gm_sigma_rad: 5f64.to_radians(),
+            gm_filter_rad: 10f64.to_radians(),
         }
     }
 }
@@ -103,6 +131,12 @@ pub struct AveragingResult {
     pub outlier_threshold_rad: f64,
     /// 거짓이면 이상치가 너무 많아 잡음 추정이 무너졌다(문턱이 상한에 걸림 또는 정상 비율 부족).
     pub reliable: bool,
+    /// 삼각형 지지 덩어리(정점 5 개 이상) 사이 간선 수. 덩어리 쌍이 여럿이면 가장 약한 쌍의 값.
+    pub bridge_edge_count: usize,
+    /// 가장 약한 덩어리 쌍에서 양쪽 중 적은 쪽의 서로 다른 끝점 수(이어지는 위치 수).
+    pub bridge_position_count: usize,
+    /// 덩어리 사이 간선 수 < 3 또는 이어지는 위치 수 < 3 인 덩어리 쌍이 있다.
+    pub weak_bridge: bool,
 }
 
 /// 잔차 각(rad) 목록에서 이상치 문턱을 정한다: clamp(k·중앙값/1.5382, 하한, 상한).
@@ -544,6 +578,197 @@ fn refine_global(
     }
 }
 
+/// 덩어리: 삼각형(공통 이웃 정점) 지지가 둘 이상인 간선으로 이은 연결 성분의 표지.
+/// 덩어리 사이 간선은 보통 삼각형이 없다.
+fn triangle_labels(n: usize, edges: &[RelativeRotation], comp_ids: &[usize]) -> Vec<usize> {
+    let mut nbr: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); n];
+    for &k in comp_ids {
+        nbr[edges[k].i].insert(edges[k].j);
+        nbr[edges[k].j].insert(edges[k].i);
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    for &k in comp_ids {
+        let (i, j) = (edges[k].i, edges[k].j);
+        if nbr[i].intersection(&nbr[j]).count() >= 2 {
+            let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+            parent[a] = b;
+        }
+    }
+    (0..n).map(|v| find(&mut parent, v)).collect()
+}
+
+type PairStats = std::collections::BTreeMap<
+    (usize, usize),
+    (
+        usize,
+        std::collections::BTreeSet<usize>,
+        std::collections::BTreeSet<usize>,
+    ),
+>;
+
+/// 덩어리 사이 간선(양쪽 덩어리 모두 정점 5 개 이상)의 번호, 가장 약한 덩어리 쌍의 (간선 수, 위치 수).
+fn cross_edges(
+    edges: &[RelativeRotation],
+    comp_ids: &[usize],
+    nodes: &[usize],
+    label: &[usize],
+) -> (Vec<usize>, usize, usize) {
+    let mut size = vec![0usize; label.len()];
+    for &v in nodes {
+        size[label[v]] += 1;
+    }
+    let mut pairs: PairStats = Default::default();
+    let mut cross = Vec::new();
+    for &k in comp_ids {
+        let e = &edges[k];
+        let (la, lb) = (label[e.i], label[e.j]);
+        if la == lb || size[la] < 5 || size[lb] < 5 {
+            continue;
+        }
+        cross.push(k);
+        let (lo, hi, vlo, vhi) = if la < lb {
+            (la, lb, e.i, e.j)
+        } else {
+            (lb, la, e.j, e.i)
+        };
+        let ent = pairs.entry((lo, hi)).or_default();
+        ent.0 += 1;
+        ent.1.insert(vlo);
+        ent.2.insert(vhi);
+    }
+    let worst = pairs
+        .values()
+        .map(|(c, a, b)| (*c, a.len().min(b.len())))
+        .min()
+        .unwrap_or((0, 0));
+    (cross, worst.0, worst.1)
+}
+
+/// 정상 간선 `active` 가 만드는 연결 덩어리가 여럿이면, 뿌리 덩어리부터 시작해 덩어리를 하나씩 잇는다.
+/// 이미 이은 집합과 덩어리 사이의 모든 간선(빠진 것 포함)이 가리키는 덩어리 회전 보정 G(R_v ← R_v G)를
+/// 가중치로 무리 짓고, 가중합이 가장 큰 무리의 평균 보정을 적용한다. 무리의 간선은 돌려주는 목록(다리)에 든다.
+#[allow(clippy::too_many_arguments)]
+fn bridge_components(
+    rot: &mut [Rotation3<f64>],
+    edges: &[RelativeRotation],
+    comp_ids: &[usize],
+    nodes: &[usize],
+    root: usize,
+    agree: f64,
+    label: &[usize],
+    irls_scale: Option<f64>,
+) -> Vec<usize> {
+    let n = rot.len();
+    let mut merged: Vec<bool> = vec![false; n]; // 덩어리 표지 기준
+    merged[label[root]] = true;
+    let mut done: Vec<bool> = vec![false; n]; // 정점별: 이은 덩어리 소속
+    let mut size = vec![0usize; n];
+    for &v in nodes {
+        size[label[v]] += 1;
+    }
+    for &v in nodes {
+        // 작은 덩어리(정점 5 개 미만)는 옮기지 않고 이은 쪽으로 친다.
+        done[v] = merged[label[v]] || size[label[v]] < 5;
+    }
+    let mut bridges = Vec::new();
+    loop {
+        // 이은 집합과 이어지지 않은 덩어리 사이 후보 보정.
+        let mut cand: std::collections::BTreeMap<usize, Vec<(usize, Rotation3<f64>, f64)>> =
+            Default::default();
+        for &k in comp_ids {
+            let e = &edges[k];
+            let (a, b) = (done[e.i], done[e.j]);
+            if a == b {
+                continue;
+            }
+            // 움직이는 쪽 m, 고정 쪽 f, f→m 측정 R_fm = R_m R_fᵀ 이므로 G = R_mᵀ R_fm R_f.
+            let (m, f, rfm) = if b {
+                (e.i, e.j, e.rotation.inverse())
+            } else {
+                (e.j, e.i, e.rotation)
+            };
+            let g = rot[m].inverse() * rfm * rot[f];
+            cand.entry(label[m]).or_default().push((k, g, e.weight));
+        }
+        // 가중합이 가장 큰 무리를 가진 덩어리를 먼저 잇는다.
+        let mut best: Option<(f64, usize, Vec<usize>, Rotation3<f64>)> = None;
+        for (&lab, list) in &cand {
+            if let Some(scale) = irls_scale {
+                // 가중 L1 중앙점에서 시작해 Geman–McClure 가중 평균으로 다듬는다.
+                let l1 = |c: &Rotation3<f64>| -> f64 {
+                    list.iter().map(|x| x.2 * angle(&(c.inverse() * x.1))).sum()
+                };
+                let Some(med) = list
+                    .iter()
+                    .map(|x| x.1)
+                    .min_by(|a, b| l1(a).total_cmp(&l1(b)))
+                else {
+                    continue;
+                };
+                let gm = |r: f64| {
+                    let u = r / scale;
+                    1.0 / ((1.0 + u * u) * (1.0 + u * u))
+                };
+                let mut mean = med;
+                for _ in 0..10 {
+                    let mut sum = Matrix3::zeros();
+                    for x in list {
+                        sum += x.1.matrix() * (x.2 * gm(angle(&(mean.inverse() * x.1))));
+                    }
+                    if let Some(m) = project_to_rotation(&sum) {
+                        mean = m;
+                    }
+                }
+                let score: f64 = list
+                    .iter()
+                    .map(|x| x.2 * gm(angle(&(mean.inverse() * x.1))))
+                    .sum();
+                if best.as_ref().is_none_or(|b| score > b.0) {
+                    let ks = list
+                        .iter()
+                        .filter(|x| angle(&(mean.inverse() * x.1)) < agree)
+                        .map(|x| x.0)
+                        .collect();
+                    best = Some((score, lab, ks, mean));
+                }
+                continue;
+            }
+            for (_, gc, _) in list {
+                let members: Vec<usize> = (0..list.len())
+                    .filter(|&x| angle(&(gc.inverse() * list[x].1)) < agree)
+                    .collect();
+                let w: f64 = members.iter().map(|&x| list[x].2).sum();
+                if best.as_ref().is_none_or(|b| w > b.0) {
+                    let mut sum = Matrix3::zeros();
+                    for &x in &members {
+                        sum += list[x].1.matrix() * list[x].2;
+                    }
+                    let mean = project_to_rotation(&sum).unwrap_or(*gc);
+                    best = Some((w, lab, members.iter().map(|&x| list[x].0).collect(), mean));
+                }
+            }
+        }
+        let Some((_, lab, ks, g)) = best else {
+            break;
+        };
+        for &v in nodes {
+            if label[v] == lab {
+                rot[v] *= g;
+                done[v] = true;
+            }
+        }
+        bridges.extend(ks);
+    }
+    bridges
+}
+
 /// 정점 `n` 개와 상대 회전 간선으로 전역 회전을 구한다.
 ///
 /// None: n = 0, 범위 밖 정점 번호, 쓸 수 있는 간선 없음.
@@ -627,34 +852,122 @@ pub fn average_rotations(
     // 최소제곱 뒤 잔차로 정상 집합을 다시 정하고, 바뀌었으면 다시 푼다(두 번 연속 같을 때까지, 최대
     // `active_set_rounds` 번 풀이). 상한에 닿거나 전에 푼 집합으로 되돌아가면(순환) 다시 정한 집합을
     // 버리고 멈춘다. 어느 경우든 돌려주는 정상 표시는 마지막으로 푼 집합 그대로다.
+    let label = triangle_labels(n, edges, &comp_ids);
+    let (cross, bridge_edge_count, bridge_position_count) =
+        cross_edges(edges, &comp_ids, &comp, &label);
+    let weak_bridge = !cross.is_empty() && (bridge_edge_count < 3 || bridge_position_count < 3);
+    let by_class = cfg.class_thresholds || cfg.gm_irls;
+    let bridges = if by_class {
+        bridge_components(
+            &mut rot,
+            edges,
+            &comp_ids,
+            &comp,
+            root,
+            cfg.class_floor_rad,
+            &label,
+            Some(if cfg.gm_irls {
+                cfg.gm_sigma_rad
+            } else {
+                cfg.robust_scale_rad
+            }),
+        )
+    } else if cfg.bridge_components {
+        bridge_components(
+            &mut rot,
+            edges,
+            &comp_ids,
+            &comp,
+            root,
+            cfg.bridge_agree_rad,
+            &label,
+            None,
+        )
+    } else {
+        Vec::new()
+    };
+    // 덩어리 사이 간선의 문턱: 정렬된 자세에서 자기 잔차 분포로(하한 `class_floor_rad`).
+    let mut is_cross = vec![false; edges.len()];
+    for &k in &cross {
+        is_cross[k] = true;
+    }
+    let mut thr_cross = thr;
+    if by_class && !cross.is_empty() {
+        let cr: Vec<f64> = cross
+            .iter()
+            .map(|&k| edge_residual(&edges[k], &rot))
+            .collect();
+        let mut sorted = cr.clone();
+        sorted.sort_by(f64::total_cmp);
+        let med = sorted[sorted.len() / 2];
+        let raw = cfg
+            .class_floor_rad
+            .max(cfg.outlier_sigma_factor * med / 1.5382);
+        thr_cross = raw.min(cfg.outlier_cap_rad.max(cfg.class_floor_rad));
+    }
+    let keep = |k: usize, rot: &[Rotation3<f64>]| -> bool {
+        let r = edge_residual(&edges[k], rot);
+        if cfg.gm_irls {
+            r < cfg.gm_filter_rad
+        } else if by_class && is_cross[k] {
+            r < thr_cross
+        } else {
+            r < thr || bridges.contains(&k)
+        }
+    };
+    if !bridges.is_empty() || by_class {
+        active = comp_ids
+            .iter()
+            .copied()
+            .filter(|&k| keep(k, &rot))
+            .collect();
+    }
     let rounds = cfg.active_set_rounds.max(1);
     let mut seen: Vec<Vec<usize>> = Vec::new();
     let mut reselections = 0;
     let mut converged = false;
-    loop {
-        refine_global(
-            &mut rot,
-            edges,
-            &active,
-            &comp,
-            root,
-            cfg.global_iterations,
-            Solver::Pcg,
-        );
-        let next: Vec<usize> = comp_ids
+    if cfg.gm_irls {
+        // 하드 문턱 없이 Geman–McClure 가중 반복. 가중치 = 관측 가중치 · 1/(1+(r/s)²)².
+        let mut ed = edges.to_vec();
+        for _ in 0..cfg.gm_iterations.max(1) {
+            for &k in &comp_ids {
+                let u = edge_residual(&edges[k], &rot) / cfg.gm_sigma_rad;
+                ed[k].weight = edges[k].weight / ((1.0 + u * u) * (1.0 + u * u));
+            }
+            refine_global(&mut rot, &ed, &comp_ids, &comp, root, 1, Solver::Pcg);
+        }
+        active = comp_ids
             .iter()
             .copied()
-            .filter(|&k| edge_residual(&edges[k], &rot) < thr)
+            .filter(|&k| keep(k, &rot))
             .collect();
-        if next == active {
-            converged = true;
-            break;
+        converged = true;
+    } else {
+        loop {
+            refine_global(
+                &mut rot,
+                edges,
+                &active,
+                &comp,
+                root,
+                cfg.global_iterations,
+                Solver::Pcg,
+            );
+            let next: Vec<usize> = comp_ids
+                .iter()
+                .copied()
+                .filter(|&k| keep(k, &rot))
+                .collect();
+            if next == active {
+                converged = true;
+                break;
+            }
+            if reselections + 1 >= rounds || seen.contains(&next) {
+                break;
+            }
+            seen.push(std::mem::replace(&mut active, next));
+            reselections += 1;
         }
-        if reselections + 1 >= rounds || seen.contains(&next) {
-            break;
-        }
-        seen.push(std::mem::replace(&mut active, next));
-        reselections += 1;
     }
 
     let residuals_rad: Vec<f64> = (0..edges.len())
@@ -681,6 +994,9 @@ pub fn average_rotations(
         active_set_converged: converged,
         outlier_threshold_rad: thr,
         reliable: !capped && ratio >= cfg.min_inlier_ratio,
+        bridge_edge_count,
+        bridge_position_count,
+        weak_bridge,
     })
 }
 

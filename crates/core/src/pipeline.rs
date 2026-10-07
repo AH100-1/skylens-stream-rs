@@ -1107,6 +1107,62 @@ fn vote_pairs(n: usize, pm: &[PairMatch], keep: &mut [bool]) {
     }
 }
 
+/// 진단용: 환경 변수 `SKYLENS_DUMP_ROTAVG` 폴더에 회전 평균 직후(좌표계 맞춤 전) 회전과 입력 간선을 쓴다.
+/// 줄 형식 `R 색인 카메라 위치 회전9` / `E i j 카메라i 위치i 카메라j 위치j 정상짝수 유지 회전9`. 기본 동작 불변.
+fn dump_rotavg(n: usize, pm: &[PairMatch], keep: &[bool], rots: &[Option<Rotation3<f64>>]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let Some(dir) = std::env::var_os("SKYLENS_DUMP_ROTAVG") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let mut view = vec![(0usize, 0usize); n];
+    for p in pm {
+        view[p.i] = p.views.0;
+        view[p.j] = p.views.1;
+    }
+    let row = |r: &Rotation3<f64>| {
+        let m = r.matrix();
+        (0..9)
+            .map(|k| format!(" {:.12e}", m[(k / 3, k % 3)]))
+            .collect::<String>()
+    };
+    let mut txt = String::new();
+    for (i, r) in rots.iter().enumerate() {
+        if let Some(r) = r {
+            txt += &format!("R {i} {} {}{}\n", view[i].0, view[i].1, row(r));
+        }
+    }
+    for (p, &kp) in pm.iter().zip(keep) {
+        txt += &format!(
+            "E {} {} {} {} {} {} {} {}{}\n",
+            p.i,
+            p.j,
+            p.views.0 .0,
+            p.views.0 .1,
+            p.views.1 .0,
+            p.views.1 .1,
+            p.inl.len(),
+            u8::from(kp),
+            row(&p.rot)
+        );
+    }
+    let c = CALLS.fetch_add(1, Ordering::SeqCst);
+    let _ = std::fs::write(dir.join(format!("rotavg_{c:03}_{n}.txt")), txt);
+}
+
+/// 회전 평균 설정. 환경 변수 `SKYLENS_ROT_BRIDGE`(덩어리 잇기), `SKYLENS_ROT_CLASS_THRESH`(종류별 문턱),
+/// `SKYLENS_ROT_GM`(GM IRLS) 가 1 이면 각각 켠다(기본 끔).
+fn rot_cfg() -> AveragingConfig {
+    AveragingConfig {
+        bridge_components: std::env::var("SKYLENS_ROT_BRIDGE").as_deref() == Ok("1"),
+        class_thresholds: std::env::var("SKYLENS_ROT_CLASS_THRESH").as_deref() == Ok("1"),
+        gm_irls: std::env::var("SKYLENS_ROT_GM").as_deref() == Ok("1"),
+        ..AveragingConfig::default()
+    }
+}
+
 /// 회전 평균 + 상대 회전과 어긋나는 간선 제거 뒤 재평균. 반환: 회전, 간선 유지 표시.
 fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<RotsAndKeep, String> {
     let mk = |keep: &[bool]| -> Vec<RelativeRotation> {
@@ -1122,14 +1178,54 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
             .collect()
     };
     let mut keep: Vec<bool> = pm.iter().map(|p| p.inl.len() >= opts.min_inl).collect();
+    let keep_min_inl = keep.clone();
     if opts.pair_vote {
         vote_pairs(n, pm, &mut keep);
     }
-    let ra = average_rotations(n, &mk(&keep), &AveragingConfig::default())
+    let keep_vote = keep.clone();
+    let ra = average_rotations(n, &mk(&keep), &rot_cfg())
         .ok_or("회전 평균 실패: 쓸 수 있는 간선 없음")?;
     let mut rots = ra.rotations;
+    dump_rotavg(n, pm, &keep, &rots);
+    let dbg_cam = std::env::var("SKYLENS_PRUNE_CAM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let dbg = |tag: &str, rots: &[Option<Rotation3<f64>>], keep: &[bool]| {
+        let Some(cam) = dbg_cam else { return };
+        for (e, p) in pm.iter().enumerate() {
+            if p.views.0 .0 != cam && p.views.1 .0 != cam {
+                continue;
+            }
+            let res = match (rots[p.i], rots[p.j]) {
+                (Some(a), Some(b)) => format!(
+                    "{:.2}",
+                    (b * a.inverse() * p.rot.inverse()).angle().to_degrees()
+                ),
+                _ => "none".to_string(),
+            };
+            let why = if !keep_min_inl[e] {
+                "min_inl"
+            } else if !keep_vote[e] {
+                "vote"
+            } else if keep[e] {
+                "kept"
+            } else {
+                "prune"
+            };
+            eprintln!(
+                "prune_dbg n {n} {tag} edge {} {} cam {} pos {} - cam {} pos {} inl {} resid_deg {res} {why}",
+                p.i, p.j, p.views.0 .0, p.views.0 .1, p.views.1 .0, p.views.1 .1, p.inl.len()
+            );
+        }
+        let none: Vec<usize> = (0..n).filter(|&i| rots[i].is_none()).collect();
+        eprintln!(
+            "prune_dbg n {n} {tag} rot_none_count {} {none:?}",
+            none.len()
+        );
+    };
+    dbg("init", &rots, &keep);
     if let Some(deg) = opts.prune_deg {
-        for _ in 0..opts.passes.max(1) {
+        for pass in 0..opts.passes.max(1) {
             for (kp, p) in keep.iter_mut().zip(pm) {
                 *kp = *kp
                     && match (rots[p.i], rots[p.j]) {
@@ -1139,9 +1235,10 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
                         _ => false,
                     };
             }
-            if let Some(r2) = average_rotations(n, &mk(&keep), &AveragingConfig::default()) {
+            if let Some(r2) = average_rotations(n, &mk(&keep), &rot_cfg()) {
                 rots = r2.rotations;
             }
+            dbg(&format!("pass{pass}"), &rots, &keep);
         }
     }
     Ok((rots, keep))
@@ -1258,6 +1355,39 @@ fn sparse_init_roll(
         },
     )
     .map(|r| r.0)
+}
+
+fn recs_gids(full: &Option<(Vec<usize>, usize)>, base: &[usize]) -> Vec<usize> {
+    full.as_ref().map_or_else(|| base.to_vec(), |f| f.0.clone())
+}
+
+/// 진단용: 환경 변수 `SKYLENS_DUMP_STAGES` 폴더에 단계별 포즈(색인 i, 회전 9개 행 우선, 이동 3개)를 쓴다.
+/// 기본 동작은 바뀌지 않는다. `gids` 가 있으면 색인 대신 사진 번호를 쓴다.
+fn dump_stage(tag: &str, gids: Option<&[usize]>, poses: &[Option<Pose>]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let Some(dir) = std::env::var_os("SKYLENS_DUMP_STAGES") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let mut txt = String::new();
+    for (i, p) in poses.iter().enumerate() {
+        let Some(p) = p else { continue };
+        let m = p.rotation.matrix();
+        txt += &format!("{}", gids.map_or(i, |g| g[i]));
+        for a in 0..3 {
+            for b in 0..3 {
+                txt += &format!(" {:.12e}", m[(a, b)]);
+            }
+        }
+        txt += &format!(
+            " {:.12e} {:.12e} {:.12e}\n",
+            p.translation.x, p.translation.y, p.translation.z
+        );
+    }
+    let n = CALLS.fetch_add(1, Ordering::SeqCst);
+    let _ = std::fs::write(dir.join(format!("{tag}_{n:03}_{}.txt", poses.len())), txt);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1392,6 +1522,7 @@ fn sparse_init_with(
             stages.pruned.0
         );
     }
+    dump_stage("placed", None, &poses);
     if opts.snap {
         snap_poses_to_gps(&mut poses, gps, opts.vfix);
     }
@@ -1472,6 +1603,7 @@ fn sparse_init_with(
         }
         s.rms = after;
     }
+    dump_stage("preview", None, &s.poses);
     Ok((s, stages))
 }
 
@@ -2655,6 +2787,7 @@ pub fn run_pipeline_with(
                 None
             };
             let gids_coarse = if split { gids_t.clone() } else { Vec::new() };
+            let gids_dump = gids_t.clone();
             let (maxf, upf, position, region) =
                 (cfg.max_features, cfg.upscale_fill, cfg.position, *r);
             let tri_t = TriConfig::from_config(cfg);
@@ -2735,9 +2868,19 @@ pub fn run_pipeline_with(
                         anchored = true;
                     }
                 }
+                dump_stage(
+                    "refined_pre",
+                    Some(&recs_gids(&full, &gids_dump)),
+                    &rs.poses,
+                );
                 rs.rms = crate::timing::timed("ba_refined", || {
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
+                dump_stage(
+                    "refined_post",
+                    Some(&recs_gids(&full, &gids_dump)),
+                    &rs.poses,
+                );
                 if !anchored && (anchor.is_none() || full.is_some()) {
                     crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
                 }
@@ -2898,6 +3041,31 @@ pub fn run_pipeline_with(
         reg_ref.extend(rec.centers.keys().copied());
     }
     res.up_cross = up_cross_report(&recs);
+    // 진단용: SKYLENS_DUMP_RPOSES 가 있으면 구역별 정밀 포즈(구역 좌표계)를 그 폴더에 쓴다.
+    if let Some(dir) = std::env::var_os("SKYLENS_DUMP_RPOSES") {
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        for rec in &recs {
+            let mut gids: Vec<usize> = rec.rposes.keys().copied().collect();
+            gids.sort_unstable();
+            let mut txt = String::new();
+            for g in gids {
+                let p = &rec.rposes[&g];
+                let m = p.rotation.matrix();
+                txt += &format!("{} {}", name(g), g);
+                for i in 0..3 {
+                    for j in 0..3 {
+                        txt += &format!(" {:.12e}", m[(i, j)]);
+                    }
+                }
+                txt += &format!(
+                    " {:.12e} {:.12e} {:.12e}\n",
+                    p.translation.x, p.translation.y, p.translation.z
+                );
+            }
+            let _ = std::fs::write(dir.join(format!("region{}.txt", rec.region.index)), txt);
+        }
+    }
     if let Some(m) = res.up_cross.max_diff_deg {
         let msg = format!(
             "위 방향 교차 검사: 카메라 폴더 묶음 사이 최대 어긋남 {m:.3}° (문턱 {}°)",
