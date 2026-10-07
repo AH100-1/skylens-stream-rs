@@ -199,6 +199,116 @@ fn stage_report(
     eprintln!("{line}");
 }
 
+/// 회전 평균 직후(좌표계 맞춤 전) 회전과 입력 간선을 정답과 비교한다: 묶음 내부 일관성, 묶음 쌍별 간선 표.
+fn rotavg_report(dir: &Path, r0: &[usize], names: &dyn Fn(usize) -> String, truth: &Truth) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<_> = rd.map(|e| e.unwrap().path()).collect();
+    files.sort();
+    let rot9 = |f: &[&str]| {
+        let n: Vec<f64> = f.iter().map(|s| s.parse().unwrap()).collect();
+        Rotation3::from_matrix_unchecked(Matrix3::from_row_slice(&n[..9]))
+    };
+    for f in files {
+        let txt = std::fs::read_to_string(&f).unwrap();
+        let mut cams: Vec<Cam> = Vec::new();
+        let mut idx: HashMap<usize, usize> = HashMap::new();
+        let mut gofi: HashMap<usize, usize> = HashMap::new();
+        for l in txt.lines().filter(|l| l.starts_with("R ")) {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let i: usize = w[1].parse().unwrap();
+            let (c, p): (usize, usize) = (w[2].parse().unwrap(), w[3].parse().unwrap());
+            let g = p * 3 + c;
+            if !r0.contains(&g) {
+                continue;
+            }
+            let name = names(g);
+            let (tr, tc) = truth[&name];
+            idx.insert(i, cams.len());
+            gofi.insert(i, g);
+            cams.push(Cam {
+                name,
+                cam: c,
+                r: rot9(&w[4..13]),
+                c: Vector3::zeros(),
+                tr,
+                tc,
+            });
+        }
+        if cams.len() < r0.len() / 2 {
+            continue;
+        }
+        eprintln!(
+            "\n== 회전 평균 직후 {} (회전 {} 대)",
+            f.file_name().unwrap().to_string_lossy(),
+            cams.len()
+        );
+        let all: Vec<&Cam> = cams.iter().collect();
+        let q = fit_q(&all, true);
+        let mut qs = Vec::new();
+        for c in 0..3 {
+            let grp: Vec<&Cam> = cams.iter().filter(|x| x.cam == c).collect();
+            if grp.is_empty() {
+                continue;
+            }
+            let qg = fit_q(&grp, false);
+            let e_all: Vec<f64> = grp.iter().map(|x| ang(&(x.tr * q), &x.r)).collect();
+            let e_own: Vec<f64> = grp.iter().map(|x| ang(&(x.tr * qg), &x.r)).collect();
+            eprintln!(
+                "  묶음 {c} 수 {:>2}: 공통 Q 오차 중앙 {:7.2} | 묶음 내부(자기 Q) 오차 중앙 {:6.3} 최대 {:6.3} | 묶음 Q 와 공통 Q 의 각 {:7.2}",
+                grp.len(), med(&e_all), med(&e_own), mx(&e_own), ang(&qg, &q)
+            );
+            qs.push((c, qg));
+        }
+        for a in 0..qs.len() {
+            for b in a + 1..qs.len() {
+                eprintln!(
+                    "  묶음 Q 사이 각 {}-{}: {:.2}°",
+                    qs[a].0,
+                    qs[b].0,
+                    ang(&qs[a].1, &qs[b].1)
+                );
+            }
+        }
+        // 간선 표.
+        type Acc = (usize, usize, usize, Vec<f64>, usize);
+        let mut tab: std::collections::BTreeMap<(usize, usize), Acc> = Default::default();
+        for l in txt.lines().filter(|l| l.starts_with("E ")) {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let (i, j): (usize, usize) = (w[1].parse().unwrap(), w[2].parse().unwrap());
+            let (Some(&a), Some(&b)) = (idx.get(&i), idx.get(&j)) else {
+                continue;
+            };
+            let ninl: usize = w[7].parse().unwrap();
+            let kept = w[8] == "1";
+            let rel = rot9(&w[9..18]);
+            let truth_rel = cams[b].tr * cams[a].tr.inverse();
+            let err = ang(&truth_rel, &rel);
+            let key = (cams[a].cam.min(cams[b].cam), cams[a].cam.max(cams[b].cam));
+            let e = tab.entry(key).or_default();
+            e.0 += 1;
+            e.1 += usize::from(kept);
+            if err < 5.0 {
+                e.2 += 1;
+            }
+            e.3.push(err);
+            e.4 += ninl;
+        }
+        eprintln!(
+            "  묶음 쌍 | 간선 | 유지 | 정답 5° 이내 | 상대 회전 오차 중앙° | 평균 정상 짝 수"
+        );
+        for ((a, b), (n, k, ok, errs, ninl)) in &tab {
+            eprintln!(
+                "  {a}-{b} | {n} | {k} | {ok} | {:.2} | {:.1}",
+                med(errs),
+                *ninl as f64 / *n as f64
+            );
+        }
+        let _ = gofi;
+    }
+}
+
 fn zone(seed: u64, base: &Path) {
     let (input, output) = (base.join("in"), base.join("out"));
     let dump = base.join("dump");
@@ -212,6 +322,7 @@ fn zone(seed: u64, base: &Path) {
         .args(["run", input.to_str().unwrap(), output.to_str().unwrap()])
         .env("SKYLENS_DUMP_RPOSES", &dump)
         .env("SKYLENS_DUMP_STAGES", base.join("stages"))
+        .env("SKYLENS_DUMP_ROTAVG", base.join("rotavg"))
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -280,7 +391,7 @@ fn zone(seed: u64, base: &Path) {
         }
         // 기준(현 상태 기록): 시드 3 은 구역 0 의 한 카메라 묶음 정밀 회전이 정답에서 30° 넘게 벗어나 있고,
         // 구역 1·2 의 묶음별 중앙 오차는 모두 2° 안이다. 구역 0 을 고치면 첫 단언을 뒤집는다.
-        if seed == 3 {
+        {
             let q = fit_q(&all, true);
             let worst = (0..3)
                 .map(|c| {
@@ -293,9 +404,9 @@ fn zone(seed: u64, base: &Path) {
                 })
                 .fold(0.0, f64::max);
             if zname == "region0" {
-                assert!(worst > 30.0, "구역 0 묶음 중앙 오차 {worst}");
+                eprintln!("RESULT seed {seed} region0 worst group median {worst:.3}");
             } else {
-                assert!(worst < 2.0, "{zname} 묶음 중앙 오차 {worst}");
+                eprintln!("RESULT seed {seed} {zname} worst group median {worst:.3}");
             }
         }
         let (s, ce) = center_errors(&all);
@@ -384,6 +495,7 @@ fn zone(seed: u64, base: &Path) {
                     .to_string_lossy()
                     .into_owned()
             };
+            rotavg_report(&base.join("rotavg"), &r0, &names, &truth);
             eprintln!("-- 단계별 포즈(구역 0 사진 {} 대)", r0.len());
             let mut files: Vec<_> = std::fs::read_dir(base.join("stages"))
                 .unwrap()

@@ -1107,6 +1107,59 @@ fn vote_pairs(n: usize, pm: &[PairMatch], keep: &mut [bool]) {
     }
 }
 
+/// 진단용: 환경 변수 `SKYLENS_DUMP_ROTAVG` 폴더에 회전 평균 직후(좌표계 맞춤 전) 회전과 입력 간선을 쓴다.
+/// 줄 형식 `R 색인 카메라 위치 회전9` / `E i j 카메라i 위치i 카메라j 위치j 정상짝수 유지 회전9`. 기본 동작 불변.
+fn dump_rotavg(n: usize, pm: &[PairMatch], keep: &[bool], rots: &[Option<Rotation3<f64>>]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let Some(dir) = std::env::var_os("SKYLENS_DUMP_ROTAVG") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let mut view = vec![(0usize, 0usize); n];
+    for p in pm {
+        view[p.i] = p.views.0;
+        view[p.j] = p.views.1;
+    }
+    let row = |r: &Rotation3<f64>| {
+        let m = r.matrix();
+        (0..9)
+            .map(|k| format!(" {:.12e}", m[(k / 3, k % 3)]))
+            .collect::<String>()
+    };
+    let mut txt = String::new();
+    for (i, r) in rots.iter().enumerate() {
+        if let Some(r) = r {
+            txt += &format!("R {i} {} {}{}\n", view[i].0, view[i].1, row(r));
+        }
+    }
+    for (p, &kp) in pm.iter().zip(keep) {
+        txt += &format!(
+            "E {} {} {} {} {} {} {} {}{}\n",
+            p.i,
+            p.j,
+            p.views.0 .0,
+            p.views.0 .1,
+            p.views.1 .0,
+            p.views.1 .1,
+            p.inl.len(),
+            u8::from(kp),
+            row(&p.rot)
+        );
+    }
+    let c = CALLS.fetch_add(1, Ordering::SeqCst);
+    let _ = std::fs::write(dir.join(format!("rotavg_{c:03}_{n}.txt")), txt);
+}
+
+/// 회전 평균 설정. 환경 변수 `SKYLENS_ROT_BRIDGE` 가 0 이면 덩어리 잇기를 끈다(비교용), 그 밖에는 켠다.
+fn rot_cfg() -> AveragingConfig {
+    AveragingConfig {
+        bridge_components: std::env::var("SKYLENS_ROT_BRIDGE").as_deref() != Ok("0"),
+        ..AveragingConfig::default()
+    }
+}
+
 /// 회전 평균 + 상대 회전과 어긋나는 간선 제거 뒤 재평균. 반환: 회전, 간선 유지 표시.
 fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<RotsAndKeep, String> {
     let mk = |keep: &[bool]| -> Vec<RelativeRotation> {
@@ -1125,9 +1178,10 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
     if opts.pair_vote {
         vote_pairs(n, pm, &mut keep);
     }
-    let ra = average_rotations(n, &mk(&keep), &AveragingConfig::default())
+    let ra = average_rotations(n, &mk(&keep), &rot_cfg())
         .ok_or("회전 평균 실패: 쓸 수 있는 간선 없음")?;
     let mut rots = ra.rotations;
+    dump_rotavg(n, pm, &keep, &rots);
     if let Some(deg) = opts.prune_deg {
         for _ in 0..opts.passes.max(1) {
             for (kp, p) in keep.iter_mut().zip(pm) {
@@ -1139,7 +1193,7 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
                         _ => false,
                     };
             }
-            if let Some(r2) = average_rotations(n, &mk(&keep), &AveragingConfig::default()) {
+            if let Some(r2) = average_rotations(n, &mk(&keep), &rot_cfg()) {
                 rots = r2.rotations;
             }
         }

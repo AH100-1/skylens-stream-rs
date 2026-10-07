@@ -63,6 +63,11 @@ pub struct AveragingConfig {
     pub global_iterations: usize,
     /// 최소제곱·정상 집합 재선정을 되풀이하는 최대 횟수(1 이상으로 다룬다).
     pub active_set_rounds: usize,
+    /// 참이면 정상 간선만으로는 끊어지는 덩어리(이상치 문턱이 좁아 덩어리 사이 간선이 모두 빠진 경우)를
+    /// 빠진 간선들이 가리키는 상대 회전의 합의 무리로 다시 잇는다.
+    pub bridge_components: bool,
+    /// 덩어리 잇기에서 같은 무리로 보는 각(rad).
+    pub bridge_agree_rad: f64,
 }
 
 impl Default for AveragingConfig {
@@ -79,6 +84,8 @@ impl Default for AveragingConfig {
             init_starts: 8,
             global_iterations: 5,
             active_set_rounds: 8,
+            bridge_components: false,
+            bridge_agree_rad: 8f64.to_radians(),
         }
     }
 }
@@ -544,6 +551,90 @@ fn refine_global(
     }
 }
 
+/// 정상 간선 `active` 가 만드는 연결 덩어리가 여럿이면, 뿌리 덩어리부터 시작해 덩어리를 하나씩 잇는다.
+/// 이미 이은 집합과 덩어리 사이의 모든 간선(빠진 것 포함)이 가리키는 덩어리 회전 보정 G(R_v ← R_v G)를
+/// 가중치로 무리 짓고, 가중합이 가장 큰 무리의 평균 보정을 적용한다. 무리의 간선은 돌려주는 목록(다리)에 든다.
+fn bridge_components(
+    rot: &mut [Rotation3<f64>],
+    edges: &[RelativeRotation],
+    comp_ids: &[usize],
+    active: &[usize],
+    nodes: &[usize],
+    root: usize,
+    agree: f64,
+) -> Vec<usize> {
+    let n = rot.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    for &k in active {
+        let (a, b) = (find(&mut parent, edges[k].i), find(&mut parent, edges[k].j));
+        parent[a] = b;
+    }
+    let label: Vec<usize> = (0..n).map(|v| find(&mut parent, v)).collect();
+    let mut merged: Vec<bool> = vec![false; n]; // 덩어리 표지 기준
+    merged[label[root]] = true;
+    let mut done: Vec<bool> = vec![false; n]; // 정점별: 이은 덩어리 소속
+    for &v in nodes {
+        done[v] = merged[label[v]];
+    }
+    let mut bridges = Vec::new();
+    loop {
+        // 이은 집합과 이어지지 않은 덩어리 사이 후보 보정.
+        let mut cand: std::collections::BTreeMap<usize, Vec<(usize, Rotation3<f64>, f64)>> =
+            Default::default();
+        for &k in comp_ids {
+            let e = &edges[k];
+            let (a, b) = (done[e.i], done[e.j]);
+            if a == b {
+                continue;
+            }
+            // 움직이는 쪽 m, 고정 쪽 f, f→m 측정 R_fm = R_m R_fᵀ 이므로 G = R_mᵀ R_fm R_f.
+            let (m, f, rfm) = if b {
+                (e.i, e.j, e.rotation.inverse())
+            } else {
+                (e.j, e.i, e.rotation)
+            };
+            let g = rot[m].inverse() * rfm * rot[f];
+            cand.entry(label[m]).or_default().push((k, g, e.weight));
+        }
+        // 가중합이 가장 큰 무리를 가진 덩어리를 먼저 잇는다.
+        let mut best: Option<(f64, usize, Vec<usize>, Rotation3<f64>)> = None;
+        for (&lab, list) in &cand {
+            for (_, gc, _) in list {
+                let members: Vec<usize> = (0..list.len())
+                    .filter(|&x| angle(&(gc.inverse() * list[x].1)) < agree)
+                    .collect();
+                let w: f64 = members.iter().map(|&x| list[x].2).sum();
+                if best.as_ref().is_none_or(|b| w > b.0) {
+                    let mut sum = Matrix3::zeros();
+                    for &x in &members {
+                        sum += list[x].1.matrix() * list[x].2;
+                    }
+                    let mean = project_to_rotation(&sum).unwrap_or(*gc);
+                    best = Some((w, lab, members.iter().map(|&x| list[x].0).collect(), mean));
+                }
+            }
+        }
+        let Some((_, lab, ks, g)) = best else {
+            break;
+        };
+        for &v in nodes {
+            if label[v] == lab {
+                rot[v] *= g;
+                done[v] = true;
+            }
+        }
+        bridges.extend(ks);
+    }
+    bridges
+}
+
 /// 정점 `n` 개와 상대 회전 간선으로 전역 회전을 구한다.
 ///
 /// None: n = 0, 범위 밖 정점 번호, 쓸 수 있는 간선 없음.
@@ -627,6 +718,25 @@ pub fn average_rotations(
     // 최소제곱 뒤 잔차로 정상 집합을 다시 정하고, 바뀌었으면 다시 푼다(두 번 연속 같을 때까지, 최대
     // `active_set_rounds` 번 풀이). 상한에 닿거나 전에 푼 집합으로 되돌아가면(순환) 다시 정한 집합을
     // 버리고 멈춘다. 어느 경우든 돌려주는 정상 표시는 마지막으로 푼 집합 그대로다.
+    let bridges = if cfg.bridge_components {
+        bridge_components(
+            &mut rot,
+            edges,
+            &comp_ids,
+            &active,
+            &comp,
+            root,
+            cfg.bridge_agree_rad,
+        )
+    } else {
+        Vec::new()
+    };
+    for &k in &bridges {
+        if !active.contains(&k) {
+            active.push(k);
+        }
+    }
+    active.sort_unstable();
     let rounds = cfg.active_set_rounds.max(1);
     let mut seen: Vec<Vec<usize>> = Vec::new();
     let mut reselections = 0;
@@ -644,7 +754,7 @@ pub fn average_rotations(
         let next: Vec<usize> = comp_ids
             .iter()
             .copied()
-            .filter(|&k| edge_residual(&edges[k], &rot) < thr)
+            .filter(|&k| edge_residual(&edges[k], &rot) < thr || bridges.contains(&k))
             .collect();
         if next == active {
             converged = true;
