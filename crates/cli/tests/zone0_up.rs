@@ -326,6 +326,15 @@ fn zone(seed: u64, base: &Path) {
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v = Command::new(env!("CARGO_BIN_EXE_skylens-stream"))
+        .args(["verify", output.to_str().unwrap()])
+        .output()
+        .unwrap();
+    eprintln!(
+        "seed {seed}: verify exit {:?}\n{}",
+        v.status.code(),
+        String::from_utf8_lossy(&v.stdout)
+    );
     let report = std::fs::read_to_string(output.join("report.json")).unwrap();
     let j = parse_json(&report).unwrap();
     let uc = j.get("up_cross_check").unwrap();
