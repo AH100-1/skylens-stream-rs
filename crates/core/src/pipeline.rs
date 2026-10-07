@@ -1579,6 +1579,20 @@ fn sparse_init_with(
             g = *Rotation3::from_axis_angle(&axis, theta).matrix() * g;
         }
     }
+    if std::env::var_os("SKYLENS_DIAG_PREVIEW").is_some() {
+        let rp: Vec<Option<Pose>> = rots
+            .iter()
+            .map(|r| {
+                r.map(|r| {
+                    Pose::from_center(
+                        Rotation3::from_matrix_unchecked(r.matrix() * g.transpose()),
+                        &Point3::origin(),
+                    )
+                })
+            })
+            .collect();
+        diag_stage("rot", &rp);
+    }
     let ids: Vec<usize> = (0..n).filter(|&i| rots[i].is_some()).collect();
     let loc: HashMap<usize, usize> = ids.iter().enumerate().map(|(a, &i)| (i, a)).collect();
     let dirs: Vec<(usize, usize, Vector3<f64>)> = dirs_model
@@ -1624,7 +1638,7 @@ fn sparse_init_with(
             stages.pruned.0
         );
     }
-    dump_stage("placed", None, &poses);
+    diag_stage("placed", &poses);
     if opts.snap {
         snap_poses_to_gps(&mut poses, gps, opts.vfix);
     }
@@ -1711,7 +1725,45 @@ fn sparse_init_with(
 
 /// 정밀(BA) 결과를 GPS(ENU)에 닮음 정렬한다: 카메라 중심 ↔ GPS, 강건 추정(SPEC §3.4).
 /// BA 는 자유 좌표계에서 움직이므로 정밀 모델을 다시 GPS 좌표계로 돌려놓는다.
+#[cfg_attr(not(test), allow(dead_code))]
 fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity> {
+    gps_align_refined_ref(s, gps, None)
+}
+
+/// 위치가 거의 일직선일 때 연직 고정 정렬으로 바꾸는 문턱(공분산 둘째/첫째 고유값 비).
+/// `SKYLENS_ALIGN_LINE_FIX=<비>` 로 켠다. 기본은 꺼짐(0).
+fn line_fix_ratio() -> f64 {
+    std::env::var("SKYLENS_ALIGN_LINE_FIX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// 점들의 공분산 둘째/첫째 고유값 비(일직선이면 0 에 가깝다). 점이 3개 미만이면 `None`.
+fn line_ratio(p: &[Vector3<f64>]) -> Option<f64> {
+    if p.len() < 3 {
+        return None;
+    }
+    let mu = p.iter().sum::<Vector3<f64>>() / p.len() as f64;
+    let mut c = Matrix3::zeros();
+    for v in p {
+        c += (v - mu) * (v - mu).transpose();
+    }
+    let ev = c.symmetric_eigen().eigenvalues;
+    let mut e = [ev[0], ev[1], ev[2]];
+    e.sort_by(f64::total_cmp);
+    (e[2] > 0.0).then(|| e[1] / e[2])
+}
+
+/// `gps_align_refined` 에 BA 시작 모델의 회전(`start_rot`, 같은 색인)을 주면, 위치가 거의 일직선일 때
+/// (`SKYLENS_ALIGN_LINE_FIX` 비 미만) 직선 둘레 회전이 정해지지 않으므로 연직을 고정한다: 시작 모델은 GPS 좌표계
+/// 연직을 따르므로 BA 가 돌려놓은 좌표계 회전 Q = mean(R_시작ᵀ·R_BA) 를 구해 위 방향 Qᵀ·z 를 +z 로 보내고
+/// 방위·축척·이동만 푼다.
+fn gps_align_refined_ref(
+    s: &mut Sparse,
+    gps: &[Vector3<f64>],
+    start_rot: Option<&[Option<Rotation3<f64>>]>,
+) -> Option<Similarity> {
     let ids: Vec<usize> = (0..s.poses.len())
         .filter(|&i| s.poses[i].is_some())
         .collect();
@@ -1720,7 +1772,36 @@ fn gps_align_refined(s: &mut Sparse, gps: &[Vector3<f64>]) -> Option<Similarity>
         .map(|&i| s.poses[i].unwrap().center().coords)
         .collect();
     let dst: Vec<Vector3<f64>> = ids.iter().map(|&i| gps[i]).collect();
-    let (sim, _, _) = crate::align::robust_similarity(&src, &dst, 3, 3.0)?;
+    let mut sim = None;
+    let lim = line_fix_ratio();
+    if let (true, Some(sr), Some(ratio)) = (lim > 0.0, start_rot, line_ratio(&dst)) {
+        if std::env::var_os("SKYLENS_DIAG_PREVIEW").is_some() {
+            eprintln!(
+                "DIAGSIM line_ratio {ratio:.4} limit {lim} cameras {}",
+                ids.len()
+            );
+        }
+        if ratio < lim {
+            let mut q = Matrix3::zeros();
+            for &i in &ids {
+                if let Some(r0) = sr.get(i).copied().flatten() {
+                    q += r0.matrix().transpose() * s.poses[i].unwrap().rotation.matrix();
+                }
+            }
+            let svd = q.svd(true, true);
+            if let (Some(u), Some(vt)) = (svd.u, svd.v_t) {
+                let mut d = Matrix3::identity();
+                d[(2, 2)] = (u * vt).determinant().signum();
+                let qm = u * d * vt;
+                let up = qm.transpose() * Vector3::z();
+                sim = crate::align::similarity_fixed_up(&src, &dst, &up);
+            }
+        }
+    }
+    let sim = match sim {
+        Some(m) => m,
+        None => crate::align::robust_similarity(&src, &dst, 3, 3.0)?.0,
+    };
     apply_sparse_sim(s, &sim);
     Some(sim)
 }
@@ -2066,8 +2147,75 @@ fn shared_pairs(a: &[Track], b: &[Track], window: (usize, usize)) -> SharedPairs
     (s, d, im)
 }
 
+/// 정렬 닮음 변환이 연직을 이보다 더 기울이면 정렬 대상(정밀 모델)이 틀어진 것으로 보고 쓰지 않는다(도).
+/// 구역 정렬에서 정상인 연직 기울기는 4° 안쪽이고, 짧은 마지막 구역의 틀어진 정밀 모델(10~13°)이
+/// 이미 맞는 초벌·다른 구역 정밀 점군까지 같이 기울이는 것을 막는다. `SKYLENS_ALIGN_MAX_TILT`(도)로 켠다. 기본은 꺼짐(0): 켜면 구역 2 의 초벌·정밀 쌍이 어긋나 verify 가 악화된다.
+fn align_max_tilt_deg() -> f64 {
+    std::env::var("SKYLENS_ALIGN_MAX_TILT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
+}
+
+fn tilt_deg(s: &Similarity) -> f64 {
+    (s.r * nalgebra::Vector3::z())
+        .z
+        .clamp(-1.0, 1.0)
+        .acos()
+        .to_degrees()
+}
+
+/// 재정렬 기준 구역 선택. `SKYLENS_REALIGN_REF=1` 이면 기준을 최신 정밀 모델이 아니라 자기 초벌→정밀 정렬의
+/// 연직 기울기(GPS 좌표계인 초벌 대비)가 가장 작은 구역으로 고정하고, 기울어진 짧은 구역을 그 좌표계로 옮긴다.
+/// 기본은 꺼짐(최신 정밀 모델 기준).
+fn realign_ref_enabled() -> bool {
+    std::env::var("SKYLENS_REALIGN_REF").as_deref() == Ok("1")
+}
+
+/// 기준 후보: 정밀과 자기 정렬이 있는 구역 중 기울기가 가장 작은 구역. 현재 기준보다 1도 넘게 작아야 바꾼다.
+fn pick_ref_zone(recs: &[RegionRec], current: Option<usize>, newest: usize) -> usize {
+    let tilt = |i: usize| {
+        recs[i]
+            .own
+            .as_ref()
+            .and_then(|o| o.0.as_ref())
+            .filter(|_| recs[i].refined.is_some())
+            .map(tilt_deg)
+    };
+    let mut best = (newest, tilt(newest).unwrap_or(f64::INFINITY));
+    for i in 0..recs.len() {
+        if let Some(t) = tilt(i) {
+            if t < best.1 {
+                best = (i, t);
+            }
+        }
+    }
+    match current.and_then(|c| tilt(c).map(|t| (c, t))) {
+        Some((c, t)) if t <= best.1 + 1.0 => c,
+        _ => best.0,
+    }
+}
+
+fn tilt_ok(label: &str, s: &Similarity) -> bool {
+    let (t, lim) = (tilt_deg(s), align_max_tilt_deg());
+    let ok = lim <= 0.0 || t <= lim;
+    if !ok && std::env::var_os("SKYLENS_DIAG_PREVIEW").is_some() {
+        eprintln!("DIAGSIM reject {label} tilt_deg {t:.3} > {lim}");
+    }
+    ok
+}
+
 /// 구역 정렬(초벌→정밀, 정밀→정밀 공통): 변환, 점쌍 수, 잔차 중앙값(m).
 fn region_align(
+    a: &[Track],
+    b: &[Track],
+    ra: &Region,
+    rb: &Region,
+) -> Option<(Similarity, usize, f64)> {
+    region_align_raw(a, b, ra, rb).filter(|r| tilt_ok("region", &r.0))
+}
+
+fn region_align_raw(
     a: &[Track],
     b: &[Track],
     ra: &Region,
@@ -2119,6 +2267,7 @@ fn own_align(
             pairs = point_pairs(ta, tb, pos, (r.lo, r.hi));
             (sim, ar) = align_region(r, &pairs);
         }
+        let sim = sim.filter(|s| tilt_ok("own", s));
         return (sim, ar);
     }
     let win = if mode == 2 {
@@ -2291,6 +2440,71 @@ fn write_decimated(out: &Path, name: &str, cloud: &PointCloud) -> Result<(), Str
     })
 }
 
+thread_local! {
+    /// 진단용: 지금 만드는 희소 모델의 (구역 번호, 사진 전역 번호). `SKYLENS_DIAG_PREVIEW` 가 켜져 있을 때만 쓴다.
+    static DIAG_CTX: std::cell::RefCell<Option<(usize, Vec<usize>)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn diag_set_ctx(region: usize, gids: &[usize]) {
+    if region == usize::MAX {
+        DIAG_CTX.with(|c| *c.borrow_mut() = None);
+    } else if std::env::var_os("SKYLENS_DIAG_PREVIEW").is_some() {
+        DIAG_CTX.with(|c| *c.borrow_mut() = Some((region, gids.to_vec())));
+    }
+}
+
+/// 진단: 단계별 포즈(세계→카메라 회전 9개, 중심 3개)를 표준 오류로 낸다. 시험이 정답 회전과 비교해 연직 기울기를 구한다.
+fn diag_stage(stage: &str, poses: &[Option<Pose>]) {
+    if std::env::var_os("SKYLENS_DIAG_PREVIEW").is_none() {
+        return;
+    }
+    DIAG_CTX.with(|c| {
+        let c = c.borrow();
+        let Some((region, gids)) = c.as_ref() else {
+            return;
+        };
+        for (i, p) in poses.iter().enumerate() {
+            let (Some(p), Some(g)) = (p, gids.get(i)) else {
+                continue;
+            };
+            let m = p.rotation.matrix();
+            let ce = p.center();
+            eprintln!(
+                "DIAGPOSE {stage} {region} {g} {} {:.4} {:.4} {:.4}",
+                m.iter()
+                    .map(|v| format!("{v:.7}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                ce.x,
+                ce.y,
+                ce.z
+            );
+        }
+    });
+}
+
+/// 진단: `SKYLENS_DIAG_PREVIEW` 가 켜져 있으면 초벌→정밀 정렬 닮음 변환(축척·연직 기울기·이동 z)을 표준 오류로 낸다.
+fn diag_sim(label: &str, region: usize, target: usize, s: &Similarity, pairs: usize) {
+    if std::env::var_os("SKYLENS_DIAG_PREVIEW").is_none() {
+        return;
+    }
+    let up = s.r * nalgebra::Vector3::z();
+    let tilt = up.z.clamp(-1.0, 1.0).acos().to_degrees();
+    eprintln!(
+        "DIAGSIM {label} region {region} -> {target} pairs {pairs} scale {:.4} tilt_deg {:.3} up_xy ({:.4},{:.4}) t ({:.2},{:.2},{:.2})",
+        s.s, tilt, up.x, up.y, s.t.x, s.t.y, s.t.z
+    );
+}
+
+/// 진단: 같은 환경 변수가 켜져 있으면 정렬 전 초벌 점군을 `raw/` 에 낸다.
+fn diag_dump_raw(out: &Path, r: &Region, cloud: &PointCloud) -> Result<(), String> {
+    if std::env::var_os("SKYLENS_DIAG_PREVIEW").is_none() {
+        return Ok(());
+    }
+    let _ = std::fs::create_dir_all(out.join("raw"));
+    write_decimated(out, &format!("raw/raw_{:02}_pre.ply", r.index), cloud)
+}
+
 /// 구역 앞쪽 보조 F 사진 범위: 위치 [lo-HELPER_SPAN, lo-HELPER_MIN].
 /// 짝 규칙상 R(p)·L(p) 는 F(p-40..=p-12) 와 겹치므로 구역 첫 12 위치의 R·L 은 구역 바로 앞 F 까지 필요하다.
 const HELPER_SPAN: usize = 40;
@@ -2413,6 +2627,7 @@ pub fn run_pipeline_with(
             own_align(&rec.ta, &tb, &r, ds.config.ovl, n_pos)
         });
         if let Some(s) = &sim {
+            diag_sim("own", k, k, s, ar.pairs);
             realigns.push(ReAlign {
                 secs: t_now(),
                 region: k,
@@ -2431,7 +2646,16 @@ pub fn run_pipeline_with(
         }
         rec.own = Some((sim, ar));
         rec.refined = Some((tb, m.cloud));
-        *latest_ref = Some(k);
+        let refmode = realign_ref_enabled();
+        let target = if refmode {
+            pick_ref_zone(recs, *latest_ref, k)
+        } else {
+            k
+        };
+        if refmode && std::env::var_os("SKYLENS_DIAG_PREVIEW").is_some() {
+            eprintln!("DIAGREF new refined {k} reference zone {target}");
+        }
+        *latest_ref = Some(target);
         live.snapshot(t_now(), "refined_replace", r.index, &live_state(recs))?;
         // 다음 구역의 정밀 작업이 이 모델을 기다리고 있으면 기준을 보낸다.
         if k + 1 < recs.len() {
@@ -2457,18 +2681,19 @@ pub fn run_pipeline_with(
         let n_realign0 = realigns.len();
         // 이미 내보낸, 아직 정밀이 없는 초벌 구역을 새 정밀 모델 좌표로 다시 맞춘다.
         for j in 0..recs.len() {
-            if j == k || recs[j].refined.is_some() {
+            if j == target || recs[j].refined.is_some() {
                 continue;
             }
-            let tbk = &recs[k].refined.as_ref().unwrap().0;
+            let tbk = &recs[target].refined.as_ref().unwrap().0;
             let ca = crate::timing::timed("align_ghost", || {
-                region_align(&recs[j].ta, tbk, &recs[j].region, &recs[k].region)
+                region_align(&recs[j].ta, tbk, &recs[j].region, &recs[target].region)
             });
             if let Some((s, n, med)) = ca {
+                diag_sim("realign_coarse", j, target, &s, n);
                 realigns.push(ReAlign {
                     secs: t_now(),
                     region: j,
-                    target: k,
+                    target,
                     pairs: n,
                     median_m: med,
                     scale: s.s,
@@ -2480,12 +2705,12 @@ pub fn run_pipeline_with(
                     &crate::stream::apply_cloud(&s, &recs[j].coarse),
                 )?;
                 recs[j].sim = Some(s);
-                recs[j].target = Some(k);
+                recs[j].target = Some(target);
                 events.push(format!(
                     "{:.1}s realign coarse {} to refined {} pairs {n} median {med:.3} m",
                     t_now(),
                     jr.index,
-                    recs[k].region.index
+                    recs[target].region.index
                 ));
             }
         }
@@ -2497,15 +2722,16 @@ pub fn run_pipeline_with(
                 .map(|x| x.refined.as_ref().map(|(t, _)| (x.region, t.as_slice())))
                 .collect();
             crate::timing::timed("align_ghost", || {
-                crate::progressive::chain_realign_with(&items, k, region_align)
+                crate::progressive::chain_realign_with(&items, target, region_align)
             })
         };
         for st in steps {
             let (j, acc) = (st.region, st.total);
+            diag_sim("realign_refined", j, target, &acc, st.pairs);
             realigns.push(ReAlign {
                 secs: t_now(),
                 region: j,
-                target: k,
+                target,
                 pairs: st.pairs,
                 median_m: st.median_m,
                 scale: acc.s,
@@ -2517,12 +2743,42 @@ pub fn run_pipeline_with(
                 "{:.1}s realign refined {} to refined {} via {} pairs {} median {:.3} m",
                 t_now(),
                 jr.index,
-                recs[k].region.index,
+                recs[target].region.index,
                 recs[st.via].region.index,
                 st.pairs,
                 st.median_m
             ));
             recs[j].rsim = Some(acc);
+            if refmode {
+                // 정밀 구역의 초벌도 같은 변환으로 옮겨 쌍이 어긋나지 않게 한다(자기 정렬 뒤 재정렬).
+                if let Some(Some(own)) = recs[j].own.as_ref().map(|o| o.0) {
+                    let comb = acc.compose(&own);
+                    write_decimated(
+                        out,
+                        &preview_name(&jr),
+                        &crate::stream::apply_cloud(&comb, &recs[j].coarse),
+                    )?;
+                    recs[j].sim = Some(comb);
+                }
+            }
+        }
+        if refmode && recs[target].rsim.is_some() {
+            // 기준이 바뀌어 예전에 옮겨 둔 구역이 기준이 됐다: 자기 좌표로 되돌린다.
+            let tr = recs[target].region;
+            write_decimated(
+                out,
+                &refined_name(&tr),
+                &recs[target].refined.as_ref().unwrap().1,
+            )?;
+            recs[target].rsim = None;
+            if let Some(Some(own)) = recs[target].own.as_ref().map(|o| o.0) {
+                write_decimated(
+                    out,
+                    &preview_name(&tr),
+                    &crate::stream::apply_cloud(&own, &recs[target].coarse),
+                )?;
+                recs[target].sim = Some(own);
+            }
         }
         if realigns.len() > n_realign0 {
             live.snapshot(t_now(), "realign", r.index, &live_state(recs))?;
@@ -2671,6 +2927,7 @@ pub fn run_pipeline_with(
             .filter(|&(i, j)| i >= n_help && j >= n_help)
             .collect();
         let own_registered = |s: &Sparse| s.poses[n_help..].iter().filter(|p| p.is_some()).count();
+        diag_set_ctx(usize::MAX, &[]);
         let start = match check_motion(&gps, &views, &own_pairs)
             .and_then(|_| {
                 sparse_init_with(
@@ -2708,6 +2965,7 @@ pub fn run_pipeline_with(
         };
         // 초벌(미리보기)은 위의 광축 높이 분산 롤을 쓰고, 정밀 BA 시작점만 예전 롤 규칙으로 따로 만든다.
         let coarse_start = start;
+        diag_set_ctx(r.index, &gids);
         let start = sparse_init_with(
             &imgs,
             &pm,
@@ -2803,6 +3061,7 @@ pub fn run_pipeline_with(
             let ca =
                 crate::timing::timed("align_ghost", || region_align(&ta, tbm, r, &recs[m].region));
             if let Some((s, n, med)) = ca {
+                diag_sim("coarse_new", slot, m, &s, n);
                 realigns.push(ReAlign {
                     secs: t_now(),
                     region: slot,
@@ -2822,6 +3081,7 @@ pub fn run_pipeline_with(
             }
         }
         // 기준 모델이 없거나 겹침이 모자라면 GPS 좌표 그대로(초기 좌표계는 이미 GPS)로 내보낸다.
+        diag_dump_raw(out, r, &coarse)?;
         let shown = sim.unwrap_or_else(Similarity::identity);
         write_decimated(
             out,
@@ -2900,6 +3160,7 @@ pub fn run_pipeline_with(
                 let anchor = anchor_rx.recv().ok().flatten();
                 let t = Instant::now();
                 let mut rs = init;
+                diag_set_ctx(region.index, &gids_t);
                 let mut full: Option<(Vec<usize>, usize)> = None;
                 let mut arcs = arcs;
                 let mut gps = gps;
@@ -2931,6 +3192,7 @@ pub fn run_pipeline_with(
                             true,
                         ) {
                             in_region = gf.iter().map(|g| region.contains(g / 3)).collect();
+                            diag_set_ctx(region.index, &gf);
                             rs = sf;
                             arcs = arcs_f;
                             gps = gps_f;
@@ -2970,22 +3232,18 @@ pub fn run_pipeline_with(
                         anchored = true;
                     }
                 }
-                dump_stage(
-                    "refined_pre",
-                    Some(&recs_gids(&full, &gids_dump)),
-                    &rs.poses,
-                );
+                let start_rot: Vec<Option<Rotation3<f64>>> =
+                    rs.poses.iter().map(|p| p.map(|p| p.rotation)).collect();
                 rs.rms = crate::timing::timed("ba_refined", || {
                     run_ba(&mut rs, &k, iters, Some(&gps), psig, &fixed)
                 });
-                dump_stage(
-                    "refined_post",
-                    Some(&recs_gids(&full, &gids_dump)),
-                    &rs.poses,
-                );
+                diag_stage("ba", &rs.poses);
                 if !anchored && (anchor.is_none() || full.is_some()) {
-                    crate::timing::timed("gps_align", || gps_align_refined(&mut rs, &gps));
+                    crate::timing::timed("gps_align", || {
+                        gps_align_refined_ref(&mut rs, &gps, Some(&start_rot))
+                    });
                 }
+                diag_stage("gps", &rs.poses);
                 let cloud = crate::timing::timed("refined_dense_total", || {
                     dense_cloud(&rs, &imgs, &k, &in_region, dw, dmethod)
                 });
@@ -3057,9 +3315,16 @@ pub fn run_pipeline_with(
     }
 
     let kept: Vec<Region> = recs.iter().map(|r| r.region).collect();
+    let refmode = realign_ref_enabled();
     let sims: Vec<Option<Similarity>> = recs
         .iter()
-        .map(|r| r.own.as_ref().and_then(|o| o.0))
+        .map(|r| {
+            let own = r.own.as_ref().and_then(|o| o.0);
+            match (refmode, &r.rsim, own) {
+                (true, Some(rs), Some(o)) => Some(rs.compose(&o)),
+                _ => own,
+            }
+        })
         .collect();
     let records: Vec<AlignRecord> = recs
         .iter()
