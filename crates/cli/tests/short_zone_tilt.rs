@@ -2,8 +2,9 @@
 //! 단계별 포즈(회전 평균 직후 `rot`, 위치 평균 직후 `placed`, BA 직후 `ba`, GPS 정렬 직후 `gps`)를
 //! 정답 회전과 비교해 구역별 연직 기울기(도)를 출력하고 `verify` 통과 수를 센다.
 //! 실행: `SKYLENS_TILT_SEED=4 [SKYLENS_ALIGN_LINE_FIX=1] cargo test --release -p skylens-stream --test short_zone_tilt -- --ignored --nocapture`
-//! 기본 동작은 바꾸지 않는다. 기울기는 단계 포즈 R_i(세계→카메라)와 정답 R_i 로 G_i = R_iᵀ·R_true_i 를 모아
-//! 평균 회전 G 를 구한 뒤 G·z 와 z 의 각이다(좌표계 전체가 연직에서 얼마나 기울었는가).
+//! 기본 동작은 바꾸지 않는다. 단계 기울기(`TILT`)는 단계 포즈 R_i(세계→카메라)와 정답 R_i 로 G_i = R_iᵀ·R_true_i 를 모아
+//! 평균 회전 G 를 구한 뒤 G·z 와 z 의 각이다. 절댓값에는 카메라 축 규약 차가 섞여 구역 0·1 에서도 약 31° 가 나오므로
+//! 구역 0 의 같은 단계와의 차로만 읽는다. 켬 판정은 `DIAGSIM own` 의 기울기를 쓴다.
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -101,12 +102,21 @@ fn short_zone_tilt() {
     let text = String::from_utf8_lossy(&v.stdout);
     eprintln!("{text}");
     let _ = std::fs::remove_dir_all(&root);
-    // 기준값: 정렬 직후 모든 구역의 연직 기울기는 6° 안(정상 구간 0.9~3.8°).
+    // 기준값: 초벌→자기 정밀 정렬 닮음 변환(DIAGSIM own)의 연직 기울기는 모든 구역에서 6° 안(정상 구간 0.9~3.8°, 켜지 않은 시드 4 구역 2 는 13.458°).
     if fix {
-        for ((region, stage), t) in &tilts {
-            if stage == "gps" {
-                assert!(*t < 6.0, "구역 {region} GPS 정렬 뒤 기울기 {t:.3}° >= 6°");
+        let mut n = 0;
+        for l in String::from_utf8_lossy(&o.stderr).lines() {
+            if l.starts_with("DIAGSIM own") {
+                let t: f64 = l
+                    .split("tilt_deg ")
+                    .nth(1)
+                    .and_then(|x| x.split_whitespace().next())
+                    .and_then(|x| x.parse().ok())
+                    .unwrap();
+                assert!(t < 6.0, "자기 정렬 기울기 {t:.3}° >= 6°: {l}");
+                n += 1;
             }
         }
+        assert!(n >= 3, "자기 정렬 기록 {n} 개");
     }
 }
