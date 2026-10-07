@@ -491,6 +491,18 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
             let t_pair = Instant::now();
             let m = ratio_match(fa, fb, 0.8, true);
             crate::timing::add("matching_ratio_cpu", t_pair.elapsed().as_secs_f64());
+            let dbg_cross = std::env::var_os("SKYLENS_PRUNE_CAM").is_some()
+                && views[i].0 != views[j].0;
+            if dbg_cross {
+                eprintln!(
+                    "prune_dbg pair cam {} pos {} - cam {} pos {} ratio_matches {}",
+                    views[i].0,
+                    views[i].1,
+                    views[j].0,
+                    views[j].1,
+                    m.len()
+                );
+            }
             if m.len() < 20 {
                 return None;
             }
