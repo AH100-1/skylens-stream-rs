@@ -226,15 +226,14 @@ fn run_cond(scene_dir: &Path, base: &Path, seed: u64, cond: &str, spec: &str) ->
         let imgs = read_zone(&dump.join(format!("zone_scale_{zi:02}.txt")));
         let ok: Vec<&Img> = imgs
             .iter()
-            .filter(|i| i.placed.iter().all(|v| v.is_finite()) && truth.contains_key(&i.gid))
+            .filter(|i| i.fin.iter().all(|v| v.is_finite()) && truth.contains_key(&i.gid))
             .collect();
+        // 위치 풀이(placed)는 위치마다 카메라 1대(번호 3*위치)만 풀므로 같은 위치 3대 간격은 최종 초벌 중심(fin)으로 잰다.
         let mut r = vec![];
         for (x, ix) in ok.iter().enumerate() {
             for iy in ok.iter().skip(x + 1) {
                 if ix.gid / 3 == iy.gid / 3 {
-                    r.push(
-                        (ix.placed - iy.placed).norm() / (truth[&ix.gid] - truth[&iy.gid]).norm(),
-                    );
+                    r.push((ix.fin - iy.fin).norm() / (truth[&ix.gid] - truth[&iy.gid]).norm());
                 }
             }
         }
@@ -303,7 +302,7 @@ fn gps_prior_conditions() {
             .iter()
             .filter(|(n, _)| only.as_ref().is_none_or(|o| o.split(',').any(|x| x == *n)))
             .collect();
-        for chunk in conds.chunks(3) {
+        for chunk in conds.chunks(4) {
             let hs: Vec<_> = chunk
                 .iter()
                 .map(|&&(n, spec)| {

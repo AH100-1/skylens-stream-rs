@@ -87,7 +87,7 @@ fn truth_centers(input: &Path) -> BTreeMap<usize, Vector3<f64>> {
             -(r[1] * t[0] + r[4] * t[1] + r[7] * t[2]),
             -(r[2] * t[0] + r[5] * t[1] + r[8] * t[2]),
         );
-        m.insert(frame / 3 * 3 + cam, c + shift);
+        m.insert(frame * 3 + cam, c + shift);
     }
     m
 }
