@@ -227,7 +227,7 @@ fn lmeds_similarity(src: &[Vector3<f64>], dst: &[Vector3<f64>]) -> Option<Simila
 /// 첫 추정은 최소 표본 무작위 합의(LMedS, [`lmeds_similarity`])라 한쪽으로 몰린 이상치나
 /// 수백 m 이상치에 끌리지 않는다. 그 뒤 `iters` 번: 정상 대응 잔차 중앙값 m 으로 임계
 /// `max(3m, floor_m)` 이하만 정상으로 두어 다시 추정한다.
-/// 유한하지 않은 대응은 처음부터 제외(정상 표시 false). 최종 정상 대응이 3개 미만이면 `None`.
+/// 유한하지 않은 대응은 미리 제외(정상 표시 false). 최종 정상 대응이 3개 미만이면 `None`.
 /// 반환: (변환, 정상 표시, 정상 대응 잔차 중앙값).
 pub fn robust_similarity(
     src: &[Vector3<f64>],
