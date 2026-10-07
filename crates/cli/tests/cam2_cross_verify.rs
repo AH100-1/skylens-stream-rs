@@ -158,6 +158,7 @@ struct Row {
     best_cnt: usize,
     top: usize,
     needed: usize,
+    stage: usize,
     inl: usize,
     pts: Vec<((f64, f64), (f64, f64))>,
 }
@@ -197,6 +198,7 @@ fn parse(stderr: &str) -> Vec<Row> {
                 best_cnt: gu("best_cnt"),
                 top: gu("top"),
                 needed: gu("needed"),
+                stage: gu("stage"),
                 inl: gu("inl"),
                 pts: Vec::new(),
             });
@@ -239,8 +241,8 @@ fn cam2_cross_verify() {
     let th = RansacConfig::default().threshold_px;
     let mut rows = parse(&stderr);
     rows.sort_by_key(|r| (r.a.0.min(r.b.0), r.a.0.max(r.b.0), r.a.1, r.b.1));
-    eprintln!("| 짝(카메라 위치 - 카메라 위치) | 대응 | 결과(탈락 단계) | n | 표본 최선 | 정밀화 최다 | 유의 기준 | 최종 정상 | 겹침 a→b | 겹침 b→a | 정답 참 대응 |");
-    eprintln!("|---|---|---|---|---|---|---|---|---|---|---|");
+    eprintln!("| 짝(카메라 위치 - 카메라 위치) | 대응 | 결과(탈락 단계) | n | 표본 최선 | 정밀화 최다 | 유의 기준 | 단계 | 최종 정상 | 겹침 a→b | 겹침 b→a | 정답 참 대응 |");
+    eprintln!("|---|---|---|---|---|---|---|---|---|---|---|---|");
     for r in &rows {
         let (ca, cb) = (&truth[&name(r.a.0, r.a.1)], &truth[&name(r.b.0, r.b.1)]);
         let true_n = r
@@ -249,7 +251,7 @@ fn cam2_cross_verify() {
             .filter(|(p, q)| sampson_px(ca, cb, *p, *q) < th)
             .count();
         eprintln!(
-            "| {}-{} {}-{} | {} (하한 {}) | {} | {} | {} | {} | {} | {} | {:.2} | {:.2} | {} |",
+            "| {}-{} {}-{} | {} (하한 {}) | {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.2} | {} |",
             r.a.0,
             r.a.1,
             r.b.0,
@@ -261,6 +263,7 @@ fn cam2_cross_verify() {
             r.best_cnt,
             r.top,
             r.needed,
+            r.stage,
             r.inl,
             ca.ground_overlap_into(cb),
             cb.ground_overlap_into(ca),
