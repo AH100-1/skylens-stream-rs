@@ -357,3 +357,85 @@ fn fleet_independent_wobble_rig_share() {
         assert!(BaOptions::default().rig_share.is_none());
     }
 }
+
+/// 추정 포즈를 카메라 중심 기준 닮음(sim3) 맞춤으로 정답 좌표계에 옮긴 포즈 집합.
+fn sim3_aligned(p: &BaProblem, gt: &BaProblem) -> BaProblem {
+    use skylens_core::align::umeyama;
+    let src: Vec<Vector3<f64>> = p.poses.iter().map(|q| q.center().coords).collect();
+    let dst: Vec<Vector3<f64>> = gt.poses.iter().map(|q| q.center().coords).collect();
+    let sim = umeyama(&src, &dst).expect("umeyama");
+    let mut out = p.clone();
+    for q in out.poses.iter_mut() {
+        // 세계 점 x_gt = s R x_est + t 이므로 카메라 회전은 R_c Rᵀ.
+        let c = sim.apply_point(&q.center().coords);
+        *q = Pose::from_center(q.rotation * sim.r.inverse(), &Point3::from(c));
+    }
+    out
+}
+
+/// 고정 카메라(0, 3)를 정답 포즈로 되돌린 시작점.
+fn with_gt_fixed(st: &BaProblem, gt: &BaProblem) -> BaProblem {
+    let mut p = st.clone();
+    for c in [0usize, 3] {
+        p.poses[c] = gt.poses[c];
+    }
+    p
+}
+
+/// F-449: 편대 장면의 끔 기준선 악화가 게이지(고정 카메라가 잡음 낀 위치에 묶임) 탓인지 결합 탓인지.
+/// 변형 4개: 기존 시작 / 기존 + sim3 맞춤 뒤 / 고정 카메라 정답 / 고정 카메라 정답 + sim3 맞춤 뒤.
+/// 판정에 쓰는 행은 sim3 맞춤을 하지 않은 두 변형(기존 시작, 고정 정답)뿐이다. 닮음 맞춤 두 변형은
+/// 맞춤 자체가 오차를 가려 비교 근거가 못 되므로 표 뒤쪽에 '참고용(판정에 안 씀)' 으로 따로 찍는다.
+/// 이 시험은 출력 표만 내고 단언은 없다(무시 시험, 판정은 사람이 판정 행으로).
+/// 각 변형에서 시작·끔·켬 σ0.1.
+#[test]
+#[ignore]
+fn fleet_gauge_vs_coupling() {
+    let seeds = [1u64, 2, 3, 4];
+    let n = seeds.len() as f64;
+    for jit in [0.5, 1.0, 2.0] {
+        // [변형][시작,끔,켬][슬롯] 중앙 오차 평균
+        let mut acc = [[[0.0f64; 3]; 3]; 4];
+        for &seed in &seeds {
+            let sc = fleet_scene(seed, 12, 1500, 0.5, jit);
+            let st = start(&sc, seed, 1, 0.7, 0.3);
+            let stg = with_gt_fixed(&st, &sc.gt);
+            for (v, (base, aligned)) in [(&st, false), (&st, true), (&stg, false), (&stg, true)]
+                .into_iter()
+                .enumerate()
+            {
+                let runs = [
+                    base.clone(),
+                    run(&sc, base.clone(), None),
+                    run(&sc, base.clone(), Some(0.1)),
+                ];
+                for (r, q) in runs.iter().enumerate() {
+                    let m = if aligned {
+                        per_slot(&sim3_aligned(q, &sc.gt), &sc.gt)
+                    } else {
+                        per_slot(q, &sc.gt)
+                    };
+                    for k in 0..3 {
+                        acc[v][r][k] += m[k].0 / n;
+                    }
+                }
+            }
+        }
+        eprintln!("[편대 흔들림 {jit} 도] 중앙 오차(도) F / R / L");
+        let vn = ["기존 시작", "기존+sim3 맞춤", "고정 정답", "고정 정답+sim3"];
+        let rn = ["시작", "끔", "켬 σ0.1"];
+        // 판정 행(맞춤 없음: 변형 0, 2)을 먼저, 참고용 행(sim3 맞춤: 변형 1, 3)을 뒤에.
+        for (title, vs) in [("판정 행", [0usize, 2]), ("참고용(판정에 안 씀)", [1, 3])] {
+            eprintln!("  -- {title}");
+            for v in vs {
+                for r in 0..3 {
+                    let a = acc[v][r];
+                    eprintln!(
+                        "  {:<14} {:<8} {:.3} / {:.3} / {:.3}",
+                        vn[v], rn[r], a[0], a[1], a[2]
+                    );
+                }
+            }
+        }
+    }
+}
