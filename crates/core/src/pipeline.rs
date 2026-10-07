@@ -995,6 +995,8 @@ pub struct PreviewOpts {
     pub refine_drop_deg: f64,
     /// 다듬기: 시작 위치로 당기는 약한 항의 상대 가중.
     pub refine_anchor: f64,
+    /// 떨어진 덩어리 붙이기용 내부 호출: 위치 단계까지만 풀고 돌아온다(삼각측량·BA 생략).
+    pub placed_only: bool,
 }
 
 impl Default for PreviewOpts {
@@ -1014,6 +1016,7 @@ impl Default for PreviewOpts {
             refine_huber_deg: 0.3,
             refine_drop_deg: 2.0,
             refine_anchor: 0.02,
+            placed_only: false,
         }
     }
 }
@@ -1147,6 +1150,91 @@ fn average_pruned(n: usize, pm: &[PairMatch], opts: &PreviewOpts) -> Result<Rots
     Ok((rots, keep))
 }
 
+/// 환경 변수 `SKYLENS_ATTACH_COMPONENT=1` 이면 회전 그래프에서 떨어진 덩어리를 독립 모델로 풀어 붙인다(기본 끔).
+fn attach_component_enabled() -> bool {
+    std::env::var("SKYLENS_ATTACH_COMPONENT").as_deref() == Ok("1")
+}
+
+/// 회전 평균에서 빠진 사진(`rots` 가 None)을 그 사진들끼리의 간선만으로 독립 모델로 푼다:
+/// 덩어리 안 회전 평균 → 방향을 GPS 에 맞춤 → 비행 축 둘레 회전은 광축 높이 분산 최소(수평 롤 0 가정)로 고정 →
+/// GPS 사전 위치 풀이. 결과는 GPS(동-북-위) 좌표계라 본 모델과 같은 좌표계이므로 포즈를 그대로 합친다.
+/// 합쳐진 포즈는 이어지는 삼각측량·BA 가 공유 트랙으로 다듬는다. 반환: 새로 붙인 사진 수.
+#[allow(clippy::too_many_arguments)]
+fn attach_lost_components(
+    imgs: &[&ImgData],
+    pm: &[PairMatch],
+    gps: &[Vector3<f64>],
+    k: &Intrinsics,
+    method: PositionMethod,
+    tri: &TriConfig,
+    opts: &PreviewOpts,
+    rots: &[Option<Rotation3<f64>>],
+    poses: &mut [Option<Pose>],
+) -> usize {
+    let debug = std::env::var_os("SKYLENS_REG_DEBUG").is_some();
+    let mut remaining: Vec<usize> = (0..imgs.len()).filter(|&i| rots[i].is_none()).collect();
+    let mut attached = 0;
+    for _round in 0..4 {
+        if remaining.len() < 3 {
+            break;
+        }
+        let loc: HashMap<usize, usize> =
+            remaining.iter().enumerate().map(|(a, &i)| (i, a)).collect();
+        let sub_pm: Vec<PairMatch> = pm
+            .iter()
+            .filter(|p| loc.contains_key(&p.i) && loc.contains_key(&p.j))
+            .map(|p| PairMatch {
+                i: loc[&p.i],
+                j: loc[&p.j],
+                inl: p.inl.clone(),
+                rot: p.rot,
+                t: p.t,
+                views: p.views,
+            })
+            .collect();
+        let sub_imgs: Vec<&ImgData> = remaining.iter().map(|&i| imgs[i]).collect();
+        let sub_gps: Vec<Vector3<f64>> = remaining.iter().map(|&i| gps[i]).collect();
+        let sub_opts = PreviewOpts {
+            placed_only: true,
+            ..*opts
+        };
+        let res = sparse_init_with(
+            &sub_imgs,
+            &sub_pm,
+            &sub_gps,
+            k,
+            method,
+            tri,
+            (0, 2.0),
+            &sub_opts,
+        );
+        let Ok((sub, _)) = res else {
+            if debug {
+                eprintln!("reg_debug attach round failed: {:?}", res.err());
+            }
+            break;
+        };
+        let got: Vec<usize> = remaining
+            .iter()
+            .enumerate()
+            .filter(|&(a, _)| sub.poses[a].is_some())
+            .map(|(_, &i)| i)
+            .collect();
+        if got.len() < 3 {
+            break;
+        }
+        for &i in &got {
+            poses[i] = sub.poses[loc[&i]];
+        }
+        if debug {
+            eprintln!("reg_debug attach component {} photos: {got:?}", got.len());
+        }
+        attached += got.len();
+        remaining.retain(|i| !got.contains(i));
+    }
+    attached
+}
+
 /// 위치 단계 뒤 카메라 중심을 GPS 에 닮음 변환 강건 추정으로 맞춘다(중심·방향 모두).
 fn snap_poses_to_gps(poses: &mut [Option<Pose>], gps: &[Vector3<f64>], vfix: bool) {
     let ids: Vec<usize> = (0..poses.len()).filter(|&i| poses[i].is_some()).collect();
@@ -1216,6 +1304,49 @@ fn roll_by_level_spread(
     } else {
         th + std::f64::consts::PI
     })
+}
+
+/// 떨어진 덩어리의 가정 내려다보는 각(도). SPEC §1·§6 약 60°.
+const ATTACH_DOWN_DEG: f64 = 60.0;
+
+/// 비행 축 `axis` 둘레 회전각: 모든 카메라가 같은 장착(내려다보는 각 `down`, 수평 롤 0)이라는 가정에서
+/// (카메라 x 축의 높이 성분)² + (광축 높이 + sin(down))² 의 평균이 최소인 각. 0.25° 격자 + 이분 다듬기.
+fn roll_by_mount_prior(
+    axis: &nalgebra::Unit<Vector3<f64>>,
+    g: &Matrix3<f64>,
+    valid: &[Rotation3<f64>],
+    down: f64,
+) -> f64 {
+    let cost = |th: f64| -> f64 {
+        let m = *Rotation3::from_axis_angle(axis, th).matrix() * g;
+        valid
+            .iter()
+            .map(|r| {
+                let v = m * (r.inverse() * Vector3::z());
+                let x = m * (r.inverse() * Vector3::x());
+                x.z * x.z + (v.z + down.sin()).powi(2)
+            })
+            .sum::<f64>()
+    };
+    let mut best = (f64::INFINITY, 0.0);
+    for step in 0..1440 {
+        let th = step as f64 * 0.25f64.to_radians();
+        let c = cost(th);
+        if c < best.0 {
+            best = (c, th);
+        }
+    }
+    let mut h = 0.25f64.to_radians();
+    let mut th = best.1;
+    for _ in 0..20 {
+        for cand in [th - h, th + h] {
+            if cost(cand) < cost(th) {
+                th = cand;
+            }
+        }
+        h *= 0.5;
+    }
+    th
 }
 
 /// 회전 평균 → 방향으로 좌표계 맞춤 → 위치 → 삼각측량. 초벌 희소 모델.
@@ -1343,6 +1474,10 @@ fn sparse_init_with(
                 }
             }
             g = best.1;
+        } else if opts.placed_only {
+            // 한 카메라 덩어리: 광축 높이 분산이 없어 롤을 못 정한다. 내려다보는 각·수평 롤 0 가정으로 고정.
+            let theta = roll_by_mount_prior(&axis, &g, &valid, ATTACH_DOWN_DEG.to_radians());
+            g = *Rotation3::from_axis_angle(&axis, theta).matrix() * g;
         } else if let Some(theta) = roll_by_level_spread(&axis, &g, &valid) {
             g = *Rotation3::from_axis_angle(&axis, theta).matrix() * g;
         }
@@ -1380,7 +1515,20 @@ fn sparse_init_with(
         let r = Rotation3::from_matrix_unchecked(rots[i].unwrap().matrix() * g.transpose());
         poses[i] = Some(Pose::from_center(r, &Point3::from(c)));
     }
+    if attach_component_enabled() && !opts.placed_only {
+        attach_lost_components(imgs, pm, gps, k, method, tri, opts, &rots, &mut poses);
+    }
     stages.placed = poses.clone();
+    if opts.placed_only {
+        let s = Sparse {
+            poses,
+            points: Vec::new(),
+            obs: Vec::new(),
+            ba_only: Vec::new(),
+            rms: 0.0,
+        };
+        return Ok((s, stages));
+    }
     if std::env::var_os("SKYLENS_REG_DEBUG").is_some() {
         let no_rot: Vec<usize> = (0..n).filter(|&i| rots[i].is_none()).collect();
         let no_pos: Vec<usize> = (0..n)
@@ -3402,6 +3550,110 @@ mod diag {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::*;
+
+    fn lcg(s: &mut u64) -> f64 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*s >> 33) as f64 / (1u64 << 31) as f64) - 0.5
+    }
+
+    /// 아래 60° 를 보는 장착 회전(월드 동-북-위, 카메라 x 오른쪽·y 아래·z 앞), 방위 `az`(동에서 반시계 라디안).
+    fn mounted(az: f64, down: f64) -> Rotation3<f64> {
+        let fwd = Vector3::new(down.cos() * az.cos(), down.cos() * az.sin(), -down.sin());
+        let right = fwd.cross(&Vector3::z()).normalize();
+        let yaxis = fwd.cross(&right);
+        // 행이 카메라 축인 월드→카메라 회전.
+        Rotation3::from_matrix_unchecked(Matrix3::from_rows(&[
+            right.transpose(),
+            yaxis.transpose(),
+            fwd.transpose(),
+        ]))
+    }
+
+    fn pair(i: usize, j: usize, poses: &[Pose], cam: usize) -> PairMatch {
+        let (pi, pj) = (poses[i], poses[j]);
+        let rot = pj.rotation * pi.rotation.inverse();
+        let t = pj.translation - rot * pi.translation;
+        PairMatch {
+            i,
+            j,
+            inl: vec![(0, 0); 50],
+            rot,
+            t: Some(t.normalize()),
+            views: ((cam, i), (cam, j)),
+        }
+    }
+
+    /// 교차 간선이 없는 한 카메라 덩어리를 정답 없이(GPS 와 간선만으로) 붙여 정답 대비 오차를 잰다.
+    #[test]
+    fn detached_single_camera_component_is_attached() {
+        let mut seed = 7u64;
+        // 직선(동쪽) 비행 높이 100 m, 1 m 간격 14장; 카메라는 진행 방향에서 -116° 로 60° 아래.
+        let n = 14;
+        let truth: Vec<Pose> = (0..n)
+            .map(|i| {
+                let c = Vector3::new(i as f64 * 1.0, 0.0, 100.0);
+                Pose::from_center(
+                    mounted((-116f64).to_radians(), 60f64.to_radians()),
+                    &Point3::from(c),
+                )
+            })
+            .collect();
+        // 같은 카메라끼리 가까운 이웃 4개까지 간선.
+        let mut pm = Vec::new();
+        for i in 0..n {
+            for j in i + 1..n.min(i + 5) {
+                pm.push(pair(i, j, &truth, 2));
+            }
+        }
+        let gps: Vec<Vector3<f64>> = truth
+            .iter()
+            .map(|p| {
+                p.center().coords
+                    + Vector3::new(
+                        0.3 * lcg(&mut seed),
+                        0.3 * lcg(&mut seed),
+                        0.3 * lcg(&mut seed),
+                    )
+            })
+            .collect();
+        let img = ImgData {
+            rgb: image::RgbImage::new(1, 1),
+            feats: Vec::new(),
+        };
+        let imgs: Vec<&ImgData> = (0..n).map(|_| &img).collect();
+        let rots: Vec<Option<Rotation3<f64>>> = vec![None; n];
+        let mut poses: Vec<Option<Pose>> = vec![None; n];
+        let k = Intrinsics::from_hfov(960, 540, 65f64.to_radians());
+        let tri = TriConfig::from_config(&PipelineConfig::default());
+        let got = attach_lost_components(
+            &imgs,
+            &pm,
+            &gps,
+            &k,
+            PositionMethod::GpsLeastSquares,
+            &tri,
+            &PreviewOpts::default(),
+            &rots,
+            &mut poses,
+        );
+        assert_eq!(got, n);
+        for i in 0..n {
+            let p = poses[i].unwrap();
+            let rot_err = (p.rotation * truth[i].rotation.inverse())
+                .angle()
+                .to_degrees();
+            let c_err = (p.center() - truth[i].center()).norm();
+            assert!(rot_err <= 2.0, "photo {i} rotation error {rot_err:.2} deg");
+            assert!(c_err <= 2.0, "photo {i} center error {c_err:.2} m");
+        }
     }
 }
 
