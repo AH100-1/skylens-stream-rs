@@ -191,7 +191,67 @@ pub struct UpCrossReport {
     pub exceeds: bool,
 }
 
+/// (구역 번호, 카메라 이름, 어긋남 도).
+type Peak = (usize, &'static str, f64);
+
 impl UpCrossReport {
+    /// 구역별 검사 결과(구역 번호, 결과)로 보고를 만든다.
+    pub fn from_checks(checks: Vec<(usize, crate::align::UpCrossCheck)>) -> Self {
+        let mut out = Self::default();
+        for (region, c) in checks {
+            out.max_diff_deg = match (out.max_diff_deg, c.max_diff_deg) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            out.regions.push((region, c.labels, c.diff_deg));
+        }
+        out.exceeds = out
+            .max_diff_deg
+            .is_some_and(|d| d > crate::align::UP_CROSS_WARN_DEG);
+        out
+    }
+
+    /// 어긋남이 가장 큰 (구역, 카메라 이름, 값)과 다음으로 큰 값.
+    fn top_two(&self) -> Option<(Peak, Option<f64>)> {
+        let mut all: Vec<Peak> = Vec::new();
+        for (r, labels, diffs) in &self.regions {
+            for (l, d) in labels.iter().zip(diffs) {
+                if let Some(d) = d.filter(|d| d.is_finite()) {
+                    all.push((*r, crate::dataset::CAMERAS[*l % 3], d));
+                }
+            }
+        }
+        all.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let first = *all.first()?;
+        Some((first, all.get(1).map(|x| x.2)))
+    }
+
+    /// 문턱을 넘었을 때만 알림 문구(최대 어긋남 카메라 이름과 다음 값과의 차). 아니면 `None`.
+    /// 한 기체에 구름이 있으면 구름 없는 묶음의 어긋남도 문턱을 넘을 수 있어(구름 낀 묶음이
+    /// 나머지 쪽에 섞인다) 묶음별 값을 문턱과 하나씩 비교하지 않고 최대 묶음만 지목한다.
+    /// 구름 낀 묶음이 항상 최대는 아니다: 방위가 묶음마다 한 방향뿐인 배치에서는 세 값이 거의
+    /// 같아 시드에 따라 구름 없는 묶음이 최대가 되므로 이름은 후보로 읽어야 한다.
+    pub fn alert(&self) -> Option<String> {
+        if !self.exceeds {
+            return None;
+        }
+        let ((region, cam, d), next) = self.top_two()?;
+        let gap = next.map_or(String::new(), |n| format!(", 다음 값보다 {:.3}° 큼", d - n));
+        Some(format!(
+            "위 방향 교차 검사 초과: {cam} 묶음(구역 {region})의 어긋남 {d:.3}° 가 문턱 {}° 를 넘는다{gap}; {cam} 짐벌 구름 치우침이 의심된다",
+            crate::align::UP_CROSS_WARN_DEG
+        ))
+    }
+
+    /// 문턱 이하일 때의 정보 줄(알림 목록이 아니라 events 에 남긴다).
+    pub fn info(&self) -> Option<String> {
+        let max = self.max_diff_deg?;
+        Some(format!(
+            "위 방향 교차 검사: 최대 어긋남 {max:.3}° (문턱 {}°)",
+            crate::align::UP_CROSS_WARN_DEG
+        ))
+    }
+
     /// report.json 의 `up_cross_check` 값(JSON 객체 문자열).
     fn to_json(&self) -> String {
         let num = |d: &Option<f64>| d.map_or("null".to_string(), |v| format!("{v:.4}"));
@@ -222,24 +282,17 @@ impl UpCrossReport {
 
 /// 구역별 정밀 포즈를 사진 번호 % 3(카메라 폴더)로 묶어 위 방향 교차 검사를 한다.
 fn up_cross_report(recs: &[RegionRec]) -> UpCrossReport {
-    let mut out = UpCrossReport::default();
+    let mut checks = Vec::new();
     for rec in recs {
         let mut gids: Vec<usize> = rec.rposes.keys().copied().collect();
         gids.sort_unstable();
         let rots: Vec<Rotation3<f64>> = gids.iter().map(|g| rec.rposes[g].rotation).collect();
         let labels: Vec<usize> = gids.iter().map(|g| g % 3).collect();
         if let Some(c) = crate::align::up_cross_check(&rots, &labels) {
-            out.max_diff_deg = match (out.max_diff_deg, c.max_diff_deg) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
-            out.regions.push((rec.region.index, c.labels, c.diff_deg));
+            checks.push((rec.region.index, c));
         }
     }
-    out.exceeds = out
-        .max_diff_deg
-        .is_some_and(|d| d > crate::align::UP_CROSS_WARN_DEG);
-    out
+    UpCrossReport::from_checks(checks)
 }
 
 struct ImgData {
@@ -2867,16 +2920,10 @@ pub fn run_pipeline_with(
         reg_ref.extend(rec.centers.keys().copied());
     }
     res.up_cross = up_cross_report(&recs);
-    if let Some(m) = res.up_cross.max_diff_deg {
-        let msg = format!(
-            "위 방향 교차 검사: 카메라 폴더 묶음 사이 최대 어긋남 {m:.3}° (문턱 {}°)",
-            crate::align::UP_CROSS_WARN_DEG
-        );
-        res.issues.push(if res.up_cross.exceeds {
-            format!("{msg} 초과: 한 카메라의 짐벌 구름 치우침이 의심된다")
-        } else {
-            msg
-        });
+    if let Some(msg) = res.up_cross.alert() {
+        res.issues.push(msg);
+    } else if let Some(msg) = res.up_cross.info() {
+        events.push(msg);
     }
     for rec in recs.iter() {
         let st = &rec.stats;

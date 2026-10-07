@@ -57,9 +57,40 @@ fn run_report_has_up_cross_check_below_threshold() {
     assert_eq!(res.up_cross.regions.len(), 1);
     assert_eq!(res.up_cross.regions[0].1, vec![0, 1, 2]);
     assert!(res.up_cross.regions[0].2.iter().all(|d| d.is_some()));
-    assert!(res
-        .issues
-        .iter()
-        .any(|i| i.contains("위 방향 교차 검사") && !i.contains("초과")));
+    // 구름 없는 장면: 알림 목록에 교차 검사 줄이 없고 events 에 정보 줄로만 남는다.
+    assert!(
+        !res.issues.iter().any(|i| i.contains("교차 검사")),
+        "{:?}",
+        res.issues
+    );
+    let events = j.get("events").and_then(|v| v.as_array()).expect("events");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        skylens_core::verify::Json::Str(s) if s.contains("위 방향 교차 검사: 최대 어긋남")
+    )));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 알림 문구 단위 시험: 한 기체 구름 2° 시험 출력 값(1.116/0.849/0.849°)에서 camF 만 지목하고
+/// 다음 값과의 차 0.267° 를 적으며, 문턱 미만이면 알림이 없다.
+#[test]
+fn alert_names_camera_and_gap() {
+    use skylens_core::pipeline::UpCrossReport;
+    let mk = |d: [f64; 3]| {
+        let max = d.iter().copied().fold(0.0, f64::max);
+        UpCrossReport {
+            regions: vec![(0, vec![0, 1, 2], d.iter().map(|v| Some(*v)).collect())],
+            max_diff_deg: Some(max),
+            exceeds: max > UP_CROSS_WARN_DEG,
+        }
+    };
+    let a = mk([1.116, 0.849, 0.849]).alert().unwrap();
+    assert!(
+        a.contains("camF") && !a.contains("camR") && !a.contains("camL"),
+        "{a}"
+    );
+    assert!(a.contains("1.116") && a.contains("0.267"), "{a}");
+    let ok = mk([0.080, 0.076, 0.089]);
+    assert!(ok.alert().is_none());
+    assert!(ok.info().unwrap().contains("0.089"));
 }

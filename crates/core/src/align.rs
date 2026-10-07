@@ -1703,6 +1703,22 @@ mod tests {
                 let tilt = up.angle(&up_true).to_degrees();
                 let chk = up_cross_check(&rots, &labels).unwrap();
                 assert_eq!(chk.labels, vec![0, 1, 2]);
+                // 알림 문구: 구름 2° 면 구름 낀 camF 만 지목하고 다음 값과의 차를 적는다.
+                let rep = crate::pipeline::UpCrossReport::from_checks(vec![(0, chk.clone())]);
+                if roll >= 2.0 {
+                    // 이 배치에서는 세 값이 거의 같아 구름 낀 묶음이 최대가 아닐 수 있다(시드 0:
+                    // 0.993/0.956/1.077°). 문구는 최대 묶음 이름과 다음 값과의 차를 적는다.
+                    let a = rep.alert().expect("2 deg 알림");
+                    let mut v: Vec<f64> = chk.diff_deg.iter().flatten().copied().collect();
+                    v.sort_by(|x, y| y.total_cmp(x));
+                    let cam = crate::dataset::CAMERAS
+                        [chk.diff_deg.iter().position(|d| *d == Some(v[0])).unwrap()];
+                    assert!(a.contains(cam), "{a}");
+                    assert!(a.contains(&format!("{:.3}", v[0])), "{a}");
+                    assert!(a.contains(&format!("{:.3}", v[0] - v[1])), "{a}");
+                } else if roll == 0.0 {
+                    assert!(rep.alert().is_none());
+                }
                 // 이 배치는 묶음마다 방위가 한 방향뿐이라 대체(x 축 기울기 평균) 갈래만 돈다.
                 // 자기 위 방향 갈래는 `up_cross_check_own_branch_on_shuttle_layout` 에서 본다.
                 assert!(chk.up_own.iter().all(|u| u.is_none()));
