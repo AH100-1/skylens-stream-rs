@@ -103,7 +103,7 @@ fn cross_threshold_warns_on_sparse_links() {
     let few: Vec<RelativeRotation> = edges
         .iter()
         .enumerate()
-        .filter(|(k, _)| *k < m - 5 || *k == m - 5)
+        .filter(|(k, _)| *k <= m - 5)
         .map(|(_, e)| e.clone())
         .collect();
     let r = average_rotations(36, &few, &cfg_on(groups)).unwrap();
