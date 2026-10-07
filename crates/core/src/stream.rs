@@ -865,6 +865,18 @@ impl Json {
         }
     }
 
+    /// `\u` 뒤 16진수 4자리를 읽는다(`+`·공백 등 숫자가 아닌 글자는 오류).
+    fn hex4(b: &[u8], i: &mut usize) -> Result<u32, String> {
+        let h = b.get(*i..*i + 4).ok_or("\\u 끝")?;
+        if !h.iter().all(u8::is_ascii_hexdigit) {
+            return Err(format!("\\u 16진수 아님 @{i}"));
+        }
+        let cp = u32::from_str_radix(std::str::from_utf8(h).map_err(|e| e.to_string())?, 16)
+            .map_err(|e| e.to_string())?;
+        *i += 4;
+        Ok(cp)
+    }
+
     fn string(b: &[u8], i: &mut usize) -> Result<String, String> {
         if b.get(*i) != Some(&b'"') {
             return Err(format!("문자열 @{i}"));
@@ -879,19 +891,38 @@ impl Json {
                     let e = *b.get(*i).ok_or("이스케이프 끝")?;
                     *i += 1;
                     match e {
+                        b'"' => out.push(b'"'),
+                        b'\\' => out.push(b'\\'),
+                        b'/' => out.push(b'/'),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0c),
                         b'n' => out.push(b'\n'),
                         b't' => out.push(b'\t'),
                         b'r' => out.push(b'\r'),
                         b'u' => {
-                            let h = std::str::from_utf8(b.get(*i..*i + 4).ok_or("\\u 끝")?)
-                                .map_err(|e| e.to_string())?;
-                            let cp = u32::from_str_radix(h, 16).map_err(|e| e.to_string())?;
-                            *i += 4;
-                            let ch = char::from_u32(cp).unwrap_or('\u{fffd}');
+                            let hi = Self::hex4(b, i)?;
+                            let cp = if (0xd800..0xdc00).contains(&hi) {
+                                if b.get(*i..*i + 2) != Some(b"\\u".as_slice()) {
+                                    return Err(format!("짝 없는 높은 서로게이트 @{i}"));
+                                }
+                                *i += 2;
+                                let lo = Self::hex4(b, i)?;
+                                if !(0xdc00..0xe000).contains(&lo) {
+                                    return Err(format!("서로게이트 쌍이 아님 @{i}"));
+                                }
+                                0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)
+                            } else if (0xdc00..0xe000).contains(&hi) {
+                                return Err(format!("짝 없는 낮은 서로게이트 @{i}"));
+                            } else {
+                                hi
+                            };
+                            let ch = char::from_u32(cp).ok_or("잘못된 코드 포인트")?;
                             let mut buf = [0u8; 4];
                             out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                         }
-                        other => out.push(other),
+                        other => {
+                            return Err(format!("알 수 없는 이스케이프 \\{} @{i}", other as char))
+                        }
                     }
                 }
                 c => out.push(c),
@@ -1020,6 +1051,45 @@ pub fn write_outputs(
 
 #[cfg(test)]
 mod tests {
+    fn jstr(lit: &str) -> Result<String, String> {
+        match Json::parse(lit)? {
+            Json::Str(s) => Ok(s),
+            _ => Err("문자열 아님".into()),
+        }
+    }
+
+    #[test]
+    fn json_string_backspace_formfeed_and_simple_escapes() {
+        assert_eq!(jstr(r#""\b""#).unwrap(), "\u{8}");
+        assert_eq!(jstr(r#""\f""#).unwrap(), "\u{c}");
+        assert_eq!(jstr(r#""a\"\\\/\n\t\rz""#).unwrap(), "a\"\\/\n\t\rz");
+        assert_eq!(jstr(r#""\u0041\u00e9\ud55c""#).unwrap(), "A\u{e9}\u{d55c}");
+    }
+
+    #[test]
+    fn json_string_surrogate_pair_joins_to_one_char() {
+        let s = jstr(r#""\ud83d\ude00""#).unwrap();
+        assert_eq!(s, "\u{1F600}");
+        assert_eq!(s.chars().count(), 1);
+        assert_eq!(jstr(r#""x\uD83D\uDE00y""#).unwrap(), "x\u{1F600}y");
+    }
+
+    #[test]
+    fn json_string_lone_surrogates_and_unknown_escapes_are_errors() {
+        for bad in [
+            r#""\x""#,
+            r#""\ud83d""#,
+            r#""\ud83dx""#,
+            r#""\ud83d\u0041""#,
+            r#""\ude00""#,
+            r#""\u12""#,
+            r#""\u+123""#,
+            r#""\a""#,
+        ] {
+            assert!(jstr(bad).is_err(), "{bad}");
+        }
+    }
+
     use super::*;
     use nalgebra::{Rotation3, Unit};
 

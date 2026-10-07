@@ -69,14 +69,26 @@ impl PosesFile {
         }
     }
 
+    /// 회전·중심에 비유한 값이 있어 파일에서 빠지는 포즈 수.
+    pub fn skipped_non_finite(&self) -> usize {
+        self.poses.iter().filter(|e| !pose_is_finite(e)).count()
+    }
+
+    /// 내부 파라미터 fx·fy·cx·cy 가 모두 유한한가.
+    pub fn intrinsics_finite(&self) -> bool {
+        let (fx, fy, cx, cy, _, _) = self.intrinsics;
+        [fx, fy, cx, cy].iter().all(|v| v.is_finite())
+    }
+
     /// JSON 으로 쓴다. 회전·중심에 비유한 값이 있는 포즈는 JSON 수치로 쓸 수 없어 건너뛴다
     /// (호출부가 쓰기 오류를 파이프라인 전체 실패로 올리므로, 카메라 한 대 때문에 파일 전체를 잃지 않게 한다).
     pub fn to_json(&self) -> String {
         let (fx, fy, cx, cy, w, h) = self.intrinsics;
+        let skipped = self.skipped_non_finite();
         let rows: Vec<String> = self
             .poses
             .iter()
-            .filter(|e| e.quat_wxyz.iter().chain(&e.center).all(|v| v.is_finite()))
+            .filter(|e| pose_is_finite(e))
             .map(|e| {
                 let n = json_escape(&e.name);
                 format!(
@@ -87,7 +99,7 @@ impl PosesFile {
             })
             .collect();
         format!(
-            "{{\n  \"rotation\": \"world_to_camera\",\n  \"aligned\": {},\n  \"intrinsics\": {{\"fx\": {fx:?}, \"fy\": {fy:?}, \"cx\": {cx:?}, \"cy\": {cy:?}, \"width\": {w}, \"height\": {h}}},\n  \"poses\": [\n{}\n  ]\n}}\n",
+            "{{\n  \"rotation\": \"world_to_camera\",\n  \"aligned\": {},\n  \"skipped_non_finite\": {skipped},\n  \"intrinsics\": {{\"fx\": {fx:?}, \"fy\": {fy:?}, \"cx\": {cx:?}, \"cy\": {cy:?}, \"width\": {w}, \"height\": {h}}},\n  \"poses\": [\n{}\n  ]\n}}\n",
             self.aligned,
             rows.join(",\n")
         )
@@ -145,7 +157,11 @@ impl PosesFile {
     }
 }
 
-/// JSON 문자열 본문 이스케이프: `"` `\\` 와 제어 문자(U+0000–U+001F)는 `\\uXXXX`, 나머지(한글 포함)는 그대로.
+fn pose_is_finite(e: &PoseEntry) -> bool {
+    e.quat_wxyz.iter().chain(&e.center).all(|v| v.is_finite())
+}
+
+/// JSON 문자열 본문 이스케이프: `"` `\` 와 제어 문자(U+0000–U+001F)는 `\uXXXX`, 나머지(한글 포함)는 그대로.
 fn json_escape(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
@@ -159,17 +175,26 @@ fn json_escape(s: &str) -> String {
     o
 }
 
-/// `poses/` 폴더를 만들고 `{kind}_{k:02}.json` 을 쓴다.
+/// `poses/` 폴더를 만들고 `{kind}_{k:02}.json` 을 쓴다. 건너뛴(비유한) 포즈 수를 돌려주며,
+/// 같은 수가 파일의 `skipped_non_finite` 항목에도 남는다.
+/// 내부 파라미터 fx·fy·cx·cy 중 비유한 값이 있으면 아무것도 쓰지 않고 오류를 돌려준다.
 pub fn write_poses_file(
     out: &Path,
     kind: &str,
     region: usize,
     file: &PosesFile,
-) -> Result<(), String> {
+) -> Result<usize, String> {
+    if !file.intrinsics_finite() {
+        let (fx, fy, cx, cy, _, _) = file.intrinsics;
+        return Err(format!(
+            "{kind}_{region:02}: 내부 파라미터가 유한하지 않음 (fx={fx}, fy={fy}, cx={cx}, cy={cy})"
+        ));
+    }
     let dir = out.join("poses");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("{kind}_{region:02}.json"));
-    std::fs::write(&path, file.to_json()).map_err(|e| format!("{}: {e}", path.display()))
+    std::fs::write(&path, file.to_json()).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(file.skipped_non_finite())
 }
 
 #[cfg(test)]
@@ -251,6 +276,46 @@ mod tests {
         for i in 0..3 {
             assert!((back.poses[1].center[i] - [10.0, -4.5, 80.25][i]).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn write_reports_skipped_count_and_records_it_in_file() {
+        let p = pose();
+        let k = Intrinsics::from_hfov(320, 180, 65f64.to_radians());
+        let mut bad = entry("bad", &p);
+        bad.center[0] = f64::INFINITY;
+        let f = PosesFile::new(&k, true, vec![entry("a", &p), bad, entry("b", &p)]);
+        let dir = std::env::temp_dir().join(format!("poses_io_skip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let n = write_poses_file(&dir, "refined", 3, &f).unwrap();
+        assert_eq!(n, 1);
+        let text = std::fs::read_to_string(dir.join("poses/refined_03.json")).unwrap();
+        let j = Json::parse(&text).unwrap();
+        assert_eq!(j.get("skipped_non_finite"), Some(&Json::Num(1.0)));
+        let back = PosesFile::from_json(&text).unwrap();
+        assert_eq!(back.poses.len() + n, f.poses.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_finite_intrinsics_write_nothing_and_error() {
+        let p = pose();
+        let dir = std::env::temp_dir().join(format!("poses_io_nan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for which in 0..4 {
+            let mut k = Intrinsics::from_hfov(320, 180, 65f64.to_radians());
+            match which {
+                0 => k.fx = f64::NAN,
+                1 => k.fy = f64::INFINITY,
+                2 => k.cx = f64::NEG_INFINITY,
+                _ => k.cy = f64::NAN,
+            }
+            let f = PosesFile::new(&k, true, vec![entry("a", &p)]);
+            let err = write_poses_file(&dir, "preview", 0, &f).unwrap_err();
+            assert!(err.contains("유한"), "{err}");
+            assert!(!dir.join("poses/preview_00.json").exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
