@@ -433,11 +433,20 @@ fn registered_item(
         ReportJson::Read(Ok(j)) => {
             let res = check_registered(j);
             // report 의 구역 목록(번호·위치 수)이 기준: 출력 구역 파일이 빠졌거나 범위가 잘렸으면 FAIL.
-            // total 은 입력 위치 수 기준이라 출력 구역이 전체를 덮는지와는 따로 본다.
+            // 실제 실행은 total = 3 × 위치 수, 끝 구역 hi = 위치 수 이므로 total 이 이름이 덮는
+            // 위치 수(3 × 이름 끝)와 다르면 끝 구역 손실이거나 report 불일치다.
             if j.get("regions").and_then(Json::as_array).is_none() {
                 bad.push("report.json 에 regions 없음".into());
             }
             bad.extend(report_regions_match(j, p));
+            if let Ok(total) = num(j, &["registered", "total"]) {
+                if total != 3.0 * top as f64 {
+                    bad.push(format!(
+                        "report total {total} ≠ 3×이름 끝 위치 {top} = {}",
+                        3 * top
+                    ));
+                }
+            }
             match res {
                 Ok((ok, m)) => {
                     if !ok {
@@ -1789,11 +1798,19 @@ mod tests {
 
     #[test]
     fn registered_report_total_is_input_based() {
-        // total 은 입력 위치 수 기준이라 이름 끝(26)과 달라도 구역 목록이 맞으면 통과한다.
+        // total = 3×이름 끝 위치(26 → 78)와 맞으면 통과, 구역 목록이 맞아도 total 80 위치(240)면 FAIL.
         let two = [(0, 0, 14), (1, 10, 26)];
-        let rep = report_json(80, &two);
+        let rep = report_json(26, &two);
         let it = item_of(&out_dir(&two, &two, Some(&rep)), ITEM_REGISTERED);
         assert!(it.decided && it.pass, "{}", it.measured);
+        let rep = report_json(80, &two);
+        let it = item_of(&out_dir(&two, &two, Some(&rep)), ITEM_REGISTERED);
+        assert!(it.decided && !it.pass, "{}", it.measured);
+        assert!(
+            it.measured.contains("report total 240 ≠ 3×이름 끝 위치 26"),
+            "{}",
+            it.measured
+        );
         let mut bad = report_json(80, &FULL);
         bad = bad.replace(r#""positions":14"#, r#""positions":13"#);
         let it = item_of(&out_dir(&FULL, &FULL, Some(&bad)), ITEM_REGION_IMAGES);
