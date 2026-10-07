@@ -145,14 +145,34 @@ pub fn run(input: &str, output: &str, rest: &[&str]) -> ExitCode {
     println!("stride {} span {} ovl {}", cfg.stride, cfg.span, cfg.ovl);
     println!("positions {}", ds.positions.len());
     println!("images {}", ds.image_count());
-    let skipped = ds.skipped_frames();
-    if skipped.is_empty() {
+    if ds.skipped.is_empty() {
         println!("skipped 0");
     } else {
-        let list: Vec<String> = skipped.iter().map(u32::to_string).collect();
-        println!("skipped {} (frames {})", skipped.len(), list.join(","));
+        // 사진이 하나도 없는 격자는 구간으로 요약한다(공백 길이에 출력이 비례하지 않는다).
+        let list: Vec<String> = ds
+            .skipped
+            .iter()
+            .map(|s| {
+                if s.count == 1 {
+                    s.frame.to_string()
+                } else {
+                    format!("{}..={} step {}", s.frame, s.last_frame(), s.step)
+                }
+            })
+            .collect();
+        println!("skipped {} (frames {})", ds.skipped_count(), list.join(","));
         for s in &ds.skipped {
-            println!("skip frame {} missing {}", s.frame, s.missing.join(","));
+            if s.count == 1 {
+                println!("skip frame {} missing {}", s.frame, s.missing.join(","));
+            } else {
+                println!(
+                    "skip frames {}..={} step {} missing {}",
+                    s.frame,
+                    s.last_frame(),
+                    s.step,
+                    s.missing.join(",")
+                );
+            }
         }
     }
     println!("chunks {}", chunks.len());
