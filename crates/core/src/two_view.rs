@@ -765,6 +765,14 @@ pub struct RansacStats {
     /// 표본 단계·정밀화 단계 시간(초).
     pub secs_sample: f64,
     pub secs_refine: f64,
+    /// 표본 단계 최선 정상 수.
+    pub best_cnt: usize,
+    /// 유의 기준(우연 정상 수 상한과 `MIN_ESSENTIAL_INLIERS` 중 큰 값).
+    pub needed: usize,
+    /// 정밀화 뒤 최다 정상 수.
+    pub top: usize,
+    /// 끝난 단계: 0 통과, 1 입력 부족, 2 표본 단계 조기 포기, 3 정밀화 뒤 유의 기준 미달, 4 후보 거름 뒤 빔.
+    pub stage: u8,
 }
 
 /// 후보 목록(본질 행렬, 정상 표시).
@@ -791,6 +799,7 @@ fn ransac_essential_inner(
 ) -> Vec<(Matrix3<f64>, Vec<bool>)> {
     let n = n1.len();
     stats.n = n;
+    stats.stage = 1;
     if n < 5
         || n != n2.len()
         || !all_finite(n1)
@@ -887,8 +896,11 @@ fn ransac_essential_inner(
         let needed =
             ((5.0 + lambda + 6.0 * lambda.sqrt() + 2.0).ceil() as usize).max(MIN_ESSENTIAL_INLIERS);
         let best = pool.first().map_or(0, |p| p.1);
+        stats.best_cnt = best;
+        stats.needed = needed;
         if 2 * best < needed || (best as f64) < 0.5 * cfg.min_inlier_ratio * n as f64 {
             stats.abandoned = true;
+            stats.stage = 2;
             return vec![];
         }
     }
@@ -1001,6 +1013,9 @@ fn ransac_essential_inner(
     let lambda = (n - 5) as f64 * p_hit;
     let needed = (5.0 + lambda + 6.0 * lambda.sqrt() + 2.0).ceil() as usize;
     let needed = needed.max(MIN_ESSENTIAL_INLIERS);
+    stats.needed = needed;
+    stats.top = top;
+    stats.stage = 3;
     if top < needed {
         return vec![];
     }
@@ -1052,6 +1067,7 @@ fn ransac_essential_inner(
             }
         }
     }
+    stats.stage = if kept.is_empty() { 4 } else { 0 };
     kept.into_iter()
         .take(ESSENTIAL_CANDIDATES)
         .map(|k| (k.0, k.1))

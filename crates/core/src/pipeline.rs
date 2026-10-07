@@ -496,6 +496,43 @@ fn cross_min_matches() -> usize {
 
 const PAIR_MIN_MATCHES: usize = 20;
 
+/// 환경 변수 `SKYLENS_CROSS_DEBUG` 가 있으면 카메라 2 가 낀 다른 카메라 짝의 검증 단계별 결과와
+/// 비율 시험을 통과한 대응의 화소 좌표를 표준 오류로 낸다(진단용, 기본 동작 불변).
+fn cross_debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SKYLENS_CROSS_DEBUG").is_some())
+}
+
+/// 진단 줄 두 개: 결과 요약(`cross_dbg`)과 대응 좌표(`cross_dbg_m`).
+#[allow(clippy::too_many_arguments)]
+fn cross_debug_emit(
+    va: (usize, usize),
+    vb: (usize, usize),
+    outcome: &str,
+    min_m: usize,
+    pts: &[(Vector2<f64>, Vector2<f64>)],
+    rs: Option<&crate::two_view::RansacStats>,
+    inl: usize,
+) {
+    let r = rs.copied().unwrap_or_default();
+    eprintln!(
+        "cross_dbg a {} {} b {} {} ratio {} min {} outcome {} n {} best_cnt {} top {} needed {} stage {} inl {}",
+        va.0, va.1, vb.0, vb.1, pts.len(), min_m, outcome, r.n, r.best_cnt, r.top, r.needed, r.stage, inl
+    );
+    let body: Vec<String> = pts
+        .iter()
+        .map(|(a, b)| format!("{:.2},{:.2},{:.2},{:.2}", a.x, a.y, b.x, b.y))
+        .collect();
+    eprintln!(
+        "cross_dbg_m a {} {} b {} {} {}",
+        va.0,
+        va.1,
+        vb.0,
+        vb.1,
+        body.join(";")
+    );
+}
+
 fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> Vec<PairMatch> {
     let pairs = scheduled_pairs(views, &PairSchedule::default());
     pairs
@@ -522,7 +559,23 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
             } else {
                 PAIR_MIN_MATCHES
             };
+            let dbg = cross_debug_enabled() && views[i].0 != views[j].0 && (views[i].0 == 2 || views[j].0 == 2);
+            let dbg_pts: Vec<(Vector2<f64>, Vector2<f64>)> = if dbg {
+                m.iter()
+                    .map(|&(a, b)| {
+                        (
+                            Vector2::new(fa[a].kp.x as f64, fa[a].kp.y as f64),
+                            Vector2::new(fb[b].kp.x as f64, fb[b].kp.y as f64),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if m.len() < min_m {
+                if dbg {
+                    cross_debug_emit(views[i], views[j], "below_min_matches", min_m, &dbg_pts, None, 0);
+                }
                 return None;
             }
             let n1: Vec<_> = m.iter().map(|&(a, _)| norm(k, &fa[a])).collect();
@@ -550,6 +603,15 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
                     ransac.is_some()
                 );
             }
+            if dbg && ransac.is_none() {
+                let o = match rs.stage {
+                    1 => "ransac_input",
+                    2 => "ransac_abandoned_early",
+                    3 => "ransac_below_significance",
+                    _ => "ransac_no_candidate",
+                };
+                cross_debug_emit(views[i], views[j], o, min_m, &dbg_pts, Some(&rs), 0);
+            }
             let (e, inl) = ransac?;
             let sel = |n: &[Vector2<f64>]| -> Vec<Vector2<f64>> {
                 n.iter()
@@ -560,9 +622,17 @@ fn match_pairs(imgs: &[&ImgData], views: &[(usize, usize)], k: &Intrinsics) -> V
             };
             let (s1, s2) = (sel(&n1), sel(&n2));
             if s1.len() < min_m {
+                if dbg {
+                    cross_debug_emit(views[i], views[j], "inliers_below_min", min_m, &dbg_pts, Some(&rs), s1.len());
+                }
                 return None;
             }
-            let rp = recover_pose(&e, &s1, &s2)?;
+            let rp = recover_pose(&e, &s1, &s2);
+            if dbg {
+                let o = if rp.is_some() { "pass" } else { "pose_recovery_failed" };
+                cross_debug_emit(views[i], views[j], o, min_m, &dbg_pts, Some(&rs), s1.len());
+            }
+            let rp = rp?;
             let inl: Vec<(usize, usize)> = m
                 .iter()
                 .zip(&inl)
