@@ -1,4 +1,4 @@
-//! 출력 폴더 검증 (SPEC §2 출력 구조, §4 검증 기준 일곱 항목 + 여덟째 `up_cross`).
+//! 출력 폴더 검증 (SPEC §2 출력 구조, §4 검증 기준 여덟 항목: 앞의 일곱 + `up_cross`).
 //!
 //! 읽는 파일:
 //! - `report.json` (출력 폴더 바로 아래, 선택): 포즈 단계 기록. SPEC §2 출력 목록에 없는 파일이다.
@@ -64,12 +64,17 @@ pub const NN_CAP_M: f64 = 2.0 * NN_MEDIAN_MAX_M;
 pub const MAX_QUERIES: usize = 200_000;
 /// 이 값보다 큰 |좌표|(m)의 점은 계산에서 뺀다 (지역 직교 좌표에서 나올 수 없는 값).
 pub const COORD_LIMIT_M: f64 = 1e7;
-/// 카메라 묶음 위 방향 일치: 구역별 최대 어긋남(도)이 이 값을 넘으면 FAIL.
-/// 근거: 정상 실행 시드 1/2/3 구역별 최대 1.449° 이하, 한 기체 짐벌 구름 1~2° 장면 1.1~1.3°,
-/// 회전이 틀린 묶음은 47° 이상(시드 3 구역 0: 최대 69.5°). 정상 최대의 약 7배, 고장의 1/4 이하.
+// 위 방향 교차 검사(여덟째 항목 `up_cross`)의 두 문턱. 구역별 정밀 모델 위 방향의 교차 차(도)에 건다.
+// 실패 > 10°, 경고 > 0.3° (SPEC §4 표의 같은 줄). 값은 이 파일에서만 정하고 다른 곳은 가져다 쓴다.
+// 근거(합성 장면 실측, 구역별 최대): 시드 1/2/3 정상 실행 1.449° 이하, 시드 4 0.559/1.477/2.135°,
+// 한 기체 짐벌 구름 1~2° 장면 1.1~1.3°, 회전이 틀린 묶음 47° 이상(시드 3 구역 0 최대 69.5°).
+// 실패 문턱 10° 는 정상 최대의 약 5~7배, 고장의 1/4 이하. 경고 문턱 0.3° 는 구름 1° 이상을 모든
+// 시드에서 잡는 값이고, 정상 실행도 넘을 수 있어 경고(통과)로만 표시한다.
+
+/// 구역별 최대 어긋남(도)이 이 값을 넘으면 FAIL (정확히 같으면 통과).
 pub const UP_CROSS_FAIL_DEG: f64 = 10.0;
-/// 이 값을 넘고 `UP_CROSS_FAIL_DEG` 이하면 경고(통과). `skylens run` 의 문턱과 같다.
-pub const UP_CROSS_WARN_DEG: f64 = 0.3;
+/// 이 값을 넘고 `UP_CROSS_FAIL_DEG` 이하면 경고(통과). `skylens run` 의 문턱과 같은 상수.
+pub use crate::align::UP_CROSS_WARN_DEG;
 const EPS: f64 = 1e-9;
 
 // ---------------------------------------------------------------- 결과
@@ -1336,6 +1341,27 @@ mod tests {
         // 형식 오류는 오류.
         assert!(up_cross(r#"{"up_cross_check":{}}"#).is_err());
         assert!(up_cross(&up_cross_report("\"x\"", "0.1")).is_err());
+    }
+
+    #[test]
+    fn up_cross_threshold_boundaries() {
+        assert_eq!(UP_CROSS_WARN_DEG, 0.3);
+        assert_eq!(UP_CROSS_FAIL_DEG, 10.0);
+        let run = |v: &str| up_cross(&up_cross_report(v, "0.0")).unwrap();
+        // 경고 문턱: 0.3 은 경고 없음, 바로 위는 경고(통과).
+        let (ok, m) = run("0.3");
+        assert!(ok && !m.contains("경고"), "{m}");
+        let (ok, m) = run("0.30001");
+        assert!(ok && m.contains("경고"), "{m}");
+        let (ok, m) = run("0.29999");
+        assert!(ok && !m.contains("경고"), "{m}");
+        // 실패 문턱: 10 은 경고로 통과, 바로 위는 FAIL.
+        let (ok, m) = run("10.0");
+        assert!(ok && m.contains("경고"), "{m}");
+        let (ok, m) = run("9.99999");
+        assert!(ok && m.contains("경고"), "{m}");
+        let (ok, _) = run("10.00001");
+        assert!(!ok);
     }
 
     #[test]
