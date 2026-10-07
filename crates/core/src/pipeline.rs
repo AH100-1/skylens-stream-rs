@@ -1169,8 +1169,10 @@ fn rot_cfg() -> AveragingConfig {
 const COLLAPSE_SAME_MAX_RAD: f64 = 3.0 * std::f64::consts::PI / 180.0;
 /// 다른 종류와의 간선 잔차 중앙이 이 값 이상이면(rad) 그 종류 덩어리가 통째로 돌아간 것으로 본다.
 const COLLAPSE_CROSS_MIN_RAD: f64 = 20.0 * std::f64::consts::PI / 180.0;
-/// 종류당 최소 간선 수(같은 종류·다른 종류 각각).
-const COLLAPSE_MIN_EDGES: usize = 20;
+/// 같은 종류 간선 최소 수.
+const COLLAPSE_MIN_SAME: usize = 20;
+/// 교차 간선 최소 수(시드 3 구역 0 에서 교차 간선이 종류당 3~8 개뿐이라 작게 둔다).
+const COLLAPSE_MIN_CROSS: usize = 3;
 
 /// 회전 평균 직후 카메라 종류별 간선 잔차로 종류 덩어리 붕괴를 검출한다. 종류별 문턱 재평균을 쓸지 정한다.
 /// 요약은 항상 표준 오류로 낸다. `SKYLENS_ROT_DETECT=0` 이면 끈다.
@@ -1191,8 +1193,8 @@ fn class_collapse_detected(
     let mut hit = false;
     let mut line = String::new();
     for g in group_residual_stats(edges, rots, &group) {
-        let bad = g.same_count >= COLLAPSE_MIN_EDGES
-            && g.cross_count >= COLLAPSE_MIN_EDGES
+        let bad = g.same_count >= COLLAPSE_MIN_SAME
+            && g.cross_count >= COLLAPSE_MIN_CROSS
             && g.same_median_rad <= COLLAPSE_SAME_MAX_RAD
             && g.cross_median_rad >= COLLAPSE_CROSS_MIN_RAD;
         hit |= bad;
