@@ -1012,8 +1012,9 @@ const GP_PAIR_WEIGHT: f64 = 0.1;
 const GP_PAIR_GATE_RAD: f64 = 3.0 * std::f64::consts::PI / 180.0;
 const GP_MIN_CAM_OBS: usize = 4;
 const GP_MIN_POINT_VIEWS: usize = 3;
-/// 중심 정밀화가 받아들이는 정규방정식의 최소/최대 고윳값 비 하한.
-const GP_MIN_EIG_RATIO: f64 = 1e-4;
+/// 중심 정밀화가 받아들이는 정규방정식의 최소/최대 고윳값 비 하한. 1e-3 은 광선 퍼짐 약 2° 로 방향 잡음(1°)보다
+/// 넓다(1e-4 는 약 0.6° 라 잡음에 묻혀 한쪽으로 몰린 광선이 수 m 를 움직였다).
+const GP_MIN_EIG_RATIO: f64 = 1e-3;
 /// 보충 단계에서 카메라를 놓는 데 필요한 직선 지지 수.
 const GP_SUPPLEMENT_SUPPORT: usize = 3;
 
@@ -1039,6 +1040,21 @@ fn gp_solve(
     init: Option<(&[Vector3<f64>], &[f64])>,
     seed: u64,
 ) -> (Vec<Vector3<f64>>, Vec<f64>) {
+    let (x, d, _) = gp_solve_iters(n_cam, n_pts, obs, active, init, seed);
+    (x, d)
+}
+
+/// `gp_solve` 와 같고 반복 횟수도 돌려준다. 이어 풀기(`init`)에서는 쓰는 관측마다 d 를 현재 (c, X) 에서
+/// 다시 계산한다(거르기 사이에 되살아난 관측의 d 는 마지막 풀이값이라 바닥 1e-5 일 수 있다). 기준(첫 쓰는)
+/// 관측이 바뀌었으면 해 전체를 새 기준의 d 만큼 키워 새 기준의 d 가 1 이 되게 한다.
+fn gp_solve_iters(
+    n_cam: usize,
+    n_pts: usize,
+    obs: &[(usize, usize, Vector3<f64>, f64)],
+    active: &[bool],
+    init: Option<(&[Vector3<f64>], &[f64])>,
+    seed: u64,
+) -> (Vec<Vector3<f64>>, Vec<f64>, usize) {
     let m = n_cam + n_pts;
     let mut x: Vec<Vector3<f64>> = match init {
         Some((s, _)) => s.to_vec(),
@@ -1083,9 +1099,49 @@ fn gp_solve(
         Some((_, d0)) => d0.to_vec(),
         None => vec![1.0; obs.len()],
     };
+    if init.is_some() {
+        for (k, &(cam, pt, v, _)) in obs.iter().enumerate() {
+            if active[k] {
+                let dx = x[n_cam + pt] - x[cam];
+                d[k] = (v.dot(&dx) / dx.norm_squared().max(1e-300)).max(GP_MIN_SCALE);
+            }
+        }
+        if let Some(f) = first {
+            // 기준 관측이 카메라 뒤를 가리키면(d 가 바닥 근처) 그 값으로 맞추면 해가 통째로 줄어든다:
+            // 정상 d 를 가진 활성 관측들의 중앙값으로 축척을 맞춘다(없으면 맞추지 않는다).
+            let sane = 10.0 * GP_MIN_SCALE;
+            let s = if d[f] > sane {
+                d[f]
+            } else {
+                let mut ok: Vec<f64> = (0..obs.len())
+                    .filter(|&k| active[k] && d[k] > sane)
+                    .map(|k| d[k])
+                    .collect();
+                if ok.is_empty() {
+                    1.0
+                } else {
+                    ok.sort_by(|a, b| a.total_cmp(b));
+                    ok[ok.len() / 2]
+                }
+            };
+            if (s - 1.0).abs() > 1e-12 {
+                for p in x.iter_mut() {
+                    *p *= s;
+                }
+                for (k, dk) in d.iter_mut().enumerate() {
+                    if active[k] {
+                        *dk = (*dk / s).max(GP_MIN_SCALE);
+                    }
+                }
+                d[f] = 1.0;
+            }
+        }
+    }
     let mut irls = vec![1.0; obs.len()];
     let mut prev = f64::INFINITY;
+    let mut iters = 0usize;
     for it in 0..GP_ITERS {
+        iters = it + 1;
         let prev_centers: Vec<Vector3<f64>> = x[..n_cam].to_vec();
         // c, X 풀이: Σ w d² |(X_p − c_i) − v/d|² → 정규방정식(좌표 공통 행렬).
         // 점 블록은 스칼라 대각이라 점을 소거한 카메라 축소 계통(n_cam × n_cam)만 밀집으로 푼다.
@@ -1273,16 +1329,22 @@ fn gp_solve(
         }
         prev = cost;
     }
-    (x, d)
+    (x, d, iters)
 }
 
-/// 점 관측을 주 경로로 쓰는 전역 위치 추정. 짝 간선은 회전 일관성으로만 거르고(`rejected[0]`) 각 잔차를 보고한다.
-/// 점이 하나도 쓸 수 없으면 None.
-/// 중심 정밀화 한 걸음. 제약은 (원점, 방향, 가중, 문턱). 문턱 안 제약이 `GP_MIN_CAM_OBS` 개 미만이거나
-/// 정규방정식의 최소/최대 고윳값 비가 `GP_MIN_EIG_RATIO` 미만(한 방향뿐)이면 `None`(이전 중심 유지).
-fn refine_center(
+/// 직선 제약: (원점, 방향, 가중, 문턱).
+type GpLine = (Vector3<f64>, Vector3<f64>, f64, f64);
+
+/// 직선(원점, 방향, 가중, 문턱) 묶음에 대한 한 점의 각 오차 최소제곱 정밀화 한 걸음. 문턱 안 제약이 `min_n` 개
+/// 미만이거나 정규방정식의 최소/최대 고윳값 비가 `min_ratio` 미만(광선이 한쪽으로 몰려 깊이 방향이 약함)이면
+/// `None`(이전 위치 유지). `check` 이면 새 위치가 문턱 안 제약 수를 줄이지 않고 문턱 안 가중 각 오차 제곱합(문턱 밖은
+/// 문턱 값으로 자름)을 엄격히 줄일 때만 받아들인다.
+fn refine_on_lines(
     cur: &Vector3<f64>,
-    cons: &[(Vector3<f64>, Vector3<f64>, f64, f64)],
+    cons: &[GpLine],
+    min_n: usize,
+    min_ratio: f64,
+    check: bool,
 ) -> Option<Vector3<f64>> {
     let mut a = Matrix3::<f64>::zeros();
     let mut rhs = Vector3::<f64>::zeros();
@@ -1298,17 +1360,54 @@ fn refine_center(
         rhs += pr * o * w;
         n_in += 1;
     }
-    if n_in < GP_MIN_CAM_OBS {
+    if n_in < min_n {
         return None;
     }
     let eig = a.symmetric_eigen().eigenvalues;
     let (lo, hi) = (eig.min(), eig.max());
-    if !(hi > 0.0 && lo >= GP_MIN_EIG_RATIO * hi) {
+    if !(hi > 0.0 && lo >= min_ratio * hi) {
         return None;
     }
     a += Matrix3::identity() * (1e-9 * a.trace().max(1e-12));
     let sol = a.cholesky()?.solve(&rhs);
-    sol.iter().all(|v| v.is_finite()).then_some(sol)
+    if !sol.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    if check {
+        let (n_old, c_old) = line_fit(cur, cons);
+        let (n_new, c_new) = line_fit(&sol, cons);
+        if n_new < n_old || c_new >= c_old {
+            return None;
+        }
+    }
+    Some(sol)
+}
+
+/// 한 위치에서 직선 묶음의 (문턱 안 제약 수, 자른 가중 각 오차 제곱합).
+fn line_fit(p: &Vector3<f64>, cons: &[(Vector3<f64>, Vector3<f64>, f64, f64)]) -> (usize, f64) {
+    let mut n = 0usize;
+    let mut cost = 0.0;
+    for (o, u, wt, gate) in cons {
+        let dx = p - o;
+        let ang = if dx.dot(u) > 0.0 {
+            angle_between(&dx, u)
+        } else {
+            f64::INFINITY
+        };
+        if ang <= *gate {
+            n += 1;
+            cost += wt * ang * ang;
+        } else {
+            cost += wt * gate * gate;
+        }
+    }
+    (n, cost)
+}
+
+/// 중심 정밀화 한 걸음. 제약은 (원점, 방향, 가중, 문턱). 문턱 안 제약이 `GP_MIN_CAM_OBS` 개 미만이거나
+/// 고윳값 비가 `GP_MIN_EIG_RATIO` 미만이거나 갱신이 적합도를 떨어뜨리면 `None`(이전 중심 유지).
+fn refine_center(cur: &Vector3<f64>, cons: &[GpLine]) -> Option<Vector3<f64>> {
+    refine_on_lines(cur, cons, GP_MIN_CAM_OBS, GP_MIN_EIG_RATIO, false)
 }
 
 fn global_positioning(
@@ -1444,30 +1543,16 @@ fn global_positioning(
     // 점 광선은 내려다보는 시야에서 깊이 방향이 약해, 가로 이웃 짝 방향이 그 방향을 보강한다.
     for _ in 0..GP_REFINE_ITERS {
         // 점 다듬기: 좁은 문턱 안의 카메라 광선만으로 각 오차 최소제곱 교차.
-        let mut acc = vec![(Matrix3::<f64>::zeros(), Vector3::<f64>::zeros(), 0usize); n_pts];
+        let mut lines: Vec<Vec<GpLine>> = vec![Vec::new(); n_pts];
         for &(cam, pt, v, wt) in &obs {
-            let (Some(c), Some(x)) = (centers[cam], points[pt]) else {
-                continue;
-            };
-            let dx = x.coords - c.coords;
-            if dx.dot(&v) <= 0.0 || angle_between(&dx, &v) > GP_FINAL_GATE_RAD {
-                continue;
+            if let (Some(c), Some(_)) = (centers[cam], points[pt]) {
+                lines[pt].push((c.coords, v, wt, GP_FINAL_GATE_RAD));
             }
-            let w = wt / dx.norm_squared().max(1e-12);
-            let pr = Matrix3::identity() - v * v.transpose();
-            acc[pt].0 += pr * w;
-            acc[pt].1 += pr * c.coords * w;
-            acc[pt].2 += 1;
         }
-        for (slot, (a, rhs, n)) in points.iter_mut().zip(acc) {
-            if n < GP_MIN_POINT_VIEWS || slot.is_none() {
-                continue;
-            }
-            let a = a + Matrix3::identity() * (1e-9 * a.trace().max(1e-12));
-            if let Some(sol) = a.cholesky().map(|c| c.solve(&rhs)) {
-                if sol.iter().all(|v| v.is_finite()) {
-                    *slot = Some(Point3::from(sol));
-                }
+        for (slot, cons) in points.iter_mut().zip(&lines) {
+            let Some(cur) = *slot else { continue };
+            if let Some(sol) = refine_on_lines(&cur.coords, cons, GP_MIN_POINT_VIEWS, 0.0, true) {
+                *slot = Some(Point3::from(sol));
             }
         }
         let prev = centers.clone();
@@ -2185,6 +2270,208 @@ mod tests {
             .collect();
         let c = refine_center(&cur, &good).expect("well constrained");
         assert!((c - cur).norm() < 1e-6, "{c:?}");
+    }
+
+    /// 이어 풀기 장면(카메라 14·점 50)을 풀어 (닮음 정렬 뒤 중심 최대 차, 이어받기/냉시작 중심 크기 비,
+    /// 이어받기 반복, 냉시작 반복, 이어받기 d[0]). `flip_first` 이면 되살아나는 기준 관측 0 의 방향을 뒤집는다.
+    fn revived_warm_vs_cold(flip_first: bool) -> (f64, f64, usize, usize, f64) {
+        let mut st = 77u64;
+        let n_cam = 14;
+        let n_pts = 50;
+        let cams: Vec<Vector3<f64>> = (0..n_cam)
+            .map(|_| {
+                Vector3::new(
+                    gp_uniform(&mut st) * 40.0 - 20.0,
+                    gp_uniform(&mut st) * 40.0 - 20.0,
+                    30.0 + gp_uniform(&mut st) * 4.0,
+                )
+            })
+            .collect();
+        let pts: Vec<Vector3<f64>> = (0..n_pts)
+            .map(|_| {
+                Vector3::new(
+                    gp_uniform(&mut st) * 50.0 - 25.0,
+                    gp_uniform(&mut st) * 50.0 - 25.0,
+                    gp_uniform(&mut st) * 3.0,
+                )
+            })
+            .collect();
+        let noise = 0.3f64.to_radians();
+        let mut obs: Vec<(usize, usize, Vector3<f64>, f64)> = Vec::new();
+        for (c, cam) in cams.iter().enumerate() {
+            for (p, pt) in pts.iter().enumerate() {
+                let dir = (pt - cam).normalize();
+                let mut g = || {
+                    let u1 = gp_uniform(&mut st).max(1e-300);
+                    let u2 = gp_uniform(&mut st);
+                    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+                };
+                let v = (dir + Vector3::new(g(), g(), g()) * noise).normalize();
+                obs.push((c, p, v, 1.0));
+            }
+        }
+        // 1차: 기준 관측(0)과 약 30% 가 빠진 집합. 2차: 모두 되살아난 집합.
+        let first_round: Vec<bool> = (0..obs.len())
+            .map(|k| k != 0 && gp_uniform(&mut st) > 0.3)
+            .collect();
+        if flip_first {
+            obs[0].2 = -obs[0].2;
+        }
+        let second_round = vec![true; obs.len()];
+        let (x1, d1) = gp_solve(n_cam, n_pts, &obs, &first_round, None, 1);
+        let (xc, _, it_cold) = gp_solve_iters(n_cam, n_pts, &obs, &second_round, None, 1);
+        let (xw, dw, it_warm) =
+            gp_solve_iters(n_cam, n_pts, &obs, &second_round, Some((&x1, &d1)), 1);
+        let warm: Vec<Option<Point3<f64>>> =
+            xw[..n_cam].iter().map(|c| Some(Point3::from(*c))).collect();
+        let cold_pts: Vec<Point3<f64>> = xc[..n_cam].iter().map(|c| Point3::from(*c)).collect();
+        let errs = similarity_aligned_errors(&warm, &cold_pts);
+        let max = errs.iter().cloned().fold(0.0, f64::max);
+        let size = |x: &[Vector3<f64>]| {
+            let mean = x[..n_cam].iter().sum::<Vector3<f64>>() / n_cam as f64;
+            x[..n_cam].iter().map(|c| (c - mean).norm()).sum::<f64>()
+        };
+        let ratio = size(&xw) / size(&xc);
+        println!(
+            "flip {flip_first}: max {max:.5} m, size ratio {ratio:.5}, iterations warm {it_warm} cold {it_cold}"
+        );
+        (max, ratio, it_warm, it_cold, dw[0])
+    }
+
+    /// 거르기 사이에 관측이 되살아나는 이어 풀기: 처음부터 푼 해와 같고 반복이 더 많지 않다.
+    #[test]
+    fn warm_start_with_revived_observations_matches_cold() {
+        let (max, ratio, it_warm, it_cold, d0) = revived_warm_vs_cold(false);
+        assert_eq!(d0, 1.0);
+        assert!(max < 0.05, "max {max}");
+        assert!((0.5..2.0).contains(&ratio), "ratio {ratio}");
+        assert!(it_warm <= it_cold, "warm {it_warm} cold {it_cold}");
+    }
+
+    /// 되살아난 기준 관측이 카메라 뒤를 가리켜도 이어받기 해의 축척이 무너지지 않는다.
+    #[test]
+    fn warm_start_with_flipped_reference_observation_keeps_scale() {
+        let (max, ratio, _, _, _) = revived_warm_vs_cold(true);
+        assert!((0.5..2.0).contains(&ratio), "size ratio {ratio}");
+        assert!(max < 0.05, "max {max}");
+    }
+
+    /// 점 다듬기 채택 검사: 이상치 광선이 섞여도 적합이 나빠지면 거부, 좋아지면 채택.
+    #[test]
+    fn refine_on_lines_check_accepts_improvement_and_rejects_worse() {
+        let truth = Vector3::new(2.0, -1.0, 0.0);
+        let gate = 0.05;
+        let origins: Vec<Vector3<f64>> = (0..8)
+            .map(|k| {
+                Vector3::new(
+                    (k % 4) as f64 * 10.0 - 15.0,
+                    (k / 4) as f64 * 16.0 - 8.0,
+                    30.0,
+                )
+            })
+            .collect();
+        let line = |o: &Vector3<f64>, tilt: f64| {
+            let u = (truth - o).normalize();
+            let axis = u.cross(&Vector3::x()).normalize();
+            (
+                *o,
+                Rotation3::from_axis_angle(&nalgebra::Unit::new_normalize(axis), tilt) * u,
+                1.0,
+                gate,
+            )
+        };
+        // 채택: 점이 0.3 m 벗어나 있고 이상치 광선 하나(문턱 밖 0.3 rad)가 섞임 → 이상치는 무시, 정답 쪽으로 이동.
+        let mut cons: Vec<GpLine> = origins.iter().map(|o| line(o, 0.0)).collect();
+        cons.push(line(&origins[0], 0.3));
+        let cur = truth + Vector3::new(0.3, 0.2, 0.1);
+        let sol = refine_on_lines(&cur, &cons, 3, 1e-6, true).expect("improvement accepted");
+        assert!(
+            (sol - truth).norm() < 0.01,
+            "sol err {}",
+            (sol - truth).norm()
+        );
+        // 거부: 문턱 안 광선 4 개 중 하나가 문턱 가까이 있어, 검사 없는 갱신은 자른 잔차를 줄이지만 그 광선을 문턱 밖으로
+        // 밀어낸다(4 → 3) → 검사는 갱신을 거부한다.
+        let cur = Vector3::new(2.163934335054038, -0.6714067355990555, 0.48220482852830415);
+        let rays: [([f64; 3], [f64; 3]); 5] = [
+            (
+                [8.741058227247269, -6.819621216797155, -2.3216244023540877],
+                [-0.7348354026974541, 0.6301861257031445, 0.2507635896890357],
+            ),
+            (
+                [-11.03203738347985, 10.398115630451978, 29.551027021763936],
+                [
+                    0.41109208477132314,
+                    -0.30934994287104034,
+                    -0.8574998021481121,
+                ],
+            ),
+            (
+                [-27.070976338771967, -19.73971951193129, 12.464730307961018],
+                [0.7862219184710033, 0.5129669624850294, -0.3445576734229809],
+            ),
+            (
+                [-24.13769751765132, 16.683010508757548, 2.1183203739573564],
+                [
+                    0.8110997302922456,
+                    -0.5831471861691233,
+                    -0.045349606204250666,
+                ],
+            ),
+            (
+                [12.875920615113444, 5.491975049407513, 16.409564822870408],
+                [
+                    -0.4975458087095235,
+                    -0.28727628904374974,
+                    -0.8184867146074141,
+                ],
+            ),
+        ];
+        let cons2: Vec<GpLine> = rays
+            .iter()
+            .map(|(o, u)| (Vector3::from(*o), Vector3::from(*u), 1.0, gate))
+            .collect();
+        let free = refine_on_lines(&cur, &cons2, 3, 1e-6, false).expect("unchecked moves");
+        let (n_old, c_old) = line_fit(&cur, &cons2);
+        let (n_new, c_new) = line_fit(&free, &cons2);
+        assert_eq!((n_old, n_new), (4, 3), "in-gate counts");
+        assert!(c_new < c_old, "clipped cost {c_old} -> {c_new}");
+        assert!(refine_on_lines(&cur, &cons2, 3, 1e-6, true).is_none());
+    }
+
+    #[test]
+    fn refine_center_ignores_bunched_noisy_rays() {
+        // 광선 8 개가 한쪽(퍼짐 ≤1°)으로 몰리고 방향 잡음이 1° 이면 깊이가 정해지지 않는다: 유지하거나 1 m 미만만 이동.
+        let cur = Vector3::new(0.0, 0.0, 30.0);
+        let mut st = 5u64;
+        let mut worst = 0.0f64;
+        for spread_deg in [0.3f64, 0.6, 1.0] {
+            for _trial in 0..20 {
+                let r = 30.0 * (spread_deg.to_radians() / 2.0).tan();
+                let cons: Vec<_> = (0..8)
+                    .map(|_| {
+                        let x = Vector3::new(
+                            (gp_uniform(&mut st) * 2.0 - 1.0) * r,
+                            (gp_uniform(&mut st) * 2.0 - 1.0) * r,
+                            0.0,
+                        );
+                        let u1 = gp_uniform(&mut st).max(1e-300);
+                        let u2 = gp_uniform(&mut st);
+                        let g = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                        let axis = Vector3::new(g, 1.0 - g, 0.3).normalize();
+                        let rot = Rotation3::from_axis_angle(
+                            &nalgebra::Unit::new_normalize(axis.cross(&Vector3::z())),
+                            1f64.to_radians() * g.abs().min(2.0),
+                        );
+                        (x, rot * (cur - x).normalize(), 1.0, 0.1)
+                    })
+                    .collect();
+                if let Some(c) = refine_center(&cur, &cons) {
+                    worst = worst.max((c - cur).norm());
+                }
+            }
+        }
+        assert!(worst < 1.0, "moved {worst} m");
     }
 
     #[test]
