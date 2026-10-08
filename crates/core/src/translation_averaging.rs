@@ -1016,6 +1016,8 @@ const GP_MIN_POINT_VIEWS: usize = 3;
 const GP_MIN_EIG_RATIO: f64 = 1e-4;
 /// 보충 단계에서 카메라를 놓는 데 필요한 직선 지지 수.
 const GP_SUPPLEMENT_SUPPORT: usize = 3;
+/// 이웃 방향 산포(정규화 방향의 평균 2차 모멘트)의 둘째 고윳값이 이보다 작으면 퇴화 카메라로 본다.
+const GP_WEAK_EIG: f64 = 0.03;
 
 fn gp_uniform(state: &mut u64) -> f64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -1311,6 +1313,20 @@ fn refine_center(
     sol.iter().all(|v| v.is_finite()).then_some(sol)
 }
 
+/// 이웃 방향 산포 행렬의 둘째로 큰 고윳값. 이웃이 둘 미만이면 0(한 직선 이하).
+fn neighbour_scatter_second_eig(dirs: &[Vector3<f64>]) -> f64 {
+    if dirs.len() < 2 {
+        return 0.0;
+    }
+    let m = dirs
+        .iter()
+        .fold(Matrix3::<f64>::zeros(), |a, d| a + d * d.transpose())
+        / dirs.len() as f64;
+    let mut e: Vec<f64> = m.symmetric_eigen().eigenvalues.iter().copied().collect();
+    e.sort_by(|a, b| b.total_cmp(a));
+    e[1]
+}
+
 fn global_positioning(
     rotations: &[Option<Rotation3<f64>>],
     observations: &[RelativeTranslation],
@@ -1442,6 +1458,12 @@ fn global_positioning(
     }
     // 정밀화: 점 광선(좁은 문턱)과 이웃 짝 방향 직선(작은 가중)을 함께 쓴 각 오차 최소제곱으로 중심을 다듬는다.
     // 점 광선은 내려다보는 시야에서 깊이 방향이 약해, 가로 이웃 짝 방향이 그 방향을 보강한다.
+    let weak: Vec<bool> = (0..n_cam)
+        .map(|c| {
+            let d: Vec<Vector3<f64>> = cam_pairs[c].iter().map(|p| p.1).collect();
+            neighbour_scatter_second_eig(&d) < GP_WEAK_EIG
+        })
+        .collect();
     for _ in 0..GP_REFINE_ITERS {
         // 점 다듬기: 좁은 문턱 안의 카메라 광선만으로 각 오차 최소제곱 교차.
         let mut acc = vec![(Matrix3::<f64>::zeros(), Vector3::<f64>::zeros(), 0usize); n_pts];
@@ -1488,6 +1510,28 @@ fn global_positioning(
             }
             if let Some(c) = refine_center(&cur.coords, &cons) {
                 *slot = Some(Point3::from(c));
+            }
+        }
+    }
+    // 퇴화 카메라(이웃 방향이 거의 한 직선) 재배치: 정밀화가 약한 방향을 시작값 근처에 두므로,
+    // 점 광선과 퇴화하지 않은 이웃의 짝 직선을 함께 쓴 강건 교차로 다시 놓는다.
+    {
+        let reg = centers.clone();
+        for cam in 0..n_cam {
+            if !weak[cam] || reg[cam].is_none() {
+                continue;
+            }
+            let mut lines: Vec<(Vector3<f64>, Vector3<f64>)> = cam_obs[cam]
+                .iter()
+                .filter_map(|&k| Some((points[obs[k].1]?.coords, -obs[k].2)))
+                .collect();
+            for &(other, d) in &cam_pairs[cam] {
+                if let (Some(co), false) = (reg[other], weak[other]) {
+                    lines.push((co.coords, d));
+                }
+            }
+            if let Some(c) = robust_ray_point(&lines, GP_FINAL_GATE_RAD) {
+                centers[cam] = Some(Point3::from(c));
             }
         }
     }
@@ -2122,17 +2166,65 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "기준 미달(열린 문제 F-276)"]
+    #[ignore = "기준 미달(열린 문제 F-276): 80경우 중 14경우 실패, 최대 1.37 m, RMS 최악 0.309 m"]
     fn noisy_outliers_grid_seeds_1_to_20() {
         let fails = grid(1..=20);
         assert!(fails.is_empty(), "{} fails: {fails:?}", fails.len());
     }
 
     #[test]
-    #[ignore = "기준 미달(시드 22 점 이상치 5% RMS 0.36 m)로 열린 문제, 조정에 쓰지 않은 시드 21~25"]
+    #[ignore = "기준 미달(열린 문제 F-276): 시드 21 최대 1.25 m, 시드 22 점 이상치 5% RMS 0.365 m, 조정에 쓰지 않은 시드 21~25"]
     fn noisy_outliers_unseen_seeds_21_to_25() {
         let fails = grid(21..=25);
         assert!(fails.is_empty(), "{} fails: {fails:?}", fails.len());
+    }
+
+    #[test]
+    fn neighbour_scatter_detects_collinear_neighbours() {
+        let line: Vec<Vector3<f64>> = (0..6)
+            .map(|k| {
+                Vector3::new(1.0, 0.01 * k as f64, 0.0).normalize()
+                    * if k % 2 == 0 { 1.0 } else { -1.0 }
+            })
+            .collect();
+        assert!(neighbour_scatter_second_eig(&line) < 1e-3);
+        let spread = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, -1.0, 0.0),
+        ];
+        let l2 = neighbour_scatter_second_eig(&spread);
+        assert!((l2 - 0.5).abs() < 1e-12, "{l2}");
+        assert_eq!(neighbour_scatter_second_eig(&spread[..1]), 0.0);
+    }
+
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_fail_cases() {
+        let cases = std::env::var("DIAG_CASES").unwrap_or_default();
+        let (mut worst_rms, mut worst_max, mut nfail) = (0.0f64, 0.0f64, 0);
+        for spec in cases.split(',') {
+            let v: Vec<&str> = spec.split(':').collect();
+            let (seed, frac, pfrac): (u64, f64, f64) = (
+                v[0].parse().unwrap(),
+                v[1].parse().unwrap(),
+                v[2].parse().unwrap(),
+            );
+            let case = Case {
+                noise_deg: 1.0,
+                outlier_frac: frac,
+                unobservable_frac: 0.05,
+            };
+            let (reg, rms, max) = run_with(seed, &case, pfrac);
+            println!("CASE {spec}: reg {reg} rms {rms:.4} max {max:.4}");
+            worst_rms = worst_rms.max(rms);
+            worst_max = worst_max.max(max);
+            if reg < 238 || rms > 0.3 || max > 1.0 {
+                nfail += 1;
+            }
+        }
+        println!("CASES fails {nfail} worst rms {worst_rms:.4} worst max {worst_max:.4}");
     }
 
     #[test]
