@@ -115,6 +115,8 @@ pub struct TranslationResult {
     pub inliers: Vec<bool>,
     /// 거르기 단계별로 버린 간선 수: [무효·회전 불일치, 삼각형 불일치].
     pub rejected: [usize; 2],
+    /// 퇴화 카메라 재배치로 중심이 `GP_RELOCATE_MIN_MOVE_REL`×중심 RMS 반경 이상 움직인 카메라 수(판정을 통과한 경우만).
+    pub relocated: usize,
 }
 
 impl TranslationResult {
@@ -444,11 +446,28 @@ pub fn average_translations_with_points(
     point_observations: &[PointObservation],
     cfg: &TranslationConfig,
 ) -> TranslationResult {
+    average_translations_with_points_rule(
+        rotations,
+        observations,
+        point_observations,
+        cfg,
+        GP_RELOCATE_RULE,
+    )
+}
+
+/// [`average_translations_with_points`] 와 같되 퇴화 카메라 재배치 판정 규칙을 고를 수 있다(시험용 매개변수).
+fn average_translations_with_points_rule(
+    rotations: &[Option<Rotation3<f64>>],
+    observations: &[RelativeTranslation],
+    point_observations: &[PointObservation],
+    cfg: &TranslationConfig,
+    rule: RelocateRule,
+) -> TranslationResult {
     if point_observations.is_empty() {
         return average_core(rotations, observations, &[], cfg, None);
     }
     // 주 경로: 점–카메라 방향 제약 전역 위치 추정(무작위 초기화). 등록이 2대 미만이면 아래 단계 경로로 되돌아간다.
-    if let Some(res) = global_positioning(rotations, observations, point_observations, cfg) {
+    if let Some(res) = global_positioning(rotations, observations, point_observations, cfg, rule) {
         if res.registered() >= 2 {
             return res;
         }
@@ -806,6 +825,7 @@ fn average_core(
             residuals_rad,
             inliers,
             rejected,
+            relocated: 0,
         };
     }
 
@@ -962,6 +982,7 @@ fn average_core(
             residuals_rad,
             inliers,
             rejected,
+            relocated: 0,
         };
     }
     // 등록 판정: 정상 간선 중 서로 평행하지 않은 것이 둘 이상.
@@ -995,6 +1016,7 @@ fn average_core(
         residuals_rad,
         inliers,
         rejected,
+        relocated: 0,
     }
 }
 
@@ -1016,6 +1038,26 @@ const GP_MIN_POINT_VIEWS: usize = 3;
 const GP_MIN_EIG_RATIO: f64 = 1e-4;
 /// 보충 단계에서 카메라를 놓는 데 필요한 직선 지지 수.
 const GP_SUPPLEMENT_SUPPORT: usize = 3;
+/// 퇴화 카메라 재배치에서 새 위치의 점 광선 지지가 현재보다 이만큼까지 적어도 받아들인다.
+/// 퇴화 카메라는 깊이 방향 지지가 평탄해 1개 차이는 구별되지 않는다.
+const GP_RELOCATE_SLACK: usize = 1;
+/// 재배치 판정 규칙.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))] // Cost·Off 는 시험에서만 쓴다.
+enum RelocateRule {
+    /// 새 위치의 점 광선 지지 수 + 완화 폭 >= 현재 지지 수.
+    Slack(usize),
+    /// 새 위치의 절단 각 잔차 제곱합(문턱 밖·카메라 뒤 광선은 문턱 제곱)이 현재보다 작을 때만.
+    Cost,
+    /// 재배치하지 않는다(시험의 비교 기준).
+    Off,
+}
+const GP_RELOCATE_RULE: RelocateRule = RelocateRule::Slack(GP_RELOCATE_SLACK);
+/// `relocated` 로 세는 최소 이동 거리: 등록된 중심의 무게중심 둘레 RMS 반경에 대한 비.
+/// 축척이 임의라 상대값으로 둔다(시험 장면은 반경 23.8 m 라 0.05 m 에 해당).
+const GP_RELOCATE_MIN_MOVE_REL: f64 = 0.002;
+/// 이웃 방향 산포(정규화 방향의 평균 2차 모멘트)의 둘째 고윳값이 이보다 작으면 퇴화 카메라로 본다.
+const GP_WEAK_EIG: f64 = 0.03;
 
 fn gp_uniform(state: &mut u64) -> f64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -1311,11 +1353,26 @@ fn refine_center(
     sol.iter().all(|v| v.is_finite()).then_some(sol)
 }
 
+/// 이웃 방향 산포 행렬의 둘째로 큰 고윳값. 이웃이 둘 미만이면 0(한 직선 이하).
+fn neighbour_scatter_second_eig(dirs: &[Vector3<f64>]) -> f64 {
+    if dirs.len() < 2 {
+        return 0.0;
+    }
+    let m = dirs
+        .iter()
+        .fold(Matrix3::<f64>::zeros(), |a, d| a + d * d.transpose())
+        / dirs.len() as f64;
+    let mut e: Vec<f64> = m.symmetric_eigen().eigenvalues.iter().copied().collect();
+    e.sort_by(|a, b| b.total_cmp(a));
+    e[1]
+}
+
 fn global_positioning(
     rotations: &[Option<Rotation3<f64>>],
     observations: &[RelativeTranslation],
     point_observations: &[PointObservation],
     cfg: &TranslationConfig,
+    rule: RelocateRule,
 ) -> Option<TranslationResult> {
     let n_cam = rotations.len();
     let n_pts_orig = point_observations.iter().map(|o| o.point + 1).max()?;
@@ -1442,6 +1499,12 @@ fn global_positioning(
     }
     // 정밀화: 점 광선(좁은 문턱)과 이웃 짝 방향 직선(작은 가중)을 함께 쓴 각 오차 최소제곱으로 중심을 다듬는다.
     // 점 광선은 내려다보는 시야에서 깊이 방향이 약해, 가로 이웃 짝 방향이 그 방향을 보강한다.
+    let weak: Vec<bool> = (0..n_cam)
+        .map(|c| {
+            let d: Vec<Vector3<f64>> = cam_pairs[c].iter().map(|p| p.1).collect();
+            neighbour_scatter_second_eig(&d) < GP_WEAK_EIG
+        })
+        .collect();
     for _ in 0..GP_REFINE_ITERS {
         // 점 다듬기: 좁은 문턱 안의 카메라 광선만으로 각 오차 최소제곱 교차.
         let mut acc = vec![(Matrix3::<f64>::zeros(), Vector3::<f64>::zeros(), 0usize); n_pts];
@@ -1488,6 +1551,72 @@ fn global_positioning(
             }
             if let Some(c) = refine_center(&cur.coords, &cons) {
                 *slot = Some(Point3::from(c));
+            }
+        }
+    }
+    // 퇴화 카메라(이웃 방향이 거의 한 직선) 재배치: 정밀화가 약한 방향을 시작값 근처에 두므로,
+    // 점 광선과 퇴화하지 않은 이웃의 짝 직선을 함께 쓴 강건 교차로 다시 놓는다.
+    let mut relocated = 0usize;
+    {
+        let reg = centers.clone();
+        let reg_pts: Vec<Vector3<f64>> = reg.iter().flatten().map(|p| p.coords).collect();
+        let mean = reg_pts.iter().sum::<Vector3<f64>>() / reg_pts.len().max(1) as f64;
+        let radius = (reg_pts
+            .iter()
+            .map(|p| (p - mean).norm_squared())
+            .sum::<f64>()
+            / reg_pts.len().max(1) as f64)
+            .sqrt();
+        let min_move = GP_RELOCATE_MIN_MOVE_REL * radius;
+        for cam in 0..n_cam {
+            if !weak[cam] || reg[cam].is_none() {
+                continue;
+            }
+            let mut lines: Vec<(Vector3<f64>, Vector3<f64>)> = cam_obs[cam]
+                .iter()
+                .filter_map(|&k| Some((points[obs[k].1]?.coords, -obs[k].2)))
+                .collect();
+            let n_point_lines = lines.len();
+            for &(other, d) in &cam_pairs[cam] {
+                if let (Some(co), false) = (reg[other], weak[other]) {
+                    lines.push((co.coords, d));
+                }
+            }
+            // 새 위치의 점 광선 지지(같은 문턱)가 GP_SUPPLEMENT_SUPPORT 이상이고 현재 위치보다 GP_RELOCATE_SLACK 넘게 적지 않을 때만 받아들인다.
+            let support = |c: &Vector3<f64>| {
+                lines[..n_point_lines]
+                    .iter()
+                    .filter(|(o, d)| {
+                        (c - o).dot(d) > 0.0 && angle_between(&(c - o), d) <= GP_FINAL_GATE_RAD
+                    })
+                    .count()
+            };
+            // 절단 각 잔차 제곱합(같은 문턱 밖이거나 카메라 뒤인 광선은 문턱 제곱).
+            let cost = |c: &Vector3<f64>| {
+                lines[..n_point_lines]
+                    .iter()
+                    .map(|(o, d)| {
+                        if (c - o).dot(d) > 0.0 {
+                            angle_between(&(c - o), d).min(GP_FINAL_GATE_RAD).powi(2)
+                        } else {
+                            GP_FINAL_GATE_RAD * GP_FINAL_GATE_RAD
+                        }
+                    })
+                    .sum::<f64>()
+            };
+            if let (Some(c), Some(cur)) = (robust_ray_point(&lines, GP_FINAL_GATE_RAD), reg[cam]) {
+                let s_new = support(&c);
+                let better = match rule {
+                    RelocateRule::Slack(k) => s_new + k >= support(&cur.coords),
+                    RelocateRule::Cost => cost(&c) < cost(&cur.coords),
+                    RelocateRule::Off => false,
+                };
+                if s_new >= GP_SUPPLEMENT_SUPPORT && better {
+                    if (c - cur.coords).norm() >= min_move {
+                        relocated += 1;
+                    }
+                    centers[cam] = Some(Point3::from(c));
+                }
             }
         }
     }
@@ -1563,6 +1692,7 @@ fn global_positioning(
         residuals_rad: residuals,
         inliers,
         rejected,
+        relocated,
     })
 }
 
@@ -1854,14 +1984,35 @@ mod tests {
         point_outliers: f64,
         n_points: usize,
     ) -> (usize, f64, f64) {
+        run_points_rule(seed, case, point_outliers, n_points, GP_RELOCATE_RULE)
+    }
+
+    fn run_points_rule(
+        seed: u64,
+        case: &Case,
+        point_outliers: f64,
+        n_points: usize,
+        rule: RelocateRule,
+    ) -> (usize, f64, f64) {
         let (poses, rots, obs) = observations(seed, case);
         let (_, pobs) = point_observations(seed, &poses, n_points, POINTS.1, point_outliers);
-        let res =
-            average_translations_with_points(&rots, &obs, &pobs, &TranslationConfig::default());
+        let res = average_translations_with_points_rule(
+            &rots,
+            &obs,
+            &pobs,
+            &TranslationConfig::default(),
+            rule,
+        );
         let truth: Vec<_> = poses.iter().map(|p| p.center()).collect();
         let errs = similarity_aligned_errors(&res.centers, &truth);
         let (rms, max) = stats(&errs);
+        RELOCATED.with(|r| r.set(res.relocated));
         (res.registered(), rms, max)
+    }
+
+    thread_local! {
+        /// 마지막 실행에서 재배치된 카메라 수(진단 출력용).
+        static RELOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// 진단: 점 제약 유무별 등록 수·RMS (잡음 1°, 이상치 10·20%, 시드 1~5).
@@ -2110,7 +2261,8 @@ mod tests {
                     };
                     let (reg, rms, max) = run_with(seed, &case, pfrac);
                     println!(
-                        "GRID point {pfrac} pair {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m"
+                        "GRID point {pfrac} pair {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m relocated {}",
+                        RELOCATED.with(|r| r.get())
                     );
                     if reg < 238 || rms > 0.3 || max > 1.0 {
                         fails.push((pfrac, frac, seed, reg, rms, max));
@@ -2122,17 +2274,150 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "기준 미달(열린 문제 F-276)"]
+    #[ignore = "기준 미달(열린 문제 F-276): 80경우 중 14경우 실패, 최대 1.37 m, RMS 최악 0.309 m"]
     fn noisy_outliers_grid_seeds_1_to_20() {
         let fails = grid(1..=20);
         assert!(fails.is_empty(), "{} fails: {fails:?}", fails.len());
     }
 
     #[test]
-    #[ignore = "기준 미달(시드 22 점 이상치 5% RMS 0.36 m)로 열린 문제, 조정에 쓰지 않은 시드 21~25"]
+    #[ignore = "기준 미달(열린 문제 F-276): 시드 21 최대 1.25 m, 시드 22 점 이상치 5% RMS 0.365 m, 조정에 쓰지 않은 시드 21~25"]
     fn noisy_outliers_unseen_seeds_21_to_25() {
         let fails = grid(21..=25);
         assert!(fails.is_empty(), "{} fails: {fails:?}", fails.len());
+    }
+
+    /// 진단: 재배치 판정 규칙(완화 0·1·연속 척도)별 격자 표. 시드 범위는 환경변수 TA_SEEDS="처음:끝"(기본 21:25).
+    #[test]
+    #[ignore = "진단 출력용(조정에 쓰지 않은 시드 21~25 표)"]
+    fn relocate_rule_table() {
+        let (lo, hi) = std::env::var("TA_SEEDS")
+            .ok()
+            .and_then(|v| {
+                let (a, b) = v.split_once(':')?;
+                Some((a.parse().ok()?, b.parse().ok()?))
+            })
+            .unwrap_or((21u64, 25u64));
+        let rules = [
+            ("slack0", RelocateRule::Slack(0)),
+            ("slack1", RelocateRule::Slack(1)),
+            ("cost", RelocateRule::Cost),
+        ];
+        for (name, rule) in rules {
+            let (mut nfail, mut worst_max, mut worst_rms, mut moved_total) =
+                (0usize, 0.0f64, 0.0f64, 0usize);
+            for pfrac in [0.0, 0.05] {
+                for frac in [0.10, 0.20] {
+                    for seed in lo..=hi {
+                        let case = Case {
+                            noise_deg: 1.0,
+                            outlier_frac: frac,
+                            unobservable_frac: 0.05,
+                        };
+                        let (reg, rms, max) = run_points_rule(seed, &case, pfrac, POINTS.0, rule);
+                        let moved = RELOCATED.with(|r| r.get());
+                        println!(
+                            "RULE {name} point {pfrac} pair {frac} seed {seed}: reg {reg} rms {rms:.4} m max {max:.4} m moved {moved}"
+                        );
+                        if reg < 238 || rms > 0.3 || max > 1.0 {
+                            nfail += 1;
+                        }
+                        worst_max = worst_max.max(max);
+                        worst_rms = worst_rms.max(rms);
+                        moved_total += moved;
+                    }
+                }
+            }
+            println!(
+                "SUMMARY {name}: fails {nfail} worst max {worst_max:.4} m worst rms {worst_rms:.4} m moved total {moved_total}"
+            );
+        }
+    }
+
+    #[test]
+    fn neighbour_scatter_detects_collinear_neighbours() {
+        let line: Vec<Vector3<f64>> = (0..6)
+            .map(|k| {
+                Vector3::new(1.0, 0.01 * k as f64, 0.0).normalize()
+                    * if k % 2 == 0 { 1.0 } else { -1.0 }
+            })
+            .collect();
+        assert!(neighbour_scatter_second_eig(&line) < 1e-3);
+        let spread = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, -1.0, 0.0),
+        ];
+        let l2 = neighbour_scatter_second_eig(&spread);
+        assert!((l2 - 0.5).abs() < 1e-12, "{l2}");
+        assert_eq!(neighbour_scatter_second_eig(&spread[..1]), 0.0);
+    }
+
+    #[test]
+    fn relocation_reduces_error_seed7_point5pct() {
+        let case = Case {
+            noise_deg: 1.0,
+            outlier_frac: 0.10,
+            unobservable_frac: 0.05,
+        };
+        let (reg, rms, max) = run_with(7, &case, 0.05);
+        println!(
+            "seed 7 point 5% pair 10%: reg {reg} rms {rms:.4} max {max:.4} relocated {}",
+            RELOCATED.with(|r| r.get())
+        );
+        assert!(max <= 1.0, "max {max:.4} m (before relocation 1.78 m)");
+    }
+
+    /// 조정에 쓰지 않은 시드 23(점 이상치 5%, 짝 이상치 10%)에서 재배치가 실제로 일어나고 최대 오차가 늘지 않는다.
+    #[test]
+    fn relocation_does_not_increase_error_unseen_seed23() {
+        let case = Case {
+            noise_deg: 1.0,
+            outlier_frac: 0.10,
+            unobservable_frac: 0.05,
+        };
+        let (_, rms_off, max_off) = run_points_rule(23, &case, 0.05, POINTS.0, RelocateRule::Off);
+        let (reg, rms, max) = run_points_rule(23, &case, 0.05, POINTS.0, GP_RELOCATE_RULE);
+        let moved = RELOCATED.with(|r| r.get());
+        println!(
+            "seed 23 point 5% pair 10%: off rms {rms_off:.4} max {max_off:.4}; on reg {reg} rms {rms:.4} max {max:.4} moved {moved}"
+        );
+        assert!(moved > 0, "재배치된 카메라가 없다");
+        // RMS 는 0.148 → 0.153 으로 약간 늘어 이 경우 이득은 최대 오차에만 있다(보고서 참고).
+        assert!(rms <= rms_off * 1.1, "rms {rms:.4} > {rms_off:.4}");
+        assert!(max <= max_off + 1e-9, "max {max:.4} > {max_off:.4}");
+    }
+
+    #[test]
+    #[ignore = "진단 출력용"]
+    fn diag_fail_cases() {
+        let cases = std::env::var("DIAG_CASES").unwrap_or_default();
+        if cases.trim().is_empty() {
+            return;
+        }
+        let (mut worst_rms, mut worst_max, mut nfail) = (0.0f64, 0.0f64, 0);
+        for spec in cases.split(',') {
+            let v: Vec<&str> = spec.split(':').collect();
+            let (seed, frac, pfrac): (u64, f64, f64) = (
+                v[0].parse().unwrap(),
+                v[1].parse().unwrap(),
+                v[2].parse().unwrap(),
+            );
+            let case = Case {
+                noise_deg: 1.0,
+                outlier_frac: frac,
+                unobservable_frac: 0.05,
+            };
+            let (reg, rms, max) = run_with(seed, &case, pfrac);
+            println!("CASE {spec}: reg {reg} rms {rms:.4} max {max:.4}");
+            worst_rms = worst_rms.max(rms);
+            worst_max = worst_max.max(max);
+            if reg < 238 || rms > 0.3 || max > 1.0 {
+                nfail += 1;
+            }
+        }
+        println!("CASES fails {nfail} worst rms {worst_rms:.4} worst max {worst_max:.4}");
     }
 
     #[test]
