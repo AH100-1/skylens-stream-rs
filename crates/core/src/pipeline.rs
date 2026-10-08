@@ -928,9 +928,14 @@ fn refine_centers(
                 for &o in &by_cam[i] {
                     let (_, j, v) = obs[o];
                     let x = pts[j]?;
-                    let d = (x - ci).norm().max(1e-5);
+                    let dv = x - ci;
+                    // 카메라 뒤(또는 옆)의 점은 광선 제약에 쓰지 않는다.
+                    if dv.dot(&v) <= 0.0 {
+                        continue;
+                    }
+                    let d = dv.norm().max(1e-5);
                     let pm = proj(&v);
-                    let ang = (pm * (x - ci)).norm() / d;
+                    let ang = dv.cross(&v).norm().atan2(dv.dot(&v));
                     let w = if ang <= delta { 1.0 } else { delta / ang } / (d * d);
                     a += w * pm;
                     b += w * pm * x;
@@ -948,8 +953,9 @@ fn refine_centers(
             for (o, &(i, j, v)) in obs.iter().enumerate() {
                 if let (Some(x), Some(ci)) = (pts[j], c[i]) {
                     let d = x - ci;
-                    let ang = d.cross(&v).norm() / d.norm().max(1e-9);
-                    if ang.asin() > drop {
+                    // atan2 각은 카메라 뒤 점에서 90° 를 넘고 반올림에도 NaN 이 되지 않는다.
+                    let ang = d.cross(&v).norm().atan2(d.dot(&v));
+                    if ang > drop {
                         alive[o] = false;
                     }
                 }
@@ -1219,7 +1225,7 @@ fn roll_by_level_spread(
 }
 
 /// 회전 평균 → 방향으로 좌표계 맞춤 → 위치 → 삼각측량. 초벌 희소 모델.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn sparse_init(
     imgs: &[&ImgData],
     pm: &[PairMatch],
@@ -4049,9 +4055,16 @@ mod tri_tests {
 mod refine_tests {
     use super::*;
 
-    /// 회전을 알고 중심에 1 m 잡음이 있는 카메라 줄을 점 광선 제약으로 다듬으면 오차가 줄어든다.
-    #[test]
-    fn refine_centers_reduces_noise() {
+    struct Rig {
+        k: Intrinsics,
+        r: Rotation3<f64>,
+        truth: Vec<Vector3<f64>>,
+        tracks: Vec<Vec<(usize, usize, Vector2<f64>)>>,
+        poses: Vec<Option<Pose>>,
+    }
+
+    /// 카메라 12 대 줄(아래를 봄), x·y·z 모두 잡음이 있는 시작 중심, 점 300 개 트랙.
+    fn rig() -> Rig {
         let k = Intrinsics::from_hfov(320, 180, 65f64.to_radians());
         let r = Rotation3::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI);
         let truth: Vec<Vector3<f64>> = (0..12).map(|i| Vector3::new(i as f64, 0.0, 60.0)).collect();
@@ -4059,10 +4072,14 @@ mod refine_tests {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                c + Vector3::new(0.0, ((i * 7) % 5) as f64 - 2.0, ((i * 3) % 5) as f64 - 2.0)
+                c + Vector3::new(
+                    ((i * 5) % 7) as f64 - 3.0,
+                    ((i * 7) % 5) as f64 - 2.0,
+                    ((i * 3) % 5) as f64 - 2.0,
+                )
             })
             .collect();
-        let tracks: Vec<Vec<(usize, usize, Vector2<f64>)>> = (0..300)
+        let tracks = (0..300)
             .map(|t| {
                 let x = Point3::new(
                     (t % 20) as f64 - 4.0,
@@ -4080,25 +4097,90 @@ mod refine_tests {
                     .collect()
             })
             .collect();
-        let mut poses: Vec<Option<Pose>> = noisy
+        let poses = noisy
             .iter()
             .map(|c| Some(Pose::from_center(r, &Point3::from(*c))))
             .collect();
-        let err = |p: &[Option<Pose>]| -> f64 {
-            p.iter()
-                .zip(&truth)
-                .map(|(a, t)| (a.unwrap().center().coords - t).norm())
-                .sum::<f64>()
-                / 12.0
-        };
-        let before = err(&poses);
-        let opts = PreviewOpts {
+        Rig {
+            k,
+            r,
+            truth,
+            tracks,
+            poses,
+        }
+    }
+
+    fn mean_err(p: &[Option<Pose>], truth: &[Vector3<f64>]) -> f64 {
+        p.iter()
+            .zip(truth)
+            .map(|(a, t)| (a.unwrap().center().coords - t).norm())
+            .sum::<f64>()
+            / truth.len() as f64
+    }
+
+    fn opts() -> PreviewOpts {
+        PreviewOpts {
             refine_iters: 8,
             ..PreviewOpts::default()
-        };
-        refine_centers(&mut poses, &k, &tracks, &opts);
-        let after = err(&poses);
-        assert!(after < 0.7 * before, "{before} -> {after}");
+        }
+    }
+
+    /// 회전을 알고 중심에 잡음(x·y·z)이 있는 카메라 줄을 점 광선 제약으로 다듬으면 오차가 크게 준다.
+    #[test]
+    fn refine_centers_reduces_noise() {
+        let mut g = rig();
+        let before = mean_err(&g.poses, &g.truth);
+        refine_centers(&mut g.poses, &g.k, &g.tracks, &opts());
+        let after = mean_err(&g.poses, &g.truth);
+        eprintln!("refine {before} -> {after}");
+        assert!(after < 0.5 && after < 0.2 * before, "{before} -> {after}");
+    }
+
+    /// 이상 관측(30 px 어긋남)을 섞어도 거르기를 지나 오차가 작게 유지된다.
+    #[test]
+    fn refine_centers_survives_outlier_observations() {
+        let mut g = rig();
+        for (t, tr) in g.tracks.iter_mut().enumerate() {
+            if t % 10 == 0 {
+                tr[1].2 += Vector2::new(30.0, -30.0);
+                tr[4].2 += Vector2::new(-25.0, 20.0);
+            }
+        }
+        refine_centers(&mut g.poses, &g.k, &g.tracks, &opts());
+        let after = mean_err(&g.poses, &g.truth);
+        eprintln!("refine outliers -> {after}");
+        assert!(after < 0.4, "{after}");
+    }
+
+    /// 광선이 카메라 뒤에서 만나는 거짓 트랙은 중심을 움직이지 않는다.
+    #[test]
+    fn refine_centers_ignores_points_behind_camera() {
+        let mut clean = rig();
+        refine_centers(&mut clean.poses, &clean.k, &clean.tracks, &opts());
+
+        let mut g = rig();
+        // 점 q 가 카메라 뒤(위) 에 있고, 각 카메라에서 q 반대 방향(앞)을 가리키는 관측.
+        for t in 0..40 {
+            let q = Vector3::new((t % 8) as f64 * 2.0, (t / 8) as f64 * 6.0 - 12.0, 130.0);
+            let tr: Vec<(usize, usize, Vector2<f64>)> = (0..12)
+                .filter_map(|i| {
+                    let c = g.truth[i];
+                    let mirrored = c - (q - c);
+                    let cam = Camera {
+                        intrinsics: g.k,
+                        pose: Pose::from_center(g.r, &Point3::from(c)),
+                    };
+                    Some((i, 0, cam.project(&Point3::from(mirrored))?))
+                })
+                .collect();
+            assert!(tr.len() >= 3);
+            g.tracks.push(tr);
+        }
+        refine_centers(&mut g.poses, &g.k, &g.tracks, &opts());
+        for (a, b) in g.poses.iter().zip(&clean.poses) {
+            let d = (a.unwrap().center() - b.unwrap().center()).norm();
+            assert!(d < 1e-6, "{d}");
+        }
     }
 
     #[test]
