@@ -57,6 +57,8 @@ pub struct SparseConfig {
     /// 번들 조정에 쓰는 트랙 상한(기본 100_000).
     pub max_ba_tracks: usize,
     pub align_gps: bool,
+    /// 카메라 쌍 회전 투표(`vote_keep`)로 틀린 다른 카메라 간선을 거른다. 기본값은 true.
+    pub pair_vote: bool,
 }
 
 impl Default for SparseConfig {
@@ -69,6 +71,7 @@ impl Default for SparseConfig {
             bundle_adjust: true,
             max_ba_tracks: 100_000,
             align_gps: true,
+            pair_vote: true,
         }
     }
 }
@@ -146,9 +149,11 @@ pub(crate) struct VoteEdge {
 /// 같은 장착이라 카메라 a, b 의 같은 카메라끼리 시간 이웃으로 이은 회전 E_i = R_i W_a(R_i = 위치 회전,
 /// W_a 는 카메라별 평균 기준 회전)로 D = E_jᵀ R_ij E_i = W_bᵀ W_a 는 짝이 어디든 같다. 쌍마다 D 를
 /// 서로 `PAIR_VOTE_DEG` 이내인 무리로 묶어 가장 큰 무리 밖의 간선을 뺀다. 같은 카메라끼리의 간선,
-/// 카메라별 회전을 못 구한 간선, 가장 큰 무리가 2 미만인 쌍은 그대로 둔다.
-/// `group[k]` 는 사진 k 의 카메라 번호. 반환은 간선별 유지 표시.
-pub(crate) fn vote_keep(group: &[usize], edges: &[VoteEdge]) -> Vec<bool> {
+/// 카메라별 회전을 못 구한 간선, 가장 큰 무리가 2 미만인 쌍은 그대로 둔다. 가장 큰 무리가 전체의 절반
+/// 이하이면서 밖에 2 개 이상의 무리가 따로 있거나, 둘째 무리와 수가 같으면 어느 쪽이 맞는지 가릴 수 없어
+/// 그 쌍도 거르지 않는다. 반환은 (간선별 유지 표시, 거르지 않고 둔 쌍 수).
+/// `group[k]` 는 사진 k 의 카메라 번호.
+pub(crate) fn vote_keep(group: &[usize], edges: &[VoteEdge]) -> (Vec<bool>, usize) {
     let n = group.len();
     let groups = group.iter().copied().max().map_or(0, |g| g + 1);
     let mut est: Vec<Option<Rotation3<f64>>> = vec![None; n];
@@ -195,6 +200,7 @@ pub(crate) fn vote_keep(group: &[usize], edges: &[VoteEdge]) -> Vec<bool> {
         }
     }
     let mut keep = vec![true; edges.len()];
+    let mut skipped = 0usize;
     for list in by_pair.values() {
         if list.len() < 3 {
             continue;
@@ -217,6 +223,21 @@ pub(crate) fn vote_keep(group: &[usize], edges: &[VoteEdge]) -> Vec<bool> {
             }
         }
         if let Some((count, _, members)) = best {
+            let second = list
+                .iter()
+                .enumerate()
+                .filter(|(m, _)| !members.contains(m))
+                .map(|(_, (_, c))| {
+                    (0..list.len())
+                        .filter(|&m| !members.contains(&m) && near(c, &list[m].1))
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            if count >= 2 && (second == count || (count * 2 <= list.len() && second >= 2)) {
+                skipped += 1;
+                continue;
+            }
             if count >= 2 {
                 for m in 0..list.len() {
                     if !members.contains(&m) {
@@ -226,7 +247,7 @@ pub(crate) fn vote_keep(group: &[usize], edges: &[VoteEdge]) -> Vec<bool> {
             }
         }
     }
-    keep
+    (keep, skipped)
 }
 
 fn vote_cross_camera_pairs(inputs: &[SparseInput], results: Vec<PairResult>) -> Vec<PairResult> {
@@ -240,7 +261,7 @@ fn vote_cross_camera_pairs(inputs: &[SparseInput], results: Vec<PairResult>) -> 
             weight: p.matches.len() as f64,
         })
         .collect();
-    let keep = vote_keep(&group, &edges);
+    let (keep, _) = vote_keep(&group, &edges);
     results
         .into_iter()
         .zip(keep)
@@ -344,7 +365,11 @@ pub fn reconstruct(
         return Err("검증된 영상 짝 없음".into());
     }
 
-    let results = vote_cross_camera_pairs(inputs, results);
+    let results = if cfg.pair_vote {
+        vote_cross_camera_pairs(inputs, results)
+    } else {
+        results
+    };
     if results.is_empty() {
         return Err("검증된 영상 짝 없음".into());
     }
@@ -1189,6 +1214,7 @@ mod tests {
             &[k, k, k],
             &SparseConfig {
                 max_features: 1200,
+                pair_vote: true,
                 record_stages: true,
                 // 이 시험의 바닥값은 겹침 12·16 칸부터 매 칸 짝을 쓰는 일정으로 쟀다(기본 일정은 +20 부터 4칸 간격).
                 pair_schedule: if fixed_schedule {
@@ -1343,5 +1369,52 @@ mod tests {
             .filter(|p| p.i < positions && p.j >= 2 * positions)
             .count();
         assert_eq!(fl, 3);
+    }
+
+    /// 맞는 2 + 틀린 2(서로 3 도 안)는 어느 쪽이 맞는지 가릴 수 없어 그 쌍의 간선을 빼지 않는다.
+    #[test]
+    fn cross_camera_vote_keeps_pair_on_tie() {
+        let rot = |x: f64, y: f64, z: f64| Rotation3::from_euler_angles(x, y, z);
+        let positions = 6;
+        let mount = rot(0.0, 0.5, 0.0);
+        let body: Vec<Rotation3<f64>> = (0..positions)
+            .map(|p| rot(0.03 * p as f64, 0.1 * p as f64, 0.05 * p as f64))
+            .collect();
+        let group: Vec<usize> = (0..2 * positions).map(|k| k / positions).collect();
+        let truth = |k: usize| {
+            if k < positions {
+                body[k]
+            } else {
+                mount * body[k - positions]
+            }
+        };
+        let exact = |i: usize, j: usize| truth(j) * truth(i).inverse();
+        let mut edges = Vec::new();
+        for c in 0..2 {
+            for p in 0..positions - 1 {
+                let (i, j) = (c * positions + p, c * positions + p + 1);
+                edges.push(VoteEdge {
+                    i,
+                    j,
+                    rot: exact(i, j),
+                    weight: 30.0,
+                });
+            }
+        }
+        let ax = nalgebra::Unit::new_normalize(Vector3::new(0.0, 1.0, 0.0));
+        let off = [0.0_f64, 0.0, 60.0, 62.0];
+        for (n, d) in off.iter().enumerate() {
+            let (i, j) = (n, positions + n + 1);
+            let r = Rotation3::from_axis_angle(&ax, d.to_radians()) * exact(i, j);
+            edges.push(VoteEdge {
+                i,
+                j,
+                rot: r,
+                weight: 30.0,
+            });
+        }
+        let (keep, skipped) = vote_keep(&group, &edges);
+        assert!(keep.iter().all(|&k| k), "{keep:?}");
+        assert_eq!(skipped, 1);
     }
 }

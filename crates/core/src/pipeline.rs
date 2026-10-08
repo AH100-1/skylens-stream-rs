@@ -1075,14 +1075,15 @@ fn vote_pairs(n: usize, pm: &[PairMatch], keep: &mut [bool]) {
             weight: pm[k].inl.len() as f64,
         })
         .collect();
-    let ok = crate::sparse::vote_keep(&group, &edges);
+    let (ok, skipped) = crate::sparse::vote_keep(&group, &edges);
     let stats = std::env::var_os("SKYLENS_VOTE_STATS").is_some();
     let cross = |p: &PairMatch| p.views.0 .0 != p.views.1 .0;
     if stats {
         eprintln!(
-            "vote_stat cross_edges {} dropped {}",
+            "vote_stat cross_edges {} dropped {} skipped_pairs {}",
             idx.iter().filter(|&&k| cross(&pm[k])).count(),
-            ok.iter().filter(|&&b| !b).count()
+            ok.iter().filter(|&&b| !b).count(),
+            skipped
         );
     }
     for (&k, &o) in idx.iter().zip(&ok) {
@@ -1103,6 +1104,89 @@ fn vote_pairs(n: usize, pm: &[PairMatch], keep: &mut [bool]) {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod vote_pairs_tests {
+    use super::*;
+
+    fn pm(
+        views: ((usize, usize), (usize, usize)),
+        idx: &dyn Fn(usize, usize) -> usize,
+        rot: Rotation3<f64>,
+    ) -> PairMatch {
+        PairMatch {
+            i: idx(views.0 .0, views.0 .1),
+            j: idx(views.1 .0, views.1 .1),
+            inl: vec![(0, 0); 30],
+            rot,
+            t: None,
+            views,
+        }
+    }
+
+    /// 틀린 F–L 간선만 꺼지고 같은 카메라·F–R 간선, 맞는 F–L 간선은 켜져 있다.
+    #[test]
+    fn vote_pairs_drops_only_wrong_cross_edges() {
+        let rot = |x: f64, y: f64, z: f64| Rotation3::from_euler_angles(x, y, z);
+        let mounts = [
+            Rotation3::identity(),
+            rot(0.0, 0.5, 0.0),
+            rot(0.1, -0.5, 0.05),
+        ];
+        let positions = 9;
+        let body: Vec<Rotation3<f64>> = (0..positions)
+            .map(|p| {
+                let t = p as f64;
+                rot(0.03 * t, 0.2 * t.sin(), 0.1 * t)
+            })
+            .collect();
+        let idx = |c: usize, p: usize| c * positions + p;
+        let truth = |c: usize, p: usize| mounts[c] * body[p];
+        let exact =
+            |a: (usize, usize), b: (usize, usize)| truth(b.0, b.1) * truth(a.0, a.1).inverse();
+        let mut list = Vec::new();
+        let mut want = Vec::new();
+        for c in 0..3 {
+            for p in 0..positions - 1 {
+                let (a, b) = ((c, p), (c, p + 1));
+                list.push(pm((a, b), &idx, exact(a, b)));
+                want.push(true);
+            }
+        }
+        for p in 0..5 {
+            let (a, b) = ((0, p), (1, p + 2));
+            list.push(pm((a, b), &idx, exact(a, b)));
+            want.push(true);
+        }
+        let wrong_deg = [78.0_f64, 85.0, 91.0, 77.0];
+        let mut w = 0;
+        for p in 0..7 {
+            let (a, b) = ((0, p), (2, p + 1));
+            let mut r = exact(a, b);
+            let bad = p != 3 && p != 5 && p != 6;
+            if bad {
+                let ax = nalgebra::Unit::new_normalize(Vector3::new(1.0, p as f64, 0.5));
+                r = Rotation3::from_axis_angle(&ax, wrong_deg[w].to_radians()) * r;
+                w += 1;
+            }
+            list.push(pm((a, b), &idx, r));
+            want.push(!bad);
+        }
+        assert_eq!(w, 4);
+        let mut keep = vec![true; list.len()];
+        vote_pairs(3 * positions, &list, &mut keep);
+        assert_eq!(keep, want);
+
+        // 이미 꺼진 간선은 투표에 쓰지 않고 그대로 꺼져 있다.
+        let mut keep2 = vec![true; list.len()];
+        keep2[24] = false; // F–R 간선 하나
+        vote_pairs(3 * positions, &list, &mut keep2);
+        assert!(!keep2[24]);
+        for k in (0..list.len()).filter(|&k| k != 24) {
+            assert_eq!(keep2[k], want[k], "{k}");
         }
     }
 }

@@ -200,3 +200,30 @@ fn run_accepts_per_drone_gps() {
     );
     assert!(s.contains("positions 3\n"), "{s}");
 }
+
+/// `--upscale-fill`, `--pair-vote` 는 켜는 인자(값 없음)로 받아들여진다. 모르는 옵션이면 종료 코드 2.
+#[test]
+fn run_accepts_upscale_fill_and_pair_vote() {
+    let t = TempDir::new("vote_flags");
+    let input = t.0.join("in");
+    make_dataset(&input, 4);
+    let (i, o) = (input.to_str().unwrap(), t.0.join("o"));
+    let o = o.to_str().unwrap();
+    for extra in [
+        &["--upscale-fill"][..],
+        &["--pair-vote"],
+        &["--upscale-fill", "--pair-vote", "--max-features", "3000"],
+    ] {
+        let mut args = vec![i, o];
+        args.extend_from_slice(extra);
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(0), "{extra:?}");
+        let s = String::from_utf8(out.stdout).unwrap();
+        assert!(s.contains("images "), "{s}");
+    }
+    let out = run(&[i, o, "--pair-vote", "--nope"]);
+    assert_eq!(out.status.code(), Some(2));
+    // 값을 붙이면 다음 인자로 읽혀 오류가 된다.
+    let out = run(&[i, o, "--upscale-fill", "1"]);
+    assert_eq!(out.status.code(), Some(2));
+}
